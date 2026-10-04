@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:args/args.dart';
@@ -37,40 +38,55 @@ Future<void> main(List<String> arguments) async {
     exit(64);
   }
 
-  final specs = testEmulators.take(int.parse(options['count'] as String)).toList();
-  final emulators = Emulators(sdk: AndroidSdk.locate(), runner: const IoProcessRunner(), avdHome: defaultAvdHome());
+  try {
+    final specs = testEmulators.take(int.parse(options['count'] as String)).toList();
+    final emulators = Emulators(sdk: AndroidSdk.locate(), runner: const IoProcessRunner(), avdHome: defaultAvdHome());
 
-  switch (options.rest.first) {
-    case 'ensure':
-      for (final spec in specs) {
-        await emulators.ensure(spec);
-      }
-    case 'up':
-      for (final spec in specs) {
-        await emulators.ensure(spec);
-      }
-      final started = await emulators.up(specs);
-      stdout.writeln('ready: ${specs.map((s) => s.serial).join(' ')} (started ${started.length})');
-    case 'down':
-      for (final spec in specs) {
-        if (await emulators.isRunning(spec)) await emulators.stop(spec);
-      }
-    case 'test':
-      for (final spec in specs) {
-        await emulators.ensure(spec);
-      }
-      final started = await emulators.up(specs);
-      final appDir = p.normalize(p.join(p.dirname(Platform.script.toFilePath()), '..', '..', '..', 'app'));
-      final flutterArgs = ['test', ...options.rest.skip(1), '-d', specs.first.serial];
-      final code = await const IoProcessRunner().runInherited('flutter', flutterArgs, workingDirectory: appDir);
-      if (!(options['keep'] as bool)) {
-        for (final spec in started) {
-          await emulators.stop(spec);
+    switch (options.rest.first) {
+      case 'ensure':
+        for (final spec in specs) {
+          await emulators.ensure(spec);
         }
-      }
-      exit(code);
-    default:
-      stderr.write(usage);
-      exit(64);
+      case 'up':
+        for (final spec in specs) {
+          await emulators.ensure(spec);
+        }
+        final started = await emulators.up(specs);
+        stdout.writeln('ready: ${specs.map((s) => s.serial).join(' ')} (started ${started.length})');
+      case 'down':
+        for (final spec in specs) {
+          if (await emulators.isRunning(spec)) await emulators.stop(spec);
+        }
+      case 'test':
+        for (final spec in specs) {
+          await emulators.ensure(spec);
+        }
+        final started = await emulators.up(specs);
+        final int code;
+        try {
+          final appDir = p.normalize(p.join(p.dirname(Platform.script.toFilePath()), '..', '..', '..', 'app'));
+          final flutterArgs = ['test', ...options.rest.skip(1), '-d', specs.first.serial];
+          code = await const IoProcessRunner().runInherited('flutter', flutterArgs, workingDirectory: appDir);
+        } finally {
+          if (!(options['keep'] as bool)) {
+            for (final spec in started) {
+              await emulators.stop(spec);
+            }
+          }
+        }
+        exit(code);
+      default:
+        stderr.write(usage);
+        exit(64);
+    }
+  } on StateError catch (e) {
+    stderr.writeln(e.message);
+    exit(1);
+  } on TimeoutException catch (e) {
+    stderr.writeln(e.message);
+    exit(1);
+  } on ProcessException catch (e) {
+    stderr.writeln('${e.executable}: ${e.message}');
+    exit(1);
   }
 }

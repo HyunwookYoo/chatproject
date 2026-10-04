@@ -77,15 +77,16 @@ class Emulators {
     return parseAdbDevices(result.stdout as String);
   }
 
-  /// Name of the AVD running on [spec]'s port, or null when the port is free.
+  /// Name of the AVD on [spec]'s port, or null when adb does not list the port. An
+  /// emulator that is still booting, or stuck offline, counts as listed.
   Future<String?> runningAvd(EmulatorSpec spec) async {
-    if ((await devices())[spec.serial] != 'device') return null;
+    if (!(await devices()).containsKey(spec.serial)) return null;
     final result = await runner.run(sdk.adb, ['-s', spec.serial, 'emu', 'avd', 'name']);
     return (result.stdout as String).split(RegExp(r'\r?\n')).first.trim();
   }
 
-  /// True when [spec] already runs. Throws when another AVD holds its port, so tests
-  /// never run on (or stop) the user's own emulator.
+  /// True when [spec] already runs, in any adb state. Throws when another AVD holds its
+  /// port, so tests never run on (or stop) the user's own emulator.
   Future<bool> isRunning(EmulatorSpec spec) async {
     final name = await runningAvd(spec);
     if (name == null) return false;
@@ -107,24 +108,41 @@ class Emulators {
       if (created.exitCode != 0) throw StateError('Cannot create ${spec.avd}: ${created.stderr}');
     }
     if (hasCleanSnapshot(spec)) return;
-    if (!await isRunning(spec)) {
-      await runner.startDetached(sdk.emulator, firstBootArgs(spec));
+    final launched = !await isRunning(spec);
+    if (launched) await runner.startDetached(sdk.emulator, firstBootArgs(spec));
+    try {
+      // An emulator that already runs may still be booting: wait for it too, so the
+      // snapshot never captures a half-booted state.
       await waitBooted(spec);
+      await runner.run(sdk.adb, ['-s', spec.serial, 'emu', 'avd', 'snapshot', 'save', cleanSnapshot]);
+    } catch (_) {
+      if (launched) await _stopQuietly([spec]);
+      rethrow;
     }
-    await runner.run(sdk.adb, ['-s', spec.serial, 'emu', 'avd', 'snapshot', 'save', cleanSnapshot]);
     await stop(spec);
   }
 
-  /// Boots the emulators in [specs] that are not running; returns the ones it started.
+  /// Boots the emulators in [specs] that adb does not list yet and waits until every one of
+  /// them has finished booting; returns the ones it started. Every port is checked before
+  /// the first launch. If anything fails after a launch, the emulators it launched are
+  /// stopped before the error is rethrown.
   Future<List<EmulatorSpec>> up(List<EmulatorSpec> specs) async {
-    final started = <EmulatorSpec>[];
+    final toLaunch = <EmulatorSpec>[];
     for (final spec in specs) {
-      if (await isRunning(spec)) continue;
-      await runner.startDetached(sdk.emulator, bootArgs(spec));
-      started.add(spec);
+      if (!await isRunning(spec)) toLaunch.add(spec);
     }
-    for (final spec in started) {
-      await waitBooted(spec);
+    final started = <EmulatorSpec>[];
+    try {
+      for (final spec in toLaunch) {
+        await runner.startDetached(sdk.emulator, bootArgs(spec));
+        started.add(spec);
+      }
+      for (final spec in specs) {
+        await waitBooted(spec);
+      }
+    } catch (_) {
+      await _stopQuietly(started);
+      rethrow;
     }
     return started;
   }
@@ -147,6 +165,17 @@ class Emulators {
     while ((await devices()).containsKey(spec.serial)) {
       if (!_now().isBefore(deadline)) throw TimeoutException('${spec.serial} did not stop within 30 s');
       await _sleep(pollInterval);
+    }
+  }
+
+  /// Stops [specs] after a failure. A stop that fails too must not hide the first error.
+  Future<void> _stopQuietly(Iterable<EmulatorSpec> specs) async {
+    for (final spec in specs) {
+      try {
+        await stop(spec);
+      } catch (_) {
+        // The caller rethrows the original error; `down` can stop what is left.
+      }
     }
   }
 }
