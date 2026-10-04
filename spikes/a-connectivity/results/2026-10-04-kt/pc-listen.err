@@ -1,0 +1,19 @@
+endpoint id: e381a6b2f0648f772554faf984168b2d465bf118b948470ed034c0cac1913bf8
+  relay:https://aps1-1.relay.n0.iroh.link./
+  ip:203.0.113.10:59407
+  ip:172.27.64.1:59407
+  ip:192.168.55.159:59407
+ticket (stdout):
+waiting for connections, Ctrl-C to stop
+accepted d3d89b2dd09dea9b63c8675b2e0e054759ecf2ebe32048c798eb426995df7b90
+closed d3d89b2dd09dea9b63c8675b2e0e054759ecf2ebe32048c798eb426995df7b90: closed by peer: done (code 0)
+accepted 2e48d7eff8cbab93052eba15711c343df39efd87f26aa60eda82fdd6346d3da8
+closed 2e48d7eff8cbab93052eba15711c343df39efd87f26aa60eda82fdd6346d3da8: closed by peer: done (code 0)
+accepted 1002d657d8c14c2a2110182b6c1e5dc21f8f51b50377ff37bd86ed4228d81010
+closed 1002d657d8c14c2a2110182b6c1e5dc21f8f51b50377ff37bd86ed4228d81010: closed by peer: done (code 0)
+accepted d8a3ab8eedbfed98efff3846889020e1a976ebde76dbb3d258fc7e5cde69235e
+closed d8a3ab8eedbfed98efff3846889020e1a976ebde76dbb3d258fc7e5cde69235e: closed by peer: done (code 0)
+accepted 721a7718029f884e7120830f43eb2feca3356b6970fe19455035f40735e7c79d
+closed 721a7718029f884e7120830f43eb2feca3356b6970fe19455035f40735e7c79d: closed by peer: done (code 0)
+accepted 85fd7f46780f73d3457f8c48a213c89cee064470afff32771dd65f42b9ce3974
+closed 85fd7f46780f73d3457f8c48a213c89cee064470afff32771dd65f42b9ce3974: closed by peer: done (code 0)

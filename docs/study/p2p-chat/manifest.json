@@ -1,0 +1,740 @@
+{
+  "generatedAt": "2026-08-23T00:00:00.000Z",
+  "topic": "p2p-chat",
+  "structure": "chapter-tabs",
+  "sources": [
+    {
+      "path": "docs/research/2026-08-23-p2p-chat-feasibility.md",
+      "sha256": "3f3faddfd2570d96c1b5abbf9ea477f790f3a1fa3e1cbec40f8313c56eeccd37",
+      "bytes": 25493
+    },
+    {
+      "path": "docs/superpowers/specs/2026-08-23-p2p-chat-design.md",
+      "sha256": "ac498ea609891d18ee94cc8a7bbdb2467199a7a626658dcf5c43de967b44dcc4",
+      "bytes": 33404
+    }
+  ],
+  "spine": {
+    "kind": "architecture",
+    "axis": "서버가 어디까지 필요한가 — 모든 계층을 서버 0대 / 무상태 프록시 / 큐 릴레이 중 어디에 놓을 수 있는지로 관통한다.",
+    "runningExample": "B가 A에게 보낸 메시지 한 통 — A의 폰은 꺼져 있고 A의 PC는 켜져 있다 (설계 §3.1의 추적). 이 한 통의 상태가 스텝 사이를 흐른다.",
+    "steps": [
+      {
+        "id": "c1-s1",
+        "title": "요구사항 네 개",
+        "sourceSections": [
+          "2026-08-23-p2p-chat-feasibility §0. 요구사항 (원문)"
+        ]
+      },
+      {
+        "id": "c1-s2",
+        "title": "측정 환경과 이 회선의 정체",
+        "sourceSections": [
+          "2026-08-23-p2p-chat-feasibility §1. 실측 요약",
+          "2026-08-23-p2p-chat-feasibility §1.1 측정 환경",
+          "2026-08-23-p2p-chat-feasibility §1.2 NAT / 네트워크 (STUN RFC 5389·5780 직접 구현하여 측정)"
+        ]
+      },
+      {
+        "id": "c1-s3",
+        "title": "스택은 공짜, 경로가 전부",
+        "sourceSections": [
+          "2026-08-23-p2p-chat-feasibility §1.3 WebRTC 스택 실측 (node-datachannel 0.33.1 = libdatachannel)",
+          "2026-08-23-p2p-chat-feasibility §1.4 장거리 RTT (TCP connect 3회 최솟값)"
+        ]
+      },
+      {
+        "id": "c1-s4",
+        "title": "남의 릴레이는 뭄바이를 지난다",
+        "sourceSections": [
+          "2026-08-23-p2p-chat-feasibility §1.5 공개 릴레이 인프라 지연 (한국 기준, TCP 443)"
+        ]
+      },
+      {
+        "id": "c1-s5",
+        "title": "83 MB 대 348 MB",
+        "sourceSections": [
+          "2026-08-23-p2p-chat-feasibility §1.6 프레임워크 실측 (Hello World, Windows x64 release)"
+        ]
+      },
+      {
+        "id": "c1-s6",
+        "title": "Q1 판정 — Flutter + Rust",
+        "sourceSections": [
+          "2026-08-23-p2p-chat-feasibility §2. Q1 — 어떤 프레임워크가 방향성에 맞는가",
+          "2026-08-23-p2p-chat-feasibility §2.1 후보 평가",
+          "2026-08-23-p2p-chat-feasibility §2.2 권장: **Flutter (UI) + Rust (P2P·암호 코어) via flutter_rust_bridge**",
+          "2026-08-23-p2p-chat-feasibility §2.3 대안이 정당해지는 조건"
+        ]
+      },
+      {
+        "id": "c1-s7",
+        "title": "Q2 네트워크 계층 — 70%와 디스커버리",
+        "sourceSections": [
+          "2026-08-23-p2p-chat-feasibility §3. Q2 — 서버 없이 온전한 장거리 P2P 채팅이 가능한가",
+          "2026-08-23-p2p-chat-feasibility §결론부터: **네트워크 계층은 \"거의\" 가능. 그러나 모바일 OS 계층에서 불가능하다. iOS가 벽이다.**",
+          "2026-08-23-p2p-chat-feasibility §3.1 네트워크 계층 — 가능하지만 100%는 아니다"
+        ]
+      },
+      {
+        "id": "c1-s8",
+        "title": "OS 계층 — iOS가 벽이다",
+        "sourceSections": [
+          "2026-08-23-p2p-chat-feasibility §3.2 OS 계층 — 여기서 막힌다 (결정적)"
+        ]
+      },
+      {
+        "id": "c1-s9",
+        "title": "유일한 우회로, 그리고 Android의 6시간",
+        "sourceSections": [
+          "2026-08-23-p2p-chat-feasibility §3.2 OS 계층 — 여기서 막힌다 (결정적)"
+        ]
+      },
+      {
+        "id": "c1-s10",
+        "title": "오프라인 전달 — 논리의 벽",
+        "sourceSections": [
+          "2026-08-23-p2p-chat-feasibility §3.3 오프라인 전달이라는 별개의 벽"
+        ]
+      },
+      {
+        "id": "c1-s11",
+        "title": "L0~L3 스펙트럼과 요구사항 재해석",
+        "sourceSections": [
+          "2026-08-23-p2p-chat-feasibility §3.4 현실적인 스펙트럼 — 요구사항 #2를 지키면서 고를 수 있는 것",
+          "2026-08-23-p2p-chat-feasibility §3.5 요구사항 #1과 #2의 충돌 — 명시적으로 짚어야 할 지점"
+        ]
+      },
+      {
+        "id": "c1-s12",
+        "title": "Q3 — 블록체인을 메시지 경로에 두지 말 것",
+        "sourceSections": [
+          "2026-08-23-p2p-chat-feasibility §4. Q3 — 블록체인 도입 시 지금 염두에 둘 것",
+          "2026-08-23-p2p-chat-feasibility §원칙: **블록체인을 메시지 경로에 두지 말 것.**",
+          "2026-08-23-p2p-chat-feasibility §4.1 지금 정해야 하는 것 (나중에 바꾸면 비싼 것)"
+        ]
+      },
+      {
+        "id": "c1-s13",
+        "title": "규제 · 용도 · 성능 원칙",
+        "sourceSections": [
+          "2026-08-23-p2p-chat-feasibility §4.2 제품·규제 제약 (기능 범위를 결정한다)",
+          "2026-08-23-p2p-chat-feasibility §4.3 적합 / 부적합 용도",
+          "2026-08-23-p2p-chat-feasibility §4.4 성능 원칙"
+        ]
+      },
+      {
+        "id": "c1-s14",
+        "title": "요약 권고와 미결정 넷",
+        "sourceSections": [
+          "2026-08-23-p2p-chat-feasibility §5. 요약 권고",
+          "2026-08-23-p2p-chat-feasibility §6. 미결정 사항 (설계 착수 전 확인 필요)"
+        ]
+      },
+      {
+        "id": "c1-s15",
+        "title": "부록 — 측정 스크립트와 출처",
+        "sourceSections": [
+          "2026-08-23-p2p-chat-feasibility §부록 A. 측정 스크립트",
+          "2026-08-23-p2p-chat-feasibility §부록 B. 출처"
+        ]
+      },
+      {
+        "id": "c2-s1",
+        "title": "확정된 결정사항",
+        "sourceSections": [
+          "2026-08-23-p2p-chat-design §1. 확정된 결정사항",
+          "2026-08-23-p2p-chat-design §1.1 요구사항 #2의 확정 해석"
+        ]
+      },
+      {
+        "id": "c2-s2",
+        "title": "서버 의존도 — 두 구성",
+        "sourceSections": [
+          "2026-08-23-p2p-chat-design §2. 서버 의존도 — 설계의 중심 축",
+          "2026-08-23-p2p-chat-design §2.1 두 구성",
+          "2026-08-23-p2p-chat-design §2.2 승격 조건 — 언제 R로 가는가",
+          "2026-08-23-p2p-chat-design §2.3 사용자 소유 릴레이 (BYO)"
+        ]
+      },
+      {
+        "id": "c2-s3",
+        "title": "시스템 개요와 경로 선택 순서",
+        "sourceSections": [
+          "2026-08-23-p2p-chat-design §2.4 시스템 개요",
+          "2026-08-23-p2p-chat-design §2.5 경로 선택 순서"
+        ]
+      },
+      {
+        "id": "c2-s4",
+        "title": "동반기기 — 원리와 두 방향",
+        "sourceSections": [
+          "2026-08-23-p2p-chat-design §3. 동반기기(Companion Device) — 구성 P의 핵심",
+          "2026-08-23-p2p-chat-design §3.1 원리",
+          "2026-08-23-p2p-chat-design §3.2 두 방향 모두 작동한다"
+        ]
+      },
+      {
+        "id": "c2-s5",
+        "title": "동반기기 프로토콜 · 한계 · 부수 효과",
+        "sourceSections": [
+          "2026-08-23-p2p-chat-design §3.3 동반기기 프로토콜",
+          "2026-08-23-p2p-chat-design §3.4 한계 — 정직하게",
+          "2026-08-23-p2p-chat-design §3.5 부수 효과"
+        ]
+      },
+      {
+        "id": "c2-s6",
+        "title": "키 계층과 원칙 셋",
+        "sourceSections": [
+          "2026-08-23-p2p-chat-design §4. 아이덴티티 및 키 아키텍처",
+          "2026-08-23-p2p-chat-design §4.1 키 계층",
+          "2026-08-23-p2p-chat-design §4.2 원칙"
+        ]
+      },
+      {
+        "id": "c2-s7",
+        "title": "연락처 추가 — 서버 없이",
+        "sourceSections": [
+          "2026-08-23-p2p-chat-design §4.3 연락처 추가 — 서버 없이"
+        ]
+      },
+      {
+        "id": "c2-s8",
+        "title": "전송 계층 — dial 순서와 릴레이 폴백",
+        "sourceSections": [
+          "2026-08-23-p2p-chat-design §5. 전송 계층 (iroh)",
+          "2026-08-23-p2p-chat-design §5.1 dial 순서",
+          "2026-08-23-p2p-chat-design §5.2 릴레이 폴백"
+        ]
+      },
+      {
+        "id": "c2-s9",
+        "title": "MLS 커밋 순서 문제",
+        "sourceSections": [
+          "2026-08-23-p2p-chat-design §6. MLS 그룹 계층",
+          "2026-08-23-p2p-chat-design §6.1 커밋 순서 문제"
+        ]
+      },
+      {
+        "id": "c2-s10",
+        "title": "그룹 라이프사이클과 사이퍼수트",
+        "sourceSections": [
+          "2026-08-23-p2p-chat-design §6.2 그룹 라이프사이클",
+          "2026-08-23-p2p-chat-design §6.3 사이퍼수트"
+        ]
+      },
+      {
+        "id": "c2-s11",
+        "title": "메시지 포맷 — 봉투와 페이로드",
+        "sourceSections": [
+          "2026-08-23-p2p-chat-design §7. 메시지 포맷",
+          "2026-08-23-p2p-chat-design §7.1 전송 봉투",
+          "2026-08-23-p2p-chat-design §7.2 애플리케이션 페이로드 (MLS 안, 참여자만 복호)"
+        ]
+      },
+      {
+        "id": "c2-s12",
+        "title": "순서 · 시각 · 첨부파일",
+        "sourceSections": [
+          "2026-08-23-p2p-chat-design §7.3 순서와 시각",
+          "2026-08-23-p2p-chat-design §7.4 첨부파일"
+        ]
+      },
+      {
+        "id": "c2-s13",
+        "title": "푸시 — Android는 서버가 필요 없다",
+        "sourceSections": [
+          "2026-08-23-p2p-chat-design §8. 푸시 알림",
+          "2026-08-23-p2p-chat-design §8.1 Android — 서버 불필요"
+        ]
+      },
+      {
+        "id": "c2-s14",
+        "title": "푸시 — iOS stateless 프록시",
+        "sourceSections": [
+          "2026-08-23-p2p-chat-design §8.2 iOS — stateless 프록시"
+        ]
+      },
+      {
+        "id": "c2-s15",
+        "title": "알림에 내용 표시 — 구성 P에서도",
+        "sourceSections": [
+          "2026-08-23-p2p-chat-design §8.3 알림에 내용 표시 — 구성 P에서도 가능",
+          "2026-08-23-p2p-chat-design §8.4 완화 조치"
+        ]
+      },
+      {
+        "id": "c2-s16",
+        "title": "큐 릴레이 — 큐 모델과 명령 일곱",
+        "sourceSections": [
+          "2026-08-23-p2p-chat-design §9. 큐 릴레이 프로토콜 — 구성 R에서만",
+          "2026-08-23-p2p-chat-design §9.1 큐 모델",
+          "2026-08-23-p2p-chat-design §9.2 명령"
+        ]
+      },
+      {
+        "id": "c2-s17",
+        "title": "저장 정책과 큐 로테이션",
+        "sourceSections": [
+          "2026-08-23-p2p-chat-design §9.3 저장 정책 — 짧게 유지한다",
+          "2026-08-23-p2p-chat-design §9.4 큐 로테이션"
+        ]
+      },
+      {
+        "id": "c2-s18",
+        "title": "프라이버시 한계 — 정직한 기록",
+        "sourceSections": [
+          "2026-08-23-p2p-chat-design §10. 프라이버시 한계 — 정직한 기록"
+        ]
+      },
+      {
+        "id": "c2-s19",
+        "title": "로컬 저장과 메시지 상태 기계",
+        "sourceSections": [
+          "2026-08-23-p2p-chat-design §11. 로컬 저장",
+          "2026-08-23-p2p-chat-design §11.1 엔진",
+          "2026-08-23-p2p-chat-design §11.2 스키마 (요약)",
+          "2026-08-23-p2p-chat-design §11.3 메시지 상태 기계"
+        ]
+      },
+      {
+        "id": "c2-s20",
+        "title": "Rust ↔ Dart 경계",
+        "sourceSections": [
+          "2026-08-23-p2p-chat-design §12. Rust ↔ Dart 경계",
+          "2026-08-23-p2p-chat-design §12.1 원칙: 상태는 전부 Rust가 소유한다",
+          "2026-08-23-p2p-chat-design §12.2 규칙"
+        ]
+      },
+      {
+        "id": "c2-s21",
+        "title": "iOS NSE와 코어 공유",
+        "sourceSections": [
+          "2026-08-23-p2p-chat-design §12.3 iOS NSE와의 코어 공유"
+        ]
+      },
+      {
+        "id": "c2-s22",
+        "title": "확장 지점 — resolver · registry · orderer",
+        "sourceSections": [
+          "2026-08-23-p2p-chat-design §13. 확장 지점 (요구사항 4 + 블록체인 대비)",
+          "2026-08-23-p2p-chat-design §13.1 `IdentityResolver` — PeerId → 주소",
+          "2026-08-23-p2p-chat-design §13.2 `NameRegistry` — 이름 → PeerId",
+          "2026-08-23-p2p-chat-design §13.3 `CommitOrderer` — MLS 커밋 순서 ★"
+        ]
+      },
+      {
+        "id": "c2-s23",
+        "title": "앵커 · 지갑 바인딩 · 블록체인 원칙",
+        "sourceSections": [
+          "2026-08-23-p2p-chat-design §13.4 `Anchor` — 로컬 해시체인 앵커링",
+          "2026-08-23-p2p-chat-design §13.5 지갑 바인딩",
+          "2026-08-23-p2p-chat-design §13.6 블록체인 확정 원칙"
+        ]
+      },
+      {
+        "id": "c2-s24",
+        "title": "성능 예산과 반응성 전략",
+        "sourceSections": [
+          "2026-08-23-p2p-chat-design §14. 성능 예산 (실측 기반)",
+          "2026-08-23-p2p-chat-design §14.1 반응성 전략"
+        ]
+      },
+      {
+        "id": "c2-s25",
+        "title": "플랫폼별 구현 노트",
+        "sourceSections": [
+          "2026-08-23-p2p-chat-design §15. 플랫폼별 구현 노트"
+        ]
+      },
+      {
+        "id": "c2-s26",
+        "title": "위협 모델",
+        "sourceSections": [
+          "2026-08-23-p2p-chat-design §16. 위협 모델"
+        ]
+      },
+      {
+        "id": "c2-s27",
+        "title": "미결정 사항 및 리스크 아홉",
+        "sourceSections": [
+          "2026-08-23-p2p-chat-design §17. 미결정 사항 및 리스크"
+        ]
+      },
+      {
+        "id": "c2-s28",
+        "title": "다음 단계 — 구현 순서 아홉",
+        "sourceSections": [
+          "2026-08-23-p2p-chat-design §18. 다음 단계"
+        ]
+      }
+    ]
+  },
+  "coverage": [
+    {
+      "source": "2026-08-23-p2p-chat-feasibility §0. 요구사항 (원문)",
+      "target": "#c1-s1"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-feasibility §1. 실측 요약",
+      "target": "#c1-s2"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-feasibility §1.1 측정 환경",
+      "target": "#c1-s2"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-feasibility §1.2 NAT / 네트워크 (STUN RFC 5389·5780 직접 구현하여 측정)",
+      "target": "#c1-s2"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-feasibility §1.3 WebRTC 스택 실측 (node-datachannel 0.33.1 = libdatachannel)",
+      "target": "#c1-s3"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-feasibility §1.4 장거리 RTT (TCP connect 3회 최솟값)",
+      "target": "#c1-s3"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-feasibility §1.5 공개 릴레이 인프라 지연 (한국 기준, TCP 443)",
+      "target": "#c1-s4"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-feasibility §1.6 프레임워크 실측 (Hello World, Windows x64 release)",
+      "target": "#c1-s5"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-feasibility §2. Q1 — 어떤 프레임워크가 방향성에 맞는가",
+      "target": "#c1-s6"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-feasibility §2.1 후보 평가",
+      "target": "#c1-s6"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-feasibility §2.2 권장: **Flutter (UI) + Rust (P2P·암호 코어) via flutter_rust_bridge**",
+      "target": "#c1-s6"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-feasibility §2.3 대안이 정당해지는 조건",
+      "target": "#c1-s6"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-feasibility §3. Q2 — 서버 없이 온전한 장거리 P2P 채팅이 가능한가",
+      "target": "#c1-s7"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-feasibility §결론부터: **네트워크 계층은 \"거의\" 가능. 그러나 모바일 OS 계층에서 불가능하다. iOS가 벽이다.**",
+      "target": "#c1-s7"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-feasibility §3.1 네트워크 계층 — 가능하지만 100%는 아니다",
+      "target": "#c1-s7"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-feasibility §3.2 OS 계층 — 여기서 막힌다 (결정적)",
+      "target": "#c1-s8"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-feasibility §3.3 오프라인 전달이라는 별개의 벽",
+      "target": "#c1-s10"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-feasibility §3.4 현실적인 스펙트럼 — 요구사항 #2를 지키면서 고를 수 있는 것",
+      "target": "#c1-s11"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-feasibility §3.5 요구사항 #1과 #2의 충돌 — 명시적으로 짚어야 할 지점",
+      "target": "#c1-s11"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-feasibility §4. Q3 — 블록체인 도입 시 지금 염두에 둘 것",
+      "target": "#c1-s12"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-feasibility §원칙: **블록체인을 메시지 경로에 두지 말 것.**",
+      "target": "#c1-s12"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-feasibility §4.1 지금 정해야 하는 것 (나중에 바꾸면 비싼 것)",
+      "target": "#c1-s12"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-feasibility §4.2 제품·규제 제약 (기능 범위를 결정한다)",
+      "target": "#c1-s13"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-feasibility §4.3 적합 / 부적합 용도",
+      "target": "#c1-s13"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-feasibility §4.4 성능 원칙",
+      "target": "#c1-s13"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-feasibility §5. 요약 권고",
+      "target": "#c1-s14"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-feasibility §6. 미결정 사항 (설계 착수 전 확인 필요)",
+      "target": "#c1-s14"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-feasibility §부록 A. 측정 스크립트",
+      "target": "#c1-s15"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-feasibility §부록 B. 출처",
+      "target": "#c1-s15"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §1. 확정된 결정사항",
+      "target": "#c2-s1"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §1.1 요구사항 #2의 확정 해석",
+      "target": "#c2-s1"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §2. 서버 의존도 — 설계의 중심 축",
+      "target": "#c2-s2"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §2.1 두 구성",
+      "target": "#c2-s2"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §2.2 승격 조건 — 언제 R로 가는가",
+      "target": "#c2-s2"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §2.3 사용자 소유 릴레이 (BYO)",
+      "target": "#c2-s2"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §2.4 시스템 개요",
+      "target": "#c2-s3"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §2.5 경로 선택 순서",
+      "target": "#c2-s3"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §3. 동반기기(Companion Device) — 구성 P의 핵심",
+      "target": "#c2-s4"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §3.1 원리",
+      "target": "#c2-s4"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §3.2 두 방향 모두 작동한다",
+      "target": "#c2-s4"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §3.3 동반기기 프로토콜",
+      "target": "#c2-s5"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §3.4 한계 — 정직하게",
+      "target": "#c2-s5"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §3.5 부수 효과",
+      "target": "#c2-s5"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §4. 아이덴티티 및 키 아키텍처",
+      "target": "#c2-s6"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §4.1 키 계층",
+      "target": "#c2-s6"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §4.2 원칙",
+      "target": "#c2-s6"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §4.3 연락처 추가 — 서버 없이",
+      "target": "#c2-s7"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §5. 전송 계층 (iroh)",
+      "target": "#c2-s8"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §5.1 dial 순서",
+      "target": "#c2-s8"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §5.2 릴레이 폴백",
+      "target": "#c2-s8"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §6. MLS 그룹 계층",
+      "target": "#c2-s9"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §6.1 커밋 순서 문제",
+      "target": "#c2-s9"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §6.2 그룹 라이프사이클",
+      "target": "#c2-s10"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §6.3 사이퍼수트",
+      "target": "#c2-s10"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §7. 메시지 포맷",
+      "target": "#c2-s11"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §7.1 전송 봉투",
+      "target": "#c2-s11"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §7.2 애플리케이션 페이로드 (MLS 안, 참여자만 복호)",
+      "target": "#c2-s11"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §7.3 순서와 시각",
+      "target": "#c2-s12"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §7.4 첨부파일",
+      "target": "#c2-s12"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §8. 푸시 알림",
+      "target": "#c2-s13"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §8.1 Android — 서버 불필요",
+      "target": "#c2-s13"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §8.2 iOS — stateless 프록시",
+      "target": "#c2-s14"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §8.3 알림에 내용 표시 — 구성 P에서도 가능",
+      "target": "#c2-s15"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §8.4 완화 조치",
+      "target": "#c2-s15"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §9. 큐 릴레이 프로토콜 — 구성 R에서만",
+      "target": "#c2-s16"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §9.1 큐 모델",
+      "target": "#c2-s16"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §9.2 명령",
+      "target": "#c2-s16"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §9.3 저장 정책 — 짧게 유지한다",
+      "target": "#c2-s17"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §9.4 큐 로테이션",
+      "target": "#c2-s17"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §10. 프라이버시 한계 — 정직한 기록",
+      "target": "#c2-s18"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §11. 로컬 저장",
+      "target": "#c2-s19"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §11.1 엔진",
+      "target": "#c2-s19"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §11.2 스키마 (요약)",
+      "target": "#c2-s19"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §11.3 메시지 상태 기계",
+      "target": "#c2-s19"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §12. Rust ↔ Dart 경계",
+      "target": "#c2-s20"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §12.1 원칙: 상태는 전부 Rust가 소유한다",
+      "target": "#c2-s20"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §12.2 규칙",
+      "target": "#c2-s20"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §12.3 iOS NSE와의 코어 공유",
+      "target": "#c2-s21"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §13. 확장 지점 (요구사항 4 + 블록체인 대비)",
+      "target": "#c2-s22"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §13.1 `IdentityResolver` — PeerId → 주소",
+      "target": "#c2-s22"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §13.2 `NameRegistry` — 이름 → PeerId",
+      "target": "#c2-s22"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §13.3 `CommitOrderer` — MLS 커밋 순서 ★",
+      "target": "#c2-s22"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §13.4 `Anchor` — 로컬 해시체인 앵커링",
+      "target": "#c2-s23"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §13.5 지갑 바인딩",
+      "target": "#c2-s23"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §13.6 블록체인 확정 원칙",
+      "target": "#c2-s23"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §14. 성능 예산 (실측 기반)",
+      "target": "#c2-s24"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §14.1 반응성 전략",
+      "target": "#c2-s24"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §15. 플랫폼별 구현 노트",
+      "target": "#c2-s25"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §16. 위협 모델",
+      "target": "#c2-s26"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §17. 미결정 사항 및 리스크",
+      "target": "#c2-s27"
+    },
+    {
+      "source": "2026-08-23-p2p-chat-design §18. 다음 단계",
+      "target": "#c2-s28"
+    }
+  ]
+}

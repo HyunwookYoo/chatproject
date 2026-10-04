@@ -1,0 +1,63 @@
+{
+  "connect_ms": 460.493,
+  "time_to_direct_ms": 748.051,
+  "final_path": "direct",
+  "rtt_ms": {
+    "direct": {
+      "n": 19,
+      "p50": 107.911,
+      "p95": 214.09
+    },
+    "relay": {
+      "n": 1,
+      "p50": 261.799,
+      "p95": 261.799
+    }
+  },
+  "count": 20,
+  "online_ms": 651.99,
+  "relay_used": "https://aps1-1.relay.n0.iroh.link./",
+  "local": {
+    "endpoint_id": "6911fe80fd00efe96f3659298e4f5177095625fd859f5ea3a6fadf75de5a96e3",
+    "home_relay": "https://aps1-1.relay.n0.iroh.link./",
+    "addrs": [
+      "203.0.113.10:59462",
+      "172.27.64.1:59462",
+      "192.168.55.159:59462"
+    ]
+  },
+  "remote": {
+    "endpoint_id": "057bb1c3b982e78c76006abe3d00665c6809faf095974523fa074c73065400fd",
+    "dialed_addrs": [
+      "relay:https://aps1-1.relay.n0.iroh.link./"
+    ]
+  },
+  "path_changes": [
+    {
+      "t_ms": 460.512,
+      "path": "relay",
+      "remote": "relay:https://aps1-1.relay.n0.iroh.link./"
+    },
+    {
+      "t_ms": 748.051,
+      "path": "direct",
+      "remote": "ip:198.51.100.20:49360"
+    }
+  ],
+  "paths_at_end": [
+    {
+      "path": "relay",
+      "selected": false,
+      "remote": "relay:https://aps1-1.relay.n0.iroh.link./",
+      "local": "Relay(RelayUrl(\"https://aps1-1.relay.n0.iroh.link./\"))",
+      "quic_rtt_ms": 303.346
+    },
+    {
+      "path": "direct",
+      "selected": true,
+      "remote": "ip:198.51.100.20:49360",
+      "local": "Ip(Some(192.168.55.159))",
+      "quic_rtt_ms": 95.517
+    }
+  ]
+}

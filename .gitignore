@@ -1,0 +1,28 @@
+# Rust
+**/target/
+
+# Flutter / Dart / Android build output
+**/.dart_tool/
+**/build/
+**/.flutter-plugins
+**/.flutter-plugins-dependencies
+**/.gradle/
+**/.kotlin/
+**/.cxx/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Local machine config
+**/local.properties
+
+# Secrets: never commit
+spikes/c-push/secrets/
+*.p8
+*.p12
+*.jks
+*.keystore
+google-services.json
+GoogleService-Info.plist

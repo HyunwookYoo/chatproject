@@ -1,0 +1,16 @@
+# Android cross-compilation with NDK r28c (28.2.13676358), minimum API level 26.
+# Paths are for this machine; change the NDK prefix if your SDK lives elsewhere.
+
+[target.aarch64-linux-android]
+linker = "C:/Users/user/AppData/Local/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android26-clang.cmd"
+
+[target.x86_64-linux-android]
+linker = "C:/Users/user/AppData/Local/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/windows-x86_64/bin/x86_64-linux-android26-clang.cmd"
+
+# ring (the TLS/QUIC crypto backend) builds C and assembly through the cc crate,
+# which needs the NDK C compiler and archiver for each Android target.
+[env]
+CC_aarch64_linux_android = "C:/Users/user/AppData/Local/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android26-clang.cmd"
+AR_aarch64_linux_android = "C:/Users/user/AppData/Local/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-ar.exe"
+CC_x86_64_linux_android = "C:/Users/user/AppData/Local/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/windows-x86_64/bin/x86_64-linux-android26-clang.cmd"
+AR_x86_64_linux_android = "C:/Users/user/AppData/Local/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-ar.exe"
