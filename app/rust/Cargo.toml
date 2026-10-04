@@ -10,6 +10,10 @@ crate-type = ["cdylib", "staticlib"]
 [dependencies]
 chat_core = { path = "../../core/chat_core" }
 flutter_rust_bridge = "=2.11.1"
+uniffi = "=0.32.2"
+
+[dev-dependencies]
+tempfile = "3"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(frb_expand)'] }
