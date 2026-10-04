@@ -1,5 +1,5 @@
 [workspace]
 resolver = "3"
-members = ["core/chat_core"]
+members = ["core/chat_core", "app/rust"]
 # Spikes are separate experiments with their own Cargo.lock.
 exclude = ["spikes/a-connectivity", "spikes/b-mls-memory"]
