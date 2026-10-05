@@ -30,3 +30,4 @@ linter:
 analyzer:
   exclude:
     - lib/src/rust/**
+    - rust_builder/**
