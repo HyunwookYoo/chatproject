@@ -2237,6 +2237,7 @@ git commit -m "feat(app): theme tokens and first screen bound to the core event 
 
 **Files:**
 - Create: `.github/workflows/ci.yml`
+- Modify: `app/analysis_options.yaml`
 
 **Interfaces:**
 - Consumes: Task 1–6의 테스트와 빌드 명령
@@ -2312,6 +2313,22 @@ jobs:
   android:
     runs-on: ubuntu-latest
     steps:
+      - name: Free disk space
+        run: |
+          # The emulator image and AVD need room. Never touch /usr/local/lib/android
+          # (the SDK), Java, or anything the later steps install.
+          df -h /
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/.ghcup \
+            /opt/ghc \
+            /usr/share/swift \
+            /usr/local/share/boost \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/powershell \
+            /usr/local/share/chromium
+          sudo docker image prune --all --force
+          df -h /
       - uses: actions/checkout@v4
       - name: Enable KVM
         run: |
@@ -2369,13 +2386,24 @@ jobs:
 
 CI의 Android 작업은 `devices.dart` 대신 `reactivecircus/android-emulator-runner`가 에뮬레이터를 켠다. Linux 러너에서 KVM과 스냅숏 캐시를 이 액션이 다루기 때문이다(자동 테스트 설계 5절).
 
+`android` 작업은 맨 앞에서 러너 디스크를 비운다. 첫 CI에서 에뮬레이터 시스템 이미지를 푸는 도중 `No space left on device`로 멈췄기 때문이다. 지우는 곳은 이 작업이 쓰지 않는 도구뿐이다. `/usr/local/lib/android`(SDK)와 Java, 뒤 단계가 설치하는 것은 건드리지 않는다.
+
+깨끗한 체크아웃에서도 `flutter analyze`가 통과하도록 `app/analysis_options.yaml`의 `exclude` 목록에 `rust_builder/**`를 더한다. vendored cargokit Dart 코드는 `build_tool/`에서 `dart pub get`을 돌린 뒤에야 import가 풀리기 때문이다.
+
+```yaml
+analyzer:
+  exclude:
+    - lib/src/rust/**
+    - rust_builder/**
+```
+
 로컬에서 clippy가 깨끗한지 먼저 본다:
 
 Run: `cd /c/ChatProject && cargo clippy --workspace --all-targets -- -D warnings`
 Expected: 경고 없음. 생성 코드(`frb_generated.rs`)에서 경고가 나면 `app/rust/src/lib.rs`의 `mod frb_generated;` 위에 `#[allow(clippy::all)]`을 붙이고 다시 돌린다.
 
 ```bash
-git add .github/ app/rust/src/lib.rs
+git add .github/ app/analysis_options.yaml app/rust/src/lib.rs
 git commit -m "ci: Rust and widget tests on Linux, Windows integration, Android emulator integration"
 ```
 
@@ -2385,15 +2413,25 @@ git commit -m "ci: Rust and widget tests on Linux, Windows integration, Android 
 
 ```bash
 cd /c/ChatProject
-gh repo create chatproject --private --source . --remote origin --push
+gh repo create chatproject --private --source . --remote origin
+git push -u origin main
+git push -u origin m1a-core-skeleton
+gh pr create --base main --head m1a-core-skeleton \
+  --title "M1a: core skeleton — Rust core, Flutter shell, shared FFI, CI" \
+  --body "CI를 돌리려고 여는 PR이다. 병합 여부는 브랜치 마무리 단계에서 정한다."
 ```
 
-Expected: `✓ Created repository HyunwookYoo/chatproject on GitHub`와 `✓ Pushed commits`.
+`ci.yml`은 `main` push와 `pull_request`에서만 돌기 때문에, CI를 시작하는 것은 PR이다.
+
+Expected: `✓ Created repository HyunwookYoo/chatproject on GitHub`, 두 번의 push 성공, PR 주소 출력.
 
 - [ ] **Step 3: CI가 녹색인지 확인한다**
 
+`gh run watch`는 대화형이 아닌 셸에서 실행 ID가 있어야 한다. ID는 `gh run list --limit 1`에서 얻는다.
+
 ```bash
-gh run watch --exit-status
+RUN_ID=$(gh run list --limit 1 --json databaseId --jq '.[0].databaseId')
+gh run watch "$RUN_ID" --exit-status
 ```
 
 Expected: `rust`, `flutter`, `windows`, `android` 네 작업이 모두 `✓`.
@@ -2406,7 +2444,7 @@ Expected: `rust`, `flutter`, `windows`, `android` 네 작업이 모두 `✓`.
 ## 완료 기준 (로드맵 M1a)
 
 - [ ] `cargo test --workspace` 통과 (chat_core 13, chat_ffi 3)
-- [ ] `tools/e2e`에서 `dart test` 통과 (9)
+- [ ] `tools/e2e`에서 `dart test` 통과 (14)
 - [ ] Windows `integration_test/core_test.dart` 통과
 - [ ] `dart run tools/e2e/bin/devices.dart test integration_test`가 시험 전용 에뮬레이터에서 통과 (4). 폰을 연결하지 않아도 된다
 - [ ] 릴리스 빌드가 Windows 앱과 에뮬레이터에서 첫 화면을 띄움. 폰은 선택으로 한 번 눈 확인
