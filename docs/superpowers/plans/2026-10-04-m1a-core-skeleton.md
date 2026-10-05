@@ -2262,6 +2262,7 @@ env:
 jobs:
   rust:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -2273,6 +2274,7 @@ jobs:
 
   flutter:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: subosito/flutter-action@v2
@@ -2294,6 +2296,7 @@ jobs:
 
   windows:
     runs-on: windows-latest
+    timeout-minutes: 45
     defaults:
       run:
         working-directory: app
@@ -2312,6 +2315,7 @@ jobs:
 
   android:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - name: Free disk space
         run: |
