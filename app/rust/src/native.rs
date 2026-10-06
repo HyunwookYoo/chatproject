@@ -1,5 +1,6 @@
-//! Entry points for native code that runs without Flutter: the Android push receiver
-//! (Kotlin) now, the iOS notification extension (Swift) in M1b (design 12.3).
+//! Entry points for native code that runs without Flutter in this process: the Android
+//! push receiver (Kotlin, design 12.3). The iOS notification extension runs in its own
+//! process and links `core/chat_nse` instead.
 
 use crate::global::CORE;
 

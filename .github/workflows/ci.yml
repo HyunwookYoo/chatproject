@@ -34,6 +34,7 @@ jobs:
           "$RUNNER_TEMP/venv/bin/pip" install --quiet pyyaml==6.0.3
           echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
       - run: python tools/ci/check_workflows.py
+      - run: python -m unittest discover -s tools/ci -p 'test_*.py' -v
 
   rust:
     runs-on: ubuntu-latest
@@ -176,3 +177,42 @@ jobs:
           disable-animations: true
           working-directory: app
           script: flutter test integration_test -d emulator-5554
+
+  ios:
+    runs-on: macos-26
+    timeout-minutes: 45
+    env:
+      # One Rust slice (arm64) for the simulator instead of arm64 + x86_64.
+      FLUTTER_XCODE_ARCHS: arm64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Pin Xcode
+        run: |
+          sudo xcode-select -s /Applications/Xcode_26.6.app/Contents/Developer
+          xcodebuild -version
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master 2026-10-01
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: aarch64-apple-ios-sim
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+      - name: Flutter packages
+        working-directory: app
+        run: |
+          flutter precache --ios
+          flutter pub get
+      - name: Pick and boot an iPhone simulator
+        id: sim
+        timeout-minutes: 10
+        run: |
+          xcrun simctl list devices available iOS --json > "$RUNNER_TEMP/sim.json"
+          udid="$(python3 tools/ci/pick_simulator.py "$RUNNER_TEMP/sim.json")"
+          echo "udid=$udid" >> "$GITHUB_OUTPUT"
+          xcrun simctl bootstatus "$udid" -b
+      - name: Integration tests on the simulator
+        working-directory: app
+        run: flutter test integration_test/core_test.dart -d "${{ steps.sim.outputs.udid }}"
