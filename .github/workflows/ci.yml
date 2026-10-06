@@ -213,6 +213,37 @@ jobs:
           udid="$(python3 tools/ci/pick_simulator.py "$RUNNER_TEMP/sim.json")"
           echo "udid=$udid" >> "$GITHUB_OUTPUT"
           xcrun simctl bootstatus "$udid" -b
+      # flutter test sometimes misses the VM service line in the simulator log and then waits
+      # forever after "Xcode build done" (flutter/flutter#181771, fix proposed in #193142). The
+      # timeout ends that hang and the next step tries once more. Drop both once Flutter has the fix.
       - name: Integration tests on the simulator
+        id: tests
         working-directory: app
+        timeout-minutes: 15
+        continue-on-error: true
         run: flutter test integration_test/core_test.dart -d "${{ steps.sim.outputs.udid }}"
+      - name: Integration tests on the simulator, second attempt
+        if: steps.tests.outcome != 'success'
+        working-directory: app
+        timeout-minutes: 12
+        run: |
+          echo "::warning::The first test attempt failed or hung; trying once more (flutter/flutter#181771)."
+          xcrun simctl terminate "${{ steps.sim.outputs.udid }}" dev.chatproject.chatapp || true
+          flutter test integration_test/core_test.dart -d "${{ steps.sim.outputs.udid }}"
+      - name: Simulator diagnostics
+        if: failure()
+        timeout-minutes: 5
+        env:
+          UDID: ${{ steps.sim.outputs.udid }}
+        run: |
+          # Best effort: nothing here may fail the step.
+          set +e
+          t() { perl -e 'alarm shift; exec @ARGV' "$@"; }
+          echo "::group::Runner log inside the simulator (last 40 minutes)"
+          t 90 xcrun simctl spawn "$UDID" log show --last 40m --style compact --predicate 'processImagePath ENDSWITH "Runner"' | tail -300
+          echo "::endgroup::"
+          echo "::group::Crash reports"
+          ls -lt ~/Library/Logs/DiagnosticReports | head -10
+          for f in $(ls -t ~/Library/Logs/DiagnosticReports/Runner* 2>/dev/null | head -2); do echo "== $f"; head -c 6000 "$f"; done
+          echo "::endgroup::"
+          exit 0
