@@ -51,8 +51,16 @@ def check(path, doc):
 
 
 def main():
+    # GitHub runs both .yml and .yaml files from this directory.
+    paths = sorted(
+        path
+        for path in (ROOT / ".github" / "workflows").glob("*")
+        if path.suffix in (".yml", ".yaml")
+    )
     problems = []
-    for path in sorted((ROOT / ".github" / "workflows").glob("*.yml")):
+    if not paths:
+        problems.append("no workflow files found in .github/workflows")
+    for path in paths:
         problems += check(path, yaml.safe_load(path.read_text(encoding="utf-8")))
     if problems:
         print("\n".join(problems))
