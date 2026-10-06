@@ -51,6 +51,37 @@ jobs:
       - run: cargo test --workspace
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
+  bindings:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master 2026-10-01
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      # Also caches ~/.cargo/bin, so the codegen below is built once.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+      - run: cargo install flutter_rust_bridge_codegen --version 2.11.1 --locked
+      - name: Regenerate
+        run: |
+          (cd app && flutter pub get)
+          bash tools/gen_bindings.sh
+      - name: Generated files match the commit
+        run: |
+          changes="$(git status --porcelain)"
+          if [ -n "$changes" ]; then
+            echo "::error::Generated bindings differ from the commit. Run tools/gen_bindings.sh and commit the result."
+            echo "$changes"
+            git --no-pager diff --stat
+            exit 1
+          fi
+
   flutter:
     runs-on: ubuntu-latest
     timeout-minutes: 15
