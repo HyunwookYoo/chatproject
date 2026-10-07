@@ -2,11 +2,14 @@ import 'dart:async';
 
 import 'package:chat_app/core_client.dart';
 import 'package:chat_app/home/home_screen.dart';
+import 'package:chat_app/probe/probe_host.dart';
 import 'package:chat_app/src/rust/api/chat.dart';
 import 'package:chat_app/theme/app_theme.dart';
 import 'package:chat_app/theme/tokens.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+
+import 'probe_screen_test.dart' show FakeProbeHost;
 
 class FakeCoreClient implements CoreClient {
   FakeCoreClient({this.startError});
@@ -71,5 +74,20 @@ void main() {
     final theme = buildAppTheme();
     expect(theme.scaffoldBackgroundColor, AppColors.background);
     expect(theme.colorScheme.primary, AppColors.accent);
+  });
+
+  testWidgets('the probe button appears only with a probe host and opens the probe screen', (tester) async {
+    await pumpHome(tester);
+    expect(find.byTooltip('알림 측정'), findsNothing);
+
+    final ProbeHost probe = FakeProbeHost();
+    await tester.pumpWidget(MaterialApp(
+      theme: buildAppTheme(),
+      home: HomeScreen(core: FakeCoreClient(), probe: probe),
+    ));
+    await tester.pump();
+    await tester.tap(find.byTooltip('알림 측정'));
+    await tester.pumpAndSettle();
+    expect(find.text('알림 측정'), findsOneWidget);
   });
 }
