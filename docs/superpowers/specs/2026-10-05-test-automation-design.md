@@ -153,8 +153,8 @@ Dart 패키지 하나다. M1a에서는 기기 관리 명령만 만들고(`bin/de
 
 ## 6. iOS 시뮬레이터 (M1b)
 
-- macOS 러너에서 `xcrun simctl boot`로 시뮬레이터를 켜고 `flutter test integration_test -d <udid>`를 돌린다. 시뮬레이터는 앱 서명이 필요 없다.
-- `xcrun simctl push`로 알림 확장 처리 경로까지 시험할 수 있는지는 M1b에서 확인한다.
+- macOS 러너에서 `tools/ci/pick_simulator.py`가 가장 새 iOS 런타임의 iPhone을 고른다. `xcrun simctl bootstatus <udid> -b`로 그 시뮬레이터를 켠다. `flutter test integration_test/core_test.dart -d <udid>`로 시험한다. 시뮬레이터는 앱 서명이 필요 없다. flutter/flutter#181771 때문에 시험이 멈출 수 있어서, 첫 시도가 멈추거나 실패하면 한 번 더 시도한다.
+- `xcrun simctl push`는 알림 확장(NSE)을 실행하지 않는다. Xcode 11.4 릴리스 노트의 Known Issues(55822721)와 Xcode 14 릴리스 노트에 적혀 있고, Xcode 26.x까지 바뀌지 않았다. GitHub 러너의 시뮬레이터는 실제 APNs 토큰도 받지 못한다. 그래서 CI는 NSE가 빌드되어 앱 안(`Runner.app/PlugIns/NotificationService.appex`)에 들어갔는지만 확인한다. 복호와 메모리는 TestFlight 빌드로 잰다.
 - 알림 확장 메모리와 APNs 보관 개수는 시뮬레이터로 대신할 수 없다. TestFlight로 실제 iPhone에서 잰다.
 
 ## 7. 안전장치
@@ -187,7 +187,7 @@ Dart 패키지 하나다. M1a에서는 기기 관리 명령만 만들고(`bin/de
 | 마일스톤 | 더하는 것 |
 |---|---|
 | M1a | `tools/e2e/bin/devices.dart`(AVD 만들기·켜기·대기·시험·끄기), 시험 전용 AVD 2개, Android 통합 테스트를 에뮬레이터 기본으로, CI 에뮬레이터 작업, Rust 테스트를 Linux로 |
-| M1b | iOS 시뮬레이터 CI 작업, `simctl push` 확인 |
+| M1b | iOS 시뮬레이터 CI 작업, NSE 빌드·내장 확인 |
 | M2 | 조종 루프(`test-hooks`), `chat_node`(조종 참가자 + 로컬 릴레이), 앱 조종 모드 실행 인자, 지휘 프로그램 시나리오 실행, 첫 시나리오(에뮬레이터 ↔ `chat_node` ↔ Windows 앱), CI 야간 작업, 릴리스 표식 검사 |
 | M3 | 시나리오: 초대 → 연락처 추가, 기기 연결(두 방향), 복구 문구로 되살리기 |
 | M4 | `Clock` 주입과 `clock_advance`. 시나리오: 강제 종료 뒤 보내기 줄 재개 |
@@ -199,6 +199,6 @@ Dart 패키지 하나다. M1a에서는 기기 관리 명령만 만들고(`bin/de
 
 ## 10. 열린 질문
 
-- `xcrun simctl push`가 알림 확장을 실행하는가 (M1b에서 확인).
+- (M1b에서 답함) `xcrun simctl push`는 알림 확장을 실행하지 않는다. 6절.
 - Linux CI 러너에서 에뮬레이터 2대를 함께 돌릴 때 걸리는 시간 (M2에서 재고, 길면 1대 + `chat_node`로 줄인다).
 - 에뮬레이터끼리는 직접 경로를 기대하지 않는다. 릴레이 경로로 통과하면 충분하다 (M2에서 실제로 어떤지 기록).

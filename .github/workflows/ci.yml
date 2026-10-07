@@ -236,6 +236,14 @@ jobs:
         run: |
           flutter precache --ios
           flutter pub get
+      - name: Rust library for the notification extension
+        run: cargo build -p chat_nse --release --target aarch64-apple-ios-sim
+      - name: Add the notification extension target
+        run: |
+          gem install xcodeproj -v 1.28.1 --no-document
+          ruby app/ios/scripts/add_notification_service.rb app/ios/Runner.xcodeproj
+          # A second run must change nothing.
+          ruby app/ios/scripts/add_notification_service.rb app/ios/Runner.xcodeproj | grep -q "already up to date"
       - name: Pick and boot an iPhone simulator
         id: sim
         timeout-minutes: 10
@@ -261,6 +269,14 @@ jobs:
           echo "::warning::The first test attempt failed or hung; trying once more (flutter/flutter#181771)."
           xcrun simctl terminate "${{ steps.sim.outputs.udid }}" dev.chatproject.chatapp || true
           flutter test integration_test/core_test.dart -d "${{ steps.sim.outputs.udid }}"
+      - name: The extension is embedded in the test build
+        run: |
+          appex="$(find app/build/ios/iphonesimulator -maxdepth 3 -name NotificationService.appex -print -quit)"
+          test -n "$appex" || { echo "::error::NotificationService.appex is not embedded"; exit 1; }
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$appex/Info.plist"
+          test -f "$appex/nse_state.bin" || { echo "::error::nse_state.bin is not in the extension"; exit 1; }
+          # For the log: the extension must link system libraries only, not the Pods frameworks (chat_ffi).
+          find "$appex" -type f \( -name NotificationService -o -name '*.dylib' \) -exec otool -L {} \;
       - name: Simulator diagnostics
         if: failure()
         timeout-minutes: 5
