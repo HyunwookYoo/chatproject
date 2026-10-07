@@ -52,7 +52,6 @@ final class NotificationService: UNNotificationServiceExtension {
         } catch {
             end["ok"] = false
             end["error"] = "\(error)"
-            content.body = "#\(seq) 복호 실패: \(error)"
         }
         let sample = Memory.sample()
         end["footprint"] = sample?.footprint ?? 0
