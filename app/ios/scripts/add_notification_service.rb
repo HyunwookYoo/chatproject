@@ -90,6 +90,26 @@ runner.build_configurations.each do |config|
   set.(config, 'CODE_SIGN_ENTITLEMENTS', 'Runner/Runner.entitlements')
 end
 
+# Signing (M1b plan, decision 3). Debug and Profile sign automatically (simulator builds need
+# no profile). Release signs manually with the App Store profiles that the testflight workflow
+# installs; without Manual, archive falls back to automatic signing and fails with "No Accounts".
+TEAM = '9J2FNH63M2'
+PROFILES = { 'Runner' => 'ChatProject App Store', NSE => 'ChatProject NSE App Store' }.freeze
+[runner, nse].each do |target|
+  CONFIGS.each do |name|
+    config = target.build_configuration_list[name]
+    set.(config, 'DEVELOPMENT_TEAM', TEAM)
+    if name == 'Release'
+      set.(config, 'CODE_SIGN_STYLE', 'Manual')
+      set.(config, 'CODE_SIGN_IDENTITY', 'Apple Distribution')
+      set.(config, 'CODE_SIGN_IDENTITY[sdk=iphoneos*]', 'Apple Distribution')
+      set.(config, 'PROVISIONING_PROFILE_SPECIFIER', PROFILES.fetch(target.name))
+    else
+      set.(config, 'CODE_SIGN_STYLE', 'Automatic')
+    end
+  end
+end
+
 if changed || project.dirty?
   project.save
   puts "updated #{project_path}"

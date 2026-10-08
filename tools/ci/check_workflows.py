@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Static checks for .github/workflows/*.yml (public repo rules, M1b plan Global Constraints).
+"""Static checks for .github/workflows/*.yml and *.yaml (public repo rules, M1b plan Global Constraints).
 
 Prints one line per problem and exits 1 if there is any.
 """
@@ -47,6 +47,33 @@ def check(path, doc):
             problems.append(f"{name}: {job_id} step {index}: '{uses}' is not pinned to a full commit SHA")
         if uses.startswith("actions/checkout@") and (step.get("with") or {}).get("persist-credentials") is not False:
             problems.append(f"{name}: {job_id} step {index}: checkout must set persist-credentials: false")
+    if path.stem == "testflight":  # GitHub runs testflight.yaml too
+        problems += check_testflight(name, doc)
+    return problems
+
+
+def check_testflight(name, doc):
+    """The release job holds the App Store signing secrets (Review Focus 5)."""
+    problems = []
+    if set(triggers(doc)) - {"workflow_dispatch", "push"}:
+        problems.append(f"{name}: triggers must be workflow_dispatch and push (tags) only")
+    push = triggers(doc).get("push") or {}
+    if push and (set(push) != {"tags"} or push["tags"] != ["testflight-*"]):
+        problems.append(f"{name}: push may only be for tags testflight-*")
+    for job_id, job in (doc.get("jobs") or {}).items():
+        if job.get("environment") != "testflight":
+            problems.append(f"{name}: job {job_id} must use environment: testflight")
+        step_list = job.get("steps") or []
+        names = [step.get("name", "") for step in step_list]
+        if not names or names[0] != "Refuse re-runs":
+            problems.append(f"{name}: job {job_id} must start with the 'Refuse re-runs' step")
+        profiles = next((s for s in step_list if s.get("name") == "Install provisioning profiles"), None)
+        if profiles is None or not all(k in profiles.get("run", "") for k in
+                                        ("ProvisionedDevices", "application-groups", "aps-environment")):
+            problems.append(f"{name}: job {job_id} must validate the profiles before signing")
+        for step in step_list:
+            if "upload-artifact" in step.get("uses", ""):
+                problems.append(f"{name}: job {job_id} must not upload-artifact (IPA and profiles stay private)")
     return problems
 
 
