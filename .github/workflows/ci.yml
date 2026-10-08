@@ -231,6 +231,18 @@ jobs:
         with:
           flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: stable
+      # flutter test launches the app before its simulator log reader is attached, so it can miss
+      # the line with the VM service URL and wait forever (flutter/flutter#181771). This patch is
+      # the simulators.dart part of upstream PR flutter/flutter#193142: the tool launches the app
+      # only after `log stream` has printed its first line. Drop it once Flutter ships the fix; a
+      # Flutter upgrade then makes the apply fail loudly. Without the stamp the flutter script
+      # rebuilds the tool.
+      - name: Patch the Flutter tool (flutter/flutter#181771)
+        run: |
+          patch="$GITHUB_WORKSPACE/tools/ci/flutter-181771.patch"
+          if git -C "$FLUTTER_ROOT" apply --reverse --check "$patch" 2>/dev/null; then echo "already patched"; else git -C "$FLUTTER_ROOT" apply "$patch"; fi
+          rm -f "$FLUTTER_ROOT/bin/cache/flutter_tools.stamp"
+          flutter --version
       - name: Flutter packages
         working-directory: app
         run: |
@@ -252,16 +264,18 @@ jobs:
           udid="$(python3 tools/ci/pick_simulator.py "$RUNNER_TEMP/sim.json")"
           echo "udid=$udid" >> "$GITHUB_OUTPUT"
           xcrun simctl bootstatus "$udid" -b
-      # flutter test sometimes misses the VM service line in the simulator log and then waits
-      # forever after "Xcode build done" (flutter/flutter#181771, fix proposed in #193142). The
-      # timeouts end that hang and the next steps try up to two more times. Drop them once Flutter
-      # has the fix. -v is temporary, to see where a hang waits; remove it with the fix.
+      # The patch above should fix the hang where flutter test misses the VM service line in the
+      # simulator log and then waits forever after "Xcode build done" (flutter/flutter#181771). The
+      # timeouts and the next two steps stay as a safety net, and those steps run with -v so a hang
+      # after the fix still shows where the tool waits. The step timeout kills only the shell, so
+      # they first kill the tool and the log stream of the earlier attempt. Drop the patch, the
+      # retries and -v together once Flutter has the fix.
       - name: Integration tests on the simulator
         id: tests
         working-directory: app
         timeout-minutes: 15
         continue-on-error: true
-        run: flutter test -v integration_test/core_test.dart -d "${{ steps.sim.outputs.udid }}"
+        run: flutter test integration_test/core_test.dart -d "${{ steps.sim.outputs.udid }}"
       - name: Integration tests on the simulator, second attempt
         id: tests2
         if: steps.tests.outcome != 'success'
@@ -269,8 +283,10 @@ jobs:
         timeout-minutes: 8
         continue-on-error: true
         run: |
-          echo "::warning::The first test attempt failed or hung; trying once more (flutter/flutter#181771)."
+          echo "::warning::The first test attempt failed or hung; trying again (flutter/flutter#181771)."
           ps -axo pid,ppid,etime,command | grep -E '[f]lutter_tools|[l]og stream|[R]unner.app' || true
+          pkill -f flutter_tools.snapshot || true
+          pkill -f "log stream" || true
           xcrun simctl terminate "${{ steps.sim.outputs.udid }}" dev.chatproject.chatapp || true
           flutter test -v integration_test/core_test.dart -d "${{ steps.sim.outputs.udid }}"
       - name: Integration tests on the simulator, third attempt
@@ -280,6 +296,8 @@ jobs:
         run: |
           echo "::warning::The second test attempt also failed or hung; trying a last time (flutter/flutter#181771)."
           ps -axo pid,ppid,etime,command | grep -E '[f]lutter_tools|[l]og stream|[R]unner.app' || true
+          pkill -f flutter_tools.snapshot || true
+          pkill -f "log stream" || true
           xcrun simctl terminate "${{ steps.sim.outputs.udid }}" dev.chatproject.chatapp || true
           flutter test -v integration_test/core_test.dart -d "${{ steps.sim.outputs.udid }}"
       - name: The extension is embedded in the test build
