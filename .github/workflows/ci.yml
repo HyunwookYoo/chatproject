@@ -255,13 +255,13 @@ jobs:
       # flutter test sometimes misses the VM service line in the simulator log and then waits
       # forever after "Xcode build done" (flutter/flutter#181771, fix proposed in #193142). The
       # timeouts end that hang and the next steps try up to two more times. Drop them once Flutter
-      # has the fix.
+      # has the fix. -v is temporary, to see where a hang waits; remove it with the fix.
       - name: Integration tests on the simulator
         id: tests
         working-directory: app
         timeout-minutes: 15
         continue-on-error: true
-        run: flutter test integration_test/core_test.dart -d "${{ steps.sim.outputs.udid }}"
+        run: flutter test -v integration_test/core_test.dart -d "${{ steps.sim.outputs.udid }}"
       - name: Integration tests on the simulator, second attempt
         id: tests2
         if: steps.tests.outcome != 'success'
@@ -270,16 +270,18 @@ jobs:
         continue-on-error: true
         run: |
           echo "::warning::The first test attempt failed or hung; trying once more (flutter/flutter#181771)."
+          ps -axo pid,ppid,etime,command | grep -E '[f]lutter_tools|[l]og stream|[R]unner.app' || true
           xcrun simctl terminate "${{ steps.sim.outputs.udid }}" dev.chatproject.chatapp || true
-          flutter test integration_test/core_test.dart -d "${{ steps.sim.outputs.udid }}"
+          flutter test -v integration_test/core_test.dart -d "${{ steps.sim.outputs.udid }}"
       - name: Integration tests on the simulator, third attempt
         if: steps.tests.outcome != 'success' && steps.tests2.outcome != 'success'
         working-directory: app
         timeout-minutes: 8
         run: |
           echo "::warning::The second test attempt also failed or hung; trying a last time (flutter/flutter#181771)."
+          ps -axo pid,ppid,etime,command | grep -E '[f]lutter_tools|[l]og stream|[R]unner.app' || true
           xcrun simctl terminate "${{ steps.sim.outputs.udid }}" dev.chatproject.chatapp || true
-          flutter test integration_test/core_test.dart -d "${{ steps.sim.outputs.udid }}"
+          flutter test -v integration_test/core_test.dart -d "${{ steps.sim.outputs.udid }}"
       - name: The extension is embedded in the test build
         run: |
           appex="$(find app/build/ios/iphonesimulator -maxdepth 3 -name NotificationService.appex -print -quit)"
@@ -289,7 +291,7 @@ jobs:
           # For the log: the extension must link system libraries only, not the Pods frameworks (chat_ffi).
           find "$appex" -type f \( -name NotificationService -o -name '*.dylib' \) -exec otool -L {} \;
       - name: Simulator diagnostics
-        if: failure()
+        if: failure() || steps.tests.outcome == 'failure' || steps.tests2.outcome == 'failure'
         timeout-minutes: 5
         env:
           UDID: ${{ steps.sim.outputs.udid }}
@@ -298,7 +300,7 @@ jobs:
           set +e
           t() { perl -e 'alarm shift; exec @ARGV' "$@"; }
           echo "::group::Runner log inside the simulator (last 40 minutes)"
-          t 90 xcrun simctl spawn "$UDID" log show --last 40m --style compact --predicate 'processImagePath ENDSWITH "Runner"' | tail -300
+          t 90 xcrun simctl spawn "$UDID" log show --last 40m --style compact --predicate 'processImagePath ENDSWITH "/Runner"' | tail -300
           echo "::endgroup::"
           echo "::group::Crash reports"
           ls -lt ~/Library/Logs/DiagnosticReports | head -10
