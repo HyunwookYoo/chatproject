@@ -153,7 +153,7 @@ Dart 패키지 하나다. M1a에서는 기기 관리 명령만 만들고(`bin/de
 
 ## 6. iOS 시뮬레이터 (M1b)
 
-- macOS 러너에서 `tools/ci/pick_simulator.py`가 가장 새 iOS 런타임의 iPhone을 고른다. `xcrun simctl bootstatus <udid> -b`로 그 시뮬레이터를 켠다. `flutter test integration_test/core_test.dart -d <udid>`로 시험한다. 시뮬레이터는 앱 서명이 필요 없다. flutter/flutter#181771 때문에 시험이 멈출 수 있어서, 첫 시도가 멈추거나 실패하면 한 번 더 시도한다.
+- macOS 러너에서 `tools/ci/pick_simulator.py`가 가장 새 iOS 런타임의 iPhone을 고른다. `xcrun simctl bootstatus <udid> -b`로 그 시뮬레이터를 켠다. `flutter test integration_test/core_test.dart -d <udid>`로 시험한다. 시뮬레이터는 앱 서명이 필요 없다. flutter/flutter#181771 때문에 시험이 멈출 수 있어서, 앞 시도가 멈추거나 실패하면 두 번까지 더 시도한다.
 - `xcrun simctl push`는 알림 확장(NSE)을 실행하지 않는다. Xcode 11.4 릴리스 노트의 Known Issues(55822721)와 Xcode 14 릴리스 노트에 적혀 있고, Xcode 26.x까지 바뀌지 않았다. GitHub 러너의 시뮬레이터는 실제 APNs 토큰도 받지 못한다. 그래서 CI는 NSE가 빌드되어 앱 안(`Runner.app/PlugIns/NotificationService.appex`)에 들어갔는지만 확인한다. 복호와 메모리는 TestFlight 빌드로 잰다.
 - 알림 확장 메모리와 APNs 보관 개수는 시뮬레이터로 대신할 수 없다. TestFlight로 실제 iPhone에서 잰다.
 

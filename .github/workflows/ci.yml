@@ -211,7 +211,7 @@ jobs:
 
   ios:
     runs-on: macos-26
-    timeout-minutes: 45
+    timeout-minutes: 50
     env:
       # One Rust slice (arm64) for the simulator instead of arm64 + x86_64.
       FLUTTER_XCODE_ARCHS: arm64
@@ -254,7 +254,8 @@ jobs:
           xcrun simctl bootstatus "$udid" -b
       # flutter test sometimes misses the VM service line in the simulator log and then waits
       # forever after "Xcode build done" (flutter/flutter#181771, fix proposed in #193142). The
-      # timeout ends that hang and the next step tries once more. Drop both once Flutter has the fix.
+      # timeouts end that hang and the next steps try up to two more times. Drop them once Flutter
+      # has the fix.
       - name: Integration tests on the simulator
         id: tests
         working-directory: app
@@ -262,11 +263,21 @@ jobs:
         continue-on-error: true
         run: flutter test integration_test/core_test.dart -d "${{ steps.sim.outputs.udid }}"
       - name: Integration tests on the simulator, second attempt
+        id: tests2
         if: steps.tests.outcome != 'success'
         working-directory: app
-        timeout-minutes: 12
+        timeout-minutes: 8
+        continue-on-error: true
         run: |
           echo "::warning::The first test attempt failed or hung; trying once more (flutter/flutter#181771)."
+          xcrun simctl terminate "${{ steps.sim.outputs.udid }}" dev.chatproject.chatapp || true
+          flutter test integration_test/core_test.dart -d "${{ steps.sim.outputs.udid }}"
+      - name: Integration tests on the simulator, third attempt
+        if: steps.tests.outcome != 'success' && steps.tests2.outcome != 'success'
+        working-directory: app
+        timeout-minutes: 8
+        run: |
+          echo "::warning::The second test attempt also failed or hung; trying a last time (flutter/flutter#181771)."
           xcrun simctl terminate "${{ steps.sim.outputs.udid }}" dev.chatproject.chatapp || true
           flutter test integration_test/core_test.dart -d "${{ steps.sim.outputs.udid }}"
       - name: The extension is embedded in the test build
