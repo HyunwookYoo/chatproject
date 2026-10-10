@@ -1,0 +1,23 @@
+[package]
+name = "apns-probe"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+publish = false
+
+[dependencies]
+anyhow = "1"
+base64 = "0.23"
+clap = { version = "4.6", features = ["derive"] }
+# jsonwebtoken >= 10 has no default crypto backend: pick exactly one of rust_crypto / aws_lc_rs.
+jsonwebtoken = { version = "11", features = ["rust_crypto"] }
+# reqwest 0.13: `rustls-tls` was renamed `rustls`.
+reqwest = { version = "0.13", default-features = false, features = ["http2", "rustls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+# Throwaway P-256 key pair for the JWT tests; no secret is committed.
+p256 = { version = "0.13", features = ["pem"] }
