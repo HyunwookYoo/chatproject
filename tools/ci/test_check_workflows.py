@@ -14,7 +14,7 @@ def testflight(**overrides):
         "jobs": {"testflight": {
             "environment": "testflight",
             "steps": [
-                {"name": "Refuse re-runs", "run": 'test "$GITHUB_RUN_ATTEMPT" = 1'},
+                {"name": "Refuse re-runs", "run": 'if [ "$GITHUB_RUN_ATTEMPT" != 1 ]; then exit 1; fi'},
                 {"name": "Install provisioning profiles", "run": "ProvisionedDevices application-groups aps-environment"},
                 {"name": "Upload to TestFlight", "uses": PINNED},
             ],
@@ -61,6 +61,52 @@ class CheckTest(unittest.TestCase):
         del doc["jobs"]["testflight"]["environment"]
         problems = check(pathlib.Path("testflight.yaml"), doc)
         self.assertTrue(any("environment" in p for p in problems), problems)
+
+    def test_rerun_guard_must_test_the_attempt_and_fail(self):
+        for body in ("true", 'test "$GITHUB_RUN_ATTEMPT" = 1', "exit 1"):
+            with self.subTest(body=body):
+                doc = testflight()
+                doc["jobs"]["testflight"]["steps"][0]["run"] = body
+                self.assertTrue(any("GITHUB_RUN_ATTEMPT" in p for p in check(self.path, doc)))
+
+    def test_bare_push_is_rejected(self):
+        # A push trigger without a filter starts the job for every branch and tag.
+        shapes = {
+            "push: (null)": {"workflow_dispatch": None, "push": None},
+            "push: {}": {"push": {}},
+            "on: push": "push",
+            "on: [push]": ["push"],
+            "on: [push, workflow_dispatch]": ["push", "workflow_dispatch"],
+        }
+        for label, on in shapes.items():
+            with self.subTest(on=label):
+                problems = check(self.path, testflight(on=on))
+                self.assertTrue(any("push may only be for tags" in p for p in problems), problems)
+
+    def test_push_for_branches_or_other_tags_is_rejected(self):
+        for push in ({"branches": ["main"]}, {"tags": ["v*"]}, {"tags": ["testflight-*"], "branches": ["main"]}):
+            with self.subTest(push=push):
+                problems = check(self.path, testflight(on={"push": push}))
+                self.assertTrue(any("push may only be for tags" in p for p in problems), problems)
+
+    def test_dispatch_only_and_tags_only_triggers_are_accepted(self):
+        for on in ({"workflow_dispatch": None}, "workflow_dispatch", {"push": {"tags": ["testflight-*"]}}):
+            with self.subTest(on=on):
+                self.assertEqual(check(self.path, testflight(on=on)), [])
+
+    def test_missing_profile_step_is_rejected(self):
+        doc = testflight()
+        del doc["jobs"]["testflight"]["steps"][1]
+        self.assertTrue(any("validate the profiles" in p for p in check(self.path, doc)))
+
+    def test_each_profile_check_is_required(self):
+        for keyword in ("ProvisionedDevices", "application-groups", "aps-environment"):
+            with self.subTest(removed=keyword):
+                doc = testflight()
+                step = doc["jobs"]["testflight"]["steps"][1]
+                step["run"] = step["run"].replace(keyword, "")
+                problems = check(self.path, doc)
+                self.assertTrue(any("validate the profiles" in p for p in problems), problems)
 
 
 if __name__ == "__main__":

@@ -55,10 +55,11 @@ def check(path, doc):
 def check_testflight(name, doc):
     """The release job holds the App Store signing secrets (Review Focus 5)."""
     problems = []
-    if set(triggers(doc)) - {"workflow_dispatch", "push"}:
+    trig = triggers(doc)
+    if set(trig) - {"workflow_dispatch", "push"}:
         problems.append(f"{name}: triggers must be workflow_dispatch and push (tags) only")
-    push = triggers(doc).get("push") or {}
-    if push and (set(push) != {"tags"} or push["tags"] != ["testflight-*"]):
+    # A bare `push:` (or `on: push`) has no filter and starts the job for every branch and tag.
+    if "push" in trig and trig["push"] != {"tags": ["testflight-*"]}:
         problems.append(f"{name}: push may only be for tags testflight-*")
     for job_id, job in (doc.get("jobs") or {}).items():
         if job.get("environment") != "testflight":
@@ -67,6 +68,9 @@ def check_testflight(name, doc):
         names = [step.get("name", "") for step in step_list]
         if not names or names[0] != "Refuse re-runs":
             problems.append(f"{name}: job {job_id} must start with the 'Refuse re-runs' step")
+        guard = next((s for s in step_list if s.get("name") == "Refuse re-runs"), None)
+        if guard is not None and not all(k in guard.get("run", "") for k in ("GITHUB_RUN_ATTEMPT", "exit 1")):
+            problems.append(f"{name}: job {job_id}: the 'Refuse re-runs' step must test GITHUB_RUN_ATTEMPT and exit 1")
         profiles = next((s for s in step_list if s.get("name") == "Install provisioning profiles"), None)
         if profiles is None or not all(k in profiles.get("run", "") for k in
                                         ("ProvisionedDevices", "application-groups", "aps-environment")):
