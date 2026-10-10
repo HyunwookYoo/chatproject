@@ -5,29 +5,91 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
+# A new push to a PR cancels that PR's older run; pushes to main always finish.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   FLUTTER_VERSION: 3.44.6
   RUST_TOOLCHAIN: 1.92.0
+  # cargokit (app/rust_builder) builds with this toolchain. Must equal RUST_TOOLCHAIN.
+  CARGOKIT_TOOLCHAIN: 1.92.0
 
 jobs:
+  workflows:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Ubuntu's system Python refuses pip installs (PEP 668), so use a venv.
+      - name: Python with PyYAML
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet pyyaml==6.0.3
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+      - run: python tools/ci/check_workflows.py
+      - run: python -m unittest discover -s tools/ci -p 'test_*.py' -v
+
   rust:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master 2026-10-01
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo test --workspace
       - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  bindings:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master 2026-10-01
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      # Also caches ~/.cargo/bin, so the codegen below is built once.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+      - run: cargo install flutter_rust_bridge_codegen --version 2.11.1 --locked
+      - name: Regenerate
+        run: |
+          (cd app && flutter pub get)
+          bash tools/gen_bindings.sh
+      - name: Generated files match the commit
+        run: |
+          changes="$(git status --porcelain)"
+          if [ -n "$changes" ]; then
+            echo "::error::Generated bindings differ from the commit. Run tools/gen_bindings.sh and commit the result."
+            echo "$changes"
+            git --no-pager diff --stat
+            exit 1
+          fi
 
   flutter:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: subosito/flutter-action@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
         with:
           flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: stable
@@ -51,11 +113,13 @@ jobs:
       run:
         working-directory: app
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master 2026-10-01
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
-      - uses: subosito/flutter-action@v2
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
         with:
           flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: stable
@@ -83,31 +147,39 @@ jobs:
             /usr/local/share/chromium
           sudo docker image prune --all --force
           df -h /
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Enable KVM
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
         with:
           distribution: temurin
           java-version: '21'
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master 2026-10-01
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android
-      - uses: subosito/flutter-action@v2
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
         with:
           flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: stable
       - name: Release APK
         working-directory: app
+        env:
+          CARGOKIT_VERBOSE: '1'
         run: |
+          # The default step shell is `bash -e` without pipefail; tee would hide a failed build.
+          set -o pipefail
           flutter pub get
-          flutter build apk --release
+          flutter build apk --release 2>&1 | tee "$RUNNER_TEMP/apk.log"
+          # The vendored cargokit patch (CARGOKIT_TOOLCHAIN) must still be in effect.
+          grep -q "Running command rustup run ${CARGOKIT_TOOLCHAIN} cargo build" "$RUNNER_TEMP/apk.log"
       - name: AVD cache
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: avd-cache
         with:
           path: |
@@ -116,7 +188,7 @@ jobs:
           key: avd-api36-google_apis-x86_64
       - name: Create AVD snapshot for the cache
         if: steps.avd-cache.outputs.cache-hit != 'true'
-        uses: reactivecircus/android-emulator-runner@v2
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
         with:
           api-level: 36
           target: google_apis
@@ -126,7 +198,7 @@ jobs:
           disable-animations: false
           script: echo "AVD snapshot created"
       - name: Integration tests on the emulator
-        uses: reactivecircus/android-emulator-runner@v2
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
         with:
           api-level: 36
           target: google_apis
@@ -136,3 +208,120 @@ jobs:
           disable-animations: true
           working-directory: app
           script: flutter test integration_test -d emulator-5554
+
+  ios:
+    runs-on: macos-26
+    timeout-minutes: 50
+    env:
+      # One Rust slice (arm64) for the simulator instead of arm64 + x86_64.
+      FLUTTER_XCODE_ARCHS: arm64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Pin Xcode
+        run: |
+          sudo xcode-select -s /Applications/Xcode_26.6.app/Contents/Developer
+          xcodebuild -version
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master 2026-10-01
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: aarch64-apple-ios-sim
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+      # flutter test launches the app before its simulator log reader is attached, so it can miss
+      # the line with the VM service URL and wait forever (flutter/flutter#181771). This patch is
+      # the simulators.dart part of upstream PR flutter/flutter#193142: the tool launches the app
+      # only after `log stream` has printed its first line. Drop it once Flutter ships the fix; a
+      # Flutter upgrade then makes the apply fail loudly. Without the stamp the flutter script
+      # rebuilds the tool.
+      - name: Patch the Flutter tool (flutter/flutter#181771)
+        run: |
+          patch="$GITHUB_WORKSPACE/tools/ci/flutter-181771.patch"
+          if git -C "$FLUTTER_ROOT" apply --reverse --check "$patch" 2>/dev/null; then echo "already patched"; else git -C "$FLUTTER_ROOT" apply "$patch"; fi
+          rm -f "$FLUTTER_ROOT/bin/cache/flutter_tools.stamp"
+          flutter --version
+      - name: Flutter packages
+        working-directory: app
+        run: |
+          flutter precache --ios
+          flutter pub get
+      - name: Rust library for the notification extension
+        run: cargo build -p chat_nse --release --target aarch64-apple-ios-sim
+      - name: Add the notification extension target
+        run: |
+          gem install xcodeproj -v 1.28.1 --no-document
+          ruby app/ios/scripts/add_notification_service.rb app/ios/Runner.xcodeproj
+          # A second run must change nothing.
+          ruby app/ios/scripts/add_notification_service.rb app/ios/Runner.xcodeproj | grep -q "already up to date"
+      - name: Pick and boot an iPhone simulator
+        id: sim
+        timeout-minutes: 10
+        run: |
+          xcrun simctl list devices available iOS --json > "$RUNNER_TEMP/sim.json"
+          udid="$(python3 tools/ci/pick_simulator.py "$RUNNER_TEMP/sim.json")"
+          echo "udid=$udid" >> "$GITHUB_OUTPUT"
+          xcrun simctl bootstatus "$udid" -b
+      # The patch above should fix the hang where flutter test misses the VM service line in the
+      # simulator log and then waits forever after "Xcode build done" (flutter/flutter#181771). The
+      # timeouts and the next two steps stay as a safety net, and those steps run with -v so a hang
+      # after the fix still shows where the tool waits. The step timeout kills only the shell, so
+      # they first kill the tool and the log stream of the earlier attempt. Drop the patch, the
+      # retries and -v together once Flutter has the fix.
+      - name: Integration tests on the simulator
+        id: tests
+        working-directory: app
+        timeout-minutes: 15
+        continue-on-error: true
+        run: flutter test integration_test/core_test.dart -d "${{ steps.sim.outputs.udid }}"
+      - name: Integration tests on the simulator, second attempt
+        id: tests2
+        if: steps.tests.outcome != 'success'
+        working-directory: app
+        timeout-minutes: 8
+        continue-on-error: true
+        run: |
+          echo "::warning::The first test attempt failed or hung; trying again (flutter/flutter#181771)."
+          ps -axo pid,ppid,etime,command | grep -E '[f]lutter_tools|[l]og stream|[R]unner.app' || true
+          pkill -f flutter_tools.snapshot || true
+          pkill -f "log stream" || true
+          xcrun simctl terminate "${{ steps.sim.outputs.udid }}" dev.chatproject.chatapp || true
+          flutter test -v integration_test/core_test.dart -d "${{ steps.sim.outputs.udid }}"
+      - name: Integration tests on the simulator, third attempt
+        if: steps.tests.outcome != 'success' && steps.tests2.outcome != 'success'
+        working-directory: app
+        timeout-minutes: 8
+        run: |
+          echo "::warning::The second test attempt also failed or hung; trying a last time (flutter/flutter#181771)."
+          ps -axo pid,ppid,etime,command | grep -E '[f]lutter_tools|[l]og stream|[R]unner.app' || true
+          pkill -f flutter_tools.snapshot || true
+          pkill -f "log stream" || true
+          xcrun simctl terminate "${{ steps.sim.outputs.udid }}" dev.chatproject.chatapp || true
+          flutter test -v integration_test/core_test.dart -d "${{ steps.sim.outputs.udid }}"
+      - name: The extension is embedded in the test build
+        run: |
+          appex="$(find app/build/ios/iphonesimulator -maxdepth 3 -name NotificationService.appex -print -quit)"
+          test -n "$appex" || { echo "::error::NotificationService.appex is not embedded"; exit 1; }
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$appex/Info.plist"
+          test -f "$appex/nse_state.bin" || { echo "::error::nse_state.bin is not in the extension"; exit 1; }
+          # For the log: the extension must link system libraries only, not the Pods frameworks (chat_ffi).
+          find "$appex" -type f \( -name NotificationService -o -name '*.dylib' \) -exec otool -L {} \;
+      - name: Simulator diagnostics
+        if: failure() || steps.tests.outcome == 'failure' || steps.tests2.outcome == 'failure'
+        timeout-minutes: 5
+        env:
+          UDID: ${{ steps.sim.outputs.udid }}
+        run: |
+          # Best effort: nothing here may fail the step.
+          set +e
+          t() { perl -e 'alarm shift; exec @ARGV' "$@"; }
+          echo "::group::Runner log inside the simulator (last 40 minutes)"
+          t 90 xcrun simctl spawn "$UDID" log show --last 40m --style compact --predicate 'processImagePath ENDSWITH "/Runner"' | tail -300
+          echo "::endgroup::"
+          echo "::group::Crash reports"
+          ls -lt ~/Library/Logs/DiagnosticReports | head -10
+          for f in $(ls -t ~/Library/Logs/DiagnosticReports/Runner* 2>/dev/null | head -2); do echo "== $f"; head -c 6000 "$f"; done
+          echo "::endgroup::"
+          exit 0

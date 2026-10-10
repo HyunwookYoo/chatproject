@@ -3,6 +3,8 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 
 import '../core_client.dart';
+import '../probe/probe_host.dart';
+import '../probe/probe_screen.dart';
 import '../src/rust/api/chat.dart';
 import '../theme/tokens.dart';
 
@@ -15,9 +17,12 @@ String connectionLabel(ChatEvent_ConnectionState state) {
 }
 
 class HomeScreen extends StatefulWidget {
-  const HomeScreen({super.key, required this.core});
+  const HomeScreen({super.key, required this.core, this.probe});
 
   final CoreClient core;
+
+  /// M1b device probe (iOS only). Null hides the probe button.
+  final ProbeHost? probe;
 
   @override
   State<HomeScreen> createState() => _HomeScreenState();
@@ -69,9 +74,22 @@ class _HomeScreenState extends State<HomeScreen> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              const Text(
-                '대화',
-                style: TextStyle(fontSize: 30, fontWeight: FontWeight.w700, color: AppColors.text),
+              Row(
+                children: [
+                  const Text(
+                    '대화',
+                    style: TextStyle(fontSize: 30, fontWeight: FontWeight.w700, color: AppColors.text),
+                  ),
+                  const Spacer(),
+                  if (widget.probe != null)
+                    IconButton(
+                      tooltip: '알림 측정',
+                      icon: const Icon(Icons.science_outlined, color: AppColors.textSecondary),
+                      onPressed: () => Navigator.of(context).push(
+                        MaterialPageRoute<void>(builder: (_) => ProbeScreen(host: widget.probe!)),
+                      ),
+                    ),
+                ],
               ),
               const SizedBox(height: 16),
               Container(
