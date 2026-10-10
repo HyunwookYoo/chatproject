@@ -54,7 +54,7 @@ struct SendArgs {
     #[arg(long, default_value_t = 1000)]
     interval_ms: u64,
     /// Number of the first push; continue a series across runs.
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
     start_seq: u32,
     /// Base64 ciphertexts, one per line (Fixture/ciphertexts.txt). Without it, no `e` is sent.
     #[arg(long)]
@@ -174,13 +174,17 @@ async fn main() -> Result<()> {
         match response {
             Err(e) => {
                 failed += 1;
-                println!("seq={seq} bytes={} NETWORK-ERROR rtt_ms={rtt} {e}", body.len());
+                // reqwest's Display hides the cause (TLS, DNS, proxy, h2), so print the whole chain.
+                println!("seq={seq} bytes={} NETWORK-ERROR rtt_ms={rtt} {:#}", body.len(), anyhow::Error::from(e));
             }
             Ok(r) => {
                 let status = r.status();
                 let apns_id = r.headers().get("apns-id").and_then(|v| v.to_str().ok()).unwrap_or("-").to_owned();
                 // Empty on 200; otherwise {"reason": ..., "timestamp"?: ...}.
-                let text = r.text().await.unwrap_or_default();
+                let text = match r.text().await {
+                    Ok(text) => text,
+                    Err(e) => format!("(body read failed: {:#})", anyhow::Error::from(e)),
+                };
                 if status.is_success() { ok += 1 } else { failed += 1 }
                 println!("seq={seq} bytes={} status={} apns-id={apns_id} rtt_ms={rtt} {text}", body.len(), status.as_u16());
             }
@@ -277,5 +281,17 @@ mod tests {
     fn production_is_the_default_endpoint() {
         assert_eq!(host(false), "https://api.push.apple.com");
         assert_eq!(host(true), "https://api.sandbox.push.apple.com");
+    }
+
+    #[test]
+    fn start_seq_must_be_at_least_one() {
+        let parse = |seq: &str| {
+            Cli::try_parse_from([
+                "apns-probe", "send", "--key", "k.p8", "--key-id", "KEY", "--team-id", "TEAM",
+                "--topic", "dev.chatproject.chatapp", "--token", "00", "--start-seq", seq,
+            ])
+        };
+        assert!(parse("0").is_err());
+        assert!(parse("1").is_ok());
     }
 }
