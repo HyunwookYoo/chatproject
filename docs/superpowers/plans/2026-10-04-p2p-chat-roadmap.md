@@ -75,11 +75,11 @@ ChatProject/
 
 ### M1b — iOS 파이프라인 + 기기 실측
 
-- 범위: GitHub Actions macOS 러너에서 iOS 빌드, App Store Connect API 키로 클라우드 서명, TestFlight 업로드. App Group과 알림 확장(NSE) 타깃 추가(Mac이 없으므로 Ruby `xcodeproj` 스크립트로 프로젝트를 고친다). `chat_nse` 크레이트(UniFFI, `nse` 기능만).
+- 범위: GitHub Actions macOS 러너에서 iOS 빌드, App Store Connect API 키로 클라우드 서명, TestFlight 업로드. App Group과 알림 확장(NSE) 타깃 추가(Mac이 없으므로 Ruby `xcodeproj` 스크립트로 프로젝트를 고친다). `chat_nse` 크레이트(UniFFI Swift로 노출). M1b의 `chat_nse`는 `chat_core`의 `nse` 기능이 아니라 OpenMLS를 직접 부르는 별도 크레이트이고, M5에서 `chat_core`의 `nse` 기능을 감싸는 것으로 바뀐다.
 - 기기 실측 (설계 18절에서 미룬 것)
   - 스파이크 B 기기판: 알림 확장이 200 leaf OpenMLS 그룹 상태를 열고 복호한 뒤 자기 메모리(`phys_footprint`)를 App Group 파일에 쓴다. 앱이 그 값을 보여 준다. 기준 15 MB.
   - 스파이크 C iOS판: 꺼진 iPhone에 APNs로 여러 통 보낸 뒤 켰을 때 남는 개수(설계 가정: 앱당 1개)와 지연을 잰다.
-- 자동 시험(③): iOS 시뮬레이터 통합 테스트 CI 작업(main 브랜치 push와 매일 밤, 앱 서명 불필요). `xcrun simctl push`로 알림 확장 처리 경로까지 시험할 수 있는지 확인한다.
+- 자동 시험(③): iOS 시뮬레이터 통합 테스트 CI 작업(main 브랜치 push와 매일 밤, 앱 서명 불필요). `xcrun simctl push`는 알림 확장을 실행하지 않아서(자동 테스트 설계 6절) CI는 NSE가 빌드되어 앱 안에 들어갔는지만 확인한다.
 - 완료 기준: TestFlight 빌드가 iPhone에 설치·실행된다. NSE 피크 메모리 < 15 MB. APNs 실측값을 설계 8.2절과 스파이크 C 결과에 적는다. iOS 시뮬레이터 CI 작업이 녹색.
 - 사용자 준비: Apple Developer에서 App ID 2개(앱, NSE)와 App Group 만들기, APNs 인증 키(.p8), App Store Connect API 키(.p8)를 GitHub 저장소 시크릿에 넣기.
 - 위험: 15 MB를 넘으면 설계 17절 #1의 대안(알림은 "새 메시지"만)으로 간다.

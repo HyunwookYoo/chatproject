@@ -154,7 +154,8 @@ Dart 패키지 하나다. M1a에서는 기기 관리 명령만 만들고(`bin/de
 ## 6. iOS 시뮬레이터 (M1b)
 
 - macOS 러너에서 `tools/ci/pick_simulator.py`가 가장 새 iOS 런타임의 iPhone을 고른다. `xcrun simctl bootstatus <udid> -b`로 그 시뮬레이터를 켠다. `flutter test integration_test/core_test.dart -d <udid>`로 시험한다. 시뮬레이터는 앱 서명이 필요 없다. flutter/flutter#181771 때문에 시험이 멈출 수 있어서, 앞 시도가 멈추거나 실패하면 두 번까지 더 시도한다. CI는 Flutter 도구에 upstream 수정(#193142)을 패치해서 쓴다.
-- `xcrun simctl push`는 알림 확장(NSE)을 실행하지 않는다. Xcode 11.4 릴리스 노트의 Known Issues(55822721)와 Xcode 14 릴리스 노트에 적혀 있고, Xcode 26.x까지 바뀌지 않았다. GitHub 러너의 시뮬레이터는 실제 APNs 토큰도 받지 못한다. 그래서 CI는 NSE가 빌드되어 앱 안(`Runner.app/PlugIns/NotificationService.appex`)에 들어갔는지만 확인한다. 복호와 메모리는 TestFlight 빌드로 잰다.
+- `xcrun simctl push`는 알림 확장(NSE)을 실행하지 않는다. Xcode 11.4 릴리스 노트의 Known Issues(55822721)와 Xcode 14 릴리스 노트에 적혀 있고, Xcode 26.x까지 바뀌지 않았다. GitHub 러너의 시뮬레이터는 실제 APNs 토큰도 받지 못한다. 그래서 CI는 NSE가 빌드되어 앱 안(`Runner.app/PlugIns/NotificationService.appex`)에 들어갔는지, 그리고 `tools/ci/check_ios_app.sh`의 검사(번들 ID, 상태 파일, 확장의 버전이 앱과 같은지, 확장이 시스템 라이브러리만 링크하는지, `chat_ffi`의 FRB 심볼)만 확인한다. 복호와 메모리는 TestFlight 빌드로 잰다.
+- 시뮬레이터 작업은 Debug를 시뮬레이터용으로만 빌드한다. TestFlight 워크플로가 서명하는 기기용 Release 구성은 `ios-release` 작업이 서명 없이(`flutter build ios --release --no-codesign`) 빌드하고 같은 검사를 돌린다. TestFlight 워크플로는 태그로만 돌기 때문에 이 작업이 없으면 첫 TestFlight 실행이 그 구성을 처음 컴파일하는 때가 된다.
 - 알림 확장 메모리와 APNs 보관 개수는 시뮬레이터로 대신할 수 없다. TestFlight로 실제 iPhone에서 잰다.
 
 ## 7. 안전장치
@@ -177,7 +178,7 @@ Dart 패키지 하나다. M1a에서는 기기 관리 명령만 만들고(`bin/de
 
 | 언제 | 작업 |
 |---|---|
-| 매 push | Rust 테스트(Linux), 화면 위젯 테스트(Linux), Windows 빌드 + 통합 테스트, Android 에뮬레이터 통합 테스트, 릴리스 표식 검사(조종 코드가 생기는 M2부터), iOS 시뮬레이터 통합 테스트(M1b부터) |
+| 매 push | Rust 테스트(Linux), 화면 위젯 테스트(Linux), Windows 빌드 + 통합 테스트, Android 에뮬레이터 통합 테스트, 릴리스 표식 검사(조종 코드가 생기는 M2부터), iOS 시뮬레이터 통합 테스트와 기기용 Release 빌드(서명 없이)(M1b부터) |
 | 매일 밤 | 여러 기기 시나리오(M2부터): 에뮬레이터 2대 + `chat_node` |
 
 저장소는 2026-10-05부터 공개다. 공개 저장소에서는 macOS를 포함한 기본 러너가 무료라서, iOS도 매 push마다 돈다. 여러 기기 시나리오는 시간이 오래 걸려서 매일 밤에만 돌린다.
@@ -187,7 +188,7 @@ Dart 패키지 하나다. M1a에서는 기기 관리 명령만 만들고(`bin/de
 | 마일스톤 | 더하는 것 |
 |---|---|
 | M1a | `tools/e2e/bin/devices.dart`(AVD 만들기·켜기·대기·시험·끄기), 시험 전용 AVD 2개, Android 통합 테스트를 에뮬레이터 기본으로, CI 에뮬레이터 작업, Rust 테스트를 Linux로 |
-| M1b | iOS 시뮬레이터 CI 작업, NSE 빌드·내장 확인 |
+| M1b | iOS 시뮬레이터 CI 작업, 기기용 Release 서명 없는 빌드(`ios-release`), NSE 빌드·내장 확인 |
 | M2 | 조종 루프(`test-hooks`), `chat_node`(조종 참가자 + 로컬 릴레이), 앱 조종 모드 실행 인자, 지휘 프로그램 시나리오 실행, 첫 시나리오(에뮬레이터 ↔ `chat_node` ↔ Windows 앱), CI 야간 작업, 릴리스 표식 검사 |
 | M3 | 시나리오: 초대 → 연락처 추가, 기기 연결(두 방향), 복구 문구로 되살리기 |
 | M4 | `Clock` 주입과 `clock_advance`. 시나리오: 강제 종료 뒤 보내기 줄 재개 |
