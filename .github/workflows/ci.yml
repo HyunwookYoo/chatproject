@@ -8,7 +8,9 @@ on:
 permissions:
   contents: read
 
-# A new push to a PR cancels that PR's older run; pushes to main always finish.
+# A new push to a PR cancels that PR's older run. A push to main never cancels the run that is already
+# going, but only one more run of main may wait behind it: when several pushes arrive meanwhile, the
+# newest waits and the ones before it are cancelled.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -61,6 +63,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master 2026-10-01
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt
       # Also caches ~/.cargo/bin, so the codegen below is built once.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0

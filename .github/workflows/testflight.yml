@@ -46,18 +46,24 @@ jobs:
       # Each expression below is evaluated before the step starts and yields true or false, so this
       # step learns whether a secret is set and never receives its value. It fails the run in
       # seconds, with the secret's name, instead of half an hour into the build.
-      - name: Check that the signing secrets are set
+      - name: Check that the signing and upload secrets are set
         env:
           CERT_FILE_SET: ${{ secrets.APPSTORE_CERTIFICATES_FILE_BASE64 != '' }}
           CERT_PASSWORD_SET: ${{ secrets.APPSTORE_CERTIFICATES_PASSWORD != '' }}
           APP_PROFILE_SET: ${{ secrets.APPSTORE_PROFILE_APP_BASE64 != '' }}
           NSE_PROFILE_SET: ${{ secrets.APPSTORE_PROFILE_NSE_BASE64 != '' }}
+          ISSUER_ID_SET: ${{ secrets.APPSTORE_ISSUER_ID != '' }}
+          API_KEY_ID_SET: ${{ secrets.APPSTORE_API_KEY_ID != '' }}
+          API_KEY_SET: ${{ secrets.APPSTORE_API_PRIVATE_KEY != '' }}
         run: |
           missing=""
           [ "$CERT_FILE_SET" = true ] || missing="$missing APPSTORE_CERTIFICATES_FILE_BASE64"
           [ "$CERT_PASSWORD_SET" = true ] || missing="$missing APPSTORE_CERTIFICATES_PASSWORD"
           [ "$APP_PROFILE_SET" = true ] || missing="$missing APPSTORE_PROFILE_APP_BASE64"
           [ "$NSE_PROFILE_SET" = true ] || missing="$missing APPSTORE_PROFILE_NSE_BASE64"
+          [ "$ISSUER_ID_SET" = true ] || missing="$missing APPSTORE_ISSUER_ID"
+          [ "$API_KEY_ID_SET" = true ] || missing="$missing APPSTORE_API_KEY_ID"
+          [ "$API_KEY_SET" = true ] || missing="$missing APPSTORE_API_PRIVATE_KEY"
           if [ -n "$missing" ]; then
             echo "::error::These secrets are empty or missing in the testflight Environment:$missing"
             exit 1

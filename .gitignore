@@ -1,6 +1,9 @@
 # Rust
 **/target/
 
+# Python (tools/ci tests)
+__pycache__/
+
 # Flutter / Dart / Android build output
 **/.dart_tool/
 **/build/
