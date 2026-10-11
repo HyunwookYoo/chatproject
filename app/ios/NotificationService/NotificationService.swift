@@ -23,7 +23,7 @@ final class NotificationService: UNNotificationServiceExtension {
         let seq = (info["seq"] as? NSNumber)?.intValue ?? -1
         let pid = Int(getpid())
         // Written before any work, so a record exists even if iOS kills the extension.
-        Self.append([
+        var logProblem = Self.append([
             "phase": "start",
             "seq": seq,
             "sent_at": (info["sent_at"] as? NSNumber)?.int64Value ?? -1,
@@ -57,10 +57,17 @@ final class NotificationService: UNNotificationServiceExtension {
         end["footprint"] = sample?.footprint ?? 0
         end["peak"] = sample?.peak ?? -1
         end["available"] = os_proc_available_memory() // 0 when iOS does not report it for extensions
-        Self.append(end)
+        let endProblem = Self.append(end)
+        logProblem = logProblem ?? endProblem
+        var title: String?
         if let peak = sample?.peak {
-            content.title = String(format: "NSE 최대 %.1f MB", Double(peak) / 1_048_576)
+            title = String(format: "NSE 최대 %.1f MB", Double(peak) / 1_048_576)
         }
+        // iOS gives the extension no console, so a log that could not be written must show on the notification.
+        if let logProblem {
+            title = (title ?? "NSE") + " · 기록 실패 (\(logProblem))"
+        }
+        if let title { content.title = title }
         deliver(content)
     }
 
@@ -81,14 +88,26 @@ final class NotificationService: UNNotificationServiceExtension {
     }
 
     /// Appends one JSON line with O_APPEND, so lines from concurrent notifications do not interleave.
-    private static func append(_ record: [String: Any]) {
-        guard let dir = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroup),
-              var line = try? JSONSerialization.data(withJSONObject: record, options: [.sortedKeys]) else { return }
+    /// Returns nil on success, otherwise a short reason for the notification title: a missing App Group
+    /// (a wrong entitlement or profile) and a write before the first unlock look alike without it.
+    private static func append(_ record: [String: Any]) -> String? {
+        guard let dir = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroup) else {
+            return "그룹 없음"
+        }
+        guard var line = try? JSONSerialization.data(withJSONObject: record, options: [.sortedKeys]) else {
+            return "JSON"
+        }
         line.append(0x0A)
-        let fd = open(dir.appendingPathComponent(logName).path, O_WRONLY | O_CREAT | O_APPEND, 0o644)
-        guard fd >= 0 else { return }
+        let url = dir.appendingPathComponent(logName)
+        // The log holds measurements only. Creating it without data protection lets notifications that arrive
+        // before the first unlock after a reboot append too; the default class refuses until then.
+        // .withoutOverwriting keeps an existing log, and the error for "it exists" is expected.
+        try? Data().write(to: url, options: [.withoutOverwriting, .noFileProtection])
+        let fd = open(url.path, O_WRONLY | O_CREAT | O_APPEND, 0o644)
+        guard fd >= 0 else { return "열기 \(errno)" }
         defer { close(fd) }
-        _ = line.withUnsafeBytes { write(fd, $0.baseAddress, $0.count) }
+        let written = line.withUnsafeBytes { write(fd, $0.baseAddress, $0.count) }
+        return written == line.count ? nil : "쓰기 \(errno)"
     }
 }
 
