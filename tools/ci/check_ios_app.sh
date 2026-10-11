@@ -87,6 +87,8 @@ if [ "$signed" = true ]; then
     codesign -d --entitlements :- "$2" > "$work/$1.plist" 2> /dev/null \
       || fail "cannot read the signed entitlements of $1 (is it signed?)"
     [ -s "$work/$1.plist" ] || fail "$1 is signed without entitlements"
+    "$pb" -c 'Print' "$work/$1.plist" > /dev/null 2>&1 \
+      || fail "codesign printed the entitlements of $1 in a form PlistBuddy cannot read (expected an XML plist)"
   }
   has_group() { # entitlements-plist
     local i=0 value
