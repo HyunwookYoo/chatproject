@@ -3768,7 +3768,9 @@ git push
 - Modify: `docs/superpowers/specs/2026-10-04-p2p-chat-design.md` (8.2, 14, 17절 #1·#12)
 - Modify: `docs/superpowers/plans/2026-10-04-p2p-chat-roadmap.md` (M1b 상태, §7 entitlement 신청일)
 
-준비: Task 8의 TestFlight 빌드가 iPhone에 깔려 있다. 이 PC에 `apns-probe`가 빌드돼 있다. `.p8`은 `spikes/c-push/secrets/`에 있다. 명령은 모두 `spikes/c-push/apns-probe`에서 실행한다.
+준비: Task 8의 TestFlight 빌드가 iPhone에 깔려 있다. 빌드가 iPhone의 TestFlight 앱에 나타나려면 소유자가 App Store Connect의 내부 테스트 그룹에 들어 있어야 한다. 이 PC에 `apns-probe`가 빌드돼 있다. `.p8`은 `spikes/c-push/secrets/`에 있다. 명령은 모두 `spikes/c-push/apns-probe`에서 실행한다.
+
+결과는 앱의 **"기록 복사"**로 모은다. 앱 → 측정 → "기록 복사"를 누르면 원본 `nse_memory.jsonl` 전체가 클립보드에 복사되니, 대화창에 붙여넣어 분석한다. Mac이 없어서 이 파일을 읽을 다른 길이 없고, 파일에는 측정값만 있고 비밀은 없다. 화면의 줄에는 pid, footprint, available, plaintext_len이 나오지 않으므로 복사본이 원자료다.
 
 ```bash
 P="cargo run --release -q -- send --key ../secrets/AuthKey_<KEYID>.p8 --key-id <KEYID> --team-id 9J2FNH63M2 --topic dev.chatproject.chatapp --token <TOKEN>"
@@ -3777,6 +3779,7 @@ P="cargo run --release -q -- send --key ../secrets/AuthKey_<KEYID>.p8 --key-id <
 - [ ] **Step 1: 토큰을 받는다**
 
 1. iPhone에서 앱 → 오른쪽 위 측정 단추 → "알림 허용하고 토큰 받기" → 허용.
+   - 토큰은 허용 직후 화면에 나타난다(최대 10초). "토큰을 받지 못했어요 · …"가 나오면 뒤의 문구가 원인이다(예: `aps-environment`, 네트워크). "토큰이 아직 안 왔어요"가 나오면 잠시 뒤 새로고침을 누른다.
 2. "토큰 복사"를 누른다.
 3. 토큰을 메모나 메신저로 PC에 옮겨 `<TOKEN>`에 넣는다.
 
@@ -3785,13 +3788,17 @@ P="cargo run --release -q -- send --key ../secrets/AuthKey_<KEYID>.p8 --key-id <
 1. 앱을 완전히 닫고(앱 전환기에서 위로 밀기) iPhone을 잠근다.
 2. 기준값: `$P --count 1 --start-seq 1`. 복호 없이 Swift 런타임과 라이브러리만 올라간 NSE의 메모리다.
 3. 1분 뒤 복호를 측정한다: `$P --count 8 --start-seq 2 --interval-ms 5000 --ciphertexts ../../../app/ios/NotificationService/Fixture/ciphertexts.txt`
+   - 주의: `apns-probe`는 실행할 때마다 새 JWT를 만든다. Apple은 앞 토큰을 만든 지 20분 안에 새 토큰이 오면 `429 TooManyProviderTokenUpdates`로 답한다. 2번과 3번은 서로 다른 실행이라 3번이 429를 받을 수 있다. 그러면 20분을 기다렸다가 같은 `--start-seq`(2)로 다시 보낸다.
 4. 잠금 화면 알림을 확인한다.
    - 제목: `NSE 최대 x.x MB`
    - 본문: `#N M1b probe message …`
-5. 앱 → 측정 → 새로고침. 다음 값을 적는다.
-   - 기준 피크, 복호 피크의 최댓값
-   - 복호 시간(ms)
+   - 주의: iOS는 미리보기를 "잠금 해제 시"로 두면 잠금 화면에서 알림 문구를 숨긴다. 잠금을 푼 뒤나 알림 센터에서 제목을 읽는다.
+   - 제목 끝에 `· 기록 실패 (…)`가 붙어 있으면 NSE가 App Group 파일에 쓰지 못한 것이다. 괄호 안이 이유다(`그룹 없음`은 App Group 설정, `열기`·`쓰기`와 번호는 파일 오류).
+5. 앱 → 측정 → 새로고침. 다음 값을 적고, "기록 복사"로 원본 줄 전체를 대화창에 붙여넣는다.
+   - 기준 피크, 복호 피크의 최댓값. 화면의 "MB"는 MiB(1 MiB = 1,048,576 B)다. MiB로 적는다.
+   - 복호 시간(ms)과 로드 시간(ms)
    - "끝 기록 없음" 줄의 수
+   - 각 줄의 `지연`. `sent_at`은 PC 시계, `received_at`은 iPhone 시계이고 오프셋 보정이 없다. 스파이크 C의 S1 지연(시계 차이를 보정한 값)과 직접 비교하지 않는다.
 6. 판정:
    - 복호 피크 최댓값이 **15 MB 미만**이면 통과다.
    - 넘으면 여기서 멈추고 사용자와 설계 17절 #1의 대안을 정한다. 대안은 알림을 "새 메시지"로만 보여 주는 것이다.
@@ -3801,10 +3808,13 @@ P="cargo run --release -q -- send --key ../secrets/AuthKey_<KEYID>.p8 --key-id <
 1. 앱 → 측정 → "기록 지우기".
 2. iPhone의 전원을 끈다.
 3. `$P --count 5 --start-seq 101 --interval-ms 60000 --expiration-secs 86400`. 5분 동안 1분 간격으로 보낸다. 출력의 `status=200` 다섯 줄을 확인한다.
-4. 마지막 발송 10분 뒤 iPhone을 켜고 잠금을 푼다.
-5. 1분 기다린 뒤 다음을 적는다.
-   - 알림 센터에 뜬 알림의 수와 `#`번호
-   - 앱 → 측정 → 새로고침에 나온 각 줄의 `지연`
+   - 주의: 앞 실행(Step 2)에서 20분이 안 지났으면 `429 TooManyProviderTokenUpdates`가 올 수 있다. 20분을 기다렸다가 같은 `--start-seq`(101)로 다시 보낸다.
+4. 마지막 발송 10분 뒤 iPhone을 켜고 **바로** 잠금을 푼다.
+   - 주의: 켠 뒤 첫 잠금 해제 전에는 App Group 파일의 기본 보호(`CompleteUntilFirstUserAuthentication`) 때문에 쓰기가 막힐 수 있다. NSE는 기록 파일을 보호 없이 만들어 이를 피하도록 했지만 기기에서는 이번에 처음 확인한다.
+     푸시가 도착했는데 기록이 없고 제목에 `기록 실패`가 붙어 있으면 첫 잠금 해제 전에 NSE가 돈 것일 수 있다. 제목이 원래 문구 그대로면 NSE가 돌지 않은 것이다.
+5. 1분 기다린 뒤 다음을 적고, "기록 복사"로 원본 줄 전체를 대화창에 붙여넣는다.
+   - 알림 센터에 뜬 알림의 수와 `#`번호. 잠금 화면에서는 문구가 가려질 수 있으니 잠금을 푼 뒤 알림 센터에서 본다.
+   - 앱 → 측정 → 새로고침에 나온 각 줄의 `지연`. 시계 보정이 없다(Step 2 5번).
 6. 같은 절차를 비행기 모드로 한 번 더 한다. 전원은 켠 채 3단계 대신 비행기 모드를 켜고, 4단계에서 끈다.
 7. 설계의 가정은 앱당 1개(대개 최신)가 남는다는 것이다. 실제 수가 다르면 그대로 기록한다.
 
@@ -3812,12 +3822,12 @@ P="cargo run --release -q -- send --key ../secrets/AuthKey_<KEYID>.p8 --key-id <
 
 1. `spikes/b-mls-memory/RESULTS.md` 끝에 `## Device run (iPhone, TestFlight)` 절을 더한다.
    - 날짜, iPhone 모델과 iOS 버전, 빌드 번호
-   - 기준 피크와 복호 피크(MB), 복호와 로드 시간
+   - 기준 피크와 복호 피크(MiB), 복호와 로드 시간
    - 고정 파일 크기(1.35 MB, 자격 증명 200 B)
    - 판정
    - 상태 저장이 JSON이라 실제(M5 바이너리 저장)보다 크게 나온다는 주의
 2. `spikes/c-push/RESULTS.md` 끝에 `## iOS (APNs)` 절을 더한다.
-   - 전원 꺼짐과 비행기 모드 각각에 대해 보낸 수, 남은 수, 남은 번호, 지연
+   - 전원 꺼짐과 비행기 모드 각각에 대해 보낸 수, 남은 수, 남은 번호, 지연(PC·iPhone 시계 차이를 보정하지 않은 값이라고 적는다)
    - `apns-expiration`은 86400
 3. 설계 문서를 고친다.
    - 8.2절: "앱당 1개만 보관" 문장 뒤에 `(2026-10 실측: <결과>)`를 더한다.
