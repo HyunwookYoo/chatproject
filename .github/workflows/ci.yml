@@ -300,14 +300,8 @@ jobs:
           pkill -f "log stream" || true
           xcrun simctl terminate "${{ steps.sim.outputs.udid }}" dev.chatproject.chatapp || true
           flutter test -v integration_test/core_test.dart -d "${{ steps.sim.outputs.udid }}"
-      - name: The extension is embedded in the test build
-        run: |
-          appex="$(find app/build/ios/iphonesimulator -maxdepth 3 -name NotificationService.appex -print -quit)"
-          test -n "$appex" || { echo "::error::NotificationService.appex is not embedded"; exit 1; }
-          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$appex/Info.plist"
-          test -f "$appex/nse_state.bin" || { echo "::error::nse_state.bin is not in the extension"; exit 1; }
-          # For the log: the extension must link system libraries only, not the Pods frameworks (chat_ffi).
-          find "$appex" -type f \( -name NotificationService -o -name '*.dylib' \) -exec otool -L {} \;
+      - name: Check the app and its extension (test build)
+        run: bash tools/ci/check_ios_app.sh app/build/ios/iphonesimulator/Runner.app
       - name: Simulator diagnostics
         if: failure() || steps.tests.outcome == 'failure' || steps.tests2.outcome == 'failure'
         timeout-minutes: 5
@@ -325,3 +319,43 @@ jobs:
           for f in $(ls -t ~/Library/Logs/DiagnosticReports/Runner* 2>/dev/null | head -2); do echo "== $f"; head -c 6000 "$f"; done
           echo "::endgroup::"
           exit 0
+
+  # The simulator job above builds Debug for the simulator. Nothing else in CI compiles the Release
+  # configuration for a device (what testflight.yml signs and uploads), and that workflow runs only for a
+  # tag. This job builds it unsigned, so it needs no secrets, then looks inside the app.
+  ios-release:
+    runs-on: macos-26
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Pin Xcode
+        run: |
+          sudo xcode-select -s /Applications/Xcode_26.6.app/Contents/Developer
+          xcodebuild -version
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master 2026-10-01
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: aarch64-apple-ios
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+      - name: Rust library for the notification extension
+        run: cargo build -p chat_nse --release --target aarch64-apple-ios
+      - name: Add the notification extension target
+        run: |
+          gem install xcodeproj -v 1.28.1 --no-document
+          ruby app/ios/scripts/add_notification_service.rb app/ios/Runner.xcodeproj
+          # A second run must change nothing.
+          ruby app/ios/scripts/add_notification_service.rb app/ios/Runner.xcodeproj | grep -q "already up to date"
+      # --no-codesign makes Flutter pass CODE_SIGNING_ALLOWED=NO to xcodebuild, which wins over the
+      # Manual signing and profile names that the script sets for Release.
+      - name: Build the app for a device, unsigned
+        working-directory: app
+        run: |
+          flutter pub get
+          flutter build ios --release --no-codesign
+      - name: Check the app and its extension (device build)
+        run: bash tools/ci/check_ios_app.sh app/build/ios/iphoneos/Runner.app

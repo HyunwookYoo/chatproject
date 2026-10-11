@@ -47,8 +47,24 @@ def check(path, doc):
             problems.append(f"{name}: {job_id} step {index}: '{uses}' is not pinned to a full commit SHA")
         if uses.startswith("actions/checkout@") and (step.get("with") or {}).get("persist-credentials") is not False:
             problems.append(f"{name}: {job_id} step {index}: checkout must set persist-credentials: false")
+    if path.stem == "ci":
+        problems += check_ci(name, doc)
     if path.stem == "testflight":  # GitHub runs testflight.yaml too
         problems += check_testflight(name, doc)
+    return problems
+
+
+def check_ci(name, doc):
+    """Nothing but testflight.yml (which runs for a tag only) compiles the Release configuration for a device."""
+    job = (doc.get("jobs") or {}).get("ios-release")
+    if job is None:
+        return [f"{name}: job ios-release is missing (CI would never build the Release configuration for a device)"]
+    runs = "\n".join(step.get("run", "") for step in job.get("steps") or [])
+    problems = []
+    if "flutter build ios --release" not in runs or "--no-codesign" not in runs:
+        problems.append(f"{name}: job ios-release must run 'flutter build ios --release --no-codesign'")
+    if "tools/ci/check_ios_app.sh" not in runs:
+        problems.append(f"{name}: job ios-release must run tools/ci/check_ios_app.sh on the built app")
     return problems
 
 
@@ -75,6 +91,14 @@ def check_testflight(name, doc):
         if profiles is None or not all(k in profiles.get("run", "") for k in
                                         ("ProvisionedDevices", "application-groups", "aps-environment")):
             problems.append(f"{name}: job {job_id} must validate the profiles before signing")
+        # The IPA check is the last guard before the upload: it must exist, check the signed entitlements
+        # too, and come first.
+        ipa = next((i for i, s in enumerate(step_list) if s.get("name") == "Locate IPA and check its contents"), None)
+        upload = next((i for i, s in enumerate(step_list) if "upload-testflight-build" in s.get("uses", "")), None)
+        if ipa is None or "tools/ci/check_ios_app.sh --signed" not in step_list[ipa].get("run", ""):
+            problems.append(f"{name}: job {job_id} must run 'tools/ci/check_ios_app.sh --signed' on the exported IPA")
+        elif upload is not None and upload < ipa:
+            problems.append(f"{name}: job {job_id} must check the IPA before it uploads it")
         for step in step_list:
             if "upload-artifact" in step.get("uses", ""):
                 problems.append(f"{name}: job {job_id} must not upload-artifact (IPA and profiles stay private)")

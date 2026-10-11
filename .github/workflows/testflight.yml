@@ -188,46 +188,15 @@ jobs:
         id: ipa
         run: |
           set -euo pipefail
-          pb=/usr/libexec/PlistBuddy
           # find fails when a directory is missing; `|| true` lets the ::error:: below speak instead.
           ipa="$(find app/build/ios/ipa -maxdepth 1 -name '*.ipa' -print -quit 2>/dev/null || true)"
           test -n "$ipa" || { echo "::error::no IPA was exported"; exit 1; }
           unzip -q "$ipa" -d "$RUNNER_TEMP/ipa"
           app_dir="$(find "$RUNNER_TEMP/ipa/Payload" -maxdepth 1 -name '*.app' -print -quit 2>/dev/null || true)"
           test -n "$app_dir" || { echo "::error::the IPA has no Payload/*.app"; exit 1; }
-          appex="$app_dir/PlugIns/NotificationService.appex"
-          test -d "$appex" || { echo "::error::NotificationService.appex is not embedded in the IPA"; exit 1; }
-          got="$($pb -c 'Print :CFBundleIdentifier' "$appex/Info.plist")"
-          [ "$got" = "$NSE_ID" ] || { echo "::error::embedded extension is '$got'"; exit 1; }
-          # App Store Connect rejects an extension whose version differs from the app's, but only
-          # after the whole signed build. Both must come from FLUTTER_BUILD_NAME/NUMBER (Ruling R14).
-          for key in CFBundleVersion CFBundleShortVersionString; do
-            app_value="$($pb -c "Print :$key" "$app_dir/Info.plist")" \
-              || { echo "::error::Runner.app Info.plist has no $key"; exit 1; }
-            ext_value="$($pb -c "Print :$key" "$appex/Info.plist")" \
-              || { echo "::error::NotificationService.appex Info.plist has no $key"; exit 1; }
-            [ "$app_value" = "$ext_value" ] || {
-              echo "::error::$key differs: Runner.app has '$app_value', NotificationService.appex has '$ext_value'. App Store Connect would reject this build; both Info.plists must use FLUTTER_BUILD_NAME and FLUTTER_BUILD_NUMBER."
-              exit 1
-            }
-          done
-          # The extension runs in a ~15 MB process, so it must link system libraries only (decision D1).
-          # The first line of otool's output is the binary's own path.
-          test -f "$appex/NotificationService" || { echo "::error::NotificationService.appex has no executable"; exit 1; }
-          linked="$(otool -L "$appex/NotificationService" | tail -n +2)"
-          echo "$linked"
-          bad="$(printf '%s\n' "$linked" | grep -E 'chat_ffi|Flutter|@rpath' || true)"
-          if [ -n "$bad" ]; then
-            printf 'The extension links these, which are not system libraries:\n%s\n' "$bad"
-            echo "::error::NotificationService links chat_ffi, Flutter or an @rpath library (listed above). That adds a second Rust runtime to the 15 MB extension. Its base configuration must be Flutter/Generated.xcconfig, set in add_notification_service.rb."
-            exit 1
-          fi
-          # Write nm's output to a file first: with `grep -q` at the end of a pipe, grep stops reading at the
-          # first match, nm can die from SIGPIPE, and pipefail would then fail a good build.
-          nm -gU "$app_dir/Frameworks/chat_ffi.framework/chat_ffi" > "$RUNNER_TEMP/chat_ffi.syms" \
-            || { echo "::error::cannot read the symbols of chat_ffi.framework (is it in the IPA?)"; exit 1; }
-          grep -q frb_get_rust_content_hash "$RUNNER_TEMP/chat_ffi.syms" \
-            || { echo "::error::chat_ffi lost its flutter_rust_bridge symbols in the release build"; exit 1; }
+          # The checks that ci.yml runs on the unsigned build (job ios-release), plus the signed
+          # entitlements. NSE_ID and APP_GROUP come from the workflow env.
+          bash tools/ci/check_ios_app.sh --signed "$app_dir"
           echo "path=$ipa" >> "$GITHUB_OUTPUT"
 
       - name: Upload to TestFlight

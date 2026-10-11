@@ -16,9 +16,23 @@ def testflight(**overrides):
             "steps": [
                 {"name": "Refuse re-runs", "run": 'if [ "$GITHUB_RUN_ATTEMPT" != 1 ]; then exit 1; fi'},
                 {"name": "Install provisioning profiles", "run": "ProvisionedDevices application-groups aps-environment"},
+                {"name": "Locate IPA and check its contents", "run": 'bash tools/ci/check_ios_app.sh --signed "$app_dir"'},
                 {"name": "Upload to TestFlight", "uses": PINNED},
             ],
         }},
+    }
+    doc.update(overrides)
+    return doc
+
+
+def ci(**overrides):
+    doc = {
+        "on": {"push": {"branches": ["main"]}, "pull_request": None},
+        "permissions": {"contents": "read"},
+        "jobs": {"ios-release": {"steps": [
+            {"name": "Build the app for a device, unsigned", "run": "flutter pub get\nflutter build ios --release --no-codesign"},
+            {"name": "Check the app and its extension", "run": "bash tools/ci/check_ios_app.sh app/build/ios/iphoneos/Runner.app"},
+        ]}},
     }
     doc.update(overrides)
     return doc
@@ -52,7 +66,7 @@ class CheckTest(unittest.TestCase):
 
     def test_unpinned_action_is_rejected(self):
         doc = testflight()
-        doc["jobs"]["testflight"]["steps"][2]["uses"] = "apple-actions/upload-testflight-build@v5"
+        doc["jobs"]["testflight"]["steps"][-1]["uses"] = "apple-actions/upload-testflight-build@v5"
         self.assertTrue(any("not pinned" in p for p in check(self.path, doc)))
 
     def test_testflight_yaml_is_checked_like_testflight_yml(self):
@@ -107,6 +121,59 @@ class CheckTest(unittest.TestCase):
                 step["run"] = step["run"].replace(keyword, "")
                 problems = check(self.path, doc)
                 self.assertTrue(any("validate the profiles" in p for p in problems), problems)
+
+    def test_the_ipa_check_must_run_the_shared_script_on_the_signed_app(self):
+        for body in ("echo ok", 'bash tools/ci/check_ios_app.sh "$app_dir"'):
+            with self.subTest(body=body):
+                doc = testflight()
+                doc["jobs"]["testflight"]["steps"][2]["run"] = body
+                problems = check(self.path, doc)
+                self.assertTrue(any("check_ios_app.sh --signed" in p for p in problems), problems)
+
+    def test_missing_ipa_check_step_is_rejected(self):
+        doc = testflight()
+        del doc["jobs"]["testflight"]["steps"][2]
+        self.assertTrue(any("check_ios_app.sh --signed" in p for p in check(self.path, doc)))
+
+    def test_the_ipa_must_be_checked_before_it_is_uploaded(self):
+        doc = testflight()
+        steps = doc["jobs"]["testflight"]["steps"]
+        steps[2], steps[3] = steps[3], steps[2]
+        self.assertTrue(any("before it uploads" in p for p in check(self.path, doc)))
+
+
+class CiTest(unittest.TestCase):
+    path = pathlib.Path("ci.yml")
+
+    def test_a_good_ci_workflow_passes(self):
+        self.assertEqual(check(self.path, ci()), [])
+
+    def test_missing_ios_release_job_is_rejected(self):
+        doc = ci()
+        del doc["jobs"]["ios-release"]
+        problems = check(self.path, doc)
+        self.assertTrue(any("ios-release is missing" in p for p in problems), problems)
+
+    def test_ios_release_must_build_the_release_configuration_unsigned(self):
+        for build in ("flutter build ios --debug --no-codesign", "flutter build ios --release", "flutter build ipa --release"):
+            with self.subTest(build=build):
+                doc = ci()
+                doc["jobs"]["ios-release"]["steps"][0]["run"] = build
+                problems = check(self.path, doc)
+                self.assertTrue(any("--no-codesign" in p for p in problems), problems)
+
+    def test_ios_release_must_check_the_built_app(self):
+        doc = ci()
+        del doc["jobs"]["ios-release"]["steps"][1]
+        problems = check(self.path, doc)
+        self.assertTrue(any("check_ios_app.sh" in p for p in problems), problems)
+
+    def test_ci_yaml_is_checked_like_ci_yml(self):
+        # GitHub runs .yaml workflows too, so the rules must follow the file stem, not the extension.
+        doc = ci()
+        del doc["jobs"]["ios-release"]
+        problems = check(pathlib.Path("ci.yaml"), doc)
+        self.assertTrue(any("ios-release is missing" in p for p in problems), problems)
 
 
 if __name__ == "__main__":
