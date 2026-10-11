@@ -213,3 +213,4 @@ ChatProject/
 - 스파이크 C의 Firebase 서비스 계정 키: M7에서 운영용 키를 만들 때 삭제한다.
 - `docs/study/p2p-chat/` 학습 문서는 rev.2 기준이다. 필요할 때 rev.3로 다시 만든다.
 - M1a가 일부러 뒤로 미룬 일: [`2026-10-05-m1a-carry-forward.md`](2026-10-05-m1a-carry-forward.md)에 마일스톤별로 모았다. 각 마일스톤의 상세 계획은 쓰기 전에 자기 절을 읽는다.
+- M1b가 일부러 뒤로 미룬 일: [`2026-10-11-m1b-carry-forward.md`](2026-10-11-m1b-carry-forward.md)에 마일스톤별로 모았다. 업스트림 수정을 기다리는 일(`libc` 고정, Flutter 우회)과 러너 이미지 전환은 마지막의 "지켜볼 것"에 있다.

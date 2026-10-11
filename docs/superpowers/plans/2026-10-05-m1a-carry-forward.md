@@ -4,6 +4,8 @@ M1a를 만들고 최종 리뷰하는 동안 찾았지만 일부러 뒤로 미룬
 
 ## M1b
 
+**M1b에서 끝났다 (2026-10-11).** 1번은 Task 5, 2·5·6번은 Task 2, 7·8번은 Task 3에서 했다. 3·4번은 날짜가 와야 하는 감시라서 [M1b가 남긴 일](2026-10-11-m1b-carry-forward.md)의 "지켜볼 것"으로 옮겼다. 아래 항목은 무엇을 했는지 남기려고 그대로 둔다.
+
 1. **바인딩을 한 번에 다시 만드는 스크립트를 쓴다.** flutter_rust_bridge, UniFFI Kotlin, UniFFI Swift를 모두 다룬다. CI가 이 스크립트를 돌려 커밋된 결과와 다르면 실패하게 한다.
    - 이유: 생성한 바인딩을 커밋하는데 다시 만드는 일은 손으로 치는 명령뿐이라, 빠뜨려도 CI가 잡지 못한다.
    - 위치: [M1a 계획](2026-10-04-m1a-core-skeleton.md) Task 3 Step 6과 Task 5 Step 4. Task 5 Step 4의 `grep`은 UniFFI가 백틱으로 감싼 이름(`` `nativeInstanceId` ``)을 찾지 못한다.
