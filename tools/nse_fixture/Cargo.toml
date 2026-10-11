@@ -1,0 +1,15 @@
+[package]
+name = "nse_fixture"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+base64 = "0.22"
+chat_nse = { path = "../../core/chat_nse" }
+openmls = "=0.9.0"
+openmls_basic_credential = "=0.6.0"
+openmls_rust_crypto = "=0.6.0"
+
+[dev-dependencies]
+tempfile = "3"
