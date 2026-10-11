@@ -3885,3 +3885,46 @@ git push
 - [ ] APNs 실측값이 설계 8.2절과 스파이크 C 결과에 적혀 있다(Task 10 Step 3·4).
 - [ ] M1a가 넘긴 일 M1b 절의 8개 항목이 모두 끝났다(위 표).
 - [ ] 알림 필터링·multicast entitlement 신청일이 로드맵 §7에 적혀 있다.
+
+---
+
+## 계획과 달라진 점
+
+위 태스크의 코드 블록과 명령은 처음 쓴 그대로 두었다. 실행하면서 판정(Ruling)과 최종 리뷰로 코드나 명령이 달라진 곳은 아래와 같다. R번호는 그 판정의 번호이고, SHA는 `m1b-ios`의 커밋이다. 블록이 아래 내용과 다르면 아래가 실제 코드다. 이 절을 넣은 커밋(`docs: list where M1b deviated from its plan`)의 SHA는 여기에 적지 않는다.
+
+- **R5 — 워크플로 검사기가 `.yml`과 `.yaml`을 모두 본다 (Task 2, `d37b692`)**: 계획의 `main()`은 `*.yml`만 찾고, 워크플로 파일이 하나도 없으면 아무 말 없이 통과한다(계획 :675). 실제 `main()`은 `*.yml`과 `*.yaml`을 모두 훑고, 파일이 하나도 없으면 "no workflow files found" 문제를 내며 종료 코드 1로 끝난다. 저장소 수준의 SHA 고정 정책은 켜 두지 않았으므로 이 검사기가 고정·권한·트리거의 유일한 강제 수단이다.
+- **Task 2의 작은 지적 두 개를 Task 8의 커밋에 넣었다 (`6700415`)**: TestFlight 규칙을 켜는 조건이 계획의 `name == "testflight.yml"`(계획 :3113)에서 `path.stem == "testflight"`로 바뀌었다(GitHub는 `testflight.yaml`도 돌린다). `check_workflows.py` 맨 위 docstring은 `*.yml and *.yaml`을 말한다.
+- **R6 — `libc`를 0.2.189에 고정 (Task 3, `0a287bd`)**: 계획에 없던 `Cargo.lock` 변경이다. libc 0.2.190이 `_dyld_image_count` 같은 함수를 macOS에서만 선언해서 `backtrace` 0.3.76이 `aarch64-apple-ios-sim`에서 E0425로 깨졌다(rust-lang/libc#5601, 수정 PR #5606은 열려 있다). `cargo update -p libc --precise 0.2.189`로 잠금 파일의 `libc`만 바꿨다. **`cargo update`를 돌리면 고정이 풀려 iOS 작업이 깨진다.** 푸는 때는 [M1b가 남긴 일](2026-10-11-m1b-carry-forward.md)의 "지켜볼 것"에 있다.
+- **R7 — Task 3은 자동 테스트 설계의 2절과 8절만 고친다 (Task 3, `3908283`)**: Task 3 Files 목록의 "6절"은 계획의 오타다. 6절은 Task 6이 고친다(R11).
+- **R8·R15·R16 — iOS 통합 테스트의 재시도와 Flutter 도구 패치 (Task 3·7, `20197e4`, `0ddbca9`, `f98b683`, `f8ac999`)**: 계획의 `ios` 작업은 `flutter test`를 한 번 돈다(계획 :1122-1159). 실제는 다음과 같다.
+  - `flutter test`가 시뮬레이터 로그 리더 경쟁(flutter/flutter#181771)으로 "Xcode build done" 뒤에 멈출 수 있어서, 시험을 최대 세 번 시도한다. 첫 시도 15분, 둘째와 셋째 8분이고 앞의 둘은 `continue-on-error`다. 작업 `timeout-minutes`는 45에서 50이 됐다.
+  - 둘째와 셋째 시도 앞에서 이전 시도가 남긴 `flutter_tools.snapshot`과 `log stream`을 `pkill`로 죽이고 `simctl terminate`를 부른다. 이 두 시도에만 `flutter test -v`를 준다.
+  - `tools/ci/flutter-181771.patch`(업스트림 PR flutter/flutter#193142의 `simulators.dart` 부분을 3.44.6에 맞춘 것)를 `flutter-action` 뒤의 단계가 `$FLUTTER_ROOT`에 적용한다(되돌려 보는 검사로 두 번 적용을 피한다). 그다음 `bin/cache/flutter_tools.stamp`를 지우고 `flutter --version`으로 도구를 다시 만든다.
+  - 계획에 없던 `Simulator diagnostics` 단계를 남겨 두었다. 자동 테스트 설계 6절은 "앞 시도가 멈추거나 실패하면 두 번까지 더 시도한다"고 쓴다.
+  - 패치와 재시도를 걷는 때는 [M1b가 남긴 일](2026-10-11-m1b-carry-forward.md)의 "지켜볼 것"에 있다.
+- **R10·R11 — 내장 확인 단계의 자리와 자동 테스트 설계 6절 (Task 6, `b98d1c7`)**: "The extension is embedded in the test build" 단계는 계획이 가리키는 자리(계획 :2343)가 아니라, 재시도로 갈라진 시험 단계들 뒤, `Simulator diagnostics` 앞에 있다. 자동 테스트 설계 6절은 `simctl push` 문장 말고 첫 줄도 실제 작업에 맞게 고쳤다(`pick_simulator.py`가 가장 새 iPhone을 고르고, `xcrun simctl bootstatus <udid> -b`로 켜고, `flutter test integration_test/core_test.dart -d <udid>`로 돌린다). 이 단계의 이름은 R21에서 바뀌었다.
+- **R12·D1 — NSE의 기본 설정은 `Flutter/Generated.xcconfig`다 (Task 6, `b98d1c7`)**: 계획의 스크립트는 NSE 설정의 `base_configuration_reference`를 Runner의 것으로 맞춘다(계획 :2275-2281). 실제는 `Flutter/Generated.xcconfig`다. Flutter는 Runner의 `Debug.xcconfig`와 `Release.xcconfig` 앞에 CocoaPods include를 붙이는데, 그것을 물려받으면 확장이 `-framework chat_ffi`와 Pods의 runpath를 받아 `chat_ffi.framework`를 링크한다. 그러면 두 번째 Rust 런타임과 FRB가 15 MB 프로세스에 들어간다. `Generated.xcconfig`는 `FLUTTER_BUILD_NAME`과 `FLUTTER_BUILD_NUMBER`를 그대로 준다. 계획 코드 블록의 주석("Runner's xcconfig supplies …")도 실제와 다르다.
+- **D2 — 내장 확인 단계가 `otool -L`을 찍는다 (Task 6, `b98d1c7`)**: 확장 실행 파일의 `otool -L`을 로그에 찍는 줄이 더해졌다. 계획에는 없었다. 지금은 R14와 R21의 검사가 이 줄을 대신한다.
+- **R13 — 복호에 실패해도 본문은 그대로 (Task 6, `eb9b3f4`)**: 계획의 NSE는 `catch`에서 본문을 "#N 복호 실패: …"로 덮어쓴다(계획 :2160). 이 줄을 지웠다. 실패한 알림과 의도한 기준 푸시(`e`가 없는 푸시)는 원래 문구 "알림 N번"으로 뜨고, 이유는 기록의 `ok:false` 줄에만 남으며 제목에는 피크가 그대로 나온다. Review Focus 1이 "알림은 원래 문구로라도 뜬다"를 요구한다.
+- **R14 — IPA 검사에 버전과 링크 확인이 더해졌다 (Task 8, `6700415`)**: "Locate IPA and check its contents"가 계획의 번들 ID 확인과 `nm` 확인 말고도, 확장의 `CFBundleVersion`과 `CFBundleShortVersionString`이 앱과 같은지, 확장 실행 파일의 `otool -L`에 `chat_ffi`·`Flutter`·`@rpath`가 없는지 단언한다. App Store Connect는 버전 불일치를 서명한 빌드가 모두 끝난 뒤에야 거절하고, D1이 깨져도 다른 곳에서는 실패하지 않기 때문이다.
+- **R17 — TestFlight 워크플로와 검사기 보강 (Task 8, `9a4f63b`, `9130b73`)**: 계획 :3044-3358의 검사기와 워크플로가 다음과 같이 달라졌다.
+  - `check_testflight`는 `push:`가 `tags: [testflight-*]`가 아니면 거부한다. 필터 없는 `push:`(`on: push`, `on: [push]` 포함)는 모든 브랜치와 태그에서 작업을 시작하므로 거부한다.
+  - `tools/ci`의 시험은 17개가 됐다(`test_check_workflows.py`가 계획의 6개에서 13개). 푸시 필터, 프로파일 단계의 세 키워드, `Refuse re-runs`가 `GITHUB_RUN_ATTEMPT`를 보고 `exit 1`을 하는지를 하나씩 고정한다.
+  - 비밀값 확인 단계("Check that the signing secrets are set")가 새로 생겼다. `${{ secrets.X != '' }}`로 값이 아닌 참과 거짓만 받아서, 빈 비밀값을 이름과 함께 몇 초 안에 알린다.
+  - "Distribution identity check"는 신원 줄(인증서 소유자의 이름이 들어 있다) 대신 개수를 찍고, `import-codesign-certs`가 이미 하는 `set-keychain-settings`는 뺐다.
+  - 프로파일의 `TeamIdentifier`를 `add_notification_service.rb`의 `TEAM`과 비교한다.
+  - `find`는 `|| true`로 감싸서 디렉터리가 없을 때 `::error::`가 말하게 한다.
+  - `nm` 출력은 파일에 쓴 뒤 `grep -q`로 읽는다. `nm | grep -q`는 SIGPIPE로 멀쩡한 빌드를 실패시킬 수 있다.
+- **R19 — `apns-probe`의 오류 표시와 `--start-seq` (Task 9, `0766c6d`)**: 계획 :3608, :3727, :3733에 해당한다. 네트워크 오류는 `{e}` 대신 원인 사슬 전체(`{e:#}`)를 찍고, 응답 본문을 읽지 못하면 `unwrap_or_default()`로 삼키지 않고 실패로 센다. `--start-seq`는 1 이상만 받는다(`seq - 1`이 넘치기 때문이다). 일곱 번째 시험 `start_seq_must_be_at_least_one`이 더해졌다.
+- **진행 판정 — R1·R3, R9·R18, R20**
+  - R1·R3: Task 1은 구현 에이전트가 아니라 컨트롤러가 사용자와 함께 했고, Task 10도 그렇게 한다. 둘 다 바깥으로 나가거나 실제 기기를 만지는 일이다. 팀 ID `9J2FNH63M2`는 계획대로 쓰고 사용자가 Task 8 Step 1에서 확인했다(2026-10-11).
+  - R9·R18: 하위 에이전트가 쓴 커밋에도 실행 세션의 attribution 줄(`Co-Authored-By: Claude Opus 5.5`)을 붙인다. `b58c1a1`(Task 4)은 `Claude Haiku 4.5`로 적혀 있지만, 줄 하나 때문에 공개된 PR 브랜치를 force-push하지는 않았다. 병합 전에 사용자가 원하면 인터랙티브 rebase로 고칠 수 있다.
+  - R20: 최종 브랜치 리뷰를 Task 10 뒤가 아니라 앞으로 당겼다. Task 8 Step 6과 Task 10이 사용자의 Apple 준비를 기다리는 동안, 기기에서 첫 실행을 망칠 미룬 일을 먼저 고치기 위해서다. 그 두 단계가 바꾸는 것은 범위를 줄인 리뷰를 따로 받는다.
+- **R21 — 최종 리뷰 수정 (아래 커밋들)**: 최종 브랜치 리뷰의 Important 4개와 Minor 5개를 한 번에 고쳤다.
+  - `ci.yml`에 `ios-release` 작업이 생겼다(`c9e268c`). `aarch64-apple-ios`용 `chat_nse` 릴리스 빌드, 스크립트 두 번, `flutter build ios --release --no-codesign`, 그리고 `tools/ci/check_ios_app.sh`를 돈다. 이 스크립트가 R14의 검사와 `chat_ffi`의 FRB 심볼 검사를 한곳에 모았고, `ios` 작업의 확인 단계("Check the app and its extension (test build)", 옛 이름 "The extension is embedded in the test build")와 TestFlight의 IPA 검사가 같은 스크립트를 쓴다. TestFlight 쪽은 `--signed`로 서명된 앱과 확장의 `aps-environment`(production)와 App Group도 확인하고, `codesign`이 plist로 읽을 수 없는 출력을 내면 그렇게 말한다(`35fee82`). `check_workflows.py`는 `ios-release` 작업과 IPA 검사 단계를 고정한다(시험 8개 추가, `tools/ci` 전체 25개). 완료 기준의 CI 작업 목록과 마무리의 필수 검사 목록에는 `ios-release`가 들어간다(소유자가 나중에 ruleset에 더한다).
+  - `testflight.yml`의 비밀값 확인 단계가 `APPSTORE_ISSUER_ID`, `APPSTORE_API_KEY_ID`, `APPSTORE_API_PRIVATE_KEY`도 본다(`a30eeb3`). 단계 이름은 "Check that the signing and upload secrets are set"이 됐다. 같은 커밋이 `ci.yml`의 concurrency 주석을 사실대로 고치고, `bindings` 작업에 `components: rustfmt`를 더하고, `.gitignore`에 `__pycache__/`를 더했다.
+  - NSE (`0a8cd55`): `append()`가 실패 이유를 돌려주고, 기록에 실패하면 제목에 ` · 기록 실패 (이유)`가 붙는다. 기록 파일은 보호 없이(`.noFileProtection`) 만든다. 계획 :2190의 `append`와 그 호출부가 이 점에서 다르다.
+  - 알림 토큰 (`2945225`): `requestPush`는 토큰이나 오류가 올 때까지(최대 10초) 답을 미룬다. 채널 메서드 `registrationError`와 `didFailToRegisterForRemoteNotificationsWithError`가 생겼고 `ProbeHost`에 `registrationError()`가 더해졌다. 계획 Task 7의 `AppDelegate.swift`(계획 :2936-2956), `probe_host.dart`, `probe_screen.dart` 블록과 다르다.
+  - 측정 화면 (`ff6668d`): "기록 복사" 단추와 성공 줄의 "로드 x.x ms"가 더해졌다. 계획 :2746 이후의 `probe_screen.dart` 블록과 다르다.
+  - 문서: M1b가 남긴 일(`79a25f6`), 로드맵 두 줄과 자동 테스트 설계(`6cfcb21`), Task 10의 절차 주의(`9a275ab`).
+- **아직 없는 것**: Task 8 Step 6(첫 TestFlight 실행)과 Task 10(기기 실측)에서 달라지는 점은 두 단계를 한 뒤에 이 절에 더한다.
