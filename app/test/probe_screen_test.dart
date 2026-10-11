@@ -4,6 +4,7 @@ import 'package:chat_app/probe/probe_host.dart';
 import 'package:chat_app/probe/probe_screen.dart';
 import 'package:chat_app/theme/app_theme.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 class FakeProbeHost implements ProbeHost {
@@ -55,9 +56,27 @@ const _log = '''
 {"phase":"start","pid":8,"seq":3,"sent_at":3000,"received_at":3100,"footprint":1}
 ''';
 
+const _failedLog = '''
+{"phase":"start","pid":9,"seq":4,"sent_at":4000,"received_at":4100,"footprint":1}
+{"phase":"end","pid":9,"seq":4,"ok":false,"error":"noState","footprint":1,"peak":5242880,"available":0}
+{"phase":"start","pid":9,"seq":5,"sent_at":5000,"received_at":5100,"footprint":1}
+{"phase":"end","pid":9,"seq":5,"ok":false,"footprint":1,"peak":5242880,"available":0}
+''';
+
 Future<void> pumpProbe(WidgetTester tester, FakeProbeHost host) async {
   await tester.pumpWidget(MaterialApp(theme: buildAppTheme(), home: ProbeScreen(host: host)));
   await tester.pumpAndSettle();
+}
+
+/// Records what the app puts on the clipboard.
+List<String?> recordClipboard(WidgetTester tester) {
+  final copied = <String?>[];
+  tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(SystemChannels.platform, (call) async {
+    if (call.method == 'Clipboard.setData') copied.add((call.arguments as Map)['text'] as String?);
+    return null;
+  });
+  addTearDown(() => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(SystemChannels.platform, null));
+  return copied;
 }
 
 void main() {
@@ -123,8 +142,30 @@ void main() {
     await pumpProbe(tester, FakeProbeHost(log: _log));
     expect(find.text('가장 큰 피크 6.0 MB · 기준 15 MB 미만'), findsOneWidget);
     expect(find.text('#1 · 기준(복호 없음) · 피크 4.0 MB · 지연 400 ms'), findsOneWidget);
-    expect(find.text('#2 · 복호 성공 · 피크 6.0 MB · 복호 1.7 ms · 지연 300 ms'), findsOneWidget);
+    expect(find.text('#2 · 복호 성공 · 피크 6.0 MB · 로드 3.7 ms · 복호 1.7 ms · 지연 300 ms'), findsOneWidget);
     expect(find.text('#3 · 끝 기록 없음 (중단됐을 수 있어요)'), findsOneWidget);
+  });
+
+  testWidgets('a failed decryption shows its reason, or says there is none', (tester) async {
+    await pumpProbe(tester, FakeProbeHost(log: _failedLog));
+    expect(find.text('#4 · 복호 실패 · noState'), findsOneWidget);
+    expect(find.text('#5 · 복호 실패 · 이유 없음'), findsOneWidget);
+    expect(find.text('가장 큰 피크 5.0 MB · 기준 15 MB 미만'), findsOneWidget);
+  });
+
+  testWidgets('copying the log puts the raw file text on the clipboard', (tester) async {
+    final copied = recordClipboard(tester);
+    final raw = '${_log}not json\n'; // the parser skips this line, the copy keeps it
+    await pumpProbe(tester, FakeProbeHost(log: raw));
+    await tester.tap(find.text('기록 복사'));
+    await tester.pumpAndSettle();
+    expect(copied, [raw]);
+    expect(find.text('기록을 복사했어요'), findsOneWidget);
+  });
+
+  testWidgets('there is nothing to copy without a log', (tester) async {
+    await pumpProbe(tester, FakeProbeHost());
+    expect(tester.widget<TextButton>(find.widgetWithText(TextButton, '기록 복사')).onPressed, isNull);
   });
 
   testWidgets('clearing the log empties the list', (tester) async {

@@ -18,6 +18,8 @@ class ProbeScreen extends StatefulWidget {
 
 String _mb(int bytes) => (bytes / 1048576).toStringAsFixed(1);
 
+String _ms(int micros) => (micros / 1000).toStringAsFixed(1);
+
 /// One line per notification.
 String describeRecord(NseRecord r) {
   final latency = r.latencyMs == null ? '' : ' · 지연 ${r.latencyMs} ms';
@@ -25,8 +27,9 @@ String describeRecord(NseRecord r) {
   if (r.stopped) return '#${r.seq} · 끝 기록 없음 (중단됐을 수 있어요)';
   if (r.baseline) return '#${r.seq} · 기준(복호 없음)$peak$latency';
   if (r.ok == true) {
-    final decrypt = r.decryptMicros == null ? '' : ' · 복호 ${(r.decryptMicros! / 1000).toStringAsFixed(1)} ms';
-    return '#${r.seq} · 복호 성공$peak$decrypt$latency';
+    final load = r.loadMicros == null ? '' : ' · 로드 ${_ms(r.loadMicros!)} ms';
+    final decrypt = r.decryptMicros == null ? '' : ' · 복호 ${_ms(r.decryptMicros!)} ms';
+    return '#${r.seq} · 복호 성공$peak$load$decrypt$latency';
   }
   return '#${r.seq} · 복호 실패 · ${r.error ?? '이유 없음'}';
 }
@@ -36,6 +39,7 @@ class _ProbeScreenState extends State<ProbeScreen> {
   String? _registrationError;
   bool? _allowed;
   bool _requesting = false;
+  String _rawLog = '';
   List<NseRecord> _records = const [];
 
   @override
@@ -52,6 +56,7 @@ class _ProbeScreenState extends State<ProbeScreen> {
     setState(() {
       _token = token;
       _registrationError = failure;
+      _rawLog = log ?? '';
       _records = log == null ? const [] : parseNseLog(log);
     });
   }
@@ -66,6 +71,13 @@ class _ProbeScreenState extends State<ProbeScreen> {
     } finally {
       if (mounted) setState(() => _requesting = false);
     }
+  }
+
+  /// The file as the extension wrote it, so the measurements can be pasted into the chat for analysis.
+  Future<void> _copyLog() async {
+    await Clipboard.setData(ClipboardData(text: _rawLog));
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('기록을 복사했어요')));
   }
 
   Future<void> _clear() async {
@@ -104,8 +116,9 @@ class _ProbeScreenState extends State<ProbeScreen> {
             const Text('토큰이 아직 안 왔어요. 잠시 뒤 새로고침을 눌러 보세요.', style: TextStyle(color: AppColors.textSecondary)),
           const SizedBox(height: 24),
           const Text('NSE 기록', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600, color: AppColors.text)),
-          Row(children: [
+          Wrap(children: [
             TextButton(onPressed: _refresh, child: const Text('새로고침')),
+            TextButton(onPressed: _rawLog.isEmpty ? null : _copyLog, child: const Text('기록 복사')),
             TextButton(onPressed: _clear, child: const Text('기록 지우기')),
           ]),
           if (_records.isEmpty)

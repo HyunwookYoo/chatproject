@@ -14,6 +14,7 @@ void main() {
     expect(r.seq, 1);
     expect(r.ok, isTrue);
     expect(r.peakBytes, 6291456);
+    expect(r.loadMicros, 3700);
     expect(r.decryptMicros, 1700);
     expect(r.latencyMs, 500);
     expect(r.stopped, isFalse);
