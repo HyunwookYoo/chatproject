@@ -6,6 +6,10 @@ import UserNotifications
 @objc class AppDelegate: FlutterAppDelegate, FlutterImplicitEngineDelegate {
   /// Hex APNs device token for the M1b probe screen, set once iOS registers the app.
   private var apnsToken: String?
+  /// Why iOS could not register the app, for the probe screen: TestFlight has no console to read it from.
+  private var registrationError: String?
+  /// The `requestPush` call that waits for iOS to answer the registration.
+  private var pendingPush: FlutterResult?
 
   override func application(
     _ application: UIApplication,
@@ -23,16 +27,34 @@ import UserNotifications
       case "requestPush":
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { granted, _ in
           DispatchQueue.main.async {
-            if granted { UIApplication.shared.registerForRemoteNotifications() }
-            result(granted)
+            guard granted, let self else { return result(granted) }
+            self.registerForPush(result)
           }
         }
       case "deviceToken":
         result(self?.apnsToken)
+      case "registrationError":
+        result(self?.registrationError)
       default:
         result(FlutterMethodNotImplemented)
       }
     }
+  }
+
+  /// Asks iOS for a device token. `result` gets true once the token or the failure has come back, or after
+  /// 10 seconds, so the probe screen can read `deviceToken` and `registrationError` right after.
+  private func registerForPush(_ result: @escaping FlutterResult) {
+    finishPush()  // a second call must not leave the first one unanswered
+    pendingPush = result
+    registrationError = nil
+    UIApplication.shared.registerForRemoteNotifications()
+    DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in self?.finishPush() }
+  }
+
+  private func finishPush() {
+    guard let result = pendingPush else { return }
+    pendingPush = nil
+    result(true)
   }
 
   override func application(
@@ -40,6 +62,18 @@ import UserNotifications
     didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data
   ) {
     apnsToken = deviceToken.map { String(format: "%02x", $0) }.joined()
+    registrationError = nil
+    finishPush()
     super.application(application, didRegisterForRemoteNotificationsWithDeviceToken: deviceToken)
+  }
+
+  override func application(
+    _ application: UIApplication,
+    didFailToRegisterForRemoteNotificationsWithError error: Error
+  ) {
+    let e = error as NSError
+    registrationError = "\(e.localizedDescription) (\(e.domain) \(e.code))"
+    finishPush()
+    super.application(application, didFailToRegisterForRemoteNotificationsWithError: error)
   }
 }

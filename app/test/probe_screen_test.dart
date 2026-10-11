@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:chat_app/probe/probe_host.dart';
 import 'package:chat_app/probe/probe_screen.dart';
 import 'package:chat_app/theme/app_theme.dart';
@@ -5,21 +7,35 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 class FakeProbeHost implements ProbeHost {
-  FakeProbeHost({this.log, this.allow = true});
+  FakeProbeHost({this.log, this.allow = true, this.tokenOnRequest = 'a1b2c3', this.errorOnRequest});
 
   String? token;
+  String? error;
   String? log;
   final bool allow;
+
+  /// What iOS answers once the app has asked to register: a token, an error, or (both null) nothing.
+  final String? tokenOnRequest;
+  final String? errorOnRequest;
+
+  /// When set, requestPush waits for it, as the real call waits for iOS.
+  Completer<void>? gate;
   bool cleared = false;
 
   @override
   Future<bool> requestPush() async {
-    if (allow) token = 'a1b2c3';
-    return allow;
+    if (!allow) return false;
+    await gate?.future;
+    token = tokenOnRequest;
+    error = errorOnRequest;
+    return true;
   }
 
   @override
   Future<String?> deviceToken() async => token;
+
+  @override
+  Future<String?> registrationError() async => error;
 
   @override
   Future<String?> readNseLog() async => log;
@@ -57,6 +73,43 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.text('a1b2c3'), findsOneWidget);
     expect(find.text('토큰 복사'), findsOneWidget);
+  });
+
+  testWidgets('the token shows up once iOS has delivered it, without refreshing', (tester) async {
+    final host = FakeProbeHost()..gate = Completer<void>();
+    await pumpProbe(tester, host);
+    await tester.tap(find.text('알림 허용하고 토큰 받기'));
+    await tester.pump();
+    expect(find.text('토큰 받는 중…'), findsOneWidget);
+    expect(tester.widget<FilledButton>(find.byType(FilledButton)).onPressed, isNull);
+
+    host.gate!.complete();
+    await tester.pumpAndSettle();
+    expect(find.text('a1b2c3'), findsOneWidget);
+    expect(find.text('토큰 받는 중…'), findsNothing);
+  });
+
+  testWidgets('a registration error is shown and the button stays for another try', (tester) async {
+    final host = FakeProbeHost(tokenOnRequest: null, errorOnRequest: 'no valid aps-environment (NSCocoaErrorDomain 3000)');
+    await pumpProbe(tester, host);
+    await tester.tap(find.text('알림 허용하고 토큰 받기'));
+    await tester.pumpAndSettle();
+    expect(find.text('토큰을 받지 못했어요 · no valid aps-environment (NSCocoaErrorDomain 3000)'), findsOneWidget);
+    expect(find.text('알림 허용하고 토큰 받기'), findsOneWidget);
+  });
+
+  testWidgets('without a token or an error the screen says to refresh, and refreshing finds a late token', (tester) async {
+    final host = FakeProbeHost(tokenOnRequest: null);
+    await pumpProbe(tester, host);
+    await tester.tap(find.text('알림 허용하고 토큰 받기'));
+    await tester.pumpAndSettle();
+    expect(find.text('토큰이 아직 안 왔어요. 잠시 뒤 새로고침을 눌러 보세요.'), findsOneWidget);
+
+    host.token = 'late';
+    await tester.tap(find.text('새로고침'));
+    await tester.pumpAndSettle();
+    expect(find.text('late'), findsOneWidget);
+    expect(find.text('토큰이 아직 안 왔어요. 잠시 뒤 새로고침을 눌러 보세요.'), findsNothing);
   });
 
   testWidgets('a denied permission says how to turn it on', (tester) async {

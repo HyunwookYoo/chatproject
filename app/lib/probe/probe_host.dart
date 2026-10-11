@@ -5,12 +5,16 @@ import 'package:path_provider_foundation/path_provider_foundation.dart';
 
 /// What the M1b probe screen needs from the platform. iOS only; widget tests use a fake.
 abstract class ProbeHost {
-  /// Asks for notification permission, then registers for a device token.
+  /// Asks for notification permission, then registers for a device token. When allowed, it returns
+  /// once iOS has answered the registration (a token or an error) or after about 10 seconds.
   /// Returns whether notifications are allowed.
   Future<bool> requestPush();
 
   /// Hex APNs device token, or null until iOS has delivered one.
   Future<String?> deviceToken();
+
+  /// Why iOS could not register the app for a token, or null. TestFlight has no console to read it from.
+  Future<String?> registrationError();
 
   /// The NSE log (`nse_memory.jsonl`), or null when it does not exist yet.
   Future<String?> readNseLog();
@@ -27,6 +31,9 @@ class IosProbeHost implements ProbeHost {
 
   @override
   Future<String?> deviceToken() => _channel.invokeMethod<String>('deviceToken');
+
+  @override
+  Future<String?> registrationError() => _channel.invokeMethod<String>('registrationError');
 
   Future<File?> _log() async {
     final dir = await PathProviderFoundation().getContainerPath(appGroupIdentifier: appGroup);

@@ -33,7 +33,9 @@ String describeRecord(NseRecord r) {
 
 class _ProbeScreenState extends State<ProbeScreen> {
   String? _token;
+  String? _registrationError;
   bool? _allowed;
+  bool _requesting = false;
   List<NseRecord> _records = const [];
 
   @override
@@ -44,19 +46,26 @@ class _ProbeScreenState extends State<ProbeScreen> {
 
   Future<void> _refresh() async {
     final token = await widget.host.deviceToken();
+    final failure = await widget.host.registrationError();
     final log = await widget.host.readNseLog();
     if (!mounted) return;
     setState(() {
       _token = token;
+      _registrationError = failure;
       _records = log == null ? const [] : parseNseLog(log);
     });
   }
 
   Future<void> _requestPush() async {
-    final allowed = await widget.host.requestPush();
-    if (!mounted) return;
-    setState(() => _allowed = allowed);
-    await _refresh();
+    setState(() => _requesting = true);
+    try {
+      final allowed = await widget.host.requestPush();
+      if (!mounted) return;
+      setState(() => _allowed = allowed);
+      await _refresh();
+    } finally {
+      if (mounted) setState(() => _requesting = false);
+    }
   }
 
   Future<void> _clear() async {
@@ -76,7 +85,10 @@ class _ProbeScreenState extends State<ProbeScreen> {
           const Text('알림 토큰', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600, color: AppColors.text)),
           const SizedBox(height: 8),
           if (token == null)
-            FilledButton(onPressed: _requestPush, child: const Text('알림 허용하고 토큰 받기'))
+            FilledButton(
+              onPressed: _requesting ? null : _requestPush,
+              child: Text(_requesting ? '토큰 받는 중…' : '알림 허용하고 토큰 받기'),
+            )
           else ...[
             SelectableText(token, style: const TextStyle(fontSize: 13, color: AppColors.textSecondary)),
             TextButton(
@@ -86,6 +98,10 @@ class _ProbeScreenState extends State<ProbeScreen> {
           ],
           if (_allowed == false)
             const Text('알림이 꺼져 있어요. 설정 앱에서 허용해 주세요.', style: TextStyle(color: AppColors.textSecondary)),
+          if (_registrationError != null)
+            Text('토큰을 받지 못했어요 · $_registrationError', style: const TextStyle(color: AppColors.warning)),
+          if (_allowed == true && token == null && _registrationError == null && !_requesting)
+            const Text('토큰이 아직 안 왔어요. 잠시 뒤 새로고침을 눌러 보세요.', style: TextStyle(color: AppColors.textSecondary)),
           const SizedBox(height: 24),
           const Text('NSE 기록', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600, color: AppColors.text)),
           Row(children: [
