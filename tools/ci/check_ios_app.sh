@@ -6,7 +6,7 @@
 # ci.yml runs it on the simulator Debug build (job ios) and on the unsigned device Release build
 # (job ios-release). testflight.yml runs it with --signed on the app inside the exported IPA, before
 # the upload. It prints bundle ids, versions, library paths and the values of a few entitlements,
-# nothing else.
+# and, when codesign fails, codesign's own stderr text (only `Executable=<path>` and warnings).
 #
 # The defaults match app/ios/scripts/add_notification_service.rb; testflight.yml exports the same names.
 set -euo pipefail
@@ -83,12 +83,22 @@ grep -q frb_get_rust_content_hash "$work/chat_ffi.syms" \
 echo "chat_ffi exports frb_get_rust_content_hash"
 
 if [ "$signed" = true ]; then
+  # codesign has warned since macOS 12 that the `--entitlements :-` form is deprecated and will stop
+  # working, so ask for XML with --xml. Its stderr holds `Executable=<path>` and warnings, no secrets;
+  # it is kept and goes into the error, because codesign's own reason is what the tester needs.
+  codesign_said() { # stderr-file -> " (codesign said: ...)" on one line, or nothing
+    local text
+    text="$(tr '\r\n' '  ' < "$1" | sed 's/  */ /g; s/^ //; s/ $//' | cut -c1-500)"
+    [ -z "$text" ] || printf ' (codesign said: %s)' "$text"
+  }
   read_entitlements() { # name bundle
-    codesign -d --entitlements :- "$2" > "$work/$1.plist" 2> /dev/null \
-      || fail "cannot read the signed entitlements of $1 (is it signed?)"
-    [ -s "$work/$1.plist" ] || fail "$1 is signed without entitlements"
-    "$pb" -c 'Print' "$work/$1.plist" > /dev/null 2>&1 \
-      || fail "codesign printed the entitlements of $1 in a form PlistBuddy cannot read (expected an XML plist)"
+    local plist="$work/$1.plist" err="$work/$1.codesign.err" status=0
+    codesign -d --entitlements - --xml "$2" > "$plist" 2> "$err" || status=$?
+    [ "$status" -eq 0 ] \
+      || fail "codesign -d --entitlements - --xml exited $status for $1 (is it signed?)$(codesign_said "$err")"
+    [ -s "$plist" ] || fail "$1 is signed without entitlements$(codesign_said "$err")"
+    "$pb" -c 'Print' "$plist" > /dev/null 2>&1 \
+      || fail "codesign printed the entitlements of $1 in a form PlistBuddy cannot read (expected an XML plist)$(codesign_said "$err")"
   }
   has_group() { # entitlements-plist
     local i=0 value
