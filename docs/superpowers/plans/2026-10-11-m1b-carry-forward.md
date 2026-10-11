@@ -87,7 +87,7 @@ M1b를 만들고 최종 리뷰하는 동안 찾았지만 일부러 뒤로 미룬
    - 위치: `tools/ci/check_workflows.py:50-53,71`, `.github/workflows/testflight.yml:18-20`.
 6. **`testflight.yml`의 셸을 커밋된 테스트로 시험한다.** 이른 비밀값 확인, 프로파일 설치(팀 비교, 번들 ID, App Store 프로파일 판정, 그룹), `find` 보호, 신원 개수 확인. 스크립트로 떼어 `tools/ci`에서 가짜 `security`와 `PlistBuddy`로 돌리는 것이 한 방법이다.
    - 이유: CI는 `testflight.yml`을 태그 없이는 돌리지 않아서 이 셸은 손으로 만든 가짜로 시험했을 뿐이고, 첫 실행에서 진짜로 처음 돈다. `tools/ci/check_ios_app.sh`도 같은 이유로 서명된 IPA 갈래(`--signed`)는 가짜로만 시험했다.
-   - 위치: `.github/workflows/testflight.yml:46-70,113-158`, `tools/ci/check_ios_app.sh:85-112`.
+   - 위치: `.github/workflows/testflight.yml:46-70,113-158`, `tools/ci/check_ios_app.sh:85-122`.
 7. **(선택) 프로파일이 `.p12`의 인증서로 만든 것인지 확인한다.** 프로파일의 `DeveloperCertificates`와 키체인 신원의 SHA-1을 비교한다.
    - 이유: 다른 Apple Distribution 인증서로 만든 프로파일은 `Build IPA` 안에서 `::error::` 없이 서명 오류로 끝난다.
    - 위치: `.github/workflows/testflight.yml:105-111`(`Distribution identity check`), `:113-158`.
