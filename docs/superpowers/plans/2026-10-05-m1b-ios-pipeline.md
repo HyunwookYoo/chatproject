@@ -3872,22 +3872,26 @@ git push
 
 ## 마무리
 
-- 마지막 브랜치 리뷰 전에, main ruleset의 필수 검사에 이번에 생긴 작업 `workflows`, `bindings`, `ios`를 더한다.
-  - `$SCRUB/ruleset.json`의 `required_status_checks`에 세 항목을 더한다. 형식은 `{ "context": "ios", "integration_id": 15368 }`.
+- 마지막 브랜치 리뷰 전에, main ruleset의 필수 검사에 이번에 생긴 작업 `workflows`, `bindings`, `ios`, `ios-release`를 더한다.
+  - `$SCRUB/ruleset.json`의 `required_status_checks`에 네 항목을 더한다. 형식은 `{ "context": "ios", "integration_id": 15368 }`.
+  - 같은 파일의 `pull_request` 규칙에서 `allowed_merge_methods`를 `["merge"]`로 바꾼다. 서버 기본값은 `[merge, squash, rebase]`인데, squash나 rebase로 병합하면 이 계획과 M1a 계획이 인용하는 커밋 SHA가 사라진다.
   - `gh api -X PUT repos/HyunwookYoo/chatproject/rulesets/$RULESET_ID --input ruleset.json --silent`
+  - 이 PUT은 저장소 설정을 바꾸므로 소유자가 승인한 뒤에 한다.
 - PR을 merge commit이나 fast-forward로 병합한다(진행 방식).
 
 ## 완료 기준 (로드맵 M1b)
 
 - [ ] 저장소가 공개이고, 이력에 집 IP·폰 IP·폰 시리얼·계정 경로가 없다. Task 1의 두 번째 스캔이 증거다.
-- [ ] CI가 모두 녹색이다: `workflows`, `rust`, `bindings`, `flutter`, `windows`, `android`, `ios`.
+- [ ] CI가 모두 녹색이다: `workflows`, `rust`, `bindings`, `flutter`, `windows`, `android`, `ios`, `ios-release`.
   - `ios`는 시뮬레이터에서 `core_test` 3개를 돌리고, NSE가 앱에 들어갔는지 확인한다.
+  - `ios-release`는 기기용 Release를 서명 없이 빌드하고(`flutter build ios --release --no-codesign`), `tools/ci/check_ios_app.sh`로 확장의 번들 ID·상태 파일·버전·링크와 `chat_ffi`의 FRB 심볼을 확인한다.
   - `android`는 cargokit이 1.92.0으로 빌드했는지 확인한다.
 - [ ] TestFlight 빌드가 iPhone에 설치되고 실행된다(Task 8 Step 6).
 - [ ] NSE 피크 메모리가 15 MB 미만이다(Task 10 Step 2). 넘으면 설계 17절 #1의 대안을 사용자와 정한다.
 - [ ] APNs 실측값이 설계 8.2절과 스파이크 C 결과에 적혀 있다(Task 10 Step 3·4).
 - [ ] M1a가 넘긴 일 M1b 절의 8개 항목이 모두 끝났다(위 표).
 - [ ] 알림 필터링·multicast entitlement 신청일이 로드맵 §7에 적혀 있다.
+- [ ] main ruleset의 필수 검사에 `workflows`, `bindings`, `ios`, `ios-release`가 있고 `allowed_merge_methods`가 `["merge"]`다(마무리).
 
 ---
 
