@@ -28,7 +28,7 @@ def block(text, pattern):
 
 
 def debug_blocks(body):
-    return [block(body[m.start():], r"if\s*\(\(applicationInfo\.flags\s+and\s+ApplicationInfo\.FLAG_DEBUGGABLE\)\s*!=\s*0\)")
+    return [block(body[m.start():], r"if\s*\(\(applicationInfo\.flags\s+and\s+ApplicationInfo\.FLAG_DEBUGGABLE\)\s*!=\s*0\)(?=\s*\{)")
             for m in re.finditer(r"if\s*\(\(applicationInfo\.flags", body)]
 
 

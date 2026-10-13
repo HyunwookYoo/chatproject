@@ -114,8 +114,16 @@ class NetworkPlatformTest(unittest.TestCase):
     def test_channel_after_debug_block_is_not_guarded(self):
         self.reject("activity", ACTIVITY.replace('            MethodChannel', '        }\n        if (true) {\n            MethodChannel'), "Debug channel")
 
+    def test_unbraced_debug_channel_guard_cannot_claim_later_run_block(self):
+        guard = "if ((applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0) {"
+        self.reject("activity", ACTIVITY.replace(guard, guard[:-1] + "Unit\n        run {", 1), "Debug channel")
+
     def test_unguarded_debug_entrypoint_args(self):
         self.reject("activity", ACTIVITY.replace("if ((applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0)", "if (true)"), "Debug entrypoint")
+
+    def test_unbraced_debug_intent_guard_cannot_claim_later_run_block(self):
+        guard = "if ((applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0) {"
+        self.reject("activity", ACTIVITY.replace(guard, guard[:-1] + "Unit\n        run {"), "Debug entrypoint")
 
     def test_wrong_debug_control_extra(self):
         self.reject("activity", ACTIVITY.replace("chat_control_url", "other_control_url"), "intent contract")
