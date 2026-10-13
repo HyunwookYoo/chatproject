@@ -3,6 +3,8 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 
 import '../core_client.dart';
+import '../network/network_client.dart';
+import '../network/network_screen.dart';
 import '../probe/probe_host.dart';
 import '../probe/probe_screen.dart';
 import '../src/rust/api/chat.dart';
@@ -17,9 +19,10 @@ String connectionLabel(ChatEvent_ConnectionState state) {
 }
 
 class HomeScreen extends StatefulWidget {
-  const HomeScreen({super.key, required this.core, this.probe});
+  const HomeScreen({super.key, required this.core, this.probe, this.network});
 
   final CoreClient core;
+  final NetworkClient? network;
 
   /// M1b device probe (iOS only). Null hides the probe button.
   final ProbeHost? probe;
@@ -32,15 +35,26 @@ class _HomeScreenState extends State<HomeScreen> {
   StreamSubscription<ChatEvent>? _events;
   ChatEvent_ConnectionState? _connection;
   String? _startError;
+  String? _streamError;
 
   @override
   void initState() {
     super.initState();
     // Subscribe before starting: the core replays the latest connection state anyway.
     _events = widget.core.events().listen((event) {
+      if (!mounted) return;
       if (event is ChatEvent_ConnectionState) {
         setState(() => _connection = event);
       }
+    }, onError: (Object error, StackTrace stack) {
+      if (!mounted) return;
+      debugPrint('ChatProject Home event stream failed: $error');
+      debugPrintStack(label: 'ChatProject Home event stream failed', stackTrace: stack);
+      setState(() => _streamError = '$error');
+    }, onDone: () {
+      if (!mounted) return;
+      debugPrint('ChatProject Home event stream ended');
+      setState(() => _streamError = '이벤트 스트림이 종료됐어요');
     });
     widget.core.start().then(
       (_) {},
@@ -58,6 +72,7 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   String get _status {
+    if (_streamError != null) return '이벤트를 받지 못했어요 · $_streamError';
     final error = _startError;
     if (error != null) return '코어를 시작하지 못했어요 · $error';
     final connection = _connection;
@@ -81,6 +96,14 @@ class _HomeScreenState extends State<HomeScreen> {
                     style: TextStyle(fontSize: 30, fontWeight: FontWeight.w700, color: AppColors.text),
                   ),
                   const Spacer(),
+                  if (widget.network != null)
+                    IconButton(
+                      tooltip: '네트워크 측정',
+                      icon: const Icon(Icons.hub_outlined, color: AppColors.textSecondary),
+                      onPressed: () => Navigator.of(context).push(
+                        MaterialPageRoute<void>(builder: (_) => NetworkScreen(client: widget.network!)),
+                      ),
+                    ),
                   if (widget.probe != null)
                     IconButton(
                       tooltip: '알림 측정',
