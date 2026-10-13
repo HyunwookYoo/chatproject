@@ -9,6 +9,18 @@ serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "net", "io-util", "macros"] }
 
+iroh = { version = "=1.3.0", default-features = false, features = ["tls-ring"] }
+iroh-tickets = "=1.0.0"
+iroh-mainline-address-lookup = "=0.6.0"
+tokio-util = { version = "0.7", features = ["rt"] }
+futures-util = "0.3"
+
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["test-util"] }
+[features]
+test-hooks = []
+
+[[test]]
+name = "transport"
+required-features = ["test-hooks"]
