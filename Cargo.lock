@@ -504,6 +504,7 @@ dependencies = [
  "chat_core",
  "flutter_rust_bridge",
  "tempfile",
+ "tokio",
  "uniffi",
 ]
 

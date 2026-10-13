@@ -9,4 +9,6 @@ pub mod transport;
 pub use error::{CoreError, ErrorCode};
 pub use event::{ConnectionSnapshot, CoreEvent, EventBus, EventSink};
 pub use runtime::{CORE_VERSION, CoreConfig, CoreInfo, CoreSlot};
-pub use transport::{NetworkInfo, NetworkState, PeerInfo, PeerPath, PeerPhase};
+pub use transport::{
+    NetworkHandle, NetworkInfo, NetworkOp, NetworkReply, NetworkState, PeerInfo, PeerPath, PeerPhase,
+};

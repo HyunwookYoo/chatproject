@@ -116,6 +116,62 @@ pub fn core_start(data_dir: String) -> Result<CoreInfo, CoreError> {
     CORE.start(config, &BUS).map(CoreInfo::from).map_err(CoreError::from)
 }
 
+async fn run_network(op: chat_core::NetworkOp) -> Result<chat_core::NetworkReply, CoreError> {
+    let network = CORE.network().map_err(CoreError::from)?;
+    network.execute(op).await.map_err(CoreError::from)
+}
+
+fn unexpected_network_reply() -> CoreError {
+    CoreError { code: ErrorCode::TransportFailed, detail: "unexpected network reply".into() }
+}
+
+fn network_info_reply(reply: chat_core::NetworkReply) -> Result<NetworkInfo, CoreError> {
+    match reply {
+        chat_core::NetworkReply::Info(info) => Ok(info.into()),
+        chat_core::NetworkReply::Peer(_) | chat_core::NetworkReply::Done => {
+            Err(unexpected_network_reply())
+        }
+    }
+}
+
+fn done_reply(reply: chat_core::NetworkReply) -> Result<(), CoreError> {
+    match reply {
+        chat_core::NetworkReply::Done => Ok(()),
+        chat_core::NetworkReply::Info(_) | chat_core::NetworkReply::Peer(_) => {
+            Err(unexpected_network_reply())
+        }
+    }
+}
+
+pub async fn network_start() -> Result<NetworkInfo, CoreError> {
+    network_info_reply(run_network(chat_core::NetworkOp::Start).await?)
+}
+
+pub async fn network_info() -> Result<NetworkInfo, CoreError> {
+    network_info_reply(run_network(chat_core::NetworkOp::Info).await?)
+}
+
+pub async fn connect_peer(target: String) -> Result<PeerInfo, CoreError> {
+    match run_network(chat_core::NetworkOp::Connect { target }).await? {
+        chat_core::NetworkReply::Peer(peer) => Ok(peer.into()),
+        chat_core::NetworkReply::Info(_) | chat_core::NetworkReply::Done => {
+            Err(unexpected_network_reply())
+        }
+    }
+}
+
+pub async fn send_probe_text(peer_id: String, text: String) -> Result<(), CoreError> {
+    done_reply(run_network(chat_core::NetworkOp::Send { peer_id, text }).await?)
+}
+
+pub async fn disconnect_peer(peer_id: String) -> Result<(), CoreError> {
+    done_reply(run_network(chat_core::NetworkOp::Disconnect { peer_id }).await?)
+}
+
+pub async fn network_stop() -> Result<(), CoreError> {
+    done_reply(run_network(chat_core::NetworkOp::Stop).await?)
+}
+
 /// The single event stream of the UI (design 12.2 rule 1).
 pub fn events(sink: StreamSink<ChatEvent>) -> Result<(), CoreError> {
     BUS.subscribe(Arc::new(FrbSink(sink)));

@@ -8,6 +8,7 @@ import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 import 'package:freezed_annotation/freezed_annotation.dart' hide protected;
 part 'chat.freezed.dart';
 
+// These functions are ignored because they are not marked as `pub`: `done_reply`, `network_info_reply`, `run_network`, `unexpected_network_reply`
 // These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`
 
 String coreVersion() => RustLib.instance.api.crateApiChatCoreVersion();
@@ -15,6 +16,23 @@ String coreVersion() => RustLib.instance.api.crateApiChatCoreVersion();
 /// Starts the core, or returns the running one (see `chat_core::CoreSlot::start`).
 Future<CoreInfo> coreStart({required String dataDir}) =>
     RustLib.instance.api.crateApiChatCoreStart(dataDir: dataDir);
+
+Future<NetworkInfo> networkStart() =>
+    RustLib.instance.api.crateApiChatNetworkStart();
+
+Future<NetworkInfo> networkInfo() =>
+    RustLib.instance.api.crateApiChatNetworkInfo();
+
+Future<PeerInfo> connectPeer({required String target}) =>
+    RustLib.instance.api.crateApiChatConnectPeer(target: target);
+
+Future<void> sendProbeText({required String peerId, required String text}) =>
+    RustLib.instance.api.crateApiChatSendProbeText(peerId: peerId, text: text);
+
+Future<void> disconnectPeer({required String peerId}) =>
+    RustLib.instance.api.crateApiChatDisconnectPeer(peerId: peerId);
+
+Future<void> networkStop() => RustLib.instance.api.crateApiChatNetworkStop();
 
 /// The single event stream of the UI (design 12.2 rule 1).
 Stream<ChatEvent> events() => RustLib.instance.api.crateApiChatEvents();
