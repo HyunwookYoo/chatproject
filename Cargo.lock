@@ -503,6 +503,9 @@ version = "0.1.0"
 dependencies = [
  "chat_core",
  "flutter_rust_bridge",
+ "iroh",
+ "jni 0.21.1",
+ "ndk-context",
  "tempfile",
  "tokio",
  "uniffi",
