@@ -744,3 +744,107 @@ async fn reconnect_budget_cancels_the_third_inflight_preparation_at_thirty_secon
     a.execute(NetworkOp::Stop).await.unwrap();
     raw.close().await;
 }
+
+#[tokio::test]
+async fn disconnect_invalidates_delayed_inbound_but_allows_fresh_and_unrelated_peers() {
+    let (a, mut events, overflow) = network();
+    let ai = online(&a).await;
+    let (unrelated, mut unrelated_events, _) = network();
+    let ui = online(&unrelated).await;
+    a.execute(NetworkOp::Connect {
+        target: ui.ticket.unwrap(),
+    })
+    .await
+    .unwrap();
+    let raw = raw_endpoint(chat_core::transport::frame::ALPN).await;
+    let target = ai
+        .ticket
+        .unwrap()
+        .parse::<iroh_tickets::endpoint::EndpointTicket>()
+        .unwrap()
+        .endpoint_addr()
+        .clone();
+    let first = raw
+        .connect(target.clone(), chat_core::transport::frame::ALPN)
+        .await
+        .unwrap();
+    let mut first_send = first.open_uni().await.unwrap();
+    first_send.write_all(b"CPM2").await.unwrap();
+    let mut first_recv = first.accept_uni().await.unwrap();
+    let mut magic = [0; 4];
+    first_recv.read_exact(&mut magic).await.unwrap();
+    wait_connected(&a, &raw.id().to_string()).await;
+    let mut delayed_preparations = Vec::new();
+    for _ in 0..8 {
+        let delayed = raw
+            .connect(target.clone(), chat_core::transport::frame::ALPN)
+            .await
+            .unwrap();
+        let mut delayed_send = delayed.open_uni().await.unwrap();
+        delayed_send.write_all(b"C").await.unwrap();
+        let mut delayed_recv = delayed.accept_uni().await.unwrap();
+        delayed_recv.read_exact(&mut magic).await.unwrap();
+        delayed_preparations.push((delayed, delayed_send, delayed_recv));
+    }
+    a.execute(NetworkOp::Disconnect {
+        peer_id: raw.id().to_string(),
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        info(&a)
+            .await
+            .peers
+            .iter()
+            .find(|p| p.peer_id == raw.id().to_string())
+            .unwrap()
+            .phase,
+        PeerPhase::Disconnected
+    );
+    for (delayed, mut delayed_send, _recv) in delayed_preparations {
+        let _ = delayed_send.write_all(b"PM2").await;
+        let _ = chat_core::transport::frame::write_text(&mut delayed_send, "obsolete").await;
+        let rejected = tokio::time::timeout(Duration::from_secs(1), delayed.closed()).await;
+        assert!(
+            rejected.is_ok(),
+            "pre-Disconnect inbound preparation survived"
+        );
+    }
+    assert_eq!(
+        info(&a)
+            .await
+            .peers
+            .iter()
+            .find(|p| p.peer_id == raw.id().to_string())
+            .unwrap()
+            .phase,
+        PeerPhase::Disconnected
+    );
+    while let Ok(event) = events.try_recv() {
+        assert!(!matches!(event, CoreEvent::ProbeTextReceived { text, .. } if text == "obsolete"));
+    }
+    a.execute(NetworkOp::Send {
+        peer_id: ui.endpoint_id.unwrap(),
+        text: "unrelated works".into(),
+    })
+    .await
+    .unwrap();
+    received(&mut unrelated_events, "unrelated works").await;
+    let fresh = raw
+        .connect(target, chat_core::transport::frame::ALPN)
+        .await
+        .unwrap();
+    let mut fresh_send = fresh.open_uni().await.unwrap();
+    fresh_send.write_all(b"CPM2").await.unwrap();
+    let mut fresh_recv = fresh.accept_uni().await.unwrap();
+    fresh_recv.read_exact(&mut magic).await.unwrap();
+    wait_connected(&a, &raw.id().to_string()).await;
+    chat_core::transport::frame::write_text(&mut fresh_send, "fresh")
+        .await
+        .unwrap();
+    received(&mut events, "fresh").await;
+    assert!(!overflow.load(Ordering::SeqCst));
+    a.execute(NetworkOp::Stop).await.unwrap();
+    unrelated.execute(NetworkOp::Stop).await.unwrap();
+    raw.close().await;
+}

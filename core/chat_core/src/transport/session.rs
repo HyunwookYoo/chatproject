@@ -132,18 +132,12 @@ pub(crate) fn spawn_session(
             }
         }
     });
-    let guard_cancel = cancel.clone();
-    let guard_notes = notes.clone();
-    let guard_tag = tag.clone();
-    let guard_connection = connection.clone();
-    tasks.spawn(async move {
-        tokio::select! {
-            biased;
-            _ = guard_cancel.cancelled() => {},
-            _ = guard_connection.accept_uni() => { guard_connection.close(1u32.into(), b"extra stream"); notify(&guard_notes, &guard_cancel, Note::Ended { tag: guard_tag, error: Some(frame::protocol_error()) }).await; },
-            _ = guard_connection.accept_bi() => { guard_connection.close(1u32.into(), b"extra stream"); notify(&guard_notes, &guard_cancel, Note::Ended { tag: guard_tag, error: Some(frame::protocol_error()) }).await; },
-        }
-    });
+    tasks.spawn(guard_extra_stream(
+        connection.clone(),
+        cancel.clone(),
+        notes.clone(),
+        tag.clone(),
+    ));
     let path_connection = connection.clone();
     let path_tag = tag.clone();
     let path_cancel = cancel.clone();
@@ -167,6 +161,27 @@ pub(crate) fn spawn_session(
         writes,
         started,
     }
+}
+
+async fn guard_extra_stream(
+    connection: Connection,
+    cancel: CancellationToken,
+    notes: mpsc::Sender<Note>,
+    tag: SessionTag,
+) {
+    let extra = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return,
+        result = connection.accept_uni() => result.is_ok(),
+        result = connection.accept_bi() => result.is_ok(),
+    };
+    let error = if extra {
+        connection.close(1u32.into(), b"extra stream");
+        Some(frame::protocol_error())
+    } else {
+        None
+    };
+    notify(&notes, &cancel, Note::Ended { tag, error }).await;
 }
 
 async fn observe_paths(
@@ -241,6 +256,65 @@ fn cancel_error(root: &CancellationToken) -> CoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn extra_stream_guard_distinguishes_normal_close_from_extra_uni_and_bi() {
+        use super::super::endpoint::{
+            NetworkProfile, bind_endpoint, endpoint_ticket, parse_target,
+        };
+        for attack in 0..3 {
+            let profile = NetworkProfile::Local { relay: None };
+            let a = bind_endpoint(&profile, iroh::SecretKey::generate())
+                .await
+                .unwrap();
+            let b = bind_endpoint(&profile, iroh::SecretKey::generate())
+                .await
+                .unwrap();
+            let target = parse_target(&endpoint_ticket(&b, &profile)).unwrap();
+            let (outgoing, incoming) = tokio::join!(a.connect(target, frame::ALPN), async {
+                b.accept().await.unwrap().await.unwrap()
+            });
+            let outgoing = outgoing.unwrap();
+            let (notes, mut rx) = mpsc::channel(64);
+            let guard = tokio::spawn(guard_extra_stream(
+                incoming,
+                CancellationToken::new(),
+                notes,
+                SessionTag {
+                    epoch: 1,
+                    generation: 1,
+                    peer_id: a.id().to_string(),
+                },
+            ));
+            let mut streams = Vec::new();
+            match attack {
+                0 => outgoing.close(0u32.into(), b"ordinary close"),
+                1 => {
+                    let mut stream = outgoing.open_uni().await.unwrap();
+                    stream.write_all(b"x").await.unwrap();
+                    streams.push(stream);
+                }
+                _ => {
+                    let (mut send, _recv) = outgoing.open_bi().await.unwrap();
+                    send.write_all(b"x").await.unwrap();
+                    streams.push(send);
+                }
+            }
+            guard.await.unwrap();
+            let Note::Ended { error, .. } = rx.recv().await.unwrap() else {
+                panic!()
+            };
+            assert_eq!(
+                error.is_some(),
+                attack != 0,
+                "normal close classified as an extra stream"
+            );
+            if let Some(error) = error {
+                assert_eq!(error, frame::protocol_error());
+            }
+            a.close().await;
+            b.close().await;
+        }
+    }
     #[tokio::test]
     async fn every_notification_repolls_current_selected_path() {
         use super::super::endpoint::{

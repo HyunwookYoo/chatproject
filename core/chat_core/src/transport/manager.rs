@@ -8,6 +8,10 @@ use crate::{ConnectionSnapshot, CoreError, CoreEvent, ErrorCode, EventBus};
 use iroh::{Endpoint, EndpointAddr, SecretKey, endpoint::Incoming};
 use std::{
     collections::BTreeMap,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 use tokio::{
@@ -72,6 +76,10 @@ pub(crate) enum Note {
     Incoming {
         epoch: u64,
         incoming: Incoming,
+        sequence: u64,
+    },
+    Identified {
+        tag: SessionTag,
     },
     Ready {
         tag: SessionTag,
@@ -114,11 +122,17 @@ struct Pending {
     cancel: CancellationToken,
     reply: Option<Reply>,
 }
+struct IncomingPreparation {
+    sequence: u64,
+    peer_id: Option<String>,
+    cancel: CancellationToken,
+}
 struct Peer {
     info: PeerInfo,
     target: EndpointAddr,
     session: Option<Session>,
     pending: Option<Pending>,
+    disconnected_before: Option<u64>,
 }
 struct Manager {
     profile: NetworkProfile,
@@ -133,7 +147,9 @@ struct Manager {
     tasks: JoinSet<()>,
     notes: mpsc::Sender<Note>,
     received: mpsc::Receiver<Note>,
-    incoming: usize,
+    incoming: BTreeMap<u64, IncomingPreparation>,
+    accepted: Arc<AtomicU64>,
+    received_incoming: u64,
 }
 impl Manager {
     fn new(profile: NetworkProfile, bus: EventBus) -> Self {
@@ -157,7 +173,9 @@ impl Manager {
             tasks: JoinSet::new(),
             notes,
             received,
-            incoming: 0,
+            incoming: BTreeMap::new(),
+            accepted: Arc::new(AtomicU64::new(0)),
+            received_incoming: 0,
         }
     }
     async fn run(mut self, mut commands: mpsc::Receiver<Envelope>) {
@@ -268,7 +286,41 @@ impl Manager {
                 }
             }
             NetworkOp::Disconnect { peer_id } => {
+                let cutoff = self.accepted.load(Ordering::Acquire);
+                // Unknown identities keep the cutoff alive, including accept notes still queued.
+                if self.has_unknown_before(cutoff) && !self.peers.contains_key(&peer_id) {
+                    if let Ok(id) = peer_id.parse::<iroh::EndpointId>() {
+                        if !self.make_room(&peer_id) {
+                            let _ = reply.send(Err(err(ErrorCode::Busy)));
+                            return;
+                        }
+                        self.peers.insert(
+                            peer_id.clone(),
+                            Peer {
+                                info: PeerInfo {
+                                    peer_id: peer_id.clone(),
+                                    phase: PeerPhase::Disconnected,
+                                    path: PeerPath::Unknown,
+                                    connect_ms: None,
+                                    direct_ms: None,
+                                },
+                                target: id.into(),
+                                session: None,
+                                pending: None,
+                                disconnected_before: None,
+                            },
+                        );
+                    }
+                }
+                for preparation in self.incoming.values() {
+                    if preparation.sequence <= cutoff
+                        && preparation.peer_id.as_deref() == Some(&peer_id)
+                    {
+                        preparation.cancel.cancel();
+                    }
+                }
                 if let Some(peer) = self.peers.get_mut(&peer_id) {
+                    peer.disconnected_before = Some(cutoff);
                     if let Some(pending) = peer.pending.take() {
                         pending.cancel.cancel();
                         if let Some(reply) = pending.reply {
@@ -282,22 +334,50 @@ impl Manager {
                     peer.info.path = PeerPath::Unknown;
                     self.publish(Some(&peer_id));
                 }
+                self.release_cutoffs();
                 Ok(NetworkReply::Done)
             }
         };
         let _ = reply.send(result);
     }
-    fn make_room(&mut self, id: &str) {
+    fn has_unknown_before(&self, cutoff: u64) -> bool {
+        self.received_incoming < cutoff
+            || self
+                .incoming
+                .values()
+                .any(|p| p.sequence <= cutoff && p.peer_id.is_none())
+    }
+    fn release_cutoffs(&mut self) {
+        let releasable: Vec<String> = self
+            .peers
+            .iter()
+            .filter_map(|(id, peer)| {
+                peer.disconnected_before
+                    .filter(|cutoff| !self.has_unknown_before(*cutoff))
+                    .map(|_| id.clone())
+            })
+            .collect();
+        for id in releasable {
+            self.peers.get_mut(&id).unwrap().disconnected_before = None;
+        }
+    }
+    fn make_room(&mut self, id: &str) -> bool {
+        self.release_cutoffs();
         if !self.peers.contains_key(id) && self.peers.len() >= 8 {
             let old = self
                 .peers
                 .iter()
-                .find(|(_, p)| p.session.is_none() && p.pending.is_none())
+                .find(|(_, p)| {
+                    p.session.is_none() && p.pending.is_none() && p.disconnected_before.is_none()
+                })
                 .map(|(id, _)| id.clone());
             if let Some(old) = old {
                 self.peers.remove(&old);
+            } else {
+                return false;
             }
         }
+        true
     }
     fn connect(&mut self, target: String, reply: Reply) {
         let started = Instant::now();
@@ -320,7 +400,11 @@ impl Manager {
                 return;
             }
         }
-        self.make_room(&id);
+        if !self.make_room(&id) {
+            let _ = reply.send(Err(err(ErrorCode::Busy)));
+            return;
+        }
+        let disconnected_before = self.peers.get(&id).and_then(|p| p.disconnected_before);
         let tag = self.tag(id.clone());
         let cancel = self.cancel.child_token();
         self.peers.insert(
@@ -334,6 +418,7 @@ impl Manager {
                     direct_ms: None,
                 },
                 target: target.clone(),
+                disconnected_before,
                 session: None,
                 pending: Some(Pending {
                     tag: tag.clone(),
@@ -476,11 +561,12 @@ impl Manager {
                         self.info.ticket = Some(endpoint_ticket(&endpoint, &self.profile));
                         self.info.state = NetworkState::Online;
                         let accept_endpoint = endpoint.clone();
+                        let accepted = self.accepted.clone();
                         let cancel = self.cancel.clone();
                         let notes = self.notes.clone();
                         self.tasks.spawn(async move { loop {
                             let incoming = tokio::select! { biased; _ = cancel.cancelled() => break, incoming = accept_endpoint.accept() => match incoming { Some(incoming) => incoming, None => break } };
-                            session::notify(&notes, &cancel, Note::Incoming { epoch, incoming }).await;
+                            session::notify(&notes, &cancel, Note::Incoming { epoch, incoming, sequence: accepted.fetch_add(1, Ordering::AcqRel) + 1 }).await;
                         }});
                         self.endpoint = Some(endpoint);
                     }
@@ -494,27 +580,57 @@ impl Manager {
                 }
                 self.publish(None);
             }
-            Note::Incoming { epoch, incoming } if epoch == self.epoch => {
-                if self.incoming >= 8 {
+            Note::Incoming {
+                epoch,
+                incoming,
+                sequence,
+            } if epoch == self.epoch => {
+                self.received_incoming = sequence;
+                if self.incoming.len() >= 8 {
                     incoming.refuse();
+                    self.release_cutoffs();
                     return;
                 }
-                self.incoming += 1;
                 let mut tag = self.tag(String::new());
-                let cancel = self.cancel.clone();
+                let cancel = self.cancel.child_token();
+                self.incoming.insert(
+                    tag.generation,
+                    IncomingPreparation {
+                        sequence,
+                        peer_id: None,
+                        cancel: cancel.clone(),
+                    },
+                );
+                let root = self.cancel.clone();
                 let notes = self.notes.clone();
                 self.tasks.spawn(async move {
                     let work = async {
                         let connection = incoming.await.map_err(|_| err(ErrorCode::TransportFailed))?;
                         tag.peer_id = connection.remote_id().to_string();
+                        session::notify(&notes, &cancel, Note::Identified { tag: tag.clone() }).await;
                         match session::prepare_session(connection.clone()).await {
                             Ok((send, recv)) => Ok(Prepared { connection, send, recv, ready_at: Instant::now() }),
                             Err(error) => { connection.close(1u32.into(), b"session preparation failed"); Err(error) },
                         }
                     };
-                    let result = tokio::select! { biased; _ = cancel.cancelled() => return, result = tokio::time::timeout(Duration::from_secs(10), work) => result.unwrap_or_else(|_| Err(err(ErrorCode::NetworkTimeout))) };
-                    session::notify(&notes, &cancel, Note::Ready { tag, outgoing: false, started: None, result }).await;
+                    let result = tokio::select! { biased; _ = cancel.cancelled() => Err(err(ErrorCode::PeerNotConnected)), result = tokio::time::timeout(Duration::from_secs(10), work) => result.unwrap_or_else(|_| Err(err(ErrorCode::NetworkTimeout))) };
+                    // A peer-canceled preparation must still release its bounded registry slot.
+                    session::notify(&notes, &root, Note::Ready { tag, outgoing: false, started: None, result }).await;
                 });
+            }
+            Note::Identified { tag } if tag.epoch == self.epoch => {
+                if let Some(preparation) = self.incoming.get_mut(&tag.generation) {
+                    preparation.peer_id = Some(tag.peer_id.clone());
+                    if self
+                        .peers
+                        .get(&tag.peer_id)
+                        .and_then(|p| p.disconnected_before)
+                        .is_some_and(|cutoff| preparation.sequence <= cutoff)
+                    {
+                        preparation.cancel.cancel();
+                    }
+                }
+                self.release_cutoffs();
             }
             Note::Ready {
                 tag,
@@ -523,7 +639,19 @@ impl Manager {
                 result,
             } if tag.epoch == self.epoch => {
                 if !outgoing {
-                    self.incoming = self.incoming.saturating_sub(1);
+                    let preparation = self.incoming.remove(&tag.generation);
+                    self.release_cutoffs();
+                    if preparation.is_none_or(|p| p.cancel.is_cancelled()) {
+                        Note::Ready {
+                            tag,
+                            outgoing,
+                            started,
+                            result,
+                        }
+                        .discard()
+                        .await;
+                        return;
+                    }
                 }
                 self.ready(tag, outgoing, started, result);
             }
@@ -669,7 +797,10 @@ impl Manager {
                 .map(|p| p.remote_addr().clone())
                 .collect::<Vec<_>>(),
         );
-        self.make_room(&id);
+        if !self.make_room(&id) {
+            prepared.connection.close(0u32.into(), b"peer limit");
+            return;
+        }
         let session_tag = self.tag(id.clone());
         let peer = self.peers.entry(id.clone()).or_insert_with(|| Peer {
             info: PeerInfo {
@@ -682,6 +813,7 @@ impl Manager {
             target,
             session: None,
             pending: None,
+            disconnected_before: None,
         });
         if let Some(old) = peer.session.take() {
             old.close();
@@ -729,7 +861,9 @@ impl Manager {
         while let Ok(note) = self.received.try_recv() {
             note.discard().await;
         }
-        self.incoming = 0;
+        self.incoming.clear();
+        self.received_incoming = self.accepted.load(Ordering::Acquire);
+        self.release_cutoffs();
         if self.info.state != NetworkState::Stopped {
             self.info.state = NetworkState::Stopped;
             self.info.ticket = None;
@@ -764,6 +898,268 @@ mod tests {
             self.0.try_send(event).is_ok()
         }
     }
+    fn inactive_peer(id: iroh::EndpointId) -> Peer {
+        Peer {
+            info: PeerInfo {
+                peer_id: id.to_string(),
+                phase: PeerPhase::Disconnected,
+                path: PeerPath::Unknown,
+                connect_ms: None,
+                direct_ms: None,
+            },
+            target: id.into(),
+            session: None,
+            pending: None,
+            disconnected_before: None,
+        }
+    }
+    #[tokio::test]
+    async fn unknown_identity_protects_eight_slots_until_identified_and_canceled_cleanup_arrives() {
+        let mut manager = Manager::new(NetworkProfile::Local { relay: None }, EventBus::new());
+        manager.endpoint = Some(
+            bind_endpoint(&manager.profile, manager.key.clone())
+                .await
+                .unwrap(),
+        );
+        let ids: Vec<_> = (0..8).map(|_| SecretKey::generate().public()).collect();
+        manager.accepted.store(1, Ordering::Release);
+        // The accepted incoming note has not reached the actor yet.
+        for id in &ids {
+            manager.peers.insert(id.to_string(), inactive_peer(*id));
+            let (reply, _) = oneshot::channel();
+            manager
+                .command(Envelope {
+                    op: NetworkOp::Disconnect {
+                        peer_id: id.to_string(),
+                    },
+                    reply,
+                })
+                .await;
+        }
+        assert!(
+            manager
+                .peers
+                .values()
+                .all(|p| p.disconnected_before == Some(1))
+        );
+        let (reply, rx) = oneshot::channel();
+        manager.connect(SecretKey::generate().public().to_string(), reply);
+        assert_eq!(rx.await.unwrap().unwrap_err().code, ErrorCode::Busy);
+        assert_eq!(manager.peers.len(), 8);
+        manager.received_incoming = 1;
+        let cancel = manager.cancel.child_token();
+        manager.incoming.insert(
+            99,
+            IncomingPreparation {
+                sequence: 1,
+                peer_id: None,
+                cancel: cancel.clone(),
+            },
+        );
+        let tag = SessionTag {
+            epoch: manager.epoch,
+            generation: 99,
+            peer_id: ids[0].to_string(),
+        };
+        manager.note(Note::Identified { tag: tag.clone() }).await;
+        assert!(cancel.is_cancelled());
+        assert!(
+            manager
+                .peers
+                .values()
+                .all(|p| p.disconnected_before.is_none())
+        );
+        // Completion is processed even when the per-preparation token is canceled.
+        manager
+            .note(Note::Ready {
+                tag,
+                outgoing: false,
+                started: None,
+                result: Err(err(ErrorCode::PeerNotConnected)),
+            })
+            .await;
+        assert!(manager.incoming.is_empty());
+        assert!(manager.make_room(&SecretKey::generate().public().to_string()));
+        assert_eq!(manager.peers.len(), 7);
+        manager.stop().await;
+    }
+    #[tokio::test(start_paused = true)]
+    async fn late_identity_only_cancels_matching_pre_disconnect_preparation() {
+        let mut manager = Manager::new(NetworkProfile::Local { relay: None }, EventBus::new());
+        let id = SecretKey::generate().public();
+        manager.peers.insert(id.to_string(), inactive_peer(id));
+        manager.accepted.store(2, Ordering::Release);
+        manager.received_incoming = 2;
+        let unrelated = manager.cancel.child_token();
+        let matching = manager.cancel.child_token();
+        manager.incoming.insert(
+            1,
+            IncomingPreparation {
+                sequence: 1,
+                peer_id: None,
+                cancel: unrelated.clone(),
+            },
+        );
+        manager.incoming.insert(
+            2,
+            IncomingPreparation {
+                sequence: 2,
+                peer_id: None,
+                cancel: matching.clone(),
+            },
+        );
+        let (reply, _) = oneshot::channel();
+        manager
+            .command(Envelope {
+                op: NetworkOp::Disconnect {
+                    peer_id: id.to_string(),
+                },
+                reply,
+            })
+            .await;
+        manager
+            .note(Note::Identified {
+                tag: SessionTag {
+                    epoch: 0,
+                    generation: 1,
+                    peer_id: SecretKey::generate().public().to_string(),
+                },
+            })
+            .await;
+        assert!(!unrelated.is_cancelled());
+        assert_eq!(manager.peers[&id.to_string()].disconnected_before, Some(2));
+        manager
+            .note(Note::Identified {
+                tag: SessionTag {
+                    epoch: 0,
+                    generation: 2,
+                    peer_id: id.to_string(),
+                },
+            })
+            .await;
+        assert!(matching.is_cancelled());
+        assert!(!unrelated.is_cancelled());
+        manager.stop().await;
+        assert!(manager.incoming.is_empty());
+    }
+    async fn prepared_pair(
+        local: &Endpoint,
+        remote: &Endpoint,
+        outgoing: bool,
+    ) -> (Prepared, Prepared) {
+        let profile = NetworkProfile::Local { relay: None };
+        let (dialer, receiver) = if outgoing {
+            (local, remote)
+        } else {
+            (remote, local)
+        };
+        let target = parse_target(&endpoint_ticket(receiver, &profile)).unwrap();
+        let (dialed, accepted) = tokio::join!(dialer.connect(target, ALPN), async {
+            receiver.accept().await.unwrap().await.unwrap()
+        });
+        let (local, remote) = if outgoing {
+            (dialed.unwrap(), accepted)
+        } else {
+            (accepted, dialed.unwrap())
+        };
+        let (left, right) = tokio::join!(
+            session::prepare_session(local.clone()),
+            session::prepare_session(remote.clone())
+        );
+        let (send, recv) = left.unwrap();
+        let left = Prepared {
+            connection: local,
+            send,
+            recv,
+            ready_at: Instant::now(),
+        };
+        let (send, recv) = right.unwrap();
+        (
+            left,
+            Prepared {
+                connection: remote,
+                send,
+                recv,
+                ready_at: Instant::now(),
+            },
+        )
+    }
+    #[tokio::test]
+    async fn old_session_notes_cannot_change_an_installed_preferred_replacement() {
+        let bus = EventBus::new();
+        let (tx, mut rx) = mpsc::channel(256);
+        bus.subscribe(std::sync::Arc::new(Sink(tx)));
+        let mut manager = Manager::new(NetworkProfile::Local { relay: None }, bus);
+        let mut remote_key = SecretKey::generate();
+        if manager.key.public() > remote_key.public() {
+            std::mem::swap(&mut manager.key, &mut remote_key);
+        }
+        let local = bind_endpoint(&manager.profile, manager.key.clone())
+            .await
+            .unwrap();
+        let remote = bind_endpoint(&manager.profile, remote_key).await.unwrap();
+        manager.endpoint = Some(local.clone());
+        let id = remote.id().to_string();
+        let (first, _first_remote) = prepared_pair(&local, &remote, false).await;
+        let attempt = manager.tag(id.clone());
+        manager.ready(attempt, false, None, Ok(first));
+        let old = manager.peers[&id].session.as_ref().unwrap().tag.clone();
+        let (replacement, _replacement_remote) = prepared_pair(&local, &remote, true).await;
+        let attempt = manager.tag(id.clone());
+        manager.peers.get_mut(&id).unwrap().pending = Some(Pending {
+            tag: attempt.clone(),
+            cancel: manager.cancel.child_token(),
+            reply: None,
+        });
+        manager.ready(attempt, true, Some(Instant::now()), Ok(replacement));
+        let current = manager.peers[&id].session.as_ref().unwrap().tag.clone();
+        assert!(current.generation > old.generation);
+        manager
+            .note(Note::Path {
+                tag: current.clone(),
+                path: PeerPath::Direct,
+                observed: Instant::now(),
+            })
+            .await;
+        let revision = manager.info.revision;
+        while rx.try_recv().is_ok() {}
+        manager
+            .note(Note::Ended {
+                tag: old.clone(),
+                error: None,
+            })
+            .await;
+        manager
+            .note(Note::Path {
+                tag: old.clone(),
+                path: PeerPath::Relay,
+                observed: Instant::now(),
+            })
+            .await;
+        manager
+            .note(Note::Text {
+                tag: old,
+                text: "obsolete".into(),
+            })
+            .await;
+        assert!(manager.current(&current));
+        assert_eq!(manager.peers[&id].info.phase, PeerPhase::Connected);
+        assert_eq!(manager.peers[&id].info.path, PeerPath::Direct);
+        assert_eq!(manager.info.revision, revision);
+        assert!(rx.try_recv().is_err());
+        manager
+            .note(Note::Text {
+                tag: current,
+                text: "current".into(),
+            })
+            .await;
+        assert!(
+            matches!(rx.try_recv().unwrap(), CoreEvent::ProbeTextReceived { text, .. } if text == "current")
+        );
+        assert!(rx.try_recv().is_err());
+        manager.stop().await;
+        remote.close().await;
+    }
     #[tokio::test(start_paused = true)]
     async fn relay_and_connecting_peers_are_not_counted_as_direct() {
         let bus = EventBus::new();
@@ -789,6 +1185,7 @@ mod tests {
                     target: id.into(),
                     session: None,
                     pending: None,
+                    disconnected_before: None,
                 },
             );
         }
@@ -990,6 +1387,7 @@ mod tests {
                     direct_ms: None,
                 },
                 target: id.into(),
+                disconnected_before: None,
                 session: None,
                 pending: Some(Pending {
                     tag: tag.clone(),
