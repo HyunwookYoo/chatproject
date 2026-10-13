@@ -55,12 +55,15 @@ extension ChatEventPatterns on ChatEvent {
 /// }
 /// ```
 
-@optionalTypeArgs TResult maybeMap<TResult extends Object?>({TResult Function( ChatEvent_ConnectionState value)?  connectionState,TResult Function( ChatEvent_Error value)?  error,required TResult orElse(),}){
+@optionalTypeArgs TResult maybeMap<TResult extends Object?>({TResult Function( ChatEvent_ConnectionState value)?  connectionState,TResult Function( ChatEvent_Error value)?  error,TResult Function( ChatEvent_NetworkChanged value)?  networkChanged,TResult Function( ChatEvent_PeerChanged value)?  peerChanged,TResult Function( ChatEvent_ProbeTextReceived value)?  probeTextReceived,required TResult orElse(),}){
 final _that = this;
 switch (_that) {
 case ChatEvent_ConnectionState() when connectionState != null:
 return connectionState(_that);case ChatEvent_Error() when error != null:
-return error(_that);case _:
+return error(_that);case ChatEvent_NetworkChanged() when networkChanged != null:
+return networkChanged(_that);case ChatEvent_PeerChanged() when peerChanged != null:
+return peerChanged(_that);case ChatEvent_ProbeTextReceived() when probeTextReceived != null:
+return probeTextReceived(_that);case _:
   return orElse();
 
 }
@@ -78,12 +81,15 @@ return error(_that);case _:
 /// }
 /// ```
 
-@optionalTypeArgs TResult map<TResult extends Object?>({required TResult Function( ChatEvent_ConnectionState value)  connectionState,required TResult Function( ChatEvent_Error value)  error,}){
+@optionalTypeArgs TResult map<TResult extends Object?>({required TResult Function( ChatEvent_ConnectionState value)  connectionState,required TResult Function( ChatEvent_Error value)  error,required TResult Function( ChatEvent_NetworkChanged value)  networkChanged,required TResult Function( ChatEvent_PeerChanged value)  peerChanged,required TResult Function( ChatEvent_ProbeTextReceived value)  probeTextReceived,}){
 final _that = this;
 switch (_that) {
 case ChatEvent_ConnectionState():
 return connectionState(_that);case ChatEvent_Error():
-return error(_that);}
+return error(_that);case ChatEvent_NetworkChanged():
+return networkChanged(_that);case ChatEvent_PeerChanged():
+return peerChanged(_that);case ChatEvent_ProbeTextReceived():
+return probeTextReceived(_that);}
 }
 /// A variant of `map` that fallback to returning `null`.
 ///
@@ -97,12 +103,15 @@ return error(_that);}
 /// }
 /// ```
 
-@optionalTypeArgs TResult? mapOrNull<TResult extends Object?>({TResult? Function( ChatEvent_ConnectionState value)?  connectionState,TResult? Function( ChatEvent_Error value)?  error,}){
+@optionalTypeArgs TResult? mapOrNull<TResult extends Object?>({TResult? Function( ChatEvent_ConnectionState value)?  connectionState,TResult? Function( ChatEvent_Error value)?  error,TResult? Function( ChatEvent_NetworkChanged value)?  networkChanged,TResult? Function( ChatEvent_PeerChanged value)?  peerChanged,TResult? Function( ChatEvent_ProbeTextReceived value)?  probeTextReceived,}){
 final _that = this;
 switch (_that) {
 case ChatEvent_ConnectionState() when connectionState != null:
 return connectionState(_that);case ChatEvent_Error() when error != null:
-return error(_that);case _:
+return error(_that);case ChatEvent_NetworkChanged() when networkChanged != null:
+return networkChanged(_that);case ChatEvent_PeerChanged() when peerChanged != null:
+return peerChanged(_that);case ChatEvent_ProbeTextReceived() when probeTextReceived != null:
+return probeTextReceived(_that);case _:
   return null;
 
 }
@@ -119,11 +128,14 @@ return error(_that);case _:
 /// }
 /// ```
 
-@optionalTypeArgs TResult maybeWhen<TResult extends Object?>({TResult Function( int directPeers,  bool mailboxOk,  bool? queueOk)?  connectionState,TResult Function( ErrorCode code,  String detail)?  error,required TResult orElse(),}) {final _that = this;
+@optionalTypeArgs TResult maybeWhen<TResult extends Object?>({TResult Function( int directPeers,  bool mailboxOk,  bool? queueOk)?  connectionState,TResult Function( ErrorCode code,  String detail)?  error,TResult Function( NetworkInfo info)?  networkChanged,TResult Function( BigInt revision,  PeerInfo peer)?  peerChanged,TResult Function( String peerId,  String text)?  probeTextReceived,required TResult orElse(),}) {final _that = this;
 switch (_that) {
 case ChatEvent_ConnectionState() when connectionState != null:
 return connectionState(_that.directPeers,_that.mailboxOk,_that.queueOk);case ChatEvent_Error() when error != null:
-return error(_that.code,_that.detail);case _:
+return error(_that.code,_that.detail);case ChatEvent_NetworkChanged() when networkChanged != null:
+return networkChanged(_that.info);case ChatEvent_PeerChanged() when peerChanged != null:
+return peerChanged(_that.revision,_that.peer);case ChatEvent_ProbeTextReceived() when probeTextReceived != null:
+return probeTextReceived(_that.peerId,_that.text);case _:
   return orElse();
 
 }
@@ -141,11 +153,14 @@ return error(_that.code,_that.detail);case _:
 /// }
 /// ```
 
-@optionalTypeArgs TResult when<TResult extends Object?>({required TResult Function( int directPeers,  bool mailboxOk,  bool? queueOk)  connectionState,required TResult Function( ErrorCode code,  String detail)  error,}) {final _that = this;
+@optionalTypeArgs TResult when<TResult extends Object?>({required TResult Function( int directPeers,  bool mailboxOk,  bool? queueOk)  connectionState,required TResult Function( ErrorCode code,  String detail)  error,required TResult Function( NetworkInfo info)  networkChanged,required TResult Function( BigInt revision,  PeerInfo peer)  peerChanged,required TResult Function( String peerId,  String text)  probeTextReceived,}) {final _that = this;
 switch (_that) {
 case ChatEvent_ConnectionState():
 return connectionState(_that.directPeers,_that.mailboxOk,_that.queueOk);case ChatEvent_Error():
-return error(_that.code,_that.detail);}
+return error(_that.code,_that.detail);case ChatEvent_NetworkChanged():
+return networkChanged(_that.info);case ChatEvent_PeerChanged():
+return peerChanged(_that.revision,_that.peer);case ChatEvent_ProbeTextReceived():
+return probeTextReceived(_that.peerId,_that.text);}
 }
 /// A variant of `when` that fallback to returning `null`
 ///
@@ -159,11 +174,14 @@ return error(_that.code,_that.detail);}
 /// }
 /// ```
 
-@optionalTypeArgs TResult? whenOrNull<TResult extends Object?>({TResult? Function( int directPeers,  bool mailboxOk,  bool? queueOk)?  connectionState,TResult? Function( ErrorCode code,  String detail)?  error,}) {final _that = this;
+@optionalTypeArgs TResult? whenOrNull<TResult extends Object?>({TResult? Function( int directPeers,  bool mailboxOk,  bool? queueOk)?  connectionState,TResult? Function( ErrorCode code,  String detail)?  error,TResult? Function( NetworkInfo info)?  networkChanged,TResult? Function( BigInt revision,  PeerInfo peer)?  peerChanged,TResult? Function( String peerId,  String text)?  probeTextReceived,}) {final _that = this;
 switch (_that) {
 case ChatEvent_ConnectionState() when connectionState != null:
 return connectionState(_that.directPeers,_that.mailboxOk,_that.queueOk);case ChatEvent_Error() when error != null:
-return error(_that.code,_that.detail);case _:
+return error(_that.code,_that.detail);case ChatEvent_NetworkChanged() when networkChanged != null:
+return networkChanged(_that.info);case ChatEvent_PeerChanged() when peerChanged != null:
+return peerChanged(_that.revision,_that.peer);case ChatEvent_ProbeTextReceived() when probeTextReceived != null:
+return probeTextReceived(_that.peerId,_that.text);case _:
   return null;
 
 }
@@ -302,6 +320,208 @@ class _$ChatEvent_ErrorCopyWithImpl<$Res>
   return _then(ChatEvent_Error(
 code: null == code ? _self.code : code // ignore: cast_nullable_to_non_nullable
 as ErrorCode,detail: null == detail ? _self.detail : detail // ignore: cast_nullable_to_non_nullable
+as String,
+  ));
+}
+
+
+}
+
+/// @nodoc
+
+
+class ChatEvent_NetworkChanged extends ChatEvent {
+  const ChatEvent_NetworkChanged({required this.info}): super._();
+  
+
+ final  NetworkInfo info;
+
+/// Create a copy of ChatEvent
+/// with the given fields replaced by the non-null parameter values.
+@JsonKey(includeFromJson: false, includeToJson: false)
+@pragma('vm:prefer-inline')
+$ChatEvent_NetworkChangedCopyWith<ChatEvent_NetworkChanged> get copyWith => _$ChatEvent_NetworkChangedCopyWithImpl<ChatEvent_NetworkChanged>(this, _$identity);
+
+
+
+@override
+bool operator ==(Object other) {
+  return identical(this, other) || (other.runtimeType == runtimeType&&other is ChatEvent_NetworkChanged&&(identical(other.info, info) || other.info == info));
+}
+
+
+@override
+int get hashCode => Object.hash(runtimeType,info);
+
+@override
+String toString() {
+  return 'ChatEvent.networkChanged(info: $info)';
+}
+
+
+}
+
+/// @nodoc
+abstract mixin class $ChatEvent_NetworkChangedCopyWith<$Res> implements $ChatEventCopyWith<$Res> {
+  factory $ChatEvent_NetworkChangedCopyWith(ChatEvent_NetworkChanged value, $Res Function(ChatEvent_NetworkChanged) _then) = _$ChatEvent_NetworkChangedCopyWithImpl;
+@useResult
+$Res call({
+ NetworkInfo info
+});
+
+
+
+
+}
+/// @nodoc
+class _$ChatEvent_NetworkChangedCopyWithImpl<$Res>
+    implements $ChatEvent_NetworkChangedCopyWith<$Res> {
+  _$ChatEvent_NetworkChangedCopyWithImpl(this._self, this._then);
+
+  final ChatEvent_NetworkChanged _self;
+  final $Res Function(ChatEvent_NetworkChanged) _then;
+
+/// Create a copy of ChatEvent
+/// with the given fields replaced by the non-null parameter values.
+@pragma('vm:prefer-inline') $Res call({Object? info = null,}) {
+  return _then(ChatEvent_NetworkChanged(
+info: null == info ? _self.info : info // ignore: cast_nullable_to_non_nullable
+as NetworkInfo,
+  ));
+}
+
+
+}
+
+/// @nodoc
+
+
+class ChatEvent_PeerChanged extends ChatEvent {
+  const ChatEvent_PeerChanged({required this.revision, required this.peer}): super._();
+  
+
+ final  BigInt revision;
+ final  PeerInfo peer;
+
+/// Create a copy of ChatEvent
+/// with the given fields replaced by the non-null parameter values.
+@JsonKey(includeFromJson: false, includeToJson: false)
+@pragma('vm:prefer-inline')
+$ChatEvent_PeerChangedCopyWith<ChatEvent_PeerChanged> get copyWith => _$ChatEvent_PeerChangedCopyWithImpl<ChatEvent_PeerChanged>(this, _$identity);
+
+
+
+@override
+bool operator ==(Object other) {
+  return identical(this, other) || (other.runtimeType == runtimeType&&other is ChatEvent_PeerChanged&&(identical(other.revision, revision) || other.revision == revision)&&(identical(other.peer, peer) || other.peer == peer));
+}
+
+
+@override
+int get hashCode => Object.hash(runtimeType,revision,peer);
+
+@override
+String toString() {
+  return 'ChatEvent.peerChanged(revision: $revision, peer: $peer)';
+}
+
+
+}
+
+/// @nodoc
+abstract mixin class $ChatEvent_PeerChangedCopyWith<$Res> implements $ChatEventCopyWith<$Res> {
+  factory $ChatEvent_PeerChangedCopyWith(ChatEvent_PeerChanged value, $Res Function(ChatEvent_PeerChanged) _then) = _$ChatEvent_PeerChangedCopyWithImpl;
+@useResult
+$Res call({
+ BigInt revision, PeerInfo peer
+});
+
+
+
+
+}
+/// @nodoc
+class _$ChatEvent_PeerChangedCopyWithImpl<$Res>
+    implements $ChatEvent_PeerChangedCopyWith<$Res> {
+  _$ChatEvent_PeerChangedCopyWithImpl(this._self, this._then);
+
+  final ChatEvent_PeerChanged _self;
+  final $Res Function(ChatEvent_PeerChanged) _then;
+
+/// Create a copy of ChatEvent
+/// with the given fields replaced by the non-null parameter values.
+@pragma('vm:prefer-inline') $Res call({Object? revision = null,Object? peer = null,}) {
+  return _then(ChatEvent_PeerChanged(
+revision: null == revision ? _self.revision : revision // ignore: cast_nullable_to_non_nullable
+as BigInt,peer: null == peer ? _self.peer : peer // ignore: cast_nullable_to_non_nullable
+as PeerInfo,
+  ));
+}
+
+
+}
+
+/// @nodoc
+
+
+class ChatEvent_ProbeTextReceived extends ChatEvent {
+  const ChatEvent_ProbeTextReceived({required this.peerId, required this.text}): super._();
+  
+
+ final  String peerId;
+ final  String text;
+
+/// Create a copy of ChatEvent
+/// with the given fields replaced by the non-null parameter values.
+@JsonKey(includeFromJson: false, includeToJson: false)
+@pragma('vm:prefer-inline')
+$ChatEvent_ProbeTextReceivedCopyWith<ChatEvent_ProbeTextReceived> get copyWith => _$ChatEvent_ProbeTextReceivedCopyWithImpl<ChatEvent_ProbeTextReceived>(this, _$identity);
+
+
+
+@override
+bool operator ==(Object other) {
+  return identical(this, other) || (other.runtimeType == runtimeType&&other is ChatEvent_ProbeTextReceived&&(identical(other.peerId, peerId) || other.peerId == peerId)&&(identical(other.text, text) || other.text == text));
+}
+
+
+@override
+int get hashCode => Object.hash(runtimeType,peerId,text);
+
+@override
+String toString() {
+  return 'ChatEvent.probeTextReceived(peerId: $peerId, text: $text)';
+}
+
+
+}
+
+/// @nodoc
+abstract mixin class $ChatEvent_ProbeTextReceivedCopyWith<$Res> implements $ChatEventCopyWith<$Res> {
+  factory $ChatEvent_ProbeTextReceivedCopyWith(ChatEvent_ProbeTextReceived value, $Res Function(ChatEvent_ProbeTextReceived) _then) = _$ChatEvent_ProbeTextReceivedCopyWithImpl;
+@useResult
+$Res call({
+ String peerId, String text
+});
+
+
+
+
+}
+/// @nodoc
+class _$ChatEvent_ProbeTextReceivedCopyWithImpl<$Res>
+    implements $ChatEvent_ProbeTextReceivedCopyWith<$Res> {
+  _$ChatEvent_ProbeTextReceivedCopyWithImpl(this._self, this._then);
+
+  final ChatEvent_ProbeTextReceived _self;
+  final $Res Function(ChatEvent_ProbeTextReceived) _then;
+
+/// Create a copy of ChatEvent
+/// with the given fields replaced by the non-null parameter values.
+@pragma('vm:prefer-inline') $Res call({Object? peerId = null,Object? text = null,}) {
+  return _then(ChatEvent_ProbeTextReceived(
+peerId: null == peerId ? _self.peerId : peerId // ignore: cast_nullable_to_non_nullable
+as String,text: null == text ? _self.text : text // ignore: cast_nullable_to_non_nullable
 as String,
   ));
 }

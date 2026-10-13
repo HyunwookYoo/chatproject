@@ -21,6 +21,7 @@ pub fn native_instance_id() -> Option<String> {
 mod tests {
     use super::*;
 
+    // This test exclusively owns starting the process-global core; other tests use local CoreSlots.
     #[test]
     fn instance_id_is_none_before_start_and_matches_after() {
         assert_eq!(native_instance_id(), None);

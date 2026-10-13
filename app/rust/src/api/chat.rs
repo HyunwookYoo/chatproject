@@ -2,7 +2,7 @@
 //! logic lives in chat_core, this module only converts types.
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use crate::convert::FrbSink;
 use crate::frb_generated::StreamSink;
@@ -22,6 +22,57 @@ pub struct CoreInfo {
 pub enum ErrorCode {
     InvalidConfig,
     AlreadyStartedDifferentConfig,
+    CoreNotStarted,
+    NetworkNotStarted,
+    InvalidPeerAddress,
+    SelfConnection,
+    PeerNotConnected,
+    MessageTooLarge,
+    Busy,
+    NetworkTimeout,
+    TransportFailed,
+    NotAvailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NetworkState {
+    Stopped,
+    Starting,
+    Online,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerPhase {
+    Connecting,
+    Connected,
+    Reconnecting,
+    Disconnected,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerPath {
+    Unknown,
+    Relay,
+    Direct,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkInfo {
+    pub revision: u64,
+    pub state: NetworkState,
+    pub endpoint_id: Option<String>,
+    pub ticket: Option<String>,
+    pub peers: Vec<PeerInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerInfo {
+    pub peer_id: String,
+    pub phase: PeerPhase,
+    pub path: PeerPath,
+    pub connect_ms: Option<u64>,
+    pub direct_ms: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -41,6 +92,17 @@ pub enum ChatEvent {
         code: ErrorCode,
         detail: String,
     },
+    NetworkChanged {
+        info: NetworkInfo,
+    },
+    PeerChanged {
+        revision: u64,
+        peer: PeerInfo,
+    },
+    ProbeTextReceived {
+        peer_id: String,
+        text: String,
+    },
 }
 
 #[flutter_rust_bridge::frb(sync)]
@@ -56,6 +118,6 @@ pub fn core_start(data_dir: String) -> Result<CoreInfo, CoreError> {
 
 /// The single event stream of the UI (design 12.2 rule 1).
 pub fn events(sink: StreamSink<ChatEvent>) -> Result<(), CoreError> {
-    BUS.subscribe(Arc::new(FrbSink(Mutex::new(sink))));
+    BUS.subscribe(Arc::new(FrbSink(sink)));
     Ok(())
 }

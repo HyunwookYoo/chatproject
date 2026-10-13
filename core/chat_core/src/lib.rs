@@ -4,7 +4,9 @@
 pub mod error;
 pub mod event;
 pub mod runtime;
+pub mod transport;
 
 pub use error::{CoreError, ErrorCode};
 pub use event::{ConnectionSnapshot, CoreEvent, EventBus, EventSink};
 pub use runtime::{CORE_VERSION, CoreConfig, CoreInfo, CoreSlot};
+pub use transport::{NetworkInfo, NetworkState, PeerInfo, PeerPath, PeerPhase};

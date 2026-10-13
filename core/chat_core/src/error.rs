@@ -1,10 +1,22 @@
+use serde::{Deserialize, Serialize};
+
 /// Error kinds the UI can branch on. Never match on `detail` (design 12.2 rule 3).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ErrorCode {
     /// The start configuration is unusable, e.g. the data folder cannot be created.
     InvalidConfig,
     /// The core already runs in this process with another data folder.
     AlreadyStartedDifferentConfig,
+    CoreNotStarted,
+    NetworkNotStarted,
+    InvalidPeerAddress,
+    SelfConnection,
+    PeerNotConnected,
+    MessageTooLarge,
+    Busy,
+    NetworkTimeout,
+    TransportFailed,
+    NotAvailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
