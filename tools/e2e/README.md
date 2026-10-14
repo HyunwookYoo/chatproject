@@ -33,7 +33,9 @@ in reverse acquisition order and attempts every resource. A test's nonzero exit
 code survives cleanup failures; cleanup failure after success returns 1.
 
 Managed child output is drained into `<run-directory>/<pid>.stdout.log` and
-`<pid>.stderr.log`; `exitCode` completes after those streams are flushed. The
+`<pid>.stderr.log`; `exitCode` returns its code after those streams are flushed.
+Output failures reject it early and remain observable by late consumers;
+`stop()` still waits for owned-process termination before returning that error. The
 run directory is under ignored `build/e2e/devices/`. Ownership JSON records
 process IDs, launch paths, AVDs, and reverse mappings. Raw failure/cleanup details
 remain there as well. Do not publish those files: they can contain device IDs,
@@ -60,7 +62,7 @@ small PowerShell wrapper that copies both native streams directly into its PID
 log files. This lets the CLI exit while the emulator keeps writing output.
 The retained mode accepts native executables, not batch scripts. Ordinary
 managed starts retain the original direct-child behavior. Windows cleanup owns
-the verified wrapper and its child tree. Both modes flush logs before `exitCode`.
+the verified wrapper and its child tree. Both modes flush logs before returning an exit code.
 New runs warn about existing ownership records. `down` is explicit safe record
 cleanup: it retires records only after the owning run and recorded processes
 are confirmed absent. It never kills a stale process, even if its PID/path seems

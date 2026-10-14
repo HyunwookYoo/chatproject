@@ -1,5 +1,7 @@
 import 'dart:io';
 import 'dart:convert';
+import 'dart:async';
+import 'dart:mirrors';
 
 import 'package:chat_e2e/src/process_runner.dart';
 import 'package:test/test.dart';
@@ -12,6 +14,102 @@ void main() {
   tearDown(() async {
     await logs.delete(recursive: true);
   });
+
+  for (final failedStream in ['stdout', 'stderr']) {
+    for (final exitBeforeConsumer in [false, true]) {
+      test(
+        '$failedStream sink failure stays observed with ${exitBeforeConsumer ? 'exited' : 'live'} child and late consumer',
+        () async {
+          final portFile = File('${logs.path}/failure-port');
+          final source = File('${logs.path}/failure_child.dart')
+            ..writeAsStringSync('''
+import 'dart:io';
+Future<void> main(List<String> args) async {
+  final server = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+  File(args[0]).writeAsStringSync('\${server.port}');
+  server.listen((socket) { socket.listen((_) => exit(0)); });
+}
+''');
+          final unhandled = <Object>[];
+          Object? observedError;
+          Object? stopError;
+          Object? scenarioError;
+          bool aliveBeforeConsumer = false;
+          bool exitedAfterStop = false;
+          late int port;
+          final complete = Completer<void>();
+          runZonedGuarded(() async {
+            Process? process;
+            try {
+              process = await Process.start(Platform.resolvedExecutable, [source.path, portFile.path]);
+              await process.stdin.close();
+              var exited = false;
+              final actualExit = process.exitCode.then((code) {
+                exited = true;
+                return code;
+              });
+              Directory('${logs.path}/${process.pid}.$failedStream.log').createSync();
+              final library = reflectClass(IoProcessRunner).owner as LibraryMirror;
+              final type = library.declarations[MirrorSystem.getSymbol('_IoOwnedProcess', library)] as ClassMirror;
+              final instance = type.newInstance(const Symbol(''), [process, logs]);
+              final owned = instance.reflectee as OwnedProcess;
+              // Mirrors reproduce normal start setup only; public lifecycle/stop
+              // and a real failing filesystem sink drive the assertions.
+              await instance.invoke(MirrorSystem.getSymbol('_captureWindowsIdentity', library), []).reflectee;
+              final deadline = DateTime.now().add(const Duration(seconds: 10));
+              while (!portFile.existsSync()) {
+                if (DateTime.now().isAfter(deadline)) throw StateError('Failure fixture did not start');
+                await Future<void>.delayed(const Duration(milliseconds: 10));
+              }
+              port = int.parse(portFile.readAsStringSync());
+              await Future<void>.delayed(const Duration(milliseconds: 100));
+              if (exitBeforeConsumer) {
+                final socket = await Socket.connect(InternetAddress.loopbackIPv4, port);
+                socket.write('exit');
+                await socket.flush();
+                await socket.close();
+                await actualExit;
+                await Future<void>.delayed(const Duration(milliseconds: 100));
+              }
+              aliveBeforeConsumer = !exited;
+              try {
+                await owned.exitCode.timeout(const Duration(seconds: 1));
+              } catch (error) {
+                observedError = error;
+              }
+              try {
+                await owned.stop();
+              } catch (error) {
+                stopError = error;
+              }
+              await actualExit.timeout(const Duration(seconds: 10));
+              exitedAfterStop = exited;
+            } catch (error) {
+              scenarioError = error;
+            } finally {
+              // The fixture owns this exact live Process; always reclaim it even
+              // while testing a broken implementation.
+              process?.kill();
+              await process?.exitCode;
+              complete.complete();
+            }
+          }, (error, _) => unhandled.add(error));
+          await complete.future.timeout(const Duration(seconds: 20));
+          expect(scenarioError, isNull);
+          expect(
+            unhandled,
+            isEmpty,
+            reason: 'Neither output nor lifecycle failure may escape before a consumer attaches',
+          );
+          expect(aliveBeforeConsumer, !exitBeforeConsumer);
+          expect(observedError, isA<FileSystemException>());
+          expect(stopError, same(observedError), reason: 'stop must preserve the original logging failure');
+          expect(exitedAfterStop, isTrue);
+          await expectLater(Socket.connect(InternetAddress.loopbackIPv4, port), throwsA(isA<SocketException>()));
+        },
+      );
+    }
+  }
 
   test('managed child captures output and exit before completion', () async {
     final child = await const IoProcessRunner().start(Platform.resolvedExecutable, ['--version'], logDir: logs);

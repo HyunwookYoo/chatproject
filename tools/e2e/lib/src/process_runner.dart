@@ -14,15 +14,24 @@ class _IoOwnedProcess implements OwnedProcess {
   _IoOwnedProcess(this._process, Directory logDir, {bool fileBacked = false}) {
     final out = fileBacked ? _process.stdout.drain<void>() : _process.stdout.pipe(File(p.join(logDir.path, '$pid.stdout.log')).openWrite());
     final err = fileBacked ? _process.stderr.drain<void>() : _process.stderr.pipe(File(p.join(logDir.path, '$pid.stderr.log')).openWrite());
-    exitCode = _process.exitCode.then((code) async {
+    _processExit = _process.exitCode.then((code) {
       _exited = true;
-      await Future.wait([out, err]);
       return code;
     });
+    // Observe both streams now, even when the native child keeps running.
+    exitCode = Future.wait<dynamic>([_processExit, out, err], eagerError: true)
+        .then((results) => results.first as int);
+    // Callers may wait for readiness before observing exitCode. Keep its error
+    // available to them without allowing an early failure to escape the zone.
+    unawaited(exitCode.then<void>((_) {}, onError: (Object error, StackTrace stack) {
+      _lifecycleFailure = (error, stack);
+    }));
   }
 
   final Process _process;
   bool _exited = false;
+  late final Future<int> _processExit;
+  (Object, StackTrace)? _lifecycleFailure;
   Map<String, dynamic>? _windowsIdentity;
   Future<void>? _stopping;
   @override
@@ -33,6 +42,17 @@ class _IoOwnedProcess implements OwnedProcess {
   Future<void> stop() => _stopping ??= _stop();
 
   Future<void> _stop() async {
+    try {
+      await _terminate();
+    } catch (_) {
+      final failure = _lifecycleFailure;
+      if (failure != null) Error.throwWithStackTrace(failure.$1, failure.$2);
+      rethrow;
+    }
+    await exitCode;
+  }
+
+  Future<void> _terminate() async {
     if (Platform.isWindows && !_exited) {
       final identity = _windowsIdentity;
       if (identity == null) throw StateError('Owned process identity unavailable; manual cleanup required');
@@ -54,10 +74,10 @@ try {
       _process.kill();
     }
     try {
-      await exitCode.timeout(const Duration(seconds: 5));
+      await _processExit.timeout(const Duration(seconds: 5));
     } on TimeoutException {
       if (!_exited && !Platform.isWindows) _process.kill(ProcessSignal.sigkill);
-      await exitCode.timeout(const Duration(seconds: 5));
+      await _processExit.timeout(const Duration(seconds: 5));
     }
   }
 

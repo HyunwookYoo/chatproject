@@ -510,7 +510,11 @@ Future<void> main(List<String> args) async {
     return;
   }
   if (args.contains('name')) { print('chat_e2e_1\nOK'); return; }
-  if (args.contains('getprop')) { print('1'); return; }
+  if (args.contains('getprop')) {
+    final booted = Platform.environment['FAKE_EXISTING'] != 'false' || File('$root/emulator.json').existsSync();
+    print(booted ? '1' : '0');
+    return;
+  }
   if (args.first == 'test') {
     File('$root/flutter-args.json').writeAsStringSync(jsonEncode(args));
     print('fake flutter output');
