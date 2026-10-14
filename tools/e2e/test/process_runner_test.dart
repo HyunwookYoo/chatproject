@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:async';
 import 'dart:mirrors';
 
+import 'package:chat_e2e/src/owned_resources.dart';
 import 'package:chat_e2e/src/process_runner.dart';
 import 'package:test/test.dart';
 
@@ -110,6 +111,105 @@ Future<void> main(List<String> args) async {
       );
     }
   }
+
+  test(
+    'stop bounds inherited output drains and continues remaining cleanup',
+    () async {
+      final release = File('${logs.path}/release');
+      final ready = File('${logs.path}/ready');
+      final source = File('${logs.path}/inherited_output.dart')
+        ..writeAsStringSync('''
+import 'dart:async';
+import 'dart:io';
+Future<void> main(List<String> args) async {
+  if (args[0] == 'parent') {
+    await Process.start(Platform.resolvedExecutable,
+      [Platform.script.toFilePath(), 'grandchild', args[1], args[2]],
+      mode: ProcessStartMode.inheritStdio);
+    exit(0);
+  }
+  stdout.writeln('inherited stdout');
+  stderr.writeln('inherited stderr');
+  File(args[2]).writeAsStringSync('ready');
+  final deadline = DateTime.now().add(const Duration(seconds: 20));
+  while (!File(args[1]).existsSync() && DateTime.now().isBefore(deadline)) {
+    await Future<void>.delayed(const Duration(milliseconds: 10));
+  }
+}
+''');
+      final process = await Process.start(Platform.resolvedExecutable, [
+        source.path,
+        'parent',
+        release.path,
+        ready.path,
+      ]);
+      final library = reflectClass(IoProcessRunner).owner as LibraryMirror;
+      final type =
+          library.declarations[MirrorSystem.getSymbol(
+                '_IoOwnedProcess',
+                library,
+              )]
+              as ClassMirror;
+      // Constructor setup only: real grandchild inheritance holds both output
+      // pipes open after the native parent exits. No stale descendant is signaled.
+      final owned =
+          type.newInstance(const Symbol(''), [process, logs]).reflectee
+              as OwnedProcess;
+      final resources = OwnedResources();
+      var remainingCleaned = false;
+      var lifecycleComplete = false;
+      final lifecycle = owned.exitCode.then((code) {
+        lifecycleComplete = true;
+        return code;
+      });
+      Future<void>? stopping;
+      Future<List<String>>? closing;
+      try {
+        await process.stdin.close();
+        expect(await process.exitCode.timeout(const Duration(seconds: 5)), 0);
+        final deadline = DateTime.now().add(const Duration(seconds: 5));
+        while (!ready.existsSync()) {
+          if (DateTime.now().isAfter(deadline)) {
+            fail('Inherited output fixture did not start');
+          }
+          await Future<void>.delayed(const Duration(milliseconds: 10));
+        }
+        expect(lifecycleComplete, isFalse);
+        resources.add('remaining', () async {
+          remainingCleaned = true;
+        });
+        resources.add('process', () => stopping = owned.stop());
+        closing = resources.close();
+        // A test deadline throws out of this await; it cannot satisfy the
+        // assertions for a returned production stop failure below.
+        final failures = await closing.timeout(const Duration(seconds: 8));
+        expect(remainingCleaned, isTrue);
+        expect(failures, hasLength(1));
+        expect(failures.single, startsWith('process: TimeoutException'));
+        expect(lifecycleComplete, isFalse);
+        expect(owned.stop(), same(stopping));
+        await expectLater(stopping, throwsA(isA<TimeoutException>()));
+      } finally {
+        // The test owns the release protocol, not a stale PID. Wait for actual
+        // inherited pipe EOF before deleting fixture files or finishing the test.
+        release.writeAsStringSync('release');
+        expect(await lifecycle.timeout(const Duration(seconds: 5)), 0);
+        await closing;
+        await process.exitCode;
+      }
+      expect(remainingCleaned, isTrue);
+      expect(
+        File('${logs.path}/${owned.pid}.stdout.log').readAsStringSync(),
+        contains('inherited stdout'),
+      );
+      expect(
+        File('${logs.path}/${owned.pid}.stderr.log').readAsStringSync(),
+        contains('inherited stderr'),
+      );
+      expect(owned.stop(), same(stopping));
+      await expectLater(owned.stop(), throwsA(isA<TimeoutException>()));
+    },
+  );
 
   test('managed child captures output and exit before completion', () async {
     final child = await const IoProcessRunner().start(Platform.resolvedExecutable, ['--version'], logDir: logs);

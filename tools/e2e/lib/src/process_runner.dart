@@ -49,7 +49,9 @@ class _IoOwnedProcess implements OwnedProcess {
       if (failure != null) Error.throwWithStackTrace(failure.$1, failure.$2);
       rethrow;
     }
-    await exitCode;
+    // A descendant may retain inherited pipes after the owned native process
+    // exits. Bound draining as well so later resource cleanup still runs.
+    await exitCode.timeout(const Duration(seconds: 5));
   }
 
   Future<void> _terminate() async {
