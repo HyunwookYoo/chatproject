@@ -1,0 +1,4 @@
+{
+  "local": { "api": 36, "flavor": "google_apis_playstore", "abi": "x86_64" },
+  "ci": { "api": 36, "flavor": "google_apis", "abi": "x86_64" }
+}

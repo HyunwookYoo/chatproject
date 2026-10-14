@@ -13,6 +13,16 @@ class FakeRunner implements ProcessRunner {
   final ProcessResult Function(String executable, List<String> arguments) respond;
   final calls = <String>[];
   final detached = <List<String>>[];
+  final stopped = <String>[];
+  void Function()? onStarted;
+
+  @override
+  Future<OwnedProcess> start(String executable, List<String> arguments, {required Directory logDir, String? workingDirectory, bool retainOutput = false}) async {
+    detached.add(arguments);
+    onStarted?.call();
+    final serial = 'emulator-${arguments[arguments.indexOf('-port') + 1]}';
+    return FakeOwnedProcess(() async { stopped.add(serial); });
+  }
 
   @override
   Future<ProcessResult> run(String executable, List<String> arguments,
@@ -30,13 +40,35 @@ class FakeRunner implements ProcessRunner {
   Future<int> runInherited(String executable, List<String> arguments, {String? workingDirectory}) async => 0;
 }
 
+class FakeOwnedProcess implements OwnedProcess {
+  FakeOwnedProcess(this.onStop);
+  final Future<void> Function() onStop;
+  @override
+  int get pid => 123;
+  @override
+  Future<int> get exitCode => Completer<int>().future;
+  @override
+  Future<void> stop() => onStop();
+}
+
 ProcessResult ok(String stdout) => ProcessResult(0, 0, stdout, '');
 ProcessResult notReady() => ProcessResult(0, 1, '', "error: device 'emulator-5554' not found");
+
+void writeConfig(Directory home, {String image = 'google_apis_playstore'}) {
+  final folder = Directory('${home.path}/chat_e2e_1.avd')..createSync(recursive: true);
+  File('${folder.path}/config.ini').writeAsStringSync(
+    'image.sysdir.1=system-images/android-36/$image/x86_64/\nabi.type=x86_64\nhw.cpu.arch=x86_64\n');
+}
+
+void writeSnapshot(Directory home) =>
+  Directory('${home.path}/chat_e2e_1.avd/snapshots/clean').createSync(recursive: true);
 
 Emulators emulatorsWith(FakeRunner runner, {String avdHome = '/avd', DateTime Function()? now}) => Emulators(
       sdk: AndroidSdk('/sdk', windows: false),
       runner: runner,
       avdHome: avdHome,
+      config: AvdConfig.load(ci: false),
+      checkPort: (_) async {},
       sleep: (_) async {},
       now: now,
     );
@@ -51,6 +83,87 @@ ProcessResult listLaunched(FakeRunner runner, Set<String> killed) {
 }
 
 void main() {
+  test('a bound port fails preflight without killing its holder', () async {
+    final holder = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+    final subscription = holder.listen((socket) => socket.destroy());
+    addTearDown(() async { await subscription.cancel(); await holder.close(); });
+    final runner = FakeRunner((exe, args) => ok('List of devices attached\n'));
+    final emulators = Emulators(sdk: AndroidSdk('/sdk', windows: false), runner: runner, avdHome: '/avd');
+    await expectLater(emulators.up([EmulatorSpec('chat_e2e_1', holder.port)]), throwsA(isA<SocketException>()));
+    expect(runner.detached, isEmpty);
+    final connection = await Socket.connect(InternetAddress.loopbackIPv4, holder.port);
+    connection.destroy();
+  });
+
+  test('CI image selection is consumed by AVD creation and validation', () async {
+    final home = await Directory.systemTemp.createTemp('avd_home_');
+    addTearDown(() => home.delete(recursive: true));
+    final runner = FakeRunner((exe, args) {
+      if (args.contains('create')) { writeConfig(home, image: 'google_apis'); writeSnapshot(home); }
+      return ok('');
+    });
+    final emulators = Emulators(sdk: AndroidSdk('/sdk', windows: false), runner: runner,
+      avdHome: home.path, config: AvdConfig.load(ci: true));
+    await emulators.ensure(testEmulators.first);
+    expect(runner.calls.any((call) => call.endsWith('--package system-images;android-36;google_apis;x86_64')), isTrue);
+    expect(runner.detached, isEmpty);
+  });
+
+  for (final failure in ['save exit', 'missing snapshot', 'boot failure']) {
+    test('ensure preserves a preexisting AVD on $failure', () async {
+      final home = await Directory.systemTemp.createTemp('avd_home_');
+      addTearDown(() => home.delete(recursive: true));
+      writeConfig(home);
+      var clock = DateTime(2026);
+      final runner = FakeRunner((exe, args) {
+        if (args.contains('-list-avds')) return ok('chat_e2e_1\n');
+        if (args.first == 'devices') return ok('List of devices attached\nemulator-5554\tdevice\n');
+        if (args.contains('name')) return ok('chat_e2e_1\nOK\n');
+        if (args.contains('getprop')) {
+          clock = clock.add(const Duration(minutes: 4));
+          return ok(failure == 'boot failure' ? '0\n' : '1\n');
+        }
+        if (args.contains('save') && failure == 'save exit') return ProcessResult(0, 9, '', 'snapshot rejected');
+        return ok('');
+      });
+      await expectLater(emulatorsWith(runner, avdHome: home.path, now: () => clock).ensure(testEmulators.first), throwsA(anything));
+      expect(runner.stopped, isEmpty);
+      expect(runner.calls.any((call) => call.contains('emu kill')), isFalse);
+    });
+  }
+
+  test('ensure rejects wrong image before launching or snapshotting', () async {
+    final home = await Directory.systemTemp.createTemp('avd_home_');
+    addTearDown(() => home.delete(recursive: true));
+    writeConfig(home, image: 'google_apis');
+    final runner = FakeRunner((exe, args) => ok(args.contains('-list-avds') ? 'chat_e2e_1\n' : ''));
+    await expectLater(emulatorsWith(runner, avdHome: home.path).ensure(testEmulators.first), throwsStateError);
+    expect(runner.detached, isEmpty);
+  });
+
+  test('ensure rejects list-avds failure before creation', () async {
+    final runner = FakeRunner((exe, args) => ProcessResult(0, 9, '', 'list failed'));
+    await expectLater(emulatorsWith(runner).ensure(testEmulators.first), throwsStateError);
+    expect(runner.calls, hasLength(1));
+  });
+
+  test('empty console gets manual diagnosis without adb server reset', () async {
+    final runner = FakeRunner((exe, args) => ok(args.first == 'devices' ? 'List of devices attached\nemulator-5554\tdevice\n' : '\nOK\n'));
+    await expectLater(emulatorsWith(runner).up([testEmulators.first]),
+      throwsA(isA<StateError>().having((e) => e.message, 'diagnostic', contains('manual adb'))));
+    expect(runner.calls.any((call) => call.contains('kill-server')), isFalse);
+  });
+
+  test('failed boot stops managed process before adb ever lists it', () async {
+    var clock = DateTime(2026);
+    final runner = FakeRunner((exe, args) {
+      if (args.first == 'devices') return ok('List of devices attached\n');
+      clock = clock.add(const Duration(minutes: 4));
+      return notReady();
+    });
+    await expectLater(emulatorsWith(runner, now: () => clock).up([testEmulators.first]), throwsA(isA<TimeoutException>()));
+    expect(runner.stopped, ['emulator-5554']);
+  });
   test('parses adb devices output', () {
     const out = 'List of devices attached\nemulator-5554\tdevice\r\nPHONESERIAL\tunauthorized\n\n';
     expect(parseAdbDevices(out), {'emulator-5554': 'device', 'PHONESERIAL': 'unauthorized'});
@@ -61,6 +174,7 @@ void main() {
     expect(args, containsAllInOrder(['-avd', 'chat_e2e_1', '-port', '5554']));
     expect(args, containsAll(['-snapshot', 'clean', '-no-snapshot-save', '-no-window']));
     expect(firstBootArgs(testEmulators.first), contains('-no-snapshot-load'));
+    expect(firstBootArgs(testEmulators.first), contains('-no-snapshot-save'));
   });
 
   test('waitBooted returns once boot_completed is 1', () async {
@@ -138,7 +252,7 @@ void main() {
       emulatorsWith(runner, now: () => clock).up(testEmulators),
       throwsA(isA<TimeoutException>()),
     );
-    expect(killed, {'emulator-5554', 'emulator-5556'});
+    expect(runner.stopped, ['emulator-5556', 'emulator-5554']);
   });
 
   test('up waits for an emulator that adb lists but has not finished booting', () async {
@@ -161,19 +275,22 @@ void main() {
     final runner = FakeRunner((exe, args) {
       if (args.first == 'devices') return ok('List of devices attached\n');
       if (args.contains('getprop')) return ok('1\n');
+      if (args.contains('create')) writeConfig(avdHome);
+      if (args.contains('save')) writeSnapshot(avdHome);
       return ok('');
     });
     await emulatorsWith(runner, avdHome: avdHome.path).ensure(testEmulators.first);
-    expect(runner.calls, contains('flutter emulators --create --name chat_e2e_1'));
+    expect(runner.calls.any((call) => call.endsWith('create avd --name chat_e2e_1 --package system-images;android-36;google_apis_playstore;x86_64')), isTrue);
     expect(runner.detached.single, contains('-no-snapshot-load'));
     expect(runner.calls.any((c) => c.endsWith('-s emulator-5554 emu avd snapshot save clean')), isTrue);
-    expect(runner.calls.any((c) => c.endsWith('-s emulator-5554 emu kill')), isTrue);
+    expect(runner.stopped, ['emulator-5554']);
   });
 
   test('ensure waits for a running emulator to finish booting before it saves the snapshot', () async {
     final avdHome = await Directory.systemTemp.createTemp('avd_home_');
     addTearDown(() => avdHome.delete(recursive: true));
     var polls = 0;
+    writeConfig(avdHome);
     var killed = false;
     final runner = FakeRunner((exe, args) {
       if (args.contains('-list-avds')) return ok('chat_e2e_1\n');
@@ -181,6 +298,7 @@ void main() {
       if (args.contains('name')) return ok('chat_e2e_1\r\nOK\r\n');
       if (args.contains('getprop')) return ++polls < 3 ? notReady() : ok('1\n');
       if (args.contains('kill')) killed = true;
+      if (args.contains('save')) writeSnapshot(avdHome);
       return ok('');
     });
     await emulatorsWith(runner, avdHome: avdHome.path).ensure(testEmulators.first);
@@ -188,12 +306,14 @@ void main() {
     expect(polls, 3);
     final saved = runner.calls.indexWhere((c) => c.endsWith('emu avd snapshot save clean'));
     expect(saved, greaterThan(runner.calls.lastIndexWhere((c) => c.contains('getprop'))));
+    expect(killed, isFalse, reason: 'ensure must preserve an already running AVD');
   });
 
   test('ensure stops the emulator it launched when the first boot never finishes', () async {
     final avdHome = await Directory.systemTemp.createTemp('avd_home_');
     addTearDown(() => avdHome.delete(recursive: true));
     var clock = DateTime(2026);
+    writeConfig(avdHome);
     final killed = <String>{};
     late final FakeRunner runner;
     runner = FakeRunner((exe, args) {
@@ -210,7 +330,7 @@ void main() {
       emulatorsWith(runner, avdHome: avdHome.path, now: () => clock).ensure(testEmulators.first),
       throwsA(isA<TimeoutException>()),
     );
-    expect(killed, {'emulator-5554'});
+    expect(runner.stopped, ['emulator-5554']);
     expect(runner.calls.any((c) => c.contains('snapshot save')), isFalse);
   });
 

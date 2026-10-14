@@ -37,6 +37,7 @@ List<String> firstBootArgs(EmulatorSpec spec) => [
       '-avd', spec.avd,
       '-port', '${spec.port}',
       '-no-snapshot-load',
+      '-no-snapshot-save',
       '-no-window', '-no-audio', '-no-boot-anim',
     ];
 
@@ -60,8 +61,18 @@ class Emulators {
     this.bootTimeout = const Duration(seconds: 180),
     Future<void> Function(Duration)? sleep,
     DateTime Function()? now,
+    AvdConfig? config,
+    Directory? logDir,
+    this.checkCancelled,
+    this.onStarted,
+    this.onStopped,
+    this.retainOutput = false,
+    Future<void> Function(int)? checkPort,
   })  : _sleep = sleep ?? Future<void>.delayed,
-        _now = now ?? DateTime.now;
+        _now = now ?? DateTime.now,
+        config = config ?? AvdConfig.load(),
+        logDir = logDir ?? Directory(p.join('build', 'e2e', 'devices')),
+        _checkPort = checkPort ?? _requireFreePort;
 
   final AndroidSdk sdk;
   final ProcessRunner runner;
@@ -71,9 +82,57 @@ class Emulators {
   final Duration bootTimeout;
   final Future<void> Function(Duration) _sleep;
   final DateTime Function() _now;
+  final AvdConfig config;
+  final Directory logDir;
+  final void Function()? checkCancelled;
+  final Future<void> Function(EmulatorSpec, OwnedProcess)? onStarted;
+  final Future<void> Function(EmulatorSpec)? onStopped;
+  final bool retainOutput;
+  final Future<void> Function(int) _checkPort;
+  final _owned = <String, OwnedProcess>{};
+  final cleanupFailures = <String>[];
+
+  /// Intentionally transfer live emulators to the retained ownership record.
+  void retainOwned() => _owned.clear();
+
+  static Future<void> _requireFreePort(int port) async {
+    final socket = await ServerSocket.bind(InternetAddress.loopbackIPv4, port, shared: false);
+    await socket.close();
+  }
+
+  Future<ProcessResult> _run(String executable, List<String> args, {String? stdin}) async {
+    checkCancelled?.call();
+    final result = await runner.run(executable, args, stdin: stdin);
+    checkCancelled?.call();
+    return result;
+  }
+
+  void _requireSuccess(ProcessResult result, String operation) {
+    if (result.exitCode != 0) throw StateError('$operation failed (${result.exitCode}): ${result.stderr}');
+  }
+
+  Future<void> _start(EmulatorSpec spec, List<String> args) async {
+    checkCancelled?.call();
+    final process = await runner.start(sdk.emulator, args, logDir: logDir, retainOutput: retainOutput);
+    _owned[spec.avd] = process;
+    await onStarted?.call(spec, process);
+    checkCancelled?.call();
+  }
+
+  /// Check all console and adb ports before any launch, including ensure boots.
+  Future<void> preflight(List<EmulatorSpec> specs) async {
+    for (final spec in specs) {
+      checkCancelled?.call();
+      if (!await isRunning(spec)) {
+        await _checkPort(spec.port);
+        await _checkPort(spec.port + 1);
+      }
+    }
+  }
 
   Future<Map<String, String>> devices() async {
-    final result = await runner.run(sdk.adb, ['devices']);
+    final result = await _run(sdk.adb, ['devices']);
+    _requireSuccess(result, 'adb devices');
     return parseAdbDevices(result.stdout as String);
   }
 
@@ -81,8 +140,12 @@ class Emulators {
   /// emulator that is still booting, or stuck offline, counts as listed.
   Future<String?> runningAvd(EmulatorSpec spec) async {
     if (!(await devices()).containsKey(spec.serial)) return null;
-    final result = await runner.run(sdk.adb, ['-s', spec.serial, 'emu', 'avd', 'name']);
-    return (result.stdout as String).split(RegExp(r'\r?\n')).first.trim();
+    final result = await _run(sdk.adb, ['-s', spec.serial, 'emu', 'avd', 'name']);
+    final name = (result.stdout as String).split(RegExp(r'\r?\n')).first.trim();
+    if (result.exitCode != 0 || name.isEmpty || name == 'OK') {
+      throw StateError('${spec.serial} has a dead console; use manual adb diagnosis (adb -s <serial> emu avd name).');
+    }
+    return name;
   }
 
   /// True when [spec] already runs, in any adb state. Throws when another AVD holds its
@@ -91,7 +154,7 @@ class Emulators {
     final name = await runningAvd(spec);
     if (name == null) return false;
     if (name != spec.avd) {
-      throw StateError('${spec.serial} is taken by AVD "$name". Stop that emulator and run again.');
+      throw StateError('${spec.serial} is taken by AVD "$name" or has a dead console; use manual adb diagnosis before retrying.');
     }
     return true;
   }
@@ -101,25 +164,47 @@ class Emulators {
 
   /// Creates the AVD and its clean snapshot when they are missing.
   Future<void> ensure(EmulatorSpec spec) async {
-    final list = await runner.run(sdk.emulator, ['-list-avds']);
+    final list = await _run(sdk.emulator, ['-list-avds']);
+    _requireSuccess(list, 'list-avds');
     final avds = (list.stdout as String).split(RegExp(r'\r?\n')).map((line) => line.trim()).toSet();
     if (!avds.contains(spec.avd)) {
-      final created = await runner.run(flutter, ['emulators', '--create', '--name', spec.avd]);
-      if (created.exitCode != 0) throw StateError('Cannot create ${spec.avd}: ${created.stderr}');
+      final created = await _run(sdk.avdmanager,
+        ['create', 'avd', '--name', spec.avd, '--package', config.package], stdin: 'no\n');
+      _requireSuccess(created, 'create ${spec.avd}');
     }
+    _validateConfig(spec);
     if (hasCleanSnapshot(spec)) return;
+    await preflight([spec]);
     final launched = !await isRunning(spec);
-    if (launched) await runner.startDetached(sdk.emulator, firstBootArgs(spec));
     try {
+      if (launched) await _start(spec, firstBootArgs(spec));
       // An emulator that already runs may still be booting: wait for it too, so the
       // snapshot never captures a half-booted state.
       await waitBooted(spec);
-      await runner.run(sdk.adb, ['-s', spec.serial, 'emu', 'avd', 'snapshot', 'save', cleanSnapshot]);
+      final saved = await _run(sdk.adb, ['-s', spec.serial, 'emu', 'avd', 'snapshot', 'save', cleanSnapshot]);
+      _requireSuccess(saved, 'snapshot save');
+      if (!hasCleanSnapshot(spec)) throw StateError('Snapshot save did not create the clean snapshot directory');
     } catch (_) {
       if (launched) await _stopQuietly([spec]);
       rethrow;
     }
-    await stop(spec);
+    if (launched) await stop(spec);
+  }
+
+  void _validateConfig(EmulatorSpec spec) {
+    final file = File(p.join(avdHome, '${spec.avd}.avd', 'config.ini'));
+    if (!file.existsSync()) throw StateError('Missing config.ini for ${spec.avd}');
+    final values = <String, String>{};
+    for (final line in file.readAsLinesSync()) {
+      final separator = line.indexOf('=');
+      if (separator > 0) values[line.substring(0, separator).trim()] = line.substring(separator + 1).trim();
+    }
+    final image = (values['image.sysdir.1'] ?? '').replaceAll('\\', '/').replaceFirst(RegExp(r'/+$'), '');
+    final relative = 'system-images/android-${config.api}/${config.flavor}/${config.abi}';
+    final absolute = sdk.systemImage(config).replaceAll('\\', '/');
+    if ((image != relative && image != absolute) || values['abi.type'] != config.abi || values['hw.cpu.arch'] != config.abi) {
+      throw StateError('${spec.avd} has the wrong image or ABI; expected ${config.package}. Existing AVD was preserved.');
+    }
   }
 
   /// Boots the emulators in [specs] that adb does not list yet and waits until every one of
@@ -127,6 +212,7 @@ class Emulators {
   /// the first launch. If anything fails after a launch, the emulators it launched are
   /// stopped before the error is rethrown.
   Future<List<EmulatorSpec>> up(List<EmulatorSpec> specs) async {
+    await preflight(specs);
     final toLaunch = <EmulatorSpec>[];
     for (final spec in specs) {
       if (!await isRunning(spec)) toLaunch.add(spec);
@@ -134,14 +220,14 @@ class Emulators {
     final started = <EmulatorSpec>[];
     try {
       for (final spec in toLaunch) {
-        await runner.startDetached(sdk.emulator, bootArgs(spec));
         started.add(spec);
+        await _start(spec, bootArgs(spec));
       }
       for (final spec in specs) {
         await waitBooted(spec);
       }
     } catch (_) {
-      await _stopQuietly(started);
+      await _stopQuietly(started.reversed);
       rethrow;
     }
     return started;
@@ -150,7 +236,7 @@ class Emulators {
   Future<void> waitBooted(EmulatorSpec spec) async {
     final deadline = _now().add(bootTimeout);
     while (true) {
-      final result = await runner.run(sdk.adb, ['-s', spec.serial, 'shell', 'getprop', 'sys.boot_completed']);
+      final result = await _run(sdk.adb, ['-s', spec.serial, 'shell', 'getprop', 'sys.boot_completed']);
       if (result.exitCode == 0 && (result.stdout as String).trim() == '1') return;
       if (!_now().isBefore(deadline)) {
         throw TimeoutException('${spec.serial} did not finish booting within ${bootTimeout.inSeconds} s');
@@ -160,12 +246,11 @@ class Emulators {
   }
 
   Future<void> stop(EmulatorSpec spec) async {
-    await runner.run(sdk.adb, ['-s', spec.serial, 'emu', 'kill']);
-    final deadline = _now().add(const Duration(seconds: 30));
-    while ((await devices()).containsKey(spec.serial)) {
-      if (!_now().isBefore(deadline)) throw TimeoutException('${spec.serial} did not stop within 30 s');
-      await _sleep(pollInterval);
-    }
+    final process = _owned[spec.avd];
+    if (process == null) return;
+    await process.stop();
+    _owned.remove(spec.avd);
+    await onStopped?.call(spec);
   }
 
   /// Stops [specs] after a failure. A stop that fails too must not hide the first error.
@@ -173,8 +258,8 @@ class Emulators {
     for (final spec in specs) {
       try {
         await stop(spec);
-      } catch (_) {
-        // The caller rethrows the original error; `down` can stop what is left.
+      } catch (error) {
+        cleanupFailures.add('emulator cleanup: $error');
       }
     }
   }
