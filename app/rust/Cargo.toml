@@ -23,3 +23,7 @@ tokio = { version = "1", features = ["rt", "macros"] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(frb_expand)'] }
+
+[features]
+default = []
+test-hooks = ["chat_core/test-hooks"]

@@ -28,6 +28,14 @@ pub enum NetworkOp {
     Send { peer_id: String, text: String },
     Disconnect { peer_id: String },
     Stop,
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    ConfigureLocal {
+        relay: Option<iroh::RelayUrl>,
+    },
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    SetOffline {
+        offline: bool,
+    },
 }
 #[derive(Debug)]
 pub enum NetworkReply {
@@ -48,6 +56,20 @@ impl NetworkHandle {
         let (commands, receiver) = mpsc::channel(64);
         handle.spawn(Manager::new(profile, bus).run(receiver));
         Self { commands }
+    }
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    pub async fn configure_local(&self, relay: Option<iroh::RelayUrl>) -> Result<(), CoreError> {
+        match self.execute(NetworkOp::ConfigureLocal { relay }).await? {
+            NetworkReply::Done => Ok(()),
+            _ => Err(err(ErrorCode::TransportFailed)),
+        }
+    }
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    pub async fn set_offline(&self, offline: bool) -> Result<NetworkInfo, CoreError> {
+        match self.execute(NetworkOp::SetOffline { offline }).await? {
+            NetworkReply::Info(info) => Ok(info),
+            _ => Err(err(ErrorCode::TransportFailed)),
+        }
     }
     pub async fn execute(&self, op: NetworkOp) -> Result<NetworkReply, CoreError> {
         let (reply, received) = oneshot::channel();
@@ -150,6 +172,10 @@ struct Manager {
     incoming: BTreeMap<u64, IncomingPreparation>,
     accepted: Arc<AtomicU64>,
     received_incoming: u64,
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    offline: bool,
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    offline_targets: BTreeMap<String, EndpointAddr>,
 }
 impl Manager {
     fn new(profile: NetworkProfile, bus: EventBus) -> Self {
@@ -176,6 +202,10 @@ impl Manager {
             incoming: BTreeMap::new(),
             accepted: Arc::new(AtomicU64::new(0)),
             received_incoming: 0,
+            #[cfg(all(feature = "test-hooks", debug_assertions))]
+            offline: false,
+            #[cfg(all(feature = "test-hooks", debug_assertions))]
+            offline_targets: BTreeMap::new(),
         }
     }
     async fn run(mut self, mut commands: mpsc::Receiver<Envelope>) {
@@ -226,34 +256,47 @@ impl Manager {
         let result = match op {
             NetworkOp::Info => Ok(NetworkReply::Info(self.info.clone())),
             NetworkOp::Start => {
-                if matches!(
-                    self.info.state,
-                    NetworkState::Stopped | NetworkState::Failed
-                ) {
-                    self.cancel = CancellationToken::new();
-                    self.epoch += 1;
-                    self.info.state = NetworkState::Starting;
-                    self.publish(None);
-                    let profile = self.profile.clone();
-                    let key = self.key.clone();
-                    let epoch = self.epoch;
-                    let cancel = self.cancel.clone();
-                    let notes = self.notes.clone();
-                    self.tasks.spawn(async move {
-                        let result = tokio::select! { biased; _ = cancel.cancelled() => return, result = bind_endpoint(&profile, key) => result };
-                        #[cfg(any(test, all(feature = "test-hooks", debug_assertions)))]
-                        if let Ok(endpoint) = &result {
-                            if matches!(profile, NetworkProfile::Local { relay: Some(_) }) {
-                                let ready = tokio::select! { biased; _ = cancel.cancelled() => false, result = tokio::time::timeout(Duration::from_secs(30), endpoint.online()) => result.is_ok() };
-                                if !ready { endpoint.close().await; session::notify(&notes, &cancel, Note::Bound { epoch, result: Err(err(ErrorCode::NetworkTimeout)) }).await; return; }
-                            }
-                        }
-                        session::notify(&notes, &cancel, Note::Bound { epoch, result }).await;
-                    });
+                self.start();
+                Ok(NetworkReply::Info(self.info.clone()))
+            }
+            #[cfg(all(feature = "test-hooks", debug_assertions))]
+            NetworkOp::ConfigureLocal { relay } => {
+                if let Some(url) = &relay {
+                    if let Err(error) = crate::puppet::protocol::validate_relay(url.as_str()) {
+                        let _ = reply.send(Err(error));
+                        return;
+                    }
+                }
+                let same = matches!(&self.profile, NetworkProfile::Local { relay: current } if current == &relay);
+                if same {
+                    Ok(NetworkReply::Done)
+                } else if self.info.state == NetworkState::Stopped {
+                    self.profile = NetworkProfile::Local { relay };
+                    Ok(NetworkReply::Done)
+                } else {
+                    Err(err(ErrorCode::InvalidConfig))
+                }
+            }
+            #[cfg(all(feature = "test-hooks", debug_assertions))]
+            NetworkOp::SetOffline { offline } => {
+                if offline && !self.offline {
+                    self.offline_targets.extend(self.peers.iter()
+                        .filter(|(_, p)| p.session.is_some() || p.pending.is_some())
+                        .map(|(id, p)| (id.clone(), p.target.clone())));
+                    self.offline = true;
+                    self.stop().await;
+                } else if !offline && self.offline {
+                    self.offline = false;
+                    self.start();
                 }
                 Ok(NetworkReply::Info(self.info.clone()))
             }
             NetworkOp::Stop => {
+                #[cfg(all(feature = "test-hooks", debug_assertions))]
+                {
+                    self.offline = false;
+                    self.offline_targets.clear();
+                }
                 self.stop().await;
                 Ok(NetworkReply::Done)
             }
@@ -262,6 +305,11 @@ impl Manager {
                 return;
             }
             NetworkOp::Send { peer_id, text } => {
+                #[cfg(all(feature = "test-hooks", debug_assertions))]
+                if self.offline {
+                    let _ = reply.send(Err(err(ErrorCode::PeerNotConnected)));
+                    return;
+                }
                 if self.endpoint.is_none() {
                     Err(err(ErrorCode::NetworkNotStarted))
                 } else if let Err(error) = validate_text(&text) {
@@ -286,6 +334,8 @@ impl Manager {
                 }
             }
             NetworkOp::Disconnect { peer_id } => {
+                #[cfg(all(feature = "test-hooks", debug_assertions))]
+                self.offline_targets.remove(&peer_id);
                 let cutoff = self.accepted.load(Ordering::Acquire);
                 // Unknown identities keep the cutoff alive, including accept notes still queued.
                 if self.has_unknown_before(cutoff) && !self.peers.contains_key(&peer_id) {
@@ -339,6 +389,37 @@ impl Manager {
             }
         };
         let _ = reply.send(result);
+    }
+    fn start(&mut self) {
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        if self.offline {
+            return;
+        }
+        if matches!(
+            self.info.state,
+            NetworkState::Stopped | NetworkState::Failed
+        ) {
+            self.cancel = CancellationToken::new();
+            self.epoch += 1;
+            self.info.state = NetworkState::Starting;
+            self.publish(None);
+            let profile = self.profile.clone();
+            let key = self.key.clone();
+            let epoch = self.epoch;
+            let cancel = self.cancel.clone();
+            let notes = self.notes.clone();
+            self.tasks.spawn(async move {
+                        let result = tokio::select! { biased; _ = cancel.cancelled() => return, result = bind_endpoint(&profile, key) => result };
+                        #[cfg(any(test, all(feature = "test-hooks", debug_assertions)))]
+                        if let Ok(endpoint) = &result {
+                            if matches!(profile, NetworkProfile::Local { relay: Some(_) }) {
+                                let ready = tokio::select! { biased; _ = cancel.cancelled() => false, result = tokio::time::timeout(Duration::from_secs(30), endpoint.online()) => result.is_ok() };
+                                if !ready { endpoint.close().await; session::notify(&notes, &cancel, Note::Bound { epoch, result: Err(err(ErrorCode::NetworkTimeout)) }).await; return; }
+                            }
+                        }
+                        session::notify(&notes, &cancel, Note::Bound { epoch, result }).await;
+                    });
+        }
     }
     fn has_unknown_before(&self, cutoff: u64) -> bool {
         self.received_incoming < cutoff
@@ -569,6 +650,20 @@ impl Manager {
                             session::notify(&notes, &cancel, Note::Incoming { epoch, incoming, sequence: accepted.fetch_add(1, Ordering::AcqRel) + 1 }).await;
                         }});
                         self.endpoint = Some(endpoint);
+                        #[cfg(all(feature = "test-hooks", debug_assertions))]
+                        for (id, target) in std::mem::take(&mut self.offline_targets) {
+                            let tag = self.tag(id.clone());
+                            let cancel = self.cancel.child_token();
+                            if let Some(peer) = self.peers.get_mut(&id) {
+                                peer.info.phase = PeerPhase::Reconnecting;
+                                peer.pending = Some(Pending {
+                                    tag: tag.clone(),
+                                    cancel: cancel.clone(),
+                                    reply: None,
+                                });
+                                self.spawn_dial(target, tag, cancel, true, Instant::now());
+                            }
+                        }
                     }
                     Err(error) => {
                         self.info.state = NetworkState::Failed;
@@ -896,6 +991,61 @@ mod tests {
     impl crate::EventSink for Sink {
         fn send(&self, event: CoreEvent) -> bool {
             self.0.try_send(event).is_ok()
+        }
+    }
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    #[tokio::test]
+    async fn explicit_stop_and_disconnect_clear_intent_during_rebind() {
+        for stop in [false, true] {
+            let mut manager = Manager::new(NetworkProfile::Local { relay: None }, EventBus::new());
+            let id = SecretKey::generate().public();
+            manager.peers.insert(id.to_string(), inactive_peer(id));
+            manager.offline_targets.insert(id.to_string(), id.into());
+            manager.info.state = NetworkState::Starting;
+            let (reply, received) = oneshot::channel();
+            let op = if stop { NetworkOp::Stop } else { NetworkOp::Disconnect { peer_id: id.to_string() } };
+            manager.command(Envelope { op, reply }).await;
+            received.await.unwrap().unwrap();
+            assert!(manager.offline_targets.is_empty());
+            assert!(manager.peers.values().all(|p| p.pending.is_none() && p.session.is_none()));
+        }
+    }
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    #[tokio::test]
+    async fn offline_during_rebind_keeps_unrestored_reconnect_intent() {
+        let mut manager = Manager::new(NetworkProfile::Local { relay: None }, EventBus::new());
+        let id = SecretKey::generate().public();
+        manager.peers.insert(id.to_string(), inactive_peer(id));
+        manager.offline_targets.insert(id.to_string(), id.into());
+        manager.info.state = NetworkState::Starting;
+        let (reply, received) = oneshot::channel();
+        manager.command(Envelope { op: NetworkOp::SetOffline { offline: true }, reply }).await;
+        received.await.unwrap().unwrap();
+        assert!(manager.offline_targets.contains_key(&id.to_string()));
+    }
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    #[tokio::test]
+    async fn local_config_cannot_replace_public_starting_or_online_profile() {
+        let mut manager = Manager::new(NetworkProfile::Public, EventBus::new());
+        for state in [
+            NetworkState::Starting,
+            NetworkState::Online,
+            NetworkState::Failed,
+        ] {
+            manager.info.state = state;
+            let (reply, received) = oneshot::channel();
+            manager
+                .command(Envelope {
+                    op: NetworkOp::ConfigureLocal { relay: None },
+                    reply,
+                })
+                .await;
+            assert_eq!(
+                received.await.unwrap().unwrap_err().code,
+                ErrorCode::InvalidConfig
+            );
+            assert!(matches!(manager.profile, NetworkProfile::Public));
+            assert!(manager.endpoint.is_none());
         }
     }
     fn inactive_peer(id: iroh::EndpointId) -> Peer {

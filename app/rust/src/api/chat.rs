@@ -177,3 +177,8 @@ pub fn events(sink: StreamSink<ChatEvent>) -> Result<(), CoreError> {
     BUS.subscribe(Arc::new(FrbSink(sink)));
     Ok(())
 }
+
+/// Debug control startup waits until this core has an isolated Local profile.
+pub async fn test_hooks_start(control_url: String, name: String) -> Result<(), CoreError> {
+    CORE.test_hooks_start(control_url, name).await.map_err(CoreError::from)
+}

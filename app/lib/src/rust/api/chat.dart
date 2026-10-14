@@ -37,6 +37,15 @@ Future<void> networkStop() => RustLib.instance.api.crateApiChatNetworkStop();
 /// The single event stream of the UI (design 12.2 rule 1).
 Stream<ChatEvent> events() => RustLib.instance.api.crateApiChatEvents();
 
+/// Debug control startup waits until this core has an isolated Local profile.
+Future<void> testHooksStart({
+  required String controlUrl,
+  required String name,
+}) => RustLib.instance.api.crateApiChatTestHooksStart(
+  controlUrl: controlUrl,
+  name: name,
+);
+
 @freezed
 sealed class ChatEvent with _$ChatEvent {
   const ChatEvent._();

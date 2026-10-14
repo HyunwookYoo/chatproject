@@ -38,10 +38,16 @@ struct RunningCore {
     info: CoreInfo,
     network: NetworkHandle,
     runtime: Option<Runtime>,
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    hooks: Arc<crate::puppet::HookState>,
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    bus: EventBus,
 }
 
 impl Drop for RunningCore {
     fn drop(&mut self) {
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        self.hooks.cancel.cancel();
         if let Some(runtime) = self.runtime.take() {
             runtime.shutdown_background();
         }
@@ -91,8 +97,25 @@ impl CoreSlot {
             info: info.clone(),
             network,
             runtime: Some(runtime),
+            #[cfg(all(feature = "test-hooks", debug_assertions))]
+            hooks: Arc::default(),
+            #[cfg(all(feature = "test-hooks", debug_assertions))]
+            bus: bus.clone(),
         }));
         Ok(info)
+    }
+
+    #[cfg(not(all(feature = "test-hooks", debug_assertions)))]
+    pub async fn test_hooks_start(&self, _control_url: String, _name: String) -> Result<(), CoreError> {
+        Err(CoreError::new(ErrorCode::NotAvailable, "test hooks are disabled"))
+    }
+
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    pub async fn test_hooks_start(&self, control_url: String, name: String) -> Result<(), CoreError> {
+        let core = self.running.lock().expect("core slot lock poisoned").clone()
+            .ok_or_else(|| CoreError::new(ErrorCode::CoreNotStarted, "core not started"))?;
+        crate::puppet::start(core.runtime.as_ref().unwrap().handle(), core.hooks.clone(),
+            core.network.clone(), core.bus.clone(), core.info.instance_id.clone(), control_url, name).await
     }
 
     pub fn info(&self) -> Option<CoreInfo> {

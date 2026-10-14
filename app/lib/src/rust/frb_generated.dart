@@ -66,7 +66,7 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
   String get codegenVersion => '2.11.1';
 
   @override
-  int get rustContentHash => -93924083;
+  int get rustContentHash => -629877347;
 
   static const kDefaultExternalLibraryLoaderConfig =
       ExternalLibraryLoaderConfig(
@@ -98,6 +98,11 @@ abstract class RustLibApi extends BaseApi {
   Future<void> crateApiChatSendProbeText({
     required String peerId,
     required String text,
+  });
+
+  Future<void> crateApiChatTestHooksStart({
+    required String controlUrl,
+    required String name,
   });
 }
 
@@ -387,6 +392,40 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   TaskConstMeta get kCrateApiChatSendProbeTextConstMeta => const TaskConstMeta(
     debugName: "send_probe_text",
     argNames: ["peerId", "text"],
+  );
+
+  @override
+  Future<void> crateApiChatTestHooksStart({
+    required String controlUrl,
+    required String name,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(controlUrl, serializer);
+          sse_encode_String(name, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 11,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_unit,
+          decodeErrorData: sse_decode_core_error,
+        ),
+        constMeta: kCrateApiChatTestHooksStartConstMeta,
+        argValues: [controlUrl, name],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiChatTestHooksStartConstMeta => const TaskConstMeta(
+    debugName: "test_hooks_start",
+    argNames: ["controlUrl", "name"],
   );
 
   @protected

@@ -12,3 +12,6 @@ pub use runtime::{CORE_VERSION, CoreConfig, CoreInfo, CoreSlot};
 pub use transport::{
     NetworkHandle, NetworkInfo, NetworkOp, NetworkReply, NetworkState, PeerInfo, PeerPath, PeerPhase,
 };
+
+#[cfg(all(feature = "test-hooks", debug_assertions))]
+pub mod puppet;
