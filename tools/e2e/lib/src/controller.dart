@@ -49,6 +49,7 @@ class Controller {
   final _waiting = <String, List<Completer<Participant>>>{};
   final _sequences = SequenceGuard();
   Object? _failure;
+  Object? _cleanupFailure;
   bool _closed = false;
   Future<void>? _closing;
   int _connectionId = 0;
@@ -105,7 +106,7 @@ class Controller {
             _detach(connection, StateError('participant disconnected')),
       );
     } catch (error) {
-      if (!_closed) _fail(error);
+      _fail(error);
     }
   }
 
@@ -122,6 +123,7 @@ class Controller {
   }
 
   void _receive(_Connection connection, Object? raw) {
+    if (_closed) return;
     try {
       // Obsolete sockets are logged but cannot inspect or mutate current state.
       _record(connection, 'received', raw);
@@ -130,7 +132,7 @@ class Controller {
           !identical(_participants[participant.name], participant)) {
         return;
       }
-      if (_failure != null || _closed) return;
+      if (_failure != null) return;
       final record = WireRecord.parse(raw);
       if (participant == null) {
         if (record is! HelloRecord) throw StateError('protocol expected hello');
@@ -195,7 +197,11 @@ class Controller {
   }
 
   void _fail(Object error) {
-    if (_failure != null || _closed) return;
+    if (_closed) {
+      _cleanupFailure ??= error;
+      return;
+    }
+    if (_failure != null) return;
     _failure = error;
     for (final participant in _participants.values) {
       participant._end(error);
@@ -223,12 +229,11 @@ class Controller {
       }
     }
     _waiting.clear();
-    Object? cleanupError;
     Future<void> clean(Future<void> Function() operation) async {
       try {
         await operation();
       } catch (error) {
-        cleanupError ??= error;
+        _cleanupFailure ??= error;
       }
     }
 
@@ -250,7 +255,7 @@ class Controller {
       _log.closeSync();
     });
     if (_failure != null) throw _failure!;
-    if (cleanupError != null) throw cleanupError!;
+    if (_cleanupFailure != null) throw _cleanupFailure!;
   }
 }
 
