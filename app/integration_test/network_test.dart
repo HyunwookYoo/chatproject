@@ -12,9 +12,11 @@ void main() {
   IntegrationTestWidgetsFlutterBinding.ensureInitialized();
 
   late Directory dataDir;
+  late FrbCoreClient client;
   setUpAll(() async {
     await RustLib.init();
     dataDir = await Directory.systemTemp.createTemp('chat_network_it_');
+    client = FrbCoreClient(dataDir: dataDir.path);
   });
   tearDownAll(() => dataDir.delete(recursive: true));
 
@@ -48,7 +50,6 @@ void main() {
   });
 
   test('Frb client shares one stream and repeated start publishes no extra state', () async {
-    final client = FrbCoreClient(dataDir: dataDir.path);
     final stream = client.events();
     expect(identical(stream, client.events()), isTrue);
     final first = <ChatEvent>[];
@@ -129,4 +130,138 @@ void main() {
       await serverSubscription.cancel();
     }
   });
+
+  test('real node messages are fresh after UI listeners are removed and resubscribed', () async {
+    final executable = File('${Directory.current.parent.path}/target/debug/chat_node${Platform.isWindows ? '.exe' : ''}');
+    expect(executable.existsSync(), isTrue,
+        reason: 'Build chat_node with cargo build -p chat_node --features harness first');
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 47000);
+    final participants = <String, Completer<_Participant>>{
+      'flutter-messages': Completer<_Participant>(),
+      'node-messages': Completer<_Participant>(),
+    };
+    final serverSubscription = server.listen((request) async {
+      final socket = await WebSocketTransformer.upgrade(request);
+      final participant = _Participant(socket, (name, participant) {
+        participants[name]!.complete(participant);
+      });
+      participant.configure();
+    });
+    final nodeDir = await Directory.systemTemp.createTemp('chat_message_node_');
+    Process? relay;
+    Process? node;
+    _Participant? appControl;
+    _Participant? nodeControl;
+    StreamSubscription<ChatEvent>? uiSubscription;
+    try {
+      relay = await Process.start(executable.path, ['relay', '--bind', '127.0.0.1:3340']);
+      final relayOutput = relay.stdout.transform(utf8.decoder).transform(const LineSplitter());
+      final ready = await relayOutput.first.timeout(const Duration(seconds: 10));
+      expect(jsonDecode(ready), {'type': 'ready', 'role': 'relay'});
+      relay.stderr.drain<void>();
+      await testHooksStart(controlUrl: 'ws://127.0.0.1:47000', name: 'flutter-messages');
+      appControl = await participants['flutter-messages']!.future.timeout(const Duration(seconds: 10));
+      node = await Process.start(executable.path, [
+        'puppet', '--control-url', 'ws://127.0.0.1:47000',
+        '--name', 'node-messages', '--data-dir', nodeDir.path,
+      ]);
+      node.stdout.drain<void>();
+      node.stderr.drain<void>();
+      nodeControl = await participants['node-messages']!.future.timeout(const Duration(seconds: 10));
+      await client.startNetwork();
+      await nodeControl.rpc('network_start', {});
+      final deadline = DateTime.now().add(const Duration(seconds: 15));
+      while ((await client.networkInfo()).state != NetworkState.online ||
+          (await nodeControl.rpc('network_info', {}))['state'] != 'Online') {
+        if (DateTime.now().isAfter(deadline)) fail('Local message endpoints did not become ready');
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+      }
+      final appInfo = await client.networkInfo();
+      await nodeControl.rpc('connect_peer', {'target': appInfo.ticket});
+      final firstBodies = <String>[];
+      final firstReceived = Completer<void>();
+      uiSubscription = client.events().listen((event) {
+        if (event is ChatEvent_ProbeTextReceived) {
+          firstBodies.add(event.text);
+          if (!firstReceived.isCompleted) firstReceived.complete();
+        }
+      });
+      await nodeControl.rpc('send_probe_text', {'peer_id': appInfo.endpointId, 'text': 'first real body 안녕'});
+      await firstReceived.future.timeout(const Duration(seconds: 10));
+      expect(firstBodies, ['first real body 안녕']);
+      // This is the same cached UI broadcast, with an ordinary listener cancel.
+      // Its permanent native subscription stays alive across page lifecycles.
+      await uiSubscription.cancel().timeout(const Duration(seconds: 5));
+      final laterBodies = <String>[];
+      final freshReceived = Completer<void>();
+      uiSubscription = client.events().listen((event) {
+        if (event is ChatEvent_ProbeTextReceived) {
+          laterBodies.add(event.text);
+          if (!freshReceived.isCompleted) freshReceived.complete();
+        }
+      });
+      // Also exercise a new raw native subscription with the real fresh body.
+      // Cancel at its yielded message to respect FRB2.11.1's async* lifecycle.
+      final rawFresh = events().where((event) => event is ChatEvent_ProbeTextReceived).first;
+      await nodeControl.rpc('send_probe_text', {'peer_id': appInfo.endpointId, 'text': 'fresh real body 새 글'});
+      await freshReceived.future.timeout(const Duration(seconds: 10));
+      expect(laterBodies, ['fresh real body 새 글']);
+      expect((await rawFresh.timeout(const Duration(seconds: 10)) as ChatEvent_ProbeTextReceived).text,
+          'fresh real body 새 글');
+      expect(firstBodies, ['first real body 안녕']);
+      await nodeControl.rpc('network_stop', {});
+    } finally {
+      for (final process in [node, relay]) {
+        process?.kill();
+      }
+      // Attempt all owned cleanup even if cancellation or a close fails.
+      try {
+        await Future.wait<void>([
+          if (uiSubscription != null) uiSubscription.cancel().timeout(const Duration(seconds: 5)),
+          networkStop().timeout(const Duration(seconds: 10)),
+          if (appControl != null) appControl.close(),
+          if (nodeControl != null) nodeControl.close(),
+          for (final process in [node, relay])
+            if (process != null) process.exitCode.timeout(const Duration(seconds: 10)).then((_) {}),
+          server.close(force: true).then((_) {}),
+          serverSubscription.cancel(),
+        ]);
+      } finally {
+        await nodeDir.delete(recursive: true);
+      }
+    }
+  });
+}
+
+class _Participant {
+  _Participant(this.socket, void Function(String, _Participant) hello) {
+    subscription = socket.listen((data) {
+      final record = jsonDecode(data as String) as Map<String, dynamic>;
+      if (record['type'] == 'hello') hello(record['name'] as String, this);
+      if (record['type'] == 'result') pending.remove(record['id'])!.complete(record);
+    }, onDone: () {
+      for (final request in pending.values) {
+        request.completeError(StateError('participant disconnected'));
+      }
+      pending.clear();
+    });
+  }
+  final WebSocket socket;
+  late final StreamSubscription<dynamic> subscription;
+  final pending = <int, Completer<Map<String, dynamic>>>{};
+  var nextId = 0;
+  void configure() => socket.add(jsonEncode({'type': 'config', 'relay': 'http://127.0.0.1:3340'}));
+  Future<dynamic> rpc(String op, Map<String, dynamic> args) async {
+    final id = ++nextId;
+    final result = Completer<Map<String, dynamic>>();
+    pending[id] = result;
+    socket.add(jsonEncode({'type': 'cmd', 'id': id, 'op': op, 'args': args}));
+    final record = await result.future.timeout(const Duration(seconds: 15));
+    expect(record['ok'], isTrue, reason: 'real node RPC $op must succeed');
+    return record['value'];
+  }
+  Future<void> close() async {
+    await socket.close().timeout(const Duration(seconds: 5));
+    await subscription.cancel();
+  }
 }
