@@ -3,9 +3,47 @@ import 'dart:convert';
 import 'dart:async';
 import 'dart:mirrors';
 
+import '../bin/run.dart' as harness;
+
 import 'package:chat_e2e/src/owned_resources.dart';
 import 'package:chat_e2e/src/process_runner.dart';
 import 'package:test/test.dart';
+
+// The only simulated I/O is the selected stdin failure. Child lifetime,
+// stdout/stderr, PID and socket protocol remain those of the real Process.
+class InputFaultProcess implements Process {
+  InputFaultProcess(this.real, this.stdin);
+  final Process real;
+  @override
+  final IOSink stdin;
+  @override
+  int get pid => real.pid;
+  @override
+  Future<int> get exitCode => real.exitCode;
+  @override
+  Stream<List<int>> get stdout => real.stdout;
+  @override
+  Stream<List<int>> get stderr => real.stderr;
+  @override
+  bool kill([ProcessSignal signal = ProcessSignal.sigterm]) => real.kill(signal);
+}
+
+class FaultInput implements IOSink {
+  FaultInput(this.real, this.primary, this.stack, this.writeFailure);
+  final IOSink real;
+  final Object primary;
+  final StackTrace stack;
+  final bool writeFailure;
+  @override
+  void write(Object? value) {
+    if (writeFailure) Error.throwWithStackTrace(primary, stack);
+    real.write(value);
+  }
+  @override
+  Future<void> close() => Future<void>.error(primary, stack);
+  @override
+  dynamic noSuchMethod(Invocation invocation) => throw UnsupportedError('Unexpected fixture input operation');
+}
 
 void main() {
   late Directory logs;
@@ -14,6 +52,169 @@ void main() {
   });
   tearDown(() async {
     await logs.delete(recursive: true);
+  });
+
+  for (final writeFailure in [false, true]) {
+    for (final diagnosticCollision in [false, true]) {
+      test('failed stdin ${writeFailure ? 'write' : 'close'} and reclaim retain child${diagnosticCollision ? ' despite diagnostic collision' : ''}', () async {
+        final portFile = File('${logs.path}/live-port');
+        final script = File('${logs.path}/live.dart')..writeAsStringSync('''
+import 'dart:convert';
+import 'dart:io';
+Future<void> main(List<String> args) async {
+  final server = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+  stdout.writeln('real child alive');
+  File(args[0]).writeAsStringSync('\${server.port}');
+  server.listen((socket) { socket.listen((bytes) {
+    if (utf8.decode(bytes) == 'exit') exit(0);
+    socket.add(utf8.encode('alive'));
+  }); });
+}
+''');
+        final real = await Process.start(Platform.resolvedExecutable, [script.path, portFile.path]);
+        final primary = StateError('controlled input failure');
+        final primaryStack = StackTrace.current;
+        final delegated = InputFaultProcess(real, FaultInput(real.stdin, primary, primaryStack, writeFailure));
+        final library = reflectClass(IoProcessRunner).owner as LibraryMirror;
+        final ownedType = library.declarations[MirrorSystem.getSymbol('_IoOwnedProcess', library)] as ClassMirror;
+        // Deliberately use the existing constructor without identity capture.
+        // Windows therefore fails closed naturally, without private field edits.
+        final owned = ownedType.newInstance(const Symbol(''), [delegated, logs]).reflectee as OwnedProcess;
+        final runLibrary = (reflect(harness.main) as ClosureMirror).function.owner as LibraryMirror;
+        final runType = runLibrary.declarations[MirrorSystem.getSymbol('_Run', runLibrary)] as ClassMirror;
+        final runner = runType.newInstance(const Symbol(''), [logs]).reflectee as dynamic;
+        final remaining = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+        final remainingPort = remaining.port;
+        runner.owned.add('remaining socket', () async { await remaining.close(); });
+        int? port;
+        final diagnostic = File('${logs.path}/${real.pid}.start-failure.json');
+        try {
+          final deadline = DateTime.now().add(const Duration(seconds: 5));
+          while (!portFile.existsSync()) {
+            if (DateTime.now().isAfter(deadline)) fail('real child readiness deadline');
+            await Future<void>.delayed(const Duration(milliseconds: 10));
+          }
+          port = int.parse(portFile.readAsStringSync());
+          if (diagnosticCollision) Directory(diagnostic.path).createSync();
+          Object? failure;
+          try {
+            await (library.invoke(MirrorSystem.getSymbol('_finishManagedStart', library),
+                [delegated, owned, 'no\n', logs, Platform.resolvedExecutable]).reflectee as Future<OwnedProcess>);
+          } catch (error) { failure = error; }
+          if (!diagnosticCollision) {
+            expect(diagnostic.existsSync(), isTrue, reason: 'failed live-child reclamation must leave ownership diagnostics');
+            final record = jsonDecode(diagnostic.readAsStringSync()) as Map;
+            expect(record['pid'], real.pid);
+            expect(record['path'], Platform.resolvedExecutable);
+            expect(record['primary'], primary.toString());
+            expect(record['cleanup'], contains('identity unavailable'));
+          }
+          final handoff = failure as dynamic;
+          expect(handoff.primary, same(primary));
+          expect(handoff.primaryStack.toString(), primaryStack.toString());
+          expect(handoff.process, same(owned));
+          expect(handoff.cleanupFailure, isA<StateError>());
+          if (diagnosticCollision) {
+            expect(handoff.diagnosticFailure, isA<FileSystemException>());
+            expect(handoff.toString(), contains('diagnostic write failed'));
+          } else { expect(handoff.diagnosticFailure, isNull); }
+          Object? caughtPrimary;
+          StackTrace? caughtStack;
+          try { runner.retainStartFailure(handoff, Platform.resolvedExecutable, null, false); }
+          catch (error, stack) { caughtPrimary = error; caughtStack = stack; }
+          expect(caughtPrimary, same(primary));
+          expect(caughtStack.toString(), primaryStack.toString());
+          await runner.stopMonitors();
+          await runner.unwind();
+          final failures = await runner.owned.close();
+          expect(failures, hasLength(1));
+          expect(failures.single, contains('identity unavailable'));
+          expect(runner.cleanupFailures, contains(contains('startup stop:')));
+          if (diagnosticCollision) expect(runner.cleanupFailures, contains(contains('startup diagnostic:')));
+          final record = jsonDecode(File('${logs.path}/ownership.json').readAsStringSync()) as Map;
+          expect((record['processes'] as List).single['pid'], real.pid);
+          final ping = await Socket.connect(InternetAddress.loopbackIPv4, port);
+          ping.write('ping');
+          expect(utf8.decode(await ping.first.timeout(const Duration(seconds: 2))), 'alive');
+          ping.destroy();
+          await expectLater(Socket.connect(InternetAddress.loopbackIPv4, remainingPort), throwsA(isA<SocketException>()));
+          final stopping = owned.stop();
+          expect(owned.stop(), same(stopping));
+          await expectLater(stopping, throwsA(same(handoff.cleanupFailure)));
+          await expectLater(runner.command(Platform.resolvedExecutable, ['--version']), throwsA(isA<RunCancelled>()));
+        } finally {
+          if (port == null && portFile.existsSync()) port = int.parse(portFile.readAsStringSync());
+          if (port != null) {
+            final exitSocket = await Socket.connect(InternetAddress.loopbackIPv4, port);
+            exitSocket.write('exit');
+            await exitSocket.flush();
+            exitSocket.destroy();
+          }
+          await real.exitCode.timeout(const Duration(seconds: 5));
+          await owned.exitCode.timeout(const Duration(seconds: 5));
+          try { await real.stdin.close(); } catch (_) { /* fixture already exited */ }
+          await runner.owned.close();
+          await remaining.close();
+        }
+      }, skip: Platform.isWindows ? false : 'Controlled missing Windows identity is a Windows-only fault boundary.');
+    }
+  }
+
+  test('real managed start preserves ordinary broken-pipe stdin failure with reclaimed child', () async {
+    final ready = File('${logs.path}/closed-stdin.json');
+    final source = File('${logs.path}/closed_stdin.dart')..writeAsStringSync('''
+import 'dart:async';
+import 'dart:convert';
+import 'dart:ffi';
+import 'dart:io';
+Future<void> main(List<String> args) async {
+  final server = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+  File(args[0]).writeAsStringSync(jsonEncode({'port': server.port, 'pid': pid}));
+  if (Platform.isWindows) {
+    final kernel = DynamicLibrary.open('kernel32.dll');
+    final getHandle = kernel.lookupFunction<IntPtr Function(Int32), int Function(int)>('GetStdHandle');
+    final closeHandle = kernel.lookupFunction<Int32 Function(IntPtr), int Function(int)>('CloseHandle');
+    if (closeHandle(getHandle(-10)) == 0) throw StateError('fixture stdin close failed');
+  } else {
+    final close = DynamicLibrary.process().lookupFunction<Int32 Function(Int32), int Function(int)>('close');
+    if (close(0) != 0) throw StateError('fixture stdin close failed');
+  }
+  server.listen((socket) { socket.listen((_) => exit(0)); });
+  Timer(const Duration(seconds: 15), () => exit(3));
+}
+''');
+    Object? failure;
+    OwnedProcess? unexpectedSuccess;
+    try {
+      unexpectedSuccess = await const IoProcessRunner().start(Platform.resolvedExecutable, [source.path, ready.path],
+          logDir: logs, stdin: 'x' * (1024 * 1024)).timeout(const Duration(seconds: 10));
+    } catch (error) { failure = error; }
+    try {
+      expect(failure, isA<SocketException>());
+      expect(ready.existsSync(), isTrue);
+      final record = jsonDecode(ready.readAsStringSync()) as Map;
+      await expectLater(Socket.connect(InternetAddress.loopbackIPv4, record['port'] as int), throwsA(isA<SocketException>()));
+      if (Platform.isWindows) {
+        final lookup = await Process.run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
+          'if (Get-Process -Id ${record['pid']} -ErrorAction SilentlyContinue) { exit 0 }; exit 3']);
+        expect(lookup.exitCode, 3, reason: 'the exact fixture native child must already have exited');
+      } else if (Platform.isLinux) {
+        expect(Directory('/proc/${record['pid']}').existsSync(), isFalse);
+      }
+      expect(logs.listSync().where((f) => f.path.endsWith('.start-failure.json')), isEmpty);
+    } finally {
+      if (ready.existsSync()) {
+        final record = jsonDecode(ready.readAsStringSync()) as Map;
+        try {
+          final release = await Socket.connect(InternetAddress.loopbackIPv4, record['port'] as int);
+          release.write('exit');
+          await release.flush();
+          release.destroy();
+        } on SocketException { /* already reclaimed */ }
+      }
+      await unexpectedSuccess?.stop();
+      if (failure is OwnedProcessStartFailure) await failure.process.exitCode.timeout(const Duration(seconds: 5));
+    }
   });
 
   test('managed stdin reaches a real child before EOF and logs are flushed', () async {

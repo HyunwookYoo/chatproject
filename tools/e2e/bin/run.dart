@@ -423,7 +423,19 @@ Future<void> main(List<String> arguments) async {
       'Run status: $code. Private diagnostics: build/e2e/<run>/$profile.',
     );
   }
-  exitCode = code;
+  // A failed verified stop may leave native pipe subscriptions alive. All
+  // admitted work and cleanup have finished; retained ownership stays explicit.
+  try {
+    await stdout.flush();
+    await stderr.flush();
+  } catch (error) {
+    if (code == 0) code = 1;
+    File(
+      p.join(logs.path, 'terminal-flush.log'),
+    ).writeAsStringSync('$error', flush: true);
+  } finally {
+    exit(code);
+  }
 }
 
 class _Run extends IoProcessRunner {
@@ -442,7 +454,8 @@ class _Run extends IoProcessRunner {
   final mappings = <Map<String, Object?>>[];
   final cleanupFailures = <String>[];
   final fatal = Completer<Never>();
-  final pending = <Future<dynamic>>{};
+  final bodies = <Future<dynamic>>{};
+  final acquisitions = <Future<OwnedProcess>>{};
   final monitorStops = <Completer<void>>[];
   final monitorTasks = <Future<void>>[];
   Future<void>? _monitorClosing;
@@ -487,19 +500,24 @@ class _Run extends IoProcessRunner {
     Future<T> work, {
     Duration timeout = const Duration(seconds: 30),
     bool cleanup = false,
+    bool nativeLifetime = false,
   }) async {
     if (cleanup) return work.timeout(timeout);
-    pending.add(work);
-    unawaited(
-      work.then<void>(
-        (_) {
-          pending.remove(work);
-        },
-        onError: (Object _, StackTrace _) {
-          pending.remove(work);
-        },
-      ),
-    );
+    // A native lifetime may never finish after failed stop/output draining.
+    // Only body continuations can acquire resources and must be drained.
+    if (!nativeLifetime) {
+      bodies.add(work);
+      unawaited(
+        work.then<void>(
+          (_) {
+            bodies.remove(work);
+          },
+          onError: (Object _, StackTrace _) {
+            bodies.remove(work);
+          },
+        ),
+      );
+    }
     try {
       token.check();
       return await Future.any<T>([
@@ -514,9 +532,9 @@ class _Run extends IoProcessRunner {
   }
 
   Future<void> unwind() async {
-    while (pending.isNotEmpty) {
+    while (bodies.isNotEmpty || acquisitions.isNotEmpty) {
       await Future.wait(
-        pending.toList().map(
+        [...bodies, ...acquisitions].map(
           (f) => f.then<void>((_) {}, onError: (Object _, StackTrace _) {}),
         ),
       );
@@ -539,23 +557,58 @@ class _Run extends IoProcessRunner {
     String? stdin,
     bool persistent = false,
     bool cleanup = false,
-  }) async {
+  }) {
     if (!cleanup) {
       token.check();
       if (finishing) throw RunCancelled();
     }
+    final acquisition = _acquire(
+      executable,
+      args,
+      cwd: cwd,
+      stdin: stdin,
+      persistent: persistent,
+      cleanup: cleanup,
+    );
+    acquisitions.add(acquisition);
+    unawaited(
+      acquisition.then<void>(
+        (_) {
+          acquisitions.remove(acquisition);
+        },
+        onError: (Object _, StackTrace _) {
+          acquisitions.remove(acquisition);
+        },
+      ),
+    );
+    return acquisition;
+  }
+
+  Future<OwnedProcess> _acquire(
+    String executable,
+    List<String> args, {
+    String? cwd,
+    String? stdin,
+    required bool persistent,
+    required bool cleanup,
+  }) async {
     File(p.join(logs.path, 'commands.jsonl')).writeAsStringSync(
       '${jsonEncode({'at': DateTime.now().toUtc().toIso8601String(), 'executable': executable, 'args': args, 'cwd': cwd})}\n',
       mode: FileMode.append,
       flush: true,
     );
-    final process = await super.start(
-      executable,
-      args,
-      logDir: logs,
-      workingDirectory: cwd,
-      stdin: stdin,
-    );
+    final OwnedProcess process;
+    try {
+      process = await super.start(
+        executable,
+        args,
+        logDir: logs,
+        workingDirectory: cwd,
+        stdin: stdin,
+      );
+    } on OwnedProcessStartFailure catch (failure) {
+      retainStartFailure(failure, executable, cwd, cleanup);
+    }
     active.add(process);
     processes.add({'pid': process.pid, 'path': executable, 'cwd': cwd});
     try {
@@ -589,6 +642,28 @@ class _Run extends IoProcessRunner {
     }
     if (!cleanup) token.check();
     return process;
+  }
+
+  Never retainStartFailure(
+    OwnedProcessStartFailure failure,
+    String executable,
+    String? cwd,
+    bool cleanup,
+  ) {
+    final process = failure.process;
+    active.add(process);
+    processes.add({'pid': process.pid, 'path': executable, 'cwd': cwd});
+    cleanupFailures.add('startup stop: ${failure.cleanupFailure}');
+    if (failure.diagnosticFailure != null) {
+      cleanupFailures.add('startup diagnostic: ${failure.diagnosticFailure}');
+    }
+    try {
+      if (!cleanup) owned.add('failed startup process', () => stop(process));
+      save();
+    } catch (error) {
+      cleanupFailures.add('startup ownership: $error');
+    }
+    Error.throwWithStackTrace(failure.primary, failure.primaryStack);
   }
 
   @override
@@ -663,6 +738,7 @@ class _Run extends IoProcessRunner {
         process.exitCode,
         timeout: timeout,
         cleanup: cleanup,
+        nativeLifetime: true,
       );
       final result = ProcessResult(
         process.pid,

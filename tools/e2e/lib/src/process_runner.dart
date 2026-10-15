@@ -10,6 +10,21 @@ abstract interface class OwnedProcess {
   Future<void> stop();
 }
 
+/// A failed input operation whose exact owned child could not be reclaimed.
+/// Callers retain [process] for cleanup and preserve [primary] as their failure.
+class OwnedProcessStartFailure implements Exception {
+  OwnedProcessStartFailure(this.primary, this.primaryStack, this.process,
+      this.cleanupFailure, this.diagnosticFailure);
+  final Object primary;
+  final StackTrace primaryStack;
+  final OwnedProcess process;
+  final Object cleanupFailure;
+  final Object? diagnosticFailure;
+  @override
+  String toString() => '$primary; owned startup cleanup failed: $cleanupFailure'
+      '${diagnosticFailure == null ? '' : '; diagnostic write failed: $diagnosticFailure'}';
+}
+
 class _IoOwnedProcess implements OwnedProcess {
   _IoOwnedProcess(this._process, Directory logDir, {bool fileBacked = false}) {
     final out = fileBacked ? _process.stdout.drain<void>() : _process.stdout.pipe(File(p.join(logDir.path, '$pid.stdout.log')).openWrite());
@@ -106,6 +121,7 @@ try {
 /// Runs external programs. Tests swap in a fake so they never touch real devices.
 abstract interface class ProcessRunner {
   /// Retains the child handle and drains both output streams into [logDir].
+  /// Failed input plus failed reclamation throws [OwnedProcessStartFailure].
   Future<OwnedProcess> start(String executable, List<String> arguments, {required Directory logDir, String? workingDirectory, String? stdin, bool retainOutput = false});
   /// Runs [executable] to completion and returns its output.
   Future<ProcessResult> run(String executable, List<String> arguments, {String? stdin, String? workingDirectory});
@@ -131,14 +147,7 @@ class IoProcessRunner implements ProcessRunner {
         : await Process.start(executable, arguments, workingDirectory: workingDirectory, runInShell: batch);
     final owned = _IoOwnedProcess(process, logDir, fileBacked: retainOutput);
     await owned._captureWindowsIdentity();
-    try {
-      if (stdin != null) process.stdin.write(stdin);
-      await process.stdin.close();
-    } catch (error, stack) {
-      try { await owned.stop(); } catch (_) { /* preserve input failure */ }
-      Error.throwWithStackTrace(error, stack);
-    }
-    return owned;
+    return _finishManagedStart(process, owned, stdin, logDir, executable);
   }
 
   Future<Process> _startFileBacked(String executable, List<String> arguments, Directory logDir, String? workingDirectory) {
@@ -220,4 +229,26 @@ exit \$code
         workingDirectory: workingDirectory, runInShell: Platform.isWindows, mode: ProcessStartMode.inheritStdio);
     return process.exitCode;
   }
+}
+
+Future<OwnedProcess> _finishManagedStart(Process process, _IoOwnedProcess owned,
+    String? input, Directory logDir, String executable) async {
+  try {
+    if (input != null) process.stdin.write(input);
+    await process.stdin.close();
+  } catch (error, stack) {
+    try {
+      await owned.stop();
+    } catch (cleanup) {
+      Object? diagnosticFailure;
+      try {
+        File(p.join(logDir.path, '${owned.pid}.start-failure.json')).writeAsStringSync(
+          jsonEncode({'kind': 'failed_start', 'pid': owned.pid, 'path': executable,
+            'primary': error.toString(), 'cleanup': cleanup.toString()}), flush: true);
+      } catch (recordError) { diagnosticFailure = recordError; }
+      throw OwnedProcessStartFailure(error, stack, owned, cleanup, diagnosticFailure);
+    }
+    Error.throwWithStackTrace(error, stack);
+  }
+  return owned;
 }

@@ -260,6 +260,127 @@ class FakeCore {
 void main() {
   const short = Duration(milliseconds: 40);
   test(
+    'failed inherited drain retains ownership but never blocks remaining cleanup',
+    () async {
+      final logs = await Directory.systemTemp.createTemp(
+        'scenario-stalled-lifetime-',
+      );
+      final library =
+          (reflect(harness.main) as ClosureMirror).function.owner
+              as LibraryMirror;
+      final type =
+          library.declarations[MirrorSystem.getSymbol('_Run', library)]
+              as ClassMirror;
+      final runner =
+          type.newInstance(const Symbol(''), [logs]).reflectee as dynamic;
+      final release = File('${logs.path}/release');
+      final source = File('${logs.path}/inherited.dart')
+        ..writeAsStringSync('''
+import 'dart:async';
+import 'dart:io';
+Future<void> main(List<String> args) async {
+  if (args[0] == 'parent') {
+    await Process.start(Platform.resolvedExecutable,
+      [Platform.script.toFilePath(), 'descendant', args[1]],
+      mode: ProcessStartMode.inheritStdio);
+    exit(0);
+  }
+  stdout.writeln('descendant retains output');
+  final deadline = DateTime.now().add(const Duration(seconds: 30));
+  while (!File(args[1]).existsSync() && DateTime.now().isBefore(deadline)) {
+    await Future<void>.delayed(const Duration(milliseconds: 10));
+  }
+}
+''');
+      final controller = await Controller.start(
+        port: 0,
+        logDir: Directory('${logs.path}/controller'),
+      );
+      final holder = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+      final controllerPort = controller.port, holderPort = holder.port;
+      runner.owned.add('controller', controller.close);
+      runner.owned.add('socket', () async {
+        await holder.close();
+      });
+      final command = runner.command(Platform.resolvedExecutable, [
+        source.path,
+        'parent',
+        release.path,
+      ], timeout: const Duration(seconds: 1));
+      try {
+        await expectLater(
+          command,
+          throwsA(
+            isA<TimeoutException>().having(
+              (e) => e.duration,
+              'primary command deadline',
+              const Duration(seconds: 1),
+            ),
+          ),
+        );
+        await runner.stopMonitors();
+        // Safety deadlines cannot satisfy the following production-result checks.
+        await runner.unwind().timeout(const Duration(seconds: 2));
+        final failures = await runner.owned.close().timeout(
+          const Duration(seconds: 2),
+        );
+        expect(failures, hasLength(1));
+        expect(
+          failures.single,
+          contains('TimeoutException after 0:00:05.000000'),
+        );
+        expect(
+          runner.cleanupFailures,
+          contains(contains('command stop: TimeoutException')),
+        );
+        await expectLater(
+          Socket.connect(InternetAddress.loopbackIPv4, controllerPort),
+          throwsA(isA<SocketException>()),
+        );
+        await expectLater(
+          Socket.connect(InternetAddress.loopbackIPv4, holderPort),
+          throwsA(isA<SocketException>()),
+        );
+        final record =
+            jsonDecode(File('${logs.path}/ownership.json').readAsStringSync())
+                as Map;
+        expect(record['processes'], hasLength(1));
+        final owned = runner.active.single;
+        final stopping = owned.stop();
+        expect(owned.stop(), same(stopping));
+        await expectLater(
+          stopping,
+          throwsA(
+            isA<TimeoutException>().having(
+              (e) => e.duration,
+              'cached drain failure',
+              const Duration(seconds: 5),
+            ),
+          ),
+        );
+        await expectLater(
+          runner.command(Platform.resolvedExecutable, ['--version']),
+          throwsA(isA<RunCancelled>()),
+        );
+      } finally {
+        release.writeAsStringSync('release');
+        try {
+          await command;
+        } catch (_) {
+          /* primary checked above */
+        }
+        await runner.unwind().timeout(const Duration(seconds: 5));
+        await runner.owned.close();
+        await controller.close();
+        await holder.close();
+        for (final owned in runner.active) {
+          await owned.exitCode.timeout(const Duration(seconds: 5));
+        }
+        await logs.delete(recursive: true);
+      }
+    },
+  );
+  test(
     'monitor drain lets an in-flight real command register before closing ownership and rejects late acquisition',
     () async {
       final logs = await Directory.systemTemp.createTemp('scenario-monitor-');
