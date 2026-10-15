@@ -16,6 +16,29 @@ void main() {
     await logs.delete(recursive: true);
   });
 
+  test('managed stdin reaches a real child before EOF and logs are flushed', () async {
+    final source = File('${logs.path}/stdin_child.dart')..writeAsStringSync('''
+import 'dart:convert';
+import 'dart:io';
+Future<void> main() async {
+  final input = await stdin.transform(utf8.decoder).join();
+  stdout.write(input == 'no\\n' ? 'received-no-before-eof' : 'wrong-input');
+}
+''');
+    final child = await const IoProcessRunner().start(Platform.resolvedExecutable,
+        [source.path], logDir: logs, stdin: 'no\n');
+    try {
+      expect(await child.exitCode.timeout(const Duration(seconds: 10)), 0);
+      expect(File('${logs.path}/${child.pid}.stdout.log').readAsStringSync(), 'received-no-before-eof');
+    } finally { await child.stop(); }
+  });
+
+  test('retained mode rejects stdin before launching a child', () async {
+    await expectLater(const IoProcessRunner().start(Platform.resolvedExecutable,
+        ['--version'], logDir: logs, stdin: 'no\n', retainOutput: true), throwsArgumentError);
+    expect(logs.listSync(), isEmpty);
+  });
+
   for (final failedStream in ['stdout', 'stderr']) {
     for (final exitBeforeConsumer in [false, true]) {
       test(

@@ -106,7 +106,7 @@ try {
 /// Runs external programs. Tests swap in a fake so they never touch real devices.
 abstract interface class ProcessRunner {
   /// Retains the child handle and drains both output streams into [logDir].
-  Future<OwnedProcess> start(String executable, List<String> arguments, {required Directory logDir, String? workingDirectory, bool retainOutput = false});
+  Future<OwnedProcess> start(String executable, List<String> arguments, {required Directory logDir, String? workingDirectory, String? stdin, bool retainOutput = false});
   /// Runs [executable] to completion and returns its output.
   Future<ProcessResult> run(String executable, List<String> arguments, {String? stdin, String? workingDirectory});
 
@@ -121,7 +121,8 @@ class IoProcessRunner implements ProcessRunner {
   const IoProcessRunner();
 
   @override
-  Future<OwnedProcess> start(String executable, List<String> arguments, {required Directory logDir, String? workingDirectory, bool retainOutput = false}) async {
+  Future<OwnedProcess> start(String executable, List<String> arguments, {required Directory logDir, String? workingDirectory, String? stdin, bool retainOutput = false}) async {
+    if (retainOutput && stdin != null) throw ArgumentError('Retained output does not support stdin');
     await logDir.create(recursive: true);
     final batch = Platform.isWindows && (executable.endsWith('.bat') || executable.endsWith('.cmd'));
     if (retainOutput && batch) throw ArgumentError('Retained output requires a native executable');
@@ -129,8 +130,14 @@ class IoProcessRunner implements ProcessRunner {
         ? await _startFileBacked(executable, arguments, logDir, workingDirectory)
         : await Process.start(executable, arguments, workingDirectory: workingDirectory, runInShell: batch);
     final owned = _IoOwnedProcess(process, logDir, fileBacked: retainOutput);
-    await process.stdin.close();
     await owned._captureWindowsIdentity();
+    try {
+      if (stdin != null) process.stdin.write(stdin);
+      await process.stdin.close();
+    } catch (error, stack) {
+      try { await owned.stop(); } catch (_) { /* preserve input failure */ }
+      Error.throwWithStackTrace(error, stack);
+    }
     return owned;
   }
 

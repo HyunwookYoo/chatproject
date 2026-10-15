@@ -1,5 +1,47 @@
 # Device tooling
 
+Foreground session E2E uses one command from the repository root:
+
+```powershell
+$env:CARGOKIT_TOOLCHAIN = '1.92.0'
+$env:CARGOKIT_VERBOSE = '1'
+$env:PATH = 'C:\Program Files\Git\bin;' + $env:PATH
+# Set ANDROID_HOME to the installed SDK when it is outside the default location.
+dart run tools/e2e/bin/run.dart --profile mixed --repo-root (Get-Location).Path
+dart run tools/e2e/bin/run.dart --profile windows --repo-root (Get-Location).Path
+```
+
+`mixed` (the Windows default) runs one Windows app, one Android emulator and
+one node. `windows` runs two Windows apps and one node. `android` runs two
+Android emulators and one node; Linux nightly execution belongs to the E2E CI
+workflow. Use `--repo-root /absolute/checkout` on Linux. Install the configured
+SDK image and acceleration first; no SDK downloads or global settings changes
+are performed. Windows builds require the pinned cargokit environment above;
+Git Bash must resolve from `C:\Program Files\Git\bin`, never WSL bash.
+
+The command builds the Debug node and required apps before launching any AVD.
+It starts the local relay, loopback controller, then isolated participants.
+All three pairs exchange fresh UTF-8 text in both directions, matching exact
+sender and body and checking a selected Direct or Relay path. It exercises
+failed offline sends without replay, foreground recovery, Disconnect with the
+remote kept offline, and an owned node restart requiring a different core,
+EndpointId, ticket and explicit new Connect. State readiness checks use current
+revisions and snapshots; an older buffered Online/path event cannot satisfy them.
+These are Debug foreground transport probes, with no application delivery ACK.
+
+Ports 3340/47000 must be free. Existing AVDs and reverse mappings are preserved;
+an already running target test AVD fails before install/launch. Only emulators
+newly launched by this run receive the test APK. Handled Ctrl+C, stage failure,
+early process exit and success all close owned resources. Every short command
+uses the same managed PID/output/stop contract as long-lived participants.
+
+Private diagnostics stay under ignored `build/e2e/<run>/<profile>/`: controller
+wire records, timestamped commands, PID stdout/stderr, current ownership,
+PID-scoped Android logcat and app screenshots. Cleanup attempts every resource;
+an earlier failure keeps its nonzero result, and a cleanup failure after success
+returns 1. Ownership records with remaining entries require manual diagnosis;
+the runner never signals a PID from an older record. Do not publish these logs.
+
 Run from the repository root with the pinned Flutter SDK's Dart:
 
 ```sh

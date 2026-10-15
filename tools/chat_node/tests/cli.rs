@@ -275,9 +275,15 @@ async fn hooked_pair_exchanges_utf8_and_actual_core_selects_relay_without_direct
     let connection = endpoint.connect(target, b"chatproject/m2/1").await.unwrap();
     let mut send = connection.open_uni().await.unwrap();
     send.write_all(b"CPM2").await.unwrap();
-    let mut recv = connection.accept_uni().await.unwrap();
+    let mut recv = tokio::time::timeout(Duration::from_secs(10), connection.accept_uni())
+        .await
+        .unwrap()
+        .unwrap();
     let mut magic = [0; 4];
-    recv.read_exact(&mut magic).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), recv.read_exact(&mut magic))
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(&magic, b"CPM2");
     let raw_id = endpoint.id().to_string();
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -313,9 +319,15 @@ async fn hooked_pair_exchanges_utf8_and_actual_core_selects_relay_without_direct
     )
     .await;
     let mut length = [0; 4];
-    recv.read_exact(&mut length).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), recv.read_exact(&mut length))
+        .await
+        .unwrap()
+        .unwrap();
     let mut body = vec![0; u32::from_be_bytes(length) as usize];
-    recv.read_exact(&mut body).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), recv.read_exact(&mut body))
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(String::from_utf8(body).unwrap(), "relay 응답");
     endpoint.close().await;
     a.rpc("network_stop", json!({})).await;

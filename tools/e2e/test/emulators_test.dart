@@ -17,7 +17,7 @@ class FakeRunner implements ProcessRunner {
   void Function()? onStarted;
 
   @override
-  Future<OwnedProcess> start(String executable, List<String> arguments, {required Directory logDir, String? workingDirectory, bool retainOutput = false}) async {
+  Future<OwnedProcess> start(String executable, List<String> arguments, {required Directory logDir, String? workingDirectory, String? stdin, bool retainOutput = false}) async {
     detached.add(arguments);
     onStarted?.call();
     final serial = 'emulator-${arguments[arguments.indexOf('-port') + 1]}';

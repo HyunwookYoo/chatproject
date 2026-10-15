@@ -67,6 +67,7 @@ class CliRunner implements ProcessRunner {
     List<String> arguments, {
     required Directory logDir,
     String? workingDirectory,
+    String? stdin,
     bool retainOutput = false,
   }) async {
     launches.add(arguments);
