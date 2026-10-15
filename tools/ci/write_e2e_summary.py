@@ -5,6 +5,13 @@ import json
 import pathlib
 import re
 
+PHASES = set('preflight build_node build_windows build_android gradle_stop relay_ready '
+             'controller_start windows_start windows_participant sdk_preflight avd_preflight '
+             'avd_create avd_boot adb_reverse android_install android_launch android_pid '
+             'android_participant node_start node_participant scenario cleanup complete'.split())
+FAILURE_KINDS = set('cleanup command_exit timeout cancelled socket filesystem process_spawn '
+                    'state argument unsupported format other'.split())
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -14,6 +21,7 @@ def main():
     parser.add_argument('--exit-code', type=int, required=True)
     parser.add_argument('--output', type=pathlib.Path, required=True)
     parser.add_argument('--memory-file', type=pathlib.Path)
+    parser.add_argument('--diagnostic-file', type=pathlib.Path)
     args = parser.parse_args()
     if (args.outcome == 'success') != (args.exit_code == 0):
         parser.error('outcome and exit code disagree')
@@ -23,9 +31,28 @@ def main():
             match = re.fullmatch(r'\s*Maximum resident set size \(kbytes\): (\d+)\s*', line)
             if match:
                 peak = int(match[1])
-    # Never copy command lines, paths, log messages, tickets, or error text.
-    value = {'schema_version': 1, 'profile': args.profile, 'stage': args.stage,
-             'outcome': args.outcome, 'exitCode': args.exit_code, 'peak_rss_kib': peak}
+    safe = {'phase': None, 'failure_kind': None, 'command_exit_code': None}
+    if args.diagnostic_file and args.diagnostic_file.is_file():
+        try:
+            diagnostic = json.loads(args.diagnostic_file.read_text(encoding='utf-8'))
+            if not isinstance(diagnostic, dict) or set(diagnostic) != set(safe):
+                raise ValueError()
+            phase, kind, code = (diagnostic[key] for key in safe)
+            if not isinstance(phase, str) or phase not in PHASES:
+                raise ValueError()
+            if kind is not None and (not isinstance(kind, str) or kind not in FAILURE_KINDS):
+                raise ValueError()
+            if code is not None and type(code) is not int:  # bool is not an exit code.
+                raise ValueError()
+            if (kind == 'command_exit') != (code is not None):
+                raise ValueError()
+            safe = {'phase': phase, 'failure_kind': kind, 'command_exit_code': code}
+        except (OSError, ValueError):
+            parser.error('Invalid safe diagnostic')
+    # Reconstruct only fixed keys and validated values; never copy log/error text.
+    value = {'schema_version': 2, 'profile': args.profile, 'stage': args.stage,
+             'outcome': args.outcome, 'exitCode': args.exit_code, 'peak_rss_kib': peak,
+             **safe}
     args.output.write_text(json.dumps(value, indent=2) + '\n', encoding='utf-8')
 
 

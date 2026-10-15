@@ -52,6 +52,8 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo test --workspace
+      # The iOS OS-DNS adapter also runs on the host with loopback-only fixtures.
+      - run: cargo test --manifest-path vendor/iroh-dns/Cargo.toml --locked --lib dns::ios::tests --features tls-ring
       # Keep feature-unified controller builds out of the ordinary/Release checks.
       - run: cargo test --locked -p chat_core --features test-hooks
       - run: cargo test --locked -p chat_ffi --features test-hooks

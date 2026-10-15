@@ -160,7 +160,7 @@ Future<void> main(List<String> args) async {
     }
   }
 
-  test('real managed start preserves ordinary broken-pipe stdin failure with reclaimed child', () async {
+  test('real startup input preserves ordinary broken-pipe failure after child closes stdin', () async {
     final ready = File('${logs.path}/closed-stdin.json');
     final source = File('${logs.path}/closed_stdin.dart')..writeAsStringSync('''
 import 'dart:async';
@@ -202,14 +202,42 @@ Future<void> main(List<String> args) async {
   Timer(const Duration(seconds: 15), () => exit(3));
 }
 ''');
+    final real = await Process.start(Platform.resolvedExecutable, [source.path, ready.path]);
+    OwnedProcess? owned;
+    Future<OwnedProcess>? pending;
     Object? failure;
-    final elapsed = Stopwatch()..start();
-    final pending = const IoProcessRunner().start(Platform.resolvedExecutable, [source.path, ready.path],
-        logDir: logs, stdin: 'x' * (1024 * 1024));
+    final elapsed = Stopwatch();
     try {
-      await pending.timeout(const Duration(seconds: 10));
-    } catch (error) { failure = error; }
-    try {
+      // Use the real startup-input helper after the reader closes. Writing before
+      // that handshake can fill the pipe and hit Dart 3.12.2's dropped Linux
+      // EPOLLERR event instead of the ordinary synchronous broken-pipe path.
+      // The separate managed-stdin test covers the public start entry point.
+      final library = reflectClass(IoProcessRunner).owner as LibraryMirror;
+      final type = library.declarations[MirrorSystem.getSymbol('_IoOwnedProcess', library)] as ClassMirror;
+      final instance = type.newInstance(const Symbol(''), [real, logs]);
+      owned = instance.reflectee as OwnedProcess;
+      await instance.invoke(MirrorSystem.getSymbol('_captureWindowsIdentity', library), []).reflectee;
+      final deadline = DateTime.now().add(const Duration(seconds: 10));
+      while (true) {
+        try {
+          if (ready.existsSync()) {
+            final record = jsonDecode(ready.readAsStringSync()) as Map;
+            if (record['stage'] == 'after-close') {
+              expect(record['closed'], isTrue, reason: 'fixture must close its real stdin before input');
+              break;
+            }
+          }
+        } on FileSystemException { /* readiness record is still being written */
+        } on FormatException { /* readiness record is still being written */ }
+        if (DateTime.now().isAfter(deadline)) fail('real child stdin readiness deadline');
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+      }
+      elapsed.start();
+      pending = library.invoke(MirrorSystem.getSymbol('_finishManagedStart', library),
+          [real, owned, 'x' * (1024 * 1024), logs, Platform.resolvedExecutable]).reflectee as Future<OwnedProcess>;
+      try {
+        await pending.timeout(const Duration(seconds: 10));
+      } catch (error) { failure = error; }
       Map diagnostic = <String, Object?>{};
       try {
         if (ready.existsSync()) diagnostic = jsonDecode(ready.readAsStringSync()) as Map;
@@ -252,8 +280,10 @@ Future<void> main(List<String> args) async {
       // timeout() does not cancel the admitted start. Observe its completion
       // after releasing the exact fixture, and reclaim any late success.
       try {
-        final child = await pending.timeout(const Duration(seconds: 5));
-        await child.stop();
+        if (pending != null) {
+          final child = await pending.timeout(const Duration(seconds: 5));
+          await child.stop();
+        }
       } catch (error) {
         if (error is OwnedProcessStartFailure) {
           try { await error.process.stop(); } catch (cleanup) { print('fixture cleanup type: ${cleanup.runtimeType}'); }
@@ -261,6 +291,15 @@ Future<void> main(List<String> args) async {
           print('fixture pending-start drain type: ${error.runtimeType}');
         }
       }
+      // Retain cleanup ownership even if setup/readiness failed before input.
+      try {
+        if (owned != null) {
+          await owned.stop();
+        } else {
+          real.kill();
+          await real.exitCode.timeout(const Duration(seconds: 5));
+        }
+      } catch (error) { print('fixture owned cleanup type: ${error.runtimeType}'); }
     }
   });
 

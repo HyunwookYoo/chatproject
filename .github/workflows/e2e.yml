@@ -75,6 +75,8 @@ jobs:
       - name: Android two-app plus node scenario
         id: scenario
         working-directory: tools/e2e
+        env:
+          E2E_DIAGNOSTIC_FILE: ${{ runner.temp }}/e2e-diagnostic.json
         run: |
           test "$CARGOKIT_TOOLCHAIN" = '1.92.0'
           free -m
@@ -125,7 +127,7 @@ jobs:
           outcome=failure
           if [ "$code" = 0 ]; then outcome=success; fi
           if [ "$JOB_STATUS" = cancelled ]; then outcome=cancelled; code=130; fi
-          python3 tools/ci/write_e2e_summary.py --profile android --stage "$stage" --outcome "$outcome" --exit-code "$code" --memory-file "$RUNNER_TEMP/e2e-time.txt" --output "$RUNNER_TEMP/e2e-summary.json"
+          python3 tools/ci/write_e2e_summary.py --profile android --stage "$stage" --outcome "$outcome" --exit-code "$code" --memory-file "$RUNNER_TEMP/e2e-time.txt" --diagnostic-file "$RUNNER_TEMP/e2e-diagnostic.json" --output "$RUNNER_TEMP/e2e-summary.json"
           echo 'GNU time maximum child RSS is not the simultaneous total of two AVDs and Gradle.' >> "$GITHUB_STEP_SUMMARY"
           cat "$RUNNER_TEMP/e2e-summary.json" >> "$GITHUB_STEP_SUMMARY"
       - name: Retain only the sanitized summary
@@ -165,6 +167,8 @@ jobs:
       - name: Windows two-app plus node scenario
         id: scenario
         working-directory: tools/e2e
+        env:
+          E2E_DIAGNOSTIC_FILE: ${{ runner.temp }}/e2e-diagnostic.json
         run: |
           if ($env:CARGOKIT_TOOLCHAIN -ne '1.92.0') { throw 'Missing pinned toolchain' }
           dart run bin/run.dart --profile windows --repo-root "$env:GITHUB_WORKSPACE" *> "$env:RUNNER_TEMP/e2e-private.log"
@@ -182,7 +186,7 @@ jobs:
           if ($env:SCENARIO_CODE) { $stage = 'scenario'; $code = [int]$env:SCENARIO_CODE }
           if ($code -eq 0) { $outcome = 'success' }
           if ($env:JOB_STATUS -eq 'cancelled') { $outcome = 'cancelled'; $code = 130 }
-          python tools/ci/write_e2e_summary.py --profile windows --stage $stage --outcome $outcome --exit-code $code --output "$env:RUNNER_TEMP/e2e-summary.json"
+          python tools/ci/write_e2e_summary.py --profile windows --stage $stage --outcome $outcome --exit-code $code --diagnostic-file "$env:RUNNER_TEMP/e2e-diagnostic.json" --output "$env:RUNNER_TEMP/e2e-summary.json"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Get-Content "$env:RUNNER_TEMP/e2e-summary.json" >> $env:GITHUB_STEP_SUMMARY
       - name: Retain only the sanitized summary

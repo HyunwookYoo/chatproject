@@ -59,6 +59,7 @@ Future<void> main(List<String> arguments) async {
   try {
     signal = ProcessSignal.sigint.watch().listen((_) {
       userInterrupted = true;
+      run.recordFailure(RunCancelled());
       run.token.cancel();
     });
   } on UnsupportedError {
@@ -88,6 +89,7 @@ Future<void> main(List<String> arguments) async {
         'Set CARGOKIT_TOOLCHAIN=1.92.0 and CARGOKIT_VERBOSE=1 for Windows Debug builds',
       );
     }
+    run.phase = _Phase.buildNode;
     await run.command(
       'rustup',
       [
@@ -116,6 +118,7 @@ Future<void> main(List<String> arguments) async {
         ? 2
         : 1;
     if (windowsCount > 0) {
+      run.phase = _Phase.buildWindows;
       await run.command(
         flutter,
         ['build', 'windows', '--debug'],
@@ -124,6 +127,7 @@ Future<void> main(List<String> arguments) async {
       );
     }
     if (androidCount > 0) {
+      run.phase = _Phase.buildAndroid;
       await run.command(
         flutter,
         ['build', 'apk', '--debug', '--target-platform', 'android-x64'],
@@ -131,6 +135,7 @@ Future<void> main(List<String> arguments) async {
         timeout: const Duration(minutes: 30),
       );
       if (stopCiGradle) {
+        run.phase = _Phase.gradleStop;
         await run.command(
           Platform.isWindows ? 'gradlew.bat' : './gradlew',
           ['--stop'],
@@ -144,6 +149,7 @@ Future<void> main(List<String> arguments) async {
       'debug',
       Platform.isWindows ? 'chat_node.exe' : 'chat_node',
     );
+    run.phase = _Phase.relayReady;
     final relay = await run.start(node, ['relay'], logDir: logs);
     await run.until(() async {
       final output = File(p.join(logs.path, '${relay.pid}.stdout.log'));
@@ -154,11 +160,13 @@ Future<void> main(List<String> arguments) async {
       );
     }, const Duration(seconds: 10));
     run.token.check();
+    run.phase = _Phase.controllerStart;
     controller = await Controller.start(logDir: logs);
     run.owned.add('controller', controller.close);
     final control = controller;
     final participants = <Participant>[];
     for (var i = 1; i <= windowsCount; i++) {
+      run.phase = _Phase.windowsStart;
       final name = 'windows-$i';
       final directory = p.join(logs.path, name);
       await Directory(directory).create();
@@ -183,9 +191,11 @@ Future<void> main(List<String> arguments) async {
         ],
         logDir: logs,
       );
+      run.phase = _Phase.windowsParticipant;
       participants.add(await run.wait(control.waitParticipant(name)));
     }
     if (androidCount > 0) {
+      run.phase = _Phase.sdkPreflight;
       final sdk = AndroidSdk.locate();
       final specs = testEmulators.take(androidCount).toList();
       final config = AvdConfig.load();
@@ -204,6 +214,7 @@ Future<void> main(List<String> arguments) async {
           run.annotate(process.pid, {'avd': spec.avd, 'serial': spec.serial});
         },
       );
+      run.phase = _Phase.avdPreflight;
       for (final spec in specs) {
         // E2E installs/launches only on newly owned emulator processes.
         if (await emulators.isRunning(spec)) {
@@ -213,20 +224,24 @@ Future<void> main(List<String> arguments) async {
         }
       }
       await emulators.preflight(specs);
+      run.phase = _Phase.avdCreate;
       for (final spec in specs) {
         await run.wait(
           emulators.ensure(spec),
           timeout: const Duration(minutes: 5),
         );
       }
+      run.phase = _Phase.avdBoot;
       await run.wait(emulators.up(specs), timeout: const Duration(minutes: 5));
       for (var i = 0; i < specs.length; i++) {
         final spec = specs[i];
+        run.phase = _Phase.adbReverse;
         for (final port in [3340, 47000]) {
           await run.reverse(sdk, spec, port);
         }
         final name = 'android-${i + 1}';
         final adb = ['-s', spec.serial];
+        run.phase = _Phase.androidInstall;
         await run.command(sdk.adb, [
           ...adb,
           'install',
@@ -260,6 +275,7 @@ Future<void> main(List<String> arguments) async {
           run.activities.remove(activity);
           run.save();
         });
+        run.phase = _Phase.androidLaunch;
         await run.command(sdk.adb, [
           ...adb,
           'shell',
@@ -275,6 +291,7 @@ Future<void> main(List<String> arguments) async {
           'chat_name',
           name,
         ]);
+        run.phase = _Phase.androidPid;
         var appPid = '';
         await run.until(() async {
           final result = await run.command(sdk.adb, [
@@ -348,6 +365,7 @@ Future<void> main(List<String> arguments) async {
             ], cleanup: true);
           }
         });
+        run.phase = _Phase.androidParticipant;
         participants.add(
           await run.wait(
             control.waitParticipant(name),
@@ -358,6 +376,7 @@ Future<void> main(List<String> arguments) async {
     }
     OwnedProcess? nodeProcess;
     Future<Participant> launchNode([Participant? old]) async {
+      run.phase = _Phase.nodeStart;
       run.token.check();
       final previous = nodeProcess;
       if (previous != null) await run.stop(previous);
@@ -372,19 +391,23 @@ Future<void> main(List<String> arguments) async {
         p.join(logs.path, 'node'),
       ], logDir: logs);
       Participant? next;
+      run.phase = _Phase.nodeParticipant;
       await run.until(() async {
         next = await control.waitParticipant('node');
         return old == null || next!.instance != old.instance;
       }, const Duration(seconds: 15));
+      if (old != null) run.phase = _Phase.scenario;
       return next!;
     }
 
     participants.add(await launchNode());
+    run.phase = _Phase.scenario;
     await run.wait(
       runScenario(control, participants, restart: launchNode),
       timeout: const Duration(minutes: 4),
     );
   } catch (error, stack) {
+    run.recordFailure(error);
     code = userInterrupted ? 130 : 1;
     run.token.cancel();
     await run.interrupt(controller);
@@ -396,10 +419,12 @@ Future<void> main(List<String> arguments) async {
     );
   } finally {
     finished = true;
+    run.phase = _Phase.cleanup;
     await signal?.cancel();
     try {
       await run.stopMonitors();
     } catch (error) {
+      run.recordFailure(error);
       run.cleanupFailures.add('monitor drain: $error');
     }
     await interrupted;
@@ -407,6 +432,7 @@ Future<void> main(List<String> arguments) async {
     run.finishing = true;
     final failures = [...run.cleanupFailures, ...await run.owned.close()];
     if (failures.isNotEmpty) {
+      run.recordFailure(null);
       File(
         p.join(logs.path, 'cleanup.log'),
       ).writeAsStringSync(failures.join('\n'), flush: true);
@@ -437,11 +463,30 @@ Future<void> main(List<String> arguments) async {
     await stdout.flush();
     await stderr.flush();
   } catch (error) {
+    run.recordFailure(error);
     if (code == 0) code = 1;
     File(
       p.join(logs.path, 'terminal-flush.log'),
     ).writeAsStringSync('$error', flush: true);
   } finally {
+    final diagnostic = Platform.environment['E2E_DIAGNOSTIC_FILE'];
+    if (diagnostic != null) {
+      try {
+        File(diagnostic).writeAsStringSync(
+          jsonEncode(
+            run.safeFailure ??
+                {
+                  'phase': _Phase.complete.value,
+                  'failure_kind': null,
+                  'command_exit_code': null,
+                },
+          ),
+          flush: true,
+        );
+      } on FileSystemException {
+        /* Missing diagnostics remain null in the retained summary. */
+      }
+    }
     exit(code);
   }
 }
@@ -474,6 +519,41 @@ bool usesOwnedCiGradle(String profile, Map<String, String> environment) {
   return true;
 }
 
+enum _Phase {
+  preflight('preflight'),
+  buildNode('build_node'),
+  buildWindows('build_windows'),
+  buildAndroid('build_android'),
+  gradleStop('gradle_stop'),
+  relayReady('relay_ready'),
+  controllerStart('controller_start'),
+  windowsStart('windows_start'),
+  windowsParticipant('windows_participant'),
+  sdkPreflight('sdk_preflight'),
+  avdPreflight('avd_preflight'),
+  avdCreate('avd_create'),
+  avdBoot('avd_boot'),
+  adbReverse('adb_reverse'),
+  androidInstall('android_install'),
+  androidLaunch('android_launch'),
+  androidPid('android_pid'),
+  androidParticipant('android_participant'),
+  nodeStart('node_start'),
+  nodeParticipant('node_participant'),
+  scenario('scenario'),
+  cleanup('cleanup'),
+  complete('complete');
+
+  const _Phase(this.value);
+  final String value;
+}
+
+class _CommandFailure extends StateError {
+  _CommandFailure(this.code, String executable)
+    : super('Command failed ($code): $executable');
+  final int code;
+}
+
 class _Run extends IoProcessRunner {
   _Run(this.logs) {
     unawaited(
@@ -498,6 +578,29 @@ class _Run extends IoProcessRunner {
   Object? firstFailure;
   Future<void>? _interrupting;
   bool finishing = false;
+  _Phase phase = _Phase.preflight;
+  Map<String, Object?>? safeFailure;
+
+  void recordFailure(Object? error) {
+    safeFailure ??= {
+      'phase': phase.value,
+      'failure_kind': switch (error) {
+        null => 'cleanup',
+        _CommandFailure() => 'command_exit',
+        TimeoutException() => 'timeout',
+        RunCancelled() => 'cancelled',
+        SocketException() => 'socket',
+        FileSystemException() => 'filesystem',
+        ProcessException() => 'process_spawn',
+        StateError() => 'state',
+        ArgumentError() => 'argument',
+        UnsupportedError() => 'unsupported',
+        FormatException() => 'format',
+        _ => 'other',
+      },
+      'command_exit_code': error is _CommandFailure ? error.code : null,
+    };
+  }
 
   Future<void> stopMonitors() {
     // Close admission synchronously, then let already-started acquisitions
@@ -528,6 +631,7 @@ class _Run extends IoProcessRunner {
   }
 
   void fail(Object error, StackTrace stack) {
+    recordFailure(error);
     firstFailure ??= error;
     if (!fatal.isCompleted) fatal.completeError(error, stack);
   }
@@ -783,7 +887,7 @@ class _Run extends IoProcessRunner {
         File(p.join(logs.path, '${process.pid}.stderr.log')).readAsStringSync(),
       );
       if (requireSuccess && code != 0) {
-        throw StateError('Command failed ($code): $executable');
+        throw _CommandFailure(code, executable);
       }
       return result;
     } catch (error) {
