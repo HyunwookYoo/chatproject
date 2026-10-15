@@ -57,7 +57,9 @@ jobs:
       - name: Install canonical emulator image
         run: |
           image="$(python3 -c 'import json; c=json.load(open("tools/e2e/avd_config.json"))["ci"]; print("system-images;android-{};{};{}".format(c["api"],c["flavor"],c["abi"]))')"
-          sdkmanager "$image" 'platform-tools' 'emulator'
+          sdk_root="${ANDROID_HOME:-${ANDROID_SDK_ROOT:?Android SDK root is required}}"
+          test -x "$sdk_root/cmdline-tools/latest/bin/sdkmanager"
+          "$sdk_root/cmdline-tools/latest/bin/sdkmanager" "$image" 'platform-tools' 'emulator'
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |

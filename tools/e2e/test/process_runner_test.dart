@@ -169,28 +169,60 @@ import 'dart:ffi';
 import 'dart:io';
 Future<void> main(List<String> args) async {
   final server = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
-  File(args[0]).writeAsStringSync(jsonEncode({'port': server.port, 'pid': pid}));
+  final record = <String, Object?>{'port': server.port, 'pid': pid, 'stage': 'before-close'};
+  File(args[0]).writeAsStringSync(jsonEncode(record));
+  String? originalPipe;
+  if (Platform.isLinux) {
+    try { originalPipe = Link('/proc/self/fd/0').targetSync(); } on FileSystemException { /* diagnostic only */ }
+  }
+  bool closed;
   if (Platform.isWindows) {
     final kernel = DynamicLibrary.open('kernel32.dll');
     final getHandle = kernel.lookupFunction<IntPtr Function(Int32), int Function(int)>('GetStdHandle');
     final closeHandle = kernel.lookupFunction<Int32 Function(IntPtr), int Function(int)>('CloseHandle');
-    if (closeHandle(getHandle(-10)) == 0) throw StateError('fixture stdin close failed');
+    closed = closeHandle(getHandle(-10)) != 0;
   } else {
     final close = DynamicLibrary.process().lookupFunction<Int32 Function(Int32), int Function(int)>('close');
-    if (close(0) != 0) throw StateError('fixture stdin close failed');
+    closed = close(0) == 0;
   }
+  record['stage'] = 'after-close';
+  record['closed'] = closed;
+  if (originalPipe != null && originalPipe.startsWith('pipe:[')) {
+    try {
+      var count = 0;
+      for (final entry in Directory('/proc/self/fd').listSync(followLinks: false)) {
+        try { if (Link(entry.path).targetSync() == originalPipe) count++; } on FileSystemException { /* fd closed during enumeration */ }
+      }
+      record['same_pipe_fds'] = count;
+    } on FileSystemException { /* diagnostic only */ }
+  }
+  File(args[0]).writeAsStringSync(jsonEncode(record));
+  if (!closed) throw StateError('fixture stdin close failed');
   server.listen((socket) { socket.listen((_) => exit(0)); });
   Timer(const Duration(seconds: 15), () => exit(3));
 }
 ''');
     Object? failure;
-    OwnedProcess? unexpectedSuccess;
+    final elapsed = Stopwatch()..start();
+    final pending = const IoProcessRunner().start(Platform.resolvedExecutable, [source.path, ready.path],
+        logDir: logs, stdin: 'x' * (1024 * 1024));
     try {
-      unexpectedSuccess = await const IoProcessRunner().start(Platform.resolvedExecutable, [source.path, ready.path],
-          logDir: logs, stdin: 'x' * (1024 * 1024)).timeout(const Duration(seconds: 10));
+      await pending.timeout(const Duration(seconds: 10));
     } catch (error) { failure = error; }
     try {
-      expect(failure, isA<SocketException>());
+      Map diagnostic = <String, Object?>{};
+      try {
+        if (ready.existsSync()) diagnostic = jsonDecode(ready.readAsStringSync()) as Map;
+      } on FileSystemException {
+        diagnostic['stage'] = 'unreadable';
+      } on FormatException {
+        diagnostic['stage'] = 'unreadable';
+      }
+      expect(failure, isA<SocketException>(), reason: jsonEncode({
+        'stage': diagnostic['stage'] ?? 'not-ready', 'closed': diagnostic['closed'],
+        'same_pipe_fds': diagnostic['same_pipe_fds'], 'elapsed_ms': elapsed.elapsedMilliseconds,
+        'error_type': failure.runtimeType.toString(),
+      }));
       expect(ready.existsSync(), isTrue);
       final record = jsonDecode(ready.readAsStringSync()) as Map;
       await expectLater(Socket.connect(InternetAddress.loopbackIPv4, record['port'] as int), throwsA(isA<SocketException>()));
@@ -203,17 +235,32 @@ Future<void> main(List<String> args) async {
       }
       expect(logs.listSync().where((f) => f.path.endsWith('.start-failure.json')), isEmpty);
     } finally {
-      if (ready.existsSync()) {
-        final record = jsonDecode(ready.readAsStringSync()) as Map;
-        try {
-          final release = await Socket.connect(InternetAddress.loopbackIPv4, record['port'] as int);
-          release.write('exit');
-          await release.flush();
-          release.destroy();
-        } on SocketException { /* already reclaimed */ }
+      try {
+        if (ready.existsSync()) {
+          final record = jsonDecode(ready.readAsStringSync()) as Map;
+          try {
+            final release = await Socket.connect(InternetAddress.loopbackIPv4, record['port'] as int)
+                .timeout(const Duration(seconds: 2));
+            release.write('exit');
+            await release.flush();
+            release.destroy();
+          } on SocketException { /* already reclaimed */ }
+        }
+      } catch (error) {
+        print('fixture release type: ${error.runtimeType}');
       }
-      await unexpectedSuccess?.stop();
-      if (failure is OwnedProcessStartFailure) await failure.process.exitCode.timeout(const Duration(seconds: 5));
+      // timeout() does not cancel the admitted start. Observe its completion
+      // after releasing the exact fixture, and reclaim any late success.
+      try {
+        final child = await pending.timeout(const Duration(seconds: 5));
+        await child.stop();
+      } catch (error) {
+        if (error is OwnedProcessStartFailure) {
+          try { await error.process.stop(); } catch (cleanup) { print('fixture cleanup type: ${cleanup.runtimeType}'); }
+        } else if (error is! SocketException) {
+          print('fixture pending-start drain type: ${error.runtimeType}');
+        }
+      }
     }
   });
 

@@ -338,29 +338,30 @@ impl Manager {
                 self.offline_targets.remove(&peer_id);
                 let cutoff = self.accepted.load(Ordering::Acquire);
                 // Unknown identities keep the cutoff alive, including accept notes still queued.
-                if self.has_unknown_before(cutoff) && !self.peers.contains_key(&peer_id) {
-                    if let Ok(id) = peer_id.parse::<iroh::EndpointId>() {
-                        if !self.make_room(&peer_id) {
-                            let _ = reply.send(Err(err(ErrorCode::Busy)));
-                            return;
-                        }
-                        self.peers.insert(
-                            peer_id.clone(),
-                            Peer {
-                                info: PeerInfo {
-                                    peer_id: peer_id.clone(),
-                                    phase: PeerPhase::Disconnected,
-                                    path: PeerPath::Unknown,
-                                    connect_ms: None,
-                                    direct_ms: None,
-                                },
-                                target: id.into(),
-                                session: None,
-                                pending: None,
-                                disconnected_before: None,
-                            },
-                        );
+                if self.has_unknown_before(cutoff)
+                    && !self.peers.contains_key(&peer_id)
+                    && let Ok(id) = peer_id.parse::<iroh::EndpointId>()
+                {
+                    if !self.make_room(&peer_id) {
+                        let _ = reply.send(Err(err(ErrorCode::Busy)));
+                        return;
                     }
+                    self.peers.insert(
+                        peer_id.clone(),
+                        Peer {
+                            info: PeerInfo {
+                                peer_id: peer_id.clone(),
+                                phase: PeerPhase::Disconnected,
+                                path: PeerPath::Unknown,
+                                connect_ms: None,
+                                direct_ms: None,
+                            },
+                            target: id.into(),
+                            session: None,
+                            pending: None,
+                            disconnected_before: None,
+                        },
+                    );
                 }
                 for preparation in self.incoming.values() {
                     if preparation.sequence <= cutoff
@@ -411,11 +412,10 @@ impl Manager {
             self.tasks.spawn(async move {
                         let result = tokio::select! { biased; _ = cancel.cancelled() => return, result = bind_endpoint(&profile, key) => result };
                         #[cfg(any(test, all(feature = "test-hooks", debug_assertions)))]
-                        if let Ok(endpoint) = &result {
-                            if matches!(profile, NetworkProfile::Local { relay: Some(_) }) {
+                        if let Ok(endpoint) = &result
+                            && matches!(profile, NetworkProfile::Local { relay: Some(_) }) {
                                 let ready = tokio::select! { biased; _ = cancel.cancelled() => false, result = tokio::time::timeout(Duration::from_secs(30), endpoint.online()) => result.is_ok() };
                                 if !ready { endpoint.close().await; session::notify(&notes, &cancel, Note::Bound { epoch, result: Err(err(ErrorCode::NetworkTimeout)) }).await; return; }
-                            }
                         }
                         session::notify(&notes, &cancel, Note::Bound { epoch, result }).await;
                     });
