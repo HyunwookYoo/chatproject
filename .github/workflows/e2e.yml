@@ -22,11 +22,11 @@ jobs:
   android:
     runs-on: ubuntu-latest
     timeout-minutes: 90
-    env:
-      # The runner validates this exact namespace before building. Its --stop
-      # can only see this job's daemon registry, never a user's shared Gradle home.
-      GRADLE_USER_HOME: ${{ runner.temp }}/chatproject-${{ github.run_id }}-${{ github.run_attempt }}-android
     steps:
+      - name: Set job-owned Gradle home
+        # The runner validates this exact namespace before building. Its --stop
+        # can only see this job's daemon registry, never a user's shared Gradle home.
+        run: echo "GRADLE_USER_HOME=$RUNNER_TEMP/chatproject-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$GITHUB_JOB" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false

@@ -195,6 +195,18 @@ class PolicyTest(unittest.TestCase):
                     problems = check(pathlib.Path(filename), self.workflow(on={event: None}))
                     self.assertEqual(problems == [], allowed, problems)
 
+    def test_runner_context_is_unavailable_in_job_env_but_allowed_in_step_env(self):
+        for value in ('${{ runner.temp }}/chatproject-123-1-android', "${{ runner['temp'] }}"):
+            with self.subTest(value=value):
+                doc = self.workflow()
+                job = doc['jobs']['test']
+                job['env'] = {'GRADLE_USER_HOME': value}
+                problems = check(pathlib.Path('ordinary.yml'), doc)
+                self.assertTrue(any('runner context is unavailable in job env' in p for p in problems), problems)
+                del job['env']
+                job['steps'] = [{'env': {'GRADLE_USER_HOME': value}, 'run': 'echo ready'}]
+                self.assertEqual(check(pathlib.Path('ordinary.yml'), doc), [])
+
     def test_job_permissions_may_only_narrow_top_level_read(self):
         for permissions, allowed in ((None, True), ({}, True), ({"contents": "read"}, True),
                                      ({"contents": "none"}, True), ({"contents": "write"}, False),

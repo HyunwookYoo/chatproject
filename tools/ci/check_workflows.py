@@ -45,6 +45,10 @@ def check(path, doc):
     if "CARGOKIT_TOOLCHAIN" in env and str(env["CARGOKIT_TOOLCHAIN"]) != str(env.get("RUST_TOOLCHAIN")):
         problems.append(f"{name}: CARGOKIT_TOOLCHAIN must equal RUST_TOOLCHAIN")
     for job_id, job in (doc.get("jobs") or {}).items():
+        # Direct runner references are unavailable here; resolve them in a step.
+        for value in (job.get("env") or {}).values():
+            if isinstance(value, str) and re.search(r"\$\{\{\s*runner\s*[.\[]", value):
+                problems.append(f"{name}: job {job_id}: runner context is unavailable in job env")
         if "permissions" in job:
             permissions = job["permissions"]
             if (not isinstance(permissions, dict) or set(permissions) - {"contents"}
