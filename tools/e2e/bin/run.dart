@@ -80,6 +80,7 @@ Future<void> main(List<String> arguments) async {
       await socket.close();
     }
     // Compile before any AVD launch; every Rust invocation uses the pinned toolchain.
+    final stopCiGradle = usesOwnedCiGradle(profile, Platform.environment);
     if (Platform.isWindows &&
         (Platform.environment['CARGOKIT_TOOLCHAIN'] != '1.92.0' ||
             Platform.environment['CARGOKIT_VERBOSE'] != '1')) {
@@ -129,6 +130,13 @@ Future<void> main(List<String> arguments) async {
         cwd: p.join(root, 'app'),
         timeout: const Duration(minutes: 30),
       );
+      if (stopCiGradle) {
+        await run.command(
+          Platform.isWindows ? 'gradlew.bat' : './gradlew',
+          ['--stop'],
+          cwd: p.join(root, 'app', 'android'),
+        );
+      }
     }
     final node = p.join(
       root,
@@ -436,6 +444,34 @@ Future<void> main(List<String> arguments) async {
   } finally {
     exit(code);
   }
+}
+
+/// Only the two-emulator GitHub job may stop a daemon, in its own registry.
+bool usesOwnedCiGradle(String profile, Map<String, String> environment) {
+  if (profile != 'android' || environment['GITHUB_ACTIONS'] != 'true') {
+    return false;
+  }
+  final temp = environment['RUNNER_TEMP'];
+  final id = environment['GITHUB_RUN_ID'];
+  final attempt = environment['GITHUB_RUN_ATTEMPT'];
+  final job = environment['GITHUB_JOB'];
+  if (temp == null ||
+      temp.isEmpty ||
+      id == null ||
+      !RegExp(r'^\d+$').hasMatch(id) ||
+      attempt == null ||
+      !RegExp(r'^\d+$').hasMatch(attempt) ||
+      job == null ||
+      !RegExp(r'^[a-zA-Z0-9_-]+$').hasMatch(job)) {
+    throw StateError('Missing GitHub job-owned Gradle identity');
+  }
+  final expected = p.join(temp, 'chatproject-$id-$attempt-$job');
+  if (environment['GRADLE_USER_HOME'] != expected) {
+    throw StateError(
+      'Android CI requires the exact job-owned GRADLE_USER_HOME',
+    );
+  }
+  return true;
 }
 
 class _Run extends IoProcessRunner {

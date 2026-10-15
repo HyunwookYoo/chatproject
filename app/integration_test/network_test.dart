@@ -230,7 +230,9 @@ void main() {
         await nodeDir.delete(recursive: true);
       }
     }
-  });
+  }, skip: Platform.isAndroid || Platform.isIOS
+      ? 'Requires a host chat_node executable; mobile/node transport is covered by mixed E2E.'
+      : false);
 }
 
 class _Participant {

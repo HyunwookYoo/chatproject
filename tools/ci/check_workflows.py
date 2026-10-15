@@ -36,7 +36,7 @@ def check(path, doc):
     problems = []
     allowed = {"push", "pull_request", "workflow_dispatch"}
     if path.stem.lower() == "e2e":
-        allowed.add("schedule")
+        allowed = {"workflow_dispatch", "schedule"}
     if set(triggers(doc)) - allowed:
         problems.append(f"{name}: unsupported workflow trigger")
     if doc.get("permissions") != {"contents": "read"}:

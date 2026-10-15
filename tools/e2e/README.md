@@ -29,6 +29,32 @@ EndpointId, ticket and explicit new Connect. State readiness checks use current
 revisions and snapshots; an older buffered Online/path event cannot satisfy them.
 These are Debug foreground transport probes, with no application delivery ACK.
 
+Release validation uses `tools/ci/release_smoke.dart` after building an ordinary
+`--release --target lib/main.dart` artifact. Run it from the repository root with
+`dart --packages=tools/e2e/.dart_tool/package_config.json tools/ci/release_smoke.dart
+--platform windows --artifact <full-Release-directory>`; Android uses
+`--platform android --artifact <APK> --serial <owned-emulator-serial>`.
+Run `python tools/ci/check_release_hooks.py <artifact>` separately. The smoke
+requires the current owned Home window, native core version and offline status;
+PID existence alone never passes.
+
+Flutter 3.44.6 rejects non-web `flutter drive --release`. CI instead builds the
+dedicated `integration_test/release_contract_test.dart` AOT target with a unique
+`--dart-define=RELEASE_CONTRACT_NONCE=<nonce>` and launches it with the smoke's
+`--contract-nonce <nonce>`. This verifies actual `NotAvailable`, `Stopped` and no
+endpoint. Its Debug integration discovery is explicitly skipped. Keep this
+dedicated artifact separate from the ordinary product artifact: builds overwrite
+the default output paths. The ordinary Home smoke and both marker checks remain
+mandatory. Neither Release smoke starts networking; physical Release DNS and
+traffic validation remain Task 14.
+
+Nightly `e2e.yml` runs only on schedule/manual dispatch: two Android apps plus a
+node on Linux, or two Windows apps plus a node on Windows. Android CI uses an
+exact job-owned `GRADLE_USER_HOME` and stops only that registry's daemon after
+building, before AVD launch. It measures memory before changing heap settings.
+The downloadable failure artifact contains only the fixed-schema sanitized
+summary; full private diagnostics are retained only on the runner.
+
 Ports 3340/47000 must be free. Existing AVDs and reverse mappings are preserved;
 an already running target test AVD fails before install/launch. Only emulators
 newly launched by this run receive the test APK. Handled Ctrl+C, stage failure,

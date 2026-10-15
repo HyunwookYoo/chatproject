@@ -190,8 +190,8 @@ class PolicyTest(unittest.TestCase):
                       "pull_request_target", "workflow_run", "workflow_call"):
             for filename in ("ordinary.yml", "e2e.yml", "E2E.YAML"):
                 with self.subTest(event=event, filename=filename):
-                    allowed = event in ("push", "pull_request", "workflow_dispatch") or (
-                        event == "schedule" and filename != "ordinary.yml")
+                    allowed = (event in ("push", "pull_request", "workflow_dispatch")
+                               if filename == "ordinary.yml" else event in ("schedule", "workflow_dispatch"))
                     problems = check(pathlib.Path(filename), self.workflow(on={event: None}))
                     self.assertEqual(problems == [], allowed, problems)
 

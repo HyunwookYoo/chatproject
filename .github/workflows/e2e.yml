@@ -1,0 +1,193 @@
+name: Network E2E
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '30 17 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: network-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FLUTTER_VERSION: '3.44.6'
+  RUST_TOOLCHAIN: '1.92.0'
+  CARGOKIT_TOOLCHAIN: '1.92.0'
+  CARGOKIT_VERBOSE: '1'
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      # The runner validates this exact namespace before building. Its --stop
+      # can only see this job's daemon registry, never a user's shared Gradle home.
+      GRADLE_USER_HOME: ${{ runner.temp }}/chatproject-${{ github.run_id }}-${{ github.run_attempt }}-android
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Free disk space for two emulator images
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/.ghcup /opt/ghc /usr/share/swift /usr/local/share/boost /opt/hostedtoolcache/CodeQL /usr/local/share/powershell /usr/local/share/chromium
+          sudo docker image prune --all --force
+          df -h /
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master 2026-10-01
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: x86_64-linux-android
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+      - name: Install canonical emulator image
+        run: |
+          image="$(python3 -c 'import json; c=json.load(open("tools/e2e/avd_config.json"))["ci"]; print("system-images;android-{};{};{}".format(c["api"],c["flavor"],c["abi"]))')"
+          sdkmanager "$image" 'platform-tools' 'emulator'
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.android/avd/chat_e2e_1.avd
+            ~/.android/avd/chat_e2e_1.ini
+            ~/.android/avd/chat_e2e_2.avd
+            ~/.android/avd/chat_e2e_2.ini
+          key: nightly-avd-${{ runner.os }}-${{ hashFiles('tools/e2e/avd_config.json') }}
+      - name: Dart dependencies
+        run: |
+          (cd app && flutter pub get)
+          (cd tools/e2e && dart pub get --enforce-lockfile)
+      - name: Android two-app plus node scenario
+        id: scenario
+        working-directory: tools/e2e
+        run: |
+          test "$CARGOKIT_TOOLCHAIN" = '1.92.0'
+          free -m
+          # Sample only Gradle daemons inheriting this job's private registry.
+          python3 -u - <<'PY' > "$RUNNER_TEMP/gradle-memory.txt" &
+          import os, pathlib, time
+          stop = pathlib.Path(os.environ['RUNNER_TEMP']) / 'gradle-sampler-stop'
+          expected = ('GRADLE_USER_HOME=' + os.environ['GRADLE_USER_HOME']).encode()
+          peak = 0
+          while not stop.exists():
+              total = 0
+              for process in pathlib.Path('/proc').glob('[0-9]*'):
+                  try:
+                      if expected not in (process / 'environ').read_bytes().split(b'\0'):
+                          continue
+                      if b'GradleDaemon' not in (process / 'cmdline').read_bytes():
+                          continue
+                      for line in (process / 'status').read_text().splitlines():
+                          if line.startswith('VmRSS:'):
+                              total += int(line.split()[1])
+                  except (OSError, ValueError):
+                      pass
+              peak = max(peak, total)
+              time.sleep(1)
+          print('Owned Gradle daemon peak RSS KiB:', peak)
+          PY
+          sampler=$!
+          trap 'touch "$RUNNER_TEMP/gradle-sampler-stop"; wait "$sampler"' EXIT
+          set +e
+          /usr/bin/time -v -o "$RUNNER_TEMP/e2e-time.txt" dart run bin/run.dart --profile android --repo-root "$GITHUB_WORKSPACE" > "$RUNNER_TEMP/e2e-private.log" 2>&1
+          code=$?
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          free -m
+          touch "$RUNNER_TEMP/gradle-sampler-stop"
+          wait "$sampler"
+          cat "$RUNNER_TEMP/gradle-memory.txt"
+          echo "Android scenario exit code: $code"
+          exit "$code"
+      - name: Sanitized retained summary
+        if: always()
+        env:
+          SCENARIO_CODE: ${{ steps.scenario.outputs.exit_code }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          stage=preparation
+          code=1
+          if [ -n "$SCENARIO_CODE" ]; then stage=scenario; code="$SCENARIO_CODE"; fi
+          outcome=failure
+          if [ "$code" = 0 ]; then outcome=success; fi
+          if [ "$JOB_STATUS" = cancelled ]; then outcome=cancelled; code=130; fi
+          python3 tools/ci/write_e2e_summary.py --profile android --stage "$stage" --outcome "$outcome" --exit-code "$code" --memory-file "$RUNNER_TEMP/e2e-time.txt" --output "$RUNNER_TEMP/e2e-summary.json"
+          echo 'GNU time maximum child RSS is not the simultaneous total of two AVDs and Gradle.' >> "$GITHUB_STEP_SUMMARY"
+          cat "$RUNNER_TEMP/e2e-summary.json" >> "$GITHUB_STEP_SUMMARY"
+      - name: Retain only the sanitized summary
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: android-e2e-summary
+          path: ${{ runner.temp }}/e2e-summary.json
+          if-no-files-found: error
+          retention-days: 14
+
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master 2026-10-01
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+      - name: Dart dependencies
+        run: |
+          Push-Location app
+          flutter pub get
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Pop-Location
+          Push-Location tools/e2e
+          dart pub get --enforce-lockfile
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Pop-Location
+      - name: Windows two-app plus node scenario
+        id: scenario
+        working-directory: tools/e2e
+        run: |
+          if ($env:CARGOKIT_TOOLCHAIN -ne '1.92.0') { throw 'Missing pinned toolchain' }
+          dart run bin/run.dart --profile windows --repo-root "$env:GITHUB_WORKSPACE" *> "$env:RUNNER_TEMP/e2e-private.log"
+          $code = $LASTEXITCODE
+          "exit_code=$code" >> $env:GITHUB_OUTPUT
+          Write-Output "Windows scenario exit code: $code"
+          exit $code
+      - name: Sanitized retained summary
+        if: always()
+        env:
+          SCENARIO_CODE: ${{ steps.scenario.outputs.exit_code }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          $stage = 'preparation'; $code = 1; $outcome = 'failure'
+          if ($env:SCENARIO_CODE) { $stage = 'scenario'; $code = [int]$env:SCENARIO_CODE }
+          if ($code -eq 0) { $outcome = 'success' }
+          if ($env:JOB_STATUS -eq 'cancelled') { $outcome = 'cancelled'; $code = 130 }
+          python tools/ci/write_e2e_summary.py --profile windows --stage $stage --outcome $outcome --exit-code $code --output "$env:RUNNER_TEMP/e2e-summary.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-Content "$env:RUNNER_TEMP/e2e-summary.json" >> $env:GITHUB_STEP_SUMMARY
+      - name: Retain only the sanitized summary
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-e2e-summary
+          path: ${{ runner.temp }}/e2e-summary.json
+          if-no-files-found: error
+          retention-days: 14

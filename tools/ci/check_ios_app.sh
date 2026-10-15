@@ -82,6 +82,13 @@ grep -q frb_get_rust_content_hash "$work/chat_ffi.syms" \
   || fail "chat_ffi lost its flutter_rust_bridge symbols in this build"
 echo "chat_ffi exports frb_get_rust_content_hash"
 
+# The simulator integration build deliberately contains Debug controllers.
+# Device Release and signed exports must scan all native app/extension members.
+if [ "$signed" = true ] || [ "${CHECK_RELEASE_HOOKS:-0}" = 1 ]; then
+  python3 "$(dirname "$0")/check_release_hooks.py" "$app" \
+    || fail "Release app contains test hooks or is missing native artifacts"
+fi
+
 if [ "$signed" = true ]; then
   # codesign has warned since macOS 12 that the `--entitlements :-` form is deprecated and will stop
   # working, so ask for XML with --xml. Its stderr holds `Executable=<path>` and warnings, no secrets;
