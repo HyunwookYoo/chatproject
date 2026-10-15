@@ -9,234 +9,326 @@ part of 'chat.dart';
 // FreezedGenerator
 // **************************************************************************
 
-// dart format off
 T _$identity<T>(T value) => value;
+
 /// @nodoc
 mixin _$ChatEvent {
+  @override
+  bool operator ==(Object other) {
+    return identical(this, other) ||
+        (other.runtimeType == runtimeType && other is ChatEvent);
+  }
 
+  @override
+  int get hashCode => runtimeType.hashCode;
 
-
-
-
-@override
-bool operator ==(Object other) {
-  return identical(this, other) || (other.runtimeType == runtimeType&&other is ChatEvent);
-}
-
-
-@override
-int get hashCode => runtimeType.hashCode;
-
-@override
-String toString() {
-  return 'ChatEvent()';
-}
-
-
+  @override
+  String toString() {
+    return 'ChatEvent()';
+  }
 }
 
 /// @nodoc
-class $ChatEventCopyWith<$Res>  {
-$ChatEventCopyWith(ChatEvent _, $Res Function(ChatEvent) __);
+class $ChatEventCopyWith<$Res> {
+  $ChatEventCopyWith(ChatEvent _, $Res Function(ChatEvent) __);
 }
-
 
 /// Adds pattern-matching-related methods to [ChatEvent].
 extension ChatEventPatterns on ChatEvent {
-/// A variant of `map` that fallback to returning `orElse`.
-///
-/// It is equivalent to doing:
-/// ```dart
-/// switch (sealedClass) {
-///   case final Subclass value:
-///     return ...;
-///   case _:
-///     return orElse();
-/// }
-/// ```
+  /// A variant of `map` that fallback to returning `orElse`.
+  ///
+  /// It is equivalent to doing:
+  /// ```dart
+  /// switch (sealedClass) {
+  ///   case final Subclass value:
+  ///     return ...;
+  ///   case _:
+  ///     return orElse();
+  /// }
+  /// ```
 
-@optionalTypeArgs TResult maybeMap<TResult extends Object?>({TResult Function( ChatEvent_ConnectionState value)?  connectionState,TResult Function( ChatEvent_Error value)?  error,TResult Function( ChatEvent_NetworkChanged value)?  networkChanged,TResult Function( ChatEvent_PeerChanged value)?  peerChanged,TResult Function( ChatEvent_ProbeTextReceived value)?  probeTextReceived,required TResult orElse(),}){
-final _that = this;
-switch (_that) {
-case ChatEvent_ConnectionState() when connectionState != null:
-return connectionState(_that);case ChatEvent_Error() when error != null:
-return error(_that);case ChatEvent_NetworkChanged() when networkChanged != null:
-return networkChanged(_that);case ChatEvent_PeerChanged() when peerChanged != null:
-return peerChanged(_that);case ChatEvent_ProbeTextReceived() when probeTextReceived != null:
-return probeTextReceived(_that);case _:
-  return orElse();
+  @optionalTypeArgs
+  TResult maybeMap<TResult extends Object?>({
+    TResult Function(ChatEvent_ConnectionState value)? connectionState,
+    TResult Function(ChatEvent_Error value)? error,
+    TResult Function(ChatEvent_NetworkChanged value)? networkChanged,
+    TResult Function(ChatEvent_PeerChanged value)? peerChanged,
+    TResult Function(ChatEvent_ProbeTextReceived value)? probeTextReceived,
+    required TResult orElse(),
+  }) {
+    final _that = this;
+    switch (_that) {
+      case ChatEvent_ConnectionState() when connectionState != null:
+        return connectionState(_that);
+      case ChatEvent_Error() when error != null:
+        return error(_that);
+      case ChatEvent_NetworkChanged() when networkChanged != null:
+        return networkChanged(_that);
+      case ChatEvent_PeerChanged() when peerChanged != null:
+        return peerChanged(_that);
+      case ChatEvent_ProbeTextReceived() when probeTextReceived != null:
+        return probeTextReceived(_that);
+      case _:
+        return orElse();
+    }
+  }
 
-}
-}
-/// A `switch`-like method, using callbacks.
-///
-/// Callbacks receives the raw object, upcasted.
-/// It is equivalent to doing:
-/// ```dart
-/// switch (sealedClass) {
-///   case final Subclass value:
-///     return ...;
-///   case final Subclass2 value:
-///     return ...;
-/// }
-/// ```
+  /// A `switch`-like method, using callbacks.
+  ///
+  /// Callbacks receives the raw object, upcasted.
+  /// It is equivalent to doing:
+  /// ```dart
+  /// switch (sealedClass) {
+  ///   case final Subclass value:
+  ///     return ...;
+  ///   case final Subclass2 value:
+  ///     return ...;
+  /// }
+  /// ```
 
-@optionalTypeArgs TResult map<TResult extends Object?>({required TResult Function( ChatEvent_ConnectionState value)  connectionState,required TResult Function( ChatEvent_Error value)  error,required TResult Function( ChatEvent_NetworkChanged value)  networkChanged,required TResult Function( ChatEvent_PeerChanged value)  peerChanged,required TResult Function( ChatEvent_ProbeTextReceived value)  probeTextReceived,}){
-final _that = this;
-switch (_that) {
-case ChatEvent_ConnectionState():
-return connectionState(_that);case ChatEvent_Error():
-return error(_that);case ChatEvent_NetworkChanged():
-return networkChanged(_that);case ChatEvent_PeerChanged():
-return peerChanged(_that);case ChatEvent_ProbeTextReceived():
-return probeTextReceived(_that);}
-}
-/// A variant of `map` that fallback to returning `null`.
-///
-/// It is equivalent to doing:
-/// ```dart
-/// switch (sealedClass) {
-///   case final Subclass value:
-///     return ...;
-///   case _:
-///     return null;
-/// }
-/// ```
+  @optionalTypeArgs
+  TResult map<TResult extends Object?>({
+    required TResult Function(ChatEvent_ConnectionState value) connectionState,
+    required TResult Function(ChatEvent_Error value) error,
+    required TResult Function(ChatEvent_NetworkChanged value) networkChanged,
+    required TResult Function(ChatEvent_PeerChanged value) peerChanged,
+    required TResult Function(ChatEvent_ProbeTextReceived value)
+    probeTextReceived,
+  }) {
+    final _that = this;
+    switch (_that) {
+      case ChatEvent_ConnectionState():
+        return connectionState(_that);
+      case ChatEvent_Error():
+        return error(_that);
+      case ChatEvent_NetworkChanged():
+        return networkChanged(_that);
+      case ChatEvent_PeerChanged():
+        return peerChanged(_that);
+      case ChatEvent_ProbeTextReceived():
+        return probeTextReceived(_that);
+    }
+  }
 
-@optionalTypeArgs TResult? mapOrNull<TResult extends Object?>({TResult? Function( ChatEvent_ConnectionState value)?  connectionState,TResult? Function( ChatEvent_Error value)?  error,TResult? Function( ChatEvent_NetworkChanged value)?  networkChanged,TResult? Function( ChatEvent_PeerChanged value)?  peerChanged,TResult? Function( ChatEvent_ProbeTextReceived value)?  probeTextReceived,}){
-final _that = this;
-switch (_that) {
-case ChatEvent_ConnectionState() when connectionState != null:
-return connectionState(_that);case ChatEvent_Error() when error != null:
-return error(_that);case ChatEvent_NetworkChanged() when networkChanged != null:
-return networkChanged(_that);case ChatEvent_PeerChanged() when peerChanged != null:
-return peerChanged(_that);case ChatEvent_ProbeTextReceived() when probeTextReceived != null:
-return probeTextReceived(_that);case _:
-  return null;
+  /// A variant of `map` that fallback to returning `null`.
+  ///
+  /// It is equivalent to doing:
+  /// ```dart
+  /// switch (sealedClass) {
+  ///   case final Subclass value:
+  ///     return ...;
+  ///   case _:
+  ///     return null;
+  /// }
+  /// ```
 
-}
-}
-/// A variant of `when` that fallback to an `orElse` callback.
-///
-/// It is equivalent to doing:
-/// ```dart
-/// switch (sealedClass) {
-///   case Subclass(:final field):
-///     return ...;
-///   case _:
-///     return orElse();
-/// }
-/// ```
+  @optionalTypeArgs
+  TResult? mapOrNull<TResult extends Object?>({
+    TResult? Function(ChatEvent_ConnectionState value)? connectionState,
+    TResult? Function(ChatEvent_Error value)? error,
+    TResult? Function(ChatEvent_NetworkChanged value)? networkChanged,
+    TResult? Function(ChatEvent_PeerChanged value)? peerChanged,
+    TResult? Function(ChatEvent_ProbeTextReceived value)? probeTextReceived,
+  }) {
+    final _that = this;
+    switch (_that) {
+      case ChatEvent_ConnectionState() when connectionState != null:
+        return connectionState(_that);
+      case ChatEvent_Error() when error != null:
+        return error(_that);
+      case ChatEvent_NetworkChanged() when networkChanged != null:
+        return networkChanged(_that);
+      case ChatEvent_PeerChanged() when peerChanged != null:
+        return peerChanged(_that);
+      case ChatEvent_ProbeTextReceived() when probeTextReceived != null:
+        return probeTextReceived(_that);
+      case _:
+        return null;
+    }
+  }
 
-@optionalTypeArgs TResult maybeWhen<TResult extends Object?>({TResult Function( int directPeers,  bool mailboxOk,  bool? queueOk)?  connectionState,TResult Function( ErrorCode code,  String detail)?  error,TResult Function( NetworkInfo info)?  networkChanged,TResult Function( BigInt revision,  PeerInfo peer)?  peerChanged,TResult Function( String peerId,  String text)?  probeTextReceived,required TResult orElse(),}) {final _that = this;
-switch (_that) {
-case ChatEvent_ConnectionState() when connectionState != null:
-return connectionState(_that.directPeers,_that.mailboxOk,_that.queueOk);case ChatEvent_Error() when error != null:
-return error(_that.code,_that.detail);case ChatEvent_NetworkChanged() when networkChanged != null:
-return networkChanged(_that.info);case ChatEvent_PeerChanged() when peerChanged != null:
-return peerChanged(_that.revision,_that.peer);case ChatEvent_ProbeTextReceived() when probeTextReceived != null:
-return probeTextReceived(_that.peerId,_that.text);case _:
-  return orElse();
+  /// A variant of `when` that fallback to an `orElse` callback.
+  ///
+  /// It is equivalent to doing:
+  /// ```dart
+  /// switch (sealedClass) {
+  ///   case Subclass(:final field):
+  ///     return ...;
+  ///   case _:
+  ///     return orElse();
+  /// }
+  /// ```
 
-}
-}
-/// A `switch`-like method, using callbacks.
-///
-/// As opposed to `map`, this offers destructuring.
-/// It is equivalent to doing:
-/// ```dart
-/// switch (sealedClass) {
-///   case Subclass(:final field):
-///     return ...;
-///   case Subclass2(:final field2):
-///     return ...;
-/// }
-/// ```
+  @optionalTypeArgs
+  TResult maybeWhen<TResult extends Object?>({
+    TResult Function(int directPeers, bool mailboxOk, bool? queueOk)?
+    connectionState,
+    TResult Function(ErrorCode code, String detail)? error,
+    TResult Function(NetworkInfo info)? networkChanged,
+    TResult Function(BigInt revision, PeerInfo peer)? peerChanged,
+    TResult Function(String peerId, String text)? probeTextReceived,
+    required TResult orElse(),
+  }) {
+    final _that = this;
+    switch (_that) {
+      case ChatEvent_ConnectionState() when connectionState != null:
+        return connectionState(
+          _that.directPeers,
+          _that.mailboxOk,
+          _that.queueOk,
+        );
+      case ChatEvent_Error() when error != null:
+        return error(_that.code, _that.detail);
+      case ChatEvent_NetworkChanged() when networkChanged != null:
+        return networkChanged(_that.info);
+      case ChatEvent_PeerChanged() when peerChanged != null:
+        return peerChanged(_that.revision, _that.peer);
+      case ChatEvent_ProbeTextReceived() when probeTextReceived != null:
+        return probeTextReceived(_that.peerId, _that.text);
+      case _:
+        return orElse();
+    }
+  }
 
-@optionalTypeArgs TResult when<TResult extends Object?>({required TResult Function( int directPeers,  bool mailboxOk,  bool? queueOk)  connectionState,required TResult Function( ErrorCode code,  String detail)  error,required TResult Function( NetworkInfo info)  networkChanged,required TResult Function( BigInt revision,  PeerInfo peer)  peerChanged,required TResult Function( String peerId,  String text)  probeTextReceived,}) {final _that = this;
-switch (_that) {
-case ChatEvent_ConnectionState():
-return connectionState(_that.directPeers,_that.mailboxOk,_that.queueOk);case ChatEvent_Error():
-return error(_that.code,_that.detail);case ChatEvent_NetworkChanged():
-return networkChanged(_that.info);case ChatEvent_PeerChanged():
-return peerChanged(_that.revision,_that.peer);case ChatEvent_ProbeTextReceived():
-return probeTextReceived(_that.peerId,_that.text);}
-}
-/// A variant of `when` that fallback to returning `null`
-///
-/// It is equivalent to doing:
-/// ```dart
-/// switch (sealedClass) {
-///   case Subclass(:final field):
-///     return ...;
-///   case _:
-///     return null;
-/// }
-/// ```
+  /// A `switch`-like method, using callbacks.
+  ///
+  /// As opposed to `map`, this offers destructuring.
+  /// It is equivalent to doing:
+  /// ```dart
+  /// switch (sealedClass) {
+  ///   case Subclass(:final field):
+  ///     return ...;
+  ///   case Subclass2(:final field2):
+  ///     return ...;
+  /// }
+  /// ```
 
-@optionalTypeArgs TResult? whenOrNull<TResult extends Object?>({TResult? Function( int directPeers,  bool mailboxOk,  bool? queueOk)?  connectionState,TResult? Function( ErrorCode code,  String detail)?  error,TResult? Function( NetworkInfo info)?  networkChanged,TResult? Function( BigInt revision,  PeerInfo peer)?  peerChanged,TResult? Function( String peerId,  String text)?  probeTextReceived,}) {final _that = this;
-switch (_that) {
-case ChatEvent_ConnectionState() when connectionState != null:
-return connectionState(_that.directPeers,_that.mailboxOk,_that.queueOk);case ChatEvent_Error() when error != null:
-return error(_that.code,_that.detail);case ChatEvent_NetworkChanged() when networkChanged != null:
-return networkChanged(_that.info);case ChatEvent_PeerChanged() when peerChanged != null:
-return peerChanged(_that.revision,_that.peer);case ChatEvent_ProbeTextReceived() when probeTextReceived != null:
-return probeTextReceived(_that.peerId,_that.text);case _:
-  return null;
+  @optionalTypeArgs
+  TResult when<TResult extends Object?>({
+    required TResult Function(int directPeers, bool mailboxOk, bool? queueOk)
+    connectionState,
+    required TResult Function(ErrorCode code, String detail) error,
+    required TResult Function(NetworkInfo info) networkChanged,
+    required TResult Function(BigInt revision, PeerInfo peer) peerChanged,
+    required TResult Function(String peerId, String text) probeTextReceived,
+  }) {
+    final _that = this;
+    switch (_that) {
+      case ChatEvent_ConnectionState():
+        return connectionState(
+          _that.directPeers,
+          _that.mailboxOk,
+          _that.queueOk,
+        );
+      case ChatEvent_Error():
+        return error(_that.code, _that.detail);
+      case ChatEvent_NetworkChanged():
+        return networkChanged(_that.info);
+      case ChatEvent_PeerChanged():
+        return peerChanged(_that.revision, _that.peer);
+      case ChatEvent_ProbeTextReceived():
+        return probeTextReceived(_that.peerId, _that.text);
+    }
+  }
 
-}
-}
+  /// A variant of `when` that fallback to returning `null`
+  ///
+  /// It is equivalent to doing:
+  /// ```dart
+  /// switch (sealedClass) {
+  ///   case Subclass(:final field):
+  ///     return ...;
+  ///   case _:
+  ///     return null;
+  /// }
+  /// ```
 
+  @optionalTypeArgs
+  TResult? whenOrNull<TResult extends Object?>({
+    TResult? Function(int directPeers, bool mailboxOk, bool? queueOk)?
+    connectionState,
+    TResult? Function(ErrorCode code, String detail)? error,
+    TResult? Function(NetworkInfo info)? networkChanged,
+    TResult? Function(BigInt revision, PeerInfo peer)? peerChanged,
+    TResult? Function(String peerId, String text)? probeTextReceived,
+  }) {
+    final _that = this;
+    switch (_that) {
+      case ChatEvent_ConnectionState() when connectionState != null:
+        return connectionState(
+          _that.directPeers,
+          _that.mailboxOk,
+          _that.queueOk,
+        );
+      case ChatEvent_Error() when error != null:
+        return error(_that.code, _that.detail);
+      case ChatEvent_NetworkChanged() when networkChanged != null:
+        return networkChanged(_that.info);
+      case ChatEvent_PeerChanged() when peerChanged != null:
+        return peerChanged(_that.revision, _that.peer);
+      case ChatEvent_ProbeTextReceived() when probeTextReceived != null:
+        return probeTextReceived(_that.peerId, _that.text);
+      case _:
+        return null;
+    }
+  }
 }
 
 /// @nodoc
-
 
 class ChatEvent_ConnectionState extends ChatEvent {
-  const ChatEvent_ConnectionState({required this.directPeers, required this.mailboxOk, this.queueOk}): super._();
-  
+  const ChatEvent_ConnectionState({
+    required this.directPeers,
+    required this.mailboxOk,
+    this.queueOk,
+  }) : super._();
 
- final  int directPeers;
- final  bool mailboxOk;
- final  bool? queueOk;
+  final int directPeers;
+  final bool mailboxOk;
+  final bool? queueOk;
 
-/// Create a copy of ChatEvent
-/// with the given fields replaced by the non-null parameter values.
-@JsonKey(includeFromJson: false, includeToJson: false)
-@pragma('vm:prefer-inline')
-$ChatEvent_ConnectionStateCopyWith<ChatEvent_ConnectionState> get copyWith => _$ChatEvent_ConnectionStateCopyWithImpl<ChatEvent_ConnectionState>(this, _$identity);
+  /// Create a copy of ChatEvent
+  /// with the given fields replaced by the non-null parameter values.
+  @JsonKey(includeFromJson: false, includeToJson: false)
+  @pragma('vm:prefer-inline')
+  $ChatEvent_ConnectionStateCopyWith<ChatEvent_ConnectionState> get copyWith =>
+      _$ChatEvent_ConnectionStateCopyWithImpl<ChatEvent_ConnectionState>(
+        this,
+        _$identity,
+      );
 
+  @override
+  bool operator ==(Object other) {
+    return identical(this, other) ||
+        (other.runtimeType == runtimeType &&
+            other is ChatEvent_ConnectionState &&
+            (identical(other.directPeers, directPeers) ||
+                other.directPeers == directPeers) &&
+            (identical(other.mailboxOk, mailboxOk) ||
+                other.mailboxOk == mailboxOk) &&
+            (identical(other.queueOk, queueOk) || other.queueOk == queueOk));
+  }
 
+  @override
+  int get hashCode => Object.hash(runtimeType, directPeers, mailboxOk, queueOk);
 
-@override
-bool operator ==(Object other) {
-  return identical(this, other) || (other.runtimeType == runtimeType&&other is ChatEvent_ConnectionState&&(identical(other.directPeers, directPeers) || other.directPeers == directPeers)&&(identical(other.mailboxOk, mailboxOk) || other.mailboxOk == mailboxOk)&&(identical(other.queueOk, queueOk) || other.queueOk == queueOk));
-}
-
-
-@override
-int get hashCode => Object.hash(runtimeType,directPeers,mailboxOk,queueOk);
-
-@override
-String toString() {
-  return 'ChatEvent.connectionState(directPeers: $directPeers, mailboxOk: $mailboxOk, queueOk: $queueOk)';
-}
-
-
+  @override
+  String toString() {
+    return 'ChatEvent.connectionState(directPeers: $directPeers, mailboxOk: $mailboxOk, queueOk: $queueOk)';
+  }
 }
 
 /// @nodoc
-abstract mixin class $ChatEvent_ConnectionStateCopyWith<$Res> implements $ChatEventCopyWith<$Res> {
-  factory $ChatEvent_ConnectionStateCopyWith(ChatEvent_ConnectionState value, $Res Function(ChatEvent_ConnectionState) _then) = _$ChatEvent_ConnectionStateCopyWithImpl;
-@useResult
-$Res call({
- int directPeers, bool mailboxOk, bool? queueOk
-});
-
-
-
-
+abstract mixin class $ChatEvent_ConnectionStateCopyWith<$Res>
+    implements $ChatEventCopyWith<$Res> {
+  factory $ChatEvent_ConnectionStateCopyWith(
+    ChatEvent_ConnectionState value,
+    $Res Function(ChatEvent_ConnectionState) _then,
+  ) = _$ChatEvent_ConnectionStateCopyWithImpl;
+  @useResult
+  $Res call({int directPeers, bool mailboxOk, bool? queueOk});
 }
+
 /// @nodoc
 class _$ChatEvent_ConnectionStateCopyWithImpl<$Res>
     implements $ChatEvent_ConnectionStateCopyWith<$Res> {
@@ -245,67 +337,77 @@ class _$ChatEvent_ConnectionStateCopyWithImpl<$Res>
   final ChatEvent_ConnectionState _self;
   final $Res Function(ChatEvent_ConnectionState) _then;
 
-/// Create a copy of ChatEvent
-/// with the given fields replaced by the non-null parameter values.
-@pragma('vm:prefer-inline') $Res call({Object? directPeers = null,Object? mailboxOk = null,Object? queueOk = freezed,}) {
-  return _then(ChatEvent_ConnectionState(
-directPeers: null == directPeers ? _self.directPeers : directPeers // ignore: cast_nullable_to_non_nullable
-as int,mailboxOk: null == mailboxOk ? _self.mailboxOk : mailboxOk // ignore: cast_nullable_to_non_nullable
-as bool,queueOk: freezed == queueOk ? _self.queueOk : queueOk // ignore: cast_nullable_to_non_nullable
-as bool?,
-  ));
-}
-
-
+  /// Create a copy of ChatEvent
+  /// with the given fields replaced by the non-null parameter values.
+  @pragma('vm:prefer-inline')
+  $Res call({
+    Object? directPeers = null,
+    Object? mailboxOk = null,
+    Object? queueOk = freezed,
+  }) {
+    return _then(
+      ChatEvent_ConnectionState(
+        directPeers: null == directPeers
+            ? _self.directPeers
+            : directPeers // ignore: cast_nullable_to_non_nullable
+                  as int,
+        mailboxOk: null == mailboxOk
+            ? _self.mailboxOk
+            : mailboxOk // ignore: cast_nullable_to_non_nullable
+                  as bool,
+        queueOk: freezed == queueOk
+            ? _self.queueOk
+            : queueOk // ignore: cast_nullable_to_non_nullable
+                  as bool?,
+      ),
+    );
+  }
 }
 
 /// @nodoc
-
 
 class ChatEvent_Error extends ChatEvent {
-  const ChatEvent_Error({required this.code, required this.detail}): super._();
-  
+  const ChatEvent_Error({required this.code, required this.detail}) : super._();
 
- final  ErrorCode code;
- final  String detail;
+  final ErrorCode code;
+  final String detail;
 
-/// Create a copy of ChatEvent
-/// with the given fields replaced by the non-null parameter values.
-@JsonKey(includeFromJson: false, includeToJson: false)
-@pragma('vm:prefer-inline')
-$ChatEvent_ErrorCopyWith<ChatEvent_Error> get copyWith => _$ChatEvent_ErrorCopyWithImpl<ChatEvent_Error>(this, _$identity);
+  /// Create a copy of ChatEvent
+  /// with the given fields replaced by the non-null parameter values.
+  @JsonKey(includeFromJson: false, includeToJson: false)
+  @pragma('vm:prefer-inline')
+  $ChatEvent_ErrorCopyWith<ChatEvent_Error> get copyWith =>
+      _$ChatEvent_ErrorCopyWithImpl<ChatEvent_Error>(this, _$identity);
 
+  @override
+  bool operator ==(Object other) {
+    return identical(this, other) ||
+        (other.runtimeType == runtimeType &&
+            other is ChatEvent_Error &&
+            (identical(other.code, code) || other.code == code) &&
+            (identical(other.detail, detail) || other.detail == detail));
+  }
 
+  @override
+  int get hashCode => Object.hash(runtimeType, code, detail);
 
-@override
-bool operator ==(Object other) {
-  return identical(this, other) || (other.runtimeType == runtimeType&&other is ChatEvent_Error&&(identical(other.code, code) || other.code == code)&&(identical(other.detail, detail) || other.detail == detail));
-}
-
-
-@override
-int get hashCode => Object.hash(runtimeType,code,detail);
-
-@override
-String toString() {
-  return 'ChatEvent.error(code: $code, detail: $detail)';
-}
-
-
+  @override
+  String toString() {
+    return 'ChatEvent.error(code: $code, detail: $detail)';
+  }
 }
 
 /// @nodoc
-abstract mixin class $ChatEvent_ErrorCopyWith<$Res> implements $ChatEventCopyWith<$Res> {
-  factory $ChatEvent_ErrorCopyWith(ChatEvent_Error value, $Res Function(ChatEvent_Error) _then) = _$ChatEvent_ErrorCopyWithImpl;
-@useResult
-$Res call({
- ErrorCode code, String detail
-});
-
-
-
-
+abstract mixin class $ChatEvent_ErrorCopyWith<$Res>
+    implements $ChatEventCopyWith<$Res> {
+  factory $ChatEvent_ErrorCopyWith(
+    ChatEvent_Error value,
+    $Res Function(ChatEvent_Error) _then,
+  ) = _$ChatEvent_ErrorCopyWithImpl;
+  @useResult
+  $Res call({ErrorCode code, String detail});
 }
+
 /// @nodoc
 class _$ChatEvent_ErrorCopyWithImpl<$Res>
     implements $ChatEvent_ErrorCopyWith<$Res> {
@@ -314,65 +416,70 @@ class _$ChatEvent_ErrorCopyWithImpl<$Res>
   final ChatEvent_Error _self;
   final $Res Function(ChatEvent_Error) _then;
 
-/// Create a copy of ChatEvent
-/// with the given fields replaced by the non-null parameter values.
-@pragma('vm:prefer-inline') $Res call({Object? code = null,Object? detail = null,}) {
-  return _then(ChatEvent_Error(
-code: null == code ? _self.code : code // ignore: cast_nullable_to_non_nullable
-as ErrorCode,detail: null == detail ? _self.detail : detail // ignore: cast_nullable_to_non_nullable
-as String,
-  ));
-}
-
-
+  /// Create a copy of ChatEvent
+  /// with the given fields replaced by the non-null parameter values.
+  @pragma('vm:prefer-inline')
+  $Res call({Object? code = null, Object? detail = null}) {
+    return _then(
+      ChatEvent_Error(
+        code: null == code
+            ? _self.code
+            : code // ignore: cast_nullable_to_non_nullable
+                  as ErrorCode,
+        detail: null == detail
+            ? _self.detail
+            : detail // ignore: cast_nullable_to_non_nullable
+                  as String,
+      ),
+    );
+  }
 }
 
 /// @nodoc
-
 
 class ChatEvent_NetworkChanged extends ChatEvent {
-  const ChatEvent_NetworkChanged({required this.info}): super._();
-  
+  const ChatEvent_NetworkChanged({required this.info}) : super._();
 
- final  NetworkInfo info;
+  final NetworkInfo info;
 
-/// Create a copy of ChatEvent
-/// with the given fields replaced by the non-null parameter values.
-@JsonKey(includeFromJson: false, includeToJson: false)
-@pragma('vm:prefer-inline')
-$ChatEvent_NetworkChangedCopyWith<ChatEvent_NetworkChanged> get copyWith => _$ChatEvent_NetworkChangedCopyWithImpl<ChatEvent_NetworkChanged>(this, _$identity);
+  /// Create a copy of ChatEvent
+  /// with the given fields replaced by the non-null parameter values.
+  @JsonKey(includeFromJson: false, includeToJson: false)
+  @pragma('vm:prefer-inline')
+  $ChatEvent_NetworkChangedCopyWith<ChatEvent_NetworkChanged> get copyWith =>
+      _$ChatEvent_NetworkChangedCopyWithImpl<ChatEvent_NetworkChanged>(
+        this,
+        _$identity,
+      );
 
+  @override
+  bool operator ==(Object other) {
+    return identical(this, other) ||
+        (other.runtimeType == runtimeType &&
+            other is ChatEvent_NetworkChanged &&
+            (identical(other.info, info) || other.info == info));
+  }
 
+  @override
+  int get hashCode => Object.hash(runtimeType, info);
 
-@override
-bool operator ==(Object other) {
-  return identical(this, other) || (other.runtimeType == runtimeType&&other is ChatEvent_NetworkChanged&&(identical(other.info, info) || other.info == info));
-}
-
-
-@override
-int get hashCode => Object.hash(runtimeType,info);
-
-@override
-String toString() {
-  return 'ChatEvent.networkChanged(info: $info)';
-}
-
-
+  @override
+  String toString() {
+    return 'ChatEvent.networkChanged(info: $info)';
+  }
 }
 
 /// @nodoc
-abstract mixin class $ChatEvent_NetworkChangedCopyWith<$Res> implements $ChatEventCopyWith<$Res> {
-  factory $ChatEvent_NetworkChangedCopyWith(ChatEvent_NetworkChanged value, $Res Function(ChatEvent_NetworkChanged) _then) = _$ChatEvent_NetworkChangedCopyWithImpl;
-@useResult
-$Res call({
- NetworkInfo info
-});
-
-
-
-
+abstract mixin class $ChatEvent_NetworkChangedCopyWith<$Res>
+    implements $ChatEventCopyWith<$Res> {
+  factory $ChatEvent_NetworkChangedCopyWith(
+    ChatEvent_NetworkChanged value,
+    $Res Function(ChatEvent_NetworkChanged) _then,
+  ) = _$ChatEvent_NetworkChangedCopyWithImpl;
+  @useResult
+  $Res call({NetworkInfo info});
 }
+
 /// @nodoc
 class _$ChatEvent_NetworkChangedCopyWithImpl<$Res>
     implements $ChatEvent_NetworkChangedCopyWith<$Res> {
@@ -381,65 +488,70 @@ class _$ChatEvent_NetworkChangedCopyWithImpl<$Res>
   final ChatEvent_NetworkChanged _self;
   final $Res Function(ChatEvent_NetworkChanged) _then;
 
-/// Create a copy of ChatEvent
-/// with the given fields replaced by the non-null parameter values.
-@pragma('vm:prefer-inline') $Res call({Object? info = null,}) {
-  return _then(ChatEvent_NetworkChanged(
-info: null == info ? _self.info : info // ignore: cast_nullable_to_non_nullable
-as NetworkInfo,
-  ));
-}
-
-
+  /// Create a copy of ChatEvent
+  /// with the given fields replaced by the non-null parameter values.
+  @pragma('vm:prefer-inline')
+  $Res call({Object? info = null}) {
+    return _then(
+      ChatEvent_NetworkChanged(
+        info: null == info
+            ? _self.info
+            : info // ignore: cast_nullable_to_non_nullable
+                  as NetworkInfo,
+      ),
+    );
+  }
 }
 
 /// @nodoc
-
 
 class ChatEvent_PeerChanged extends ChatEvent {
-  const ChatEvent_PeerChanged({required this.revision, required this.peer}): super._();
-  
+  const ChatEvent_PeerChanged({required this.revision, required this.peer})
+    : super._();
 
- final  BigInt revision;
- final  PeerInfo peer;
+  final BigInt revision;
+  final PeerInfo peer;
 
-/// Create a copy of ChatEvent
-/// with the given fields replaced by the non-null parameter values.
-@JsonKey(includeFromJson: false, includeToJson: false)
-@pragma('vm:prefer-inline')
-$ChatEvent_PeerChangedCopyWith<ChatEvent_PeerChanged> get copyWith => _$ChatEvent_PeerChangedCopyWithImpl<ChatEvent_PeerChanged>(this, _$identity);
+  /// Create a copy of ChatEvent
+  /// with the given fields replaced by the non-null parameter values.
+  @JsonKey(includeFromJson: false, includeToJson: false)
+  @pragma('vm:prefer-inline')
+  $ChatEvent_PeerChangedCopyWith<ChatEvent_PeerChanged> get copyWith =>
+      _$ChatEvent_PeerChangedCopyWithImpl<ChatEvent_PeerChanged>(
+        this,
+        _$identity,
+      );
 
+  @override
+  bool operator ==(Object other) {
+    return identical(this, other) ||
+        (other.runtimeType == runtimeType &&
+            other is ChatEvent_PeerChanged &&
+            (identical(other.revision, revision) ||
+                other.revision == revision) &&
+            (identical(other.peer, peer) || other.peer == peer));
+  }
 
+  @override
+  int get hashCode => Object.hash(runtimeType, revision, peer);
 
-@override
-bool operator ==(Object other) {
-  return identical(this, other) || (other.runtimeType == runtimeType&&other is ChatEvent_PeerChanged&&(identical(other.revision, revision) || other.revision == revision)&&(identical(other.peer, peer) || other.peer == peer));
-}
-
-
-@override
-int get hashCode => Object.hash(runtimeType,revision,peer);
-
-@override
-String toString() {
-  return 'ChatEvent.peerChanged(revision: $revision, peer: $peer)';
-}
-
-
+  @override
+  String toString() {
+    return 'ChatEvent.peerChanged(revision: $revision, peer: $peer)';
+  }
 }
 
 /// @nodoc
-abstract mixin class $ChatEvent_PeerChangedCopyWith<$Res> implements $ChatEventCopyWith<$Res> {
-  factory $ChatEvent_PeerChangedCopyWith(ChatEvent_PeerChanged value, $Res Function(ChatEvent_PeerChanged) _then) = _$ChatEvent_PeerChangedCopyWithImpl;
-@useResult
-$Res call({
- BigInt revision, PeerInfo peer
-});
-
-
-
-
+abstract mixin class $ChatEvent_PeerChangedCopyWith<$Res>
+    implements $ChatEventCopyWith<$Res> {
+  factory $ChatEvent_PeerChangedCopyWith(
+    ChatEvent_PeerChanged value,
+    $Res Function(ChatEvent_PeerChanged) _then,
+  ) = _$ChatEvent_PeerChangedCopyWithImpl;
+  @useResult
+  $Res call({BigInt revision, PeerInfo peer});
 }
+
 /// @nodoc
 class _$ChatEvent_PeerChangedCopyWithImpl<$Res>
     implements $ChatEvent_PeerChangedCopyWith<$Res> {
@@ -448,66 +560,74 @@ class _$ChatEvent_PeerChangedCopyWithImpl<$Res>
   final ChatEvent_PeerChanged _self;
   final $Res Function(ChatEvent_PeerChanged) _then;
 
-/// Create a copy of ChatEvent
-/// with the given fields replaced by the non-null parameter values.
-@pragma('vm:prefer-inline') $Res call({Object? revision = null,Object? peer = null,}) {
-  return _then(ChatEvent_PeerChanged(
-revision: null == revision ? _self.revision : revision // ignore: cast_nullable_to_non_nullable
-as BigInt,peer: null == peer ? _self.peer : peer // ignore: cast_nullable_to_non_nullable
-as PeerInfo,
-  ));
-}
-
-
+  /// Create a copy of ChatEvent
+  /// with the given fields replaced by the non-null parameter values.
+  @pragma('vm:prefer-inline')
+  $Res call({Object? revision = null, Object? peer = null}) {
+    return _then(
+      ChatEvent_PeerChanged(
+        revision: null == revision
+            ? _self.revision
+            : revision // ignore: cast_nullable_to_non_nullable
+                  as BigInt,
+        peer: null == peer
+            ? _self.peer
+            : peer // ignore: cast_nullable_to_non_nullable
+                  as PeerInfo,
+      ),
+    );
+  }
 }
 
 /// @nodoc
-
 
 class ChatEvent_ProbeTextReceived extends ChatEvent {
-  const ChatEvent_ProbeTextReceived({required this.peerId, required this.text}): super._();
-  
+  const ChatEvent_ProbeTextReceived({required this.peerId, required this.text})
+    : super._();
 
- final  String peerId;
- final  String text;
+  final String peerId;
+  final String text;
 
-/// Create a copy of ChatEvent
-/// with the given fields replaced by the non-null parameter values.
-@JsonKey(includeFromJson: false, includeToJson: false)
-@pragma('vm:prefer-inline')
-$ChatEvent_ProbeTextReceivedCopyWith<ChatEvent_ProbeTextReceived> get copyWith => _$ChatEvent_ProbeTextReceivedCopyWithImpl<ChatEvent_ProbeTextReceived>(this, _$identity);
+  /// Create a copy of ChatEvent
+  /// with the given fields replaced by the non-null parameter values.
+  @JsonKey(includeFromJson: false, includeToJson: false)
+  @pragma('vm:prefer-inline')
+  $ChatEvent_ProbeTextReceivedCopyWith<ChatEvent_ProbeTextReceived>
+  get copyWith =>
+      _$ChatEvent_ProbeTextReceivedCopyWithImpl<ChatEvent_ProbeTextReceived>(
+        this,
+        _$identity,
+      );
 
+  @override
+  bool operator ==(Object other) {
+    return identical(this, other) ||
+        (other.runtimeType == runtimeType &&
+            other is ChatEvent_ProbeTextReceived &&
+            (identical(other.peerId, peerId) || other.peerId == peerId) &&
+            (identical(other.text, text) || other.text == text));
+  }
 
+  @override
+  int get hashCode => Object.hash(runtimeType, peerId, text);
 
-@override
-bool operator ==(Object other) {
-  return identical(this, other) || (other.runtimeType == runtimeType&&other is ChatEvent_ProbeTextReceived&&(identical(other.peerId, peerId) || other.peerId == peerId)&&(identical(other.text, text) || other.text == text));
-}
-
-
-@override
-int get hashCode => Object.hash(runtimeType,peerId,text);
-
-@override
-String toString() {
-  return 'ChatEvent.probeTextReceived(peerId: $peerId, text: $text)';
-}
-
-
+  @override
+  String toString() {
+    return 'ChatEvent.probeTextReceived(peerId: $peerId, text: $text)';
+  }
 }
 
 /// @nodoc
-abstract mixin class $ChatEvent_ProbeTextReceivedCopyWith<$Res> implements $ChatEventCopyWith<$Res> {
-  factory $ChatEvent_ProbeTextReceivedCopyWith(ChatEvent_ProbeTextReceived value, $Res Function(ChatEvent_ProbeTextReceived) _then) = _$ChatEvent_ProbeTextReceivedCopyWithImpl;
-@useResult
-$Res call({
- String peerId, String text
-});
-
-
-
-
+abstract mixin class $ChatEvent_ProbeTextReceivedCopyWith<$Res>
+    implements $ChatEventCopyWith<$Res> {
+  factory $ChatEvent_ProbeTextReceivedCopyWith(
+    ChatEvent_ProbeTextReceived value,
+    $Res Function(ChatEvent_ProbeTextReceived) _then,
+  ) = _$ChatEvent_ProbeTextReceivedCopyWithImpl;
+  @useResult
+  $Res call({String peerId, String text});
 }
+
 /// @nodoc
 class _$ChatEvent_ProbeTextReceivedCopyWithImpl<$Res>
     implements $ChatEvent_ProbeTextReceivedCopyWith<$Res> {
@@ -516,17 +636,21 @@ class _$ChatEvent_ProbeTextReceivedCopyWithImpl<$Res>
   final ChatEvent_ProbeTextReceived _self;
   final $Res Function(ChatEvent_ProbeTextReceived) _then;
 
-/// Create a copy of ChatEvent
-/// with the given fields replaced by the non-null parameter values.
-@pragma('vm:prefer-inline') $Res call({Object? peerId = null,Object? text = null,}) {
-  return _then(ChatEvent_ProbeTextReceived(
-peerId: null == peerId ? _self.peerId : peerId // ignore: cast_nullable_to_non_nullable
-as String,text: null == text ? _self.text : text // ignore: cast_nullable_to_non_nullable
-as String,
-  ));
+  /// Create a copy of ChatEvent
+  /// with the given fields replaced by the non-null parameter values.
+  @pragma('vm:prefer-inline')
+  $Res call({Object? peerId = null, Object? text = null}) {
+    return _then(
+      ChatEvent_ProbeTextReceived(
+        peerId: null == peerId
+            ? _self.peerId
+            : peerId // ignore: cast_nullable_to_non_nullable
+                  as String,
+        text: null == text
+            ? _self.text
+            : text // ignore: cast_nullable_to_non_nullable
+                  as String,
+      ),
+    );
+  }
 }
-
-
-}
-
-// dart format on

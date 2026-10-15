@@ -31,25 +31,39 @@ def steps(doc):
 
 def check(path, doc):
     name = path.name
+    if not isinstance(doc, dict):
+        return [f"{name}: workflow must be a YAML mapping"]
     problems = []
-    if "pull_request_target" in triggers(doc) or "workflow_run" in triggers(doc):
-        problems.append(f"{name}: pull_request_target/workflow_run is not allowed in a public repo")
+    allowed = {"push", "pull_request", "workflow_dispatch"}
+    if path.stem.lower() == "e2e":
+        allowed.add("schedule")
+    if set(triggers(doc)) - allowed:
+        problems.append(f"{name}: unsupported workflow trigger")
     if doc.get("permissions") != {"contents": "read"}:
         problems.append(f"{name}: top-level permissions must be exactly 'contents: read'")
     env = doc.get("env") or {}
     if "CARGOKIT_TOOLCHAIN" in env and str(env["CARGOKIT_TOOLCHAIN"]) != str(env.get("RUST_TOOLCHAIN")):
         problems.append(f"{name}: CARGOKIT_TOOLCHAIN must equal RUST_TOOLCHAIN")
+    for job_id, job in (doc.get("jobs") or {}).items():
+        if "permissions" in job:
+            permissions = job["permissions"]
+            if (not isinstance(permissions, dict) or set(permissions) - {"contents"}
+                    or any(value not in ("read", "none") for value in permissions.values())):
+                problems.append(f"{name}: job {job_id} permissions may only narrow contents: read")
+        uses = job.get("uses")
+        if uses and not uses.startswith("./.github/workflows/") and not PINNED.fullmatch(uses):
+            problems.append(f"{name}: job {job_id}: '{uses}' is not pinned to a full commit SHA")
     for job_id, index, job, step in steps(doc):
         uses = step.get("uses")
         if not uses:
             continue
-        if not PINNED.match(uses):
+        if not uses.startswith("./") and not PINNED.fullmatch(uses):
             problems.append(f"{name}: {job_id} step {index}: '{uses}' is not pinned to a full commit SHA")
         if uses.startswith("actions/checkout@") and (step.get("with") or {}).get("persist-credentials") is not False:
             problems.append(f"{name}: {job_id} step {index}: checkout must set persist-credentials: false")
-    if path.stem == "ci":
+    if path.stem.lower() == "ci":
         problems += check_ci(name, doc)
-    if path.stem == "testflight":  # GitHub runs testflight.yaml too
+    if path.stem.lower() == "testflight":  # GitHub runs testflight.yaml too
         problems += check_testflight(name, doc)
     return problems
 
@@ -105,18 +119,23 @@ def check_testflight(name, doc):
     return problems
 
 
-def main():
+def main(root=ROOT):
     # GitHub runs both .yml and .yaml files from this directory.
     paths = sorted(
         path
-        for path in (ROOT / ".github" / "workflows").glob("*")
-        if path.suffix in (".yml", ".yaml")
+        for path in (root / ".github" / "workflows").glob("*")
+        if path.suffix.lower() in (".yml", ".yaml")
     )
     problems = []
     if not paths:
         problems.append("no workflow files found in .github/workflows")
     for path in paths:
-        problems += check(path, yaml.safe_load(path.read_text(encoding="utf-8")))
+        try:
+            doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+        except yaml.YAMLError:
+            problems.append(f"{path.name}: invalid YAML")
+            continue
+        problems += check(path, doc)
     if problems:
         print("\n".join(problems))
         return 1

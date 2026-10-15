@@ -8,18 +8,22 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 case "$(uname -s)" in
-  MINGW* | MSYS* | CYGWIN*) ffi_lib=target/debug/chat_ffi.dll nse_lib=target/debug/chat_nse.lib ;;
-  Darwin) ffi_lib=target/debug/libchat_ffi.dylib nse_lib=target/debug/libchat_nse.a ;;
-  *) ffi_lib=target/debug/libchat_ffi.so nse_lib=target/debug/libchat_nse.a ;;
+  MINGW* | MSYS* | CYGWIN*) ffi_name=chat_ffi.dll nse_name=chat_nse.lib ;;
+  Darwin) ffi_name=libchat_ffi.dylib nse_name=libchat_nse.a ;;
+  *) ffi_name=libchat_ffi.so nse_name=libchat_nse.a ;;
 esac
 
 version="$(flutter_rust_bridge_codegen --version)"
-case "$version" in
-  *2.11.1*) ;;
-  *) echo "flutter_rust_bridge_codegen 2.11.1 is required, found: $version" >&2; exit 1 ;;
-esac
+if [[ "$version" != "flutter_rust_bridge_codegen 2.11.1" ]]; then
+  echo "flutter_rust_bridge_codegen 2.11.1 is required, found: $version" >&2
+  exit 1
+fi
+target_dir="$(cargo metadata --no-deps --format-version 1 | python -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
+ffi_lib="$target_dir/debug/$ffi_name"
+nse_lib="$target_dir/debug/$nse_name"
 
-(cd app && flutter_rust_bridge_codegen generate && dart run build_runner build)
+(cd app && flutter pub get && flutter_rust_bridge_codegen generate && \
+  dart run build_runner build --define freezed:freezed=format=true)
 cargo build -p chat_ffi -p chat_nse
 cargo run -q -p uniffi-bindgen -- generate --library "$ffi_lib" --language kotlin \
   --out-dir app/android/app/src/main/kotlin --no-format
