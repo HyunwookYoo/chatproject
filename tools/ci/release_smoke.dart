@@ -169,6 +169,7 @@ Future<void> runSmoke({
               .trim();
       if (!RegExp(r'^\d+\.\d+$').hasMatch(since))
         throw StateError('Device log window unavailable');
+      run.cancel.check();
       String? ownedPid;
       run.activities.add({'package': _package, 'serial': serial, 'pid': null});
       run.owned.add('Android activity', () async {
@@ -184,12 +185,16 @@ Future<void> runSmoke({
         run.save();
       });
       run.save();
-      await command(['shell', 'am', 'start', '-W', '-n', _activity]);
-      ownedPid = await appPid();
+      // Launch and PID registration are one admitted acquisition. Reuse the
+      // bounded, self-reclaiming cleanup commands to drain it despite Ctrl+C;
+      // checking cancellation in between would strand the launched app.
+      await command(['shell', 'am', 'start', '-W', '-n', _activity], cleanup: true);
+      ownedPid = await appPid(cleanup: true);
       if (!RegExp(r'^\d+$').hasMatch(ownedPid))
         throw StateError('Owned Android app failed to start');
       run.activities.single['pid'] = ownedPid;
       run.save();
+      run.cancel.check();
       inspect = () async {
         if (await appPid() != ownedPid)
           throw StateError('Owned Android app exited or changed');

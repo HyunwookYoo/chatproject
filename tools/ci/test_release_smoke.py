@@ -11,6 +11,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'package:chat_e2e/src/process_runner.dart';
+import 'package:chat_e2e/src/owned_resources.dart';
 import 'SMOKE_URI';
 
 class Child implements OwnedProcess {
@@ -29,21 +30,32 @@ class Child implements OwnedProcess {
   }
 }
 class Fake implements ProcessRunner {
-  Fake(this.mode);
+  Fake(this.mode, this.cancel);
   final String mode;
+  final RunCancellation cancel;
   final stops = <int>[];
   int next = 100;
   int polls = 0;
   bool launched = false;
   bool forceStopped = false;
+  int identityReads = 0;
   Future<OwnedProcess> start(String exe, List<String> args, {required Directory logDir, String? workingDirectory, String? stdin, bool retainOutput = false}) async {
     final child = Child(next++, Completer<int>(), this);
     var output = '';
     if (mode.startsWith('android-')) {
-      if (args.contains('pidof')) output = launched ? '321' : '';
+      if (args.contains('pidof')) {
+        if (launched) {
+          identityReads++;
+          output = mode == 'android-cancel-foreign' && identityReads > 1 ? '999' : '321';
+          if (mode == 'android-cancel-identity' || mode == 'android-cancel-foreign') cancel.cancel();
+        }
+      }
       if (args.contains('package')) output = 'android.permission.INTERNET android.permission.ACCESS_NETWORK_STATE';
       if (args.contains('date')) output = '1790000000.123456789';
-      if (args.contains('start')) launched = true;
+      if (args.contains('start')) {
+        launched = true;
+        if (mode == 'android-cancel-launch') cancel.cancel();
+      }
       if (args.contains('force-stop')) { forceStopped = true; launched = false; }
       if (args.contains('activities')) output = mode == 'android-wrong-activity' ? 'topResumedActivity=ActivityRecord{other.app/.Other}' : 'topResumedActivity=ActivityRecord{dev.chatproject.chat_app/.MainActivity}';
       if (args.contains('uiautomator')) output = '<node package="dev.chatproject.chat_app" text="대화 아직 대화가 없어요 연결 없음 코어 0.1.0" />';
@@ -77,16 +89,19 @@ class Fake implements ProcessRunner {
 }
 Future<void> main(List<String> args) async {
   final logs = Directory(args[1]);
-  final fake = Fake(args[0]);
+  final cancel = RunCancellation();
+  final fake = Fake(args[0], cancel);
   var result = 'PASS';
   try {
     await runSmoke(platform: args[0].startsWith('android-') ? 'android' : 'windows',
       artifact: args[0].startsWith('android-') ? '${args[2]}/chat_app.exe' : args[2], serial: 'emulator-5554', logs: logs, runner: fake,
+      cancellation: cancel,
       contractNonce: args[0].startsWith('contract') ? 'fixture-nonce' : null,
       readyTimeout: const Duration(milliseconds: 80), settleTime: const Duration(milliseconds: 30),
       pollInterval: const Duration(milliseconds: 5));
   } catch (error) { result = 'FAIL: $error'; }
-  print(jsonEncode({'result': result, 'stops': fake.stops, 'forceStopped': fake.forceStopped}));
+  print(jsonEncode({'result': result, 'stops': fake.stops, 'forceStopped': fake.forceStopped,
+    'ownership': jsonDecode(File('${logs.path}/ownership.json').readAsStringSync())}));
 }
 '''
 
@@ -137,6 +152,21 @@ class ReleaseSmokeTests(unittest.TestCase):
             with self.subTest(mode=mode):
                 data = self.probe(mode, mode == 'android-ready')
                 self.assertTrue(data['forceStopped'])
+
+    def test_android_cancellation_drains_launch_and_identity_acquisition(self):
+        for mode in ('android-cancel-launch', 'android-cancel-identity'):
+            with self.subTest(mode=mode):
+                data = self.probe(mode, False)
+                self.assertIn('RunCancelled', data['result'])
+                self.assertTrue(data['forceStopped'], data)
+                self.assertEqual(data['ownership']['activities'], [], data)
+                self.assertEqual(data['ownership']['processes'], [], data)
+
+    def test_android_cancellation_preserves_replacement_process(self):
+        data = self.probe('android-cancel-foreign', False)
+        self.assertIn('RunCancelled', data['result'])
+        self.assertFalse(data['forceStopped'], data)
+        self.assertEqual(data['ownership']['activities'][0]['pid'], '321', data)
 
 
 if __name__ == "__main__":
