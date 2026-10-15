@@ -665,7 +665,8 @@ class _Run extends IoProcessRunner {
         fatal.future,
         token.cancelled.then<T>((_) => throw RunCancelled()),
       ]).timeout(timeout);
-    } catch (_) {
+    } catch (error) {
+      recordFailure(error);
       token.cancel();
       rethrow;
     }
@@ -891,6 +892,7 @@ class _Run extends IoProcessRunner {
       }
       return result;
     } catch (error) {
+      recordFailure(error);
       primary = error;
       rethrow;
     } finally {
