@@ -86,7 +86,7 @@ ChatProject/
 
 ### M2 — iroh 1:1 직접 연결
 
-2026-10-17 현재 M2는 미완료다. [현재 결과](../results/2026-10-16-m2-transport.md)와 [39개 인계 대조표·남은 일](2026-10-13-m2-carry-forward.md)에 증거와 유예를 기록했다. 751 본문/복귀/이동/해제·일반 378 CI 및 7a 두 야간은 확인했다. 7a 일반 CI의 Android는 90분 제한으로 취소돼 native 게이트가 남고 새 CI 관찰기는 로컬 확인만 마친 미push/미실행 상태다. 일반 EE의 580 ms와 Windows 사설 진단 5회 미달은 500 ms 목표 유지·추가 RCA 대상이다. 임시 Android ID-only 1회 성공과 v2 offline capture는 일반 EE의 두 실패·ID-only/DNS/새 글·재시작/새 주소 기능 확인을 대체하지 않는다. Relay 표시는 EE에서 확인했으며 강제 fallback·양방향 DHT를 추가 요건으로 삼지 않는다. signed iPhone·전체 최종 검토도 남아 있다.
+2026-10-17 현재 M2는 미완료다. [현재 결과](../results/2026-10-16-m2-transport.md)와 [39개 인계 대조표·남은 일](2026-10-13-m2-carry-forward.md)에 증거와 유예를 기록했다. 일반 EE Phase A의 ID-only/DNS·새 본문과 실제 재시작/새 ID/수동 새 ticket 연결·새 본문은 확인했다. 과거 DHT 실패 원인은 미확정이며 수정·신뢰성 보장은 아니다. 7a 두 야간과 사설 B 두 연결은 각각 기록하되, 일반 CI Android 90분 취소/후속 CI 미실행 및 모든 500 ms 초과의 RCA·수용 판단·signed iPhone·최종 검토는 남아 있다. B 첫 준비 지연과 RTT 추정은 통제된 cold/warm·과거 원인 증거가 아니다. Relay/추가 방향을 새 필수 요건으로 늘리지 않는다.
 
 - 범위: `chat_core`에 tokio 런타임과 iroh 1.3 엔드포인트. 최소 구성(n0 preset 아님, `dns.iroh.link` 안 씀), n0 공개 릴레이(`RelayMode::Default`), pkarr에는 홈 릴레이 URL만 게시(`AddrFilter::relay_only`). 저장·MLS 없음. Android `JNI_OnLoad`는 VM을 저장하고, 명시적 JNI 초기화가 유지된 실제 applicationContext로 `iroh::dns::install_android_jni_context`를 Flutter/Endpoint 생성 전에 호출한다.
 - 여러 기기 시험 장치(자동 테스트 설계 4절): 지휘 프로그램(`tools/e2e` 시나리오 실행), Rust 조종 루프(`chat_core`의 `test-hooks`, 디버그 빌드에만), `chat_node`(조종 참가자 + 로컬 릴레이), 앱 조종 모드 실행 인자(Android 인텐트 추가 값, Windows 실행 인자), CI 매일 밤 작업, 릴리스 표식 검사.
