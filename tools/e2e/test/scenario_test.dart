@@ -24,6 +24,8 @@ class Fixture {
   (String, String)? suppressReply;
   String? suppressStop;
   final stopping = Completer<void>();
+  Duration recoveryReplyDelay = Duration.zero;
+  Timer? recoveryReplyTimer;
 
   Future<List<Participant>> start() async {
     logs = await Directory.systemTemp.createTemp('scenario-');
@@ -75,6 +77,7 @@ class Fixture {
   }
 
   Future<void> close() async {
+    recoveryReplyTimer?.cancel();
     try {
       await controller.close();
     } catch (_) {
@@ -253,18 +256,22 @@ class FakeCore {
       default:
         throw StateError('Unexpected command $op');
     }
-    socket.add(
-      jsonEncode(
-        error == null
-            ? {'type': 'result', 'id': record['id'], 'ok': true, 'value': value}
-            : {
-                'type': 'result',
-                'id': record['id'],
-                'ok': false,
-                'error': {'code': error, 'detail': 'fixture failure'},
-              },
-      ),
+    final reply = jsonEncode(
+      error == null
+          ? {'type': 'result', 'id': record['id'], 'ok': true, 'value': value}
+          : {
+              'type': 'result',
+              'id': record['id'],
+              'ok': false,
+              'error': {'code': error, 'detail': 'fixture failure'},
+            },
     );
+    if (op == 'set_offline' && args['offline'] == false &&
+        fixture.recoveryReplyDelay > Duration.zero) {
+      fixture.recoveryReplyTimer = Timer(fixture.recoveryReplyDelay, () => socket.add(reply));
+    } else {
+      socket.add(reply);
+    }
   }
 }
 
@@ -713,6 +720,10 @@ Future<void> main(List<String> args) async {
       '$fault fails the scenario and leaves command/event diagnostics',
       () async {
         final fixture = Fixture()..fault = fault;
+        if (fault == 'retry intention') {
+          // Model a scheduled successful recovery reply slower than 40ms.
+          fixture.recoveryReplyDelay = const Duration(milliseconds: 80);
+        }
         final participants = await fixture.start();
         final failures = <(Object, String?, String?)>[];
         try {
@@ -721,7 +732,10 @@ Future<void> main(List<String> args) async {
               fixture.controller,
               participants,
               restart: fixture.restart,
-              timeout: short,
+              // This asserts state, not RPC latency; leave room for scheduling.
+              timeout: fault == 'retry intention'
+                  ? const Duration(seconds: 2)
+                  : short,
               onFailure: (error, phase, kind) =>
                   failures.add((error, phase, kind)),
             ),
@@ -757,6 +771,11 @@ Future<void> main(List<String> args) async {
             }),
           );
           expect(failures, hasLength(1));
+          if (fault == 'retry intention') {
+            expect(failures.single.$1, isA<StateError>());
+            expect(failures.single.$2, isNull);
+            expect(failures.single.$3, isNull);
+          }
           if (fault == 'command') {
             expect(failures.single.$1, isA<RpcError>());
             expect(failures.single.$2, isNull);
