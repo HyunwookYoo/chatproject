@@ -54,8 +54,8 @@ class FakeOwnedProcess implements OwnedProcess {
 ProcessResult ok(String stdout) => ProcessResult(0, 0, stdout, '');
 ProcessResult notReady() => ProcessResult(0, 1, '', "error: device 'emulator-5554' not found");
 
-void writeConfig(Directory home, {String image = 'google_apis_playstore'}) {
-  final folder = Directory('${home.path}/chat_e2e_1.avd')..createSync(recursive: true);
+void writeConfig(Directory home, {String image = 'google_apis_playstore', String avd = 'chat_e2e_1'}) {
+  final folder = Directory('${home.path}/$avd.avd')..createSync(recursive: true);
   File('${folder.path}/config.ini').writeAsStringSync(
     'image.sysdir.1=system-images/android-36/$image/x86_64/\nabi.type=x86_64\nhw.cpu.arch=x86_64\n');
 }
@@ -83,6 +83,170 @@ ProcessResult listLaunched(FakeRunner runner, Set<String> killed) {
 }
 
 void main() {
+  group('snapshot preparation stop barrier', () {
+    late Directory home;
+    late FakeRunner runner;
+    late Emulators emulators;
+    late DateTime clock;
+    late Map<String, DateTime> stoppedAt;
+    late List<int> checkedPorts;
+    var portChecks = 0;
+    ProcessResult Function()? stoppedDevices;
+    Future<void> Function(int)? stoppedPort;
+    void Function()? onSleep;
+    String? consoleName;
+    var cancelled = false;
+    final cancellation = StateError('cancelled');
+
+    setUp(() async {
+      home = await Directory.systemTemp.createTemp('avd_stop_barrier_');
+      addTearDown(() => home.delete(recursive: true));
+      for (final spec in testEmulators) { writeConfig(home, avd: spec.avd); }
+      clock = DateTime(2026);
+      stoppedAt = {};
+      checkedPorts = [];
+      portChecks = 0;
+      stoppedDevices = null;
+      stoppedPort = null;
+      onSleep = null;
+      consoleName = null;
+      cancelled = false;
+      runner = FakeRunner((exe, args) {
+        if (args.contains('-list-avds')) return ok('chat_e2e_1\nchat_e2e_2\n');
+        if (args.first == 'devices') {
+          return stoppedAt.isNotEmpty && stoppedDevices != null
+            ? stoppedDevices!() : ok('List of devices attached\n');
+        }
+        if (args.contains('name')) {
+          return consoleName == null
+            ? ProcessResult(0, 1, '', 'console unavailable') : ok('$consoleName\nOK\n');
+        }
+        if (args.contains('getprop')) return ok('1\n');
+        if (args.contains('save')) {
+          final avd = args[1] == 'emulator-5554' ? 'chat_e2e_1' : 'chat_e2e_2';
+          Directory('${home.path}/$avd.avd/snapshots/clean').createSync(recursive: true);
+        }
+        return ok('');
+      });
+      emulators = Emulators(sdk: AndroidSdk('/sdk', windows: false), runner: runner,
+        avdHome: home.path, config: AvdConfig.load(ci: false),
+        pollInterval: const Duration(seconds: 1), bootTimeout: const Duration(seconds: 6),
+        now: () => clock,
+        sleep: (duration) async { clock = clock.add(duration); onSleep?.call(); },
+        checkCancelled: () { if (cancelled) throw cancellation; },
+        onStopped: (spec) async { stoppedAt[spec.serial] = clock; },
+        checkPort: (port) async {
+          portChecks++;
+          if (stoppedAt.isNotEmpty) { checkedPorts.add(port); await stoppedPort?.call(port); }
+        });
+    });
+
+    test('ensure then up waits for delayed registry removal and both ports', () async {
+      final sleepTimes = <int>[];
+      stoppedDevices = () => ok('List of devices attached\n${stoppedAt.entries
+        .where((entry) => clock.difference(entry.value).inSeconds < 2)
+        .map((entry) => '${entry.key}\toffline\n').join()}');
+      stoppedPort = (port) async {
+        for (final spec in testEmulators) {
+          final stopped = stoppedAt[spec.serial];
+          if (stopped != null && (port == spec.port || port == spec.port + 1) &&
+              clock.difference(stopped).inSeconds < (port == spec.port ? 4 : 6)) {
+            throw const SocketException('still bound');
+          }
+        }
+      };
+      var completed = 0;
+      onSleep = () {
+        expect(completed, clock.second <= 6 ? 0 : 1);
+        sleepTimes.add(clock.second);
+      };
+      for (final spec in testEmulators) {
+        await emulators.ensure(spec);
+        completed++;
+      }
+      final started = await emulators.up(testEmulators);
+      expect(started, testEmulators);
+      expect(sleepTimes, List.generate(12, (index) => index + 1));
+      expect(checkedPorts, containsAll([5554, 5555, 5556, 5557]));
+      expect(runner.detached.where((args) => args.contains('-snapshot')), hasLength(2));
+      expect(runner.stopped, ['emulator-5554', 'emulator-5556']);
+      expect(runner.calls.any((call) => call.contains('emu avd name')), isFalse);
+    });
+
+    for (final busy in ['registry', 'console port', 'adb port']) {
+      test('permanent $busy is bounded and never signals a holder', () async {
+        if (busy == 'registry') {
+          stoppedDevices = () => ok('List of devices attached\nemulator-5554\toffline\n');
+        } else {
+          stoppedPort = (port) async {
+            if (port == (busy == 'console port' ? 5554 : 5555)) throw const SocketException('foreign holder');
+          };
+        }
+        await expectLater(emulators.ensure(testEmulators.first), throwsA(isA<TimeoutException>()));
+        expect(clock, DateTime(2026).add(const Duration(seconds: 6)));
+        expect(runner.stopped, ['emulator-5554']);
+        expect(runner.calls.any((call) => call.contains('emu kill') || call.contains('kill-server') || call.contains('avd name')), isFalse);
+        expect(runner.detached, hasLength(1));
+      });
+    }
+
+    test('failed post-stop devices query is not treated as serial absence', () async {
+      stoppedDevices = () => ProcessResult(0, 7, '', 'devices unavailable');
+      await expectLater(emulators.ensure(testEmulators.first), throwsA(isA<EmulatorFailure>()
+        .having((error) => error.kind, 'kind', EmulatorFailureKind.devicesExit)
+        .having((error) => error.code, 'code', 7)));
+      expect(checkedPorts, isEmpty);
+      expect(runner.stopped, ['emulator-5554']);
+    });
+
+    test('unexpected port-check errors propagate without polling', () async {
+      final error = StateError('port check failed');
+      stoppedPort = (_) async { throw error; };
+      await expectLater(emulators.ensure(testEmulators.first), throwsA(same(error)));
+      expect(clock, DateTime(2026));
+      expect(runner.stopped, ['emulator-5554']);
+    });
+
+    test('cancellation during the final port check cannot complete ensure', () async {
+      stoppedPort = (port) async { if (port == 5555) cancelled = true; };
+      await expectLater(emulators.ensure(testEmulators.first), throwsA(same(cancellation)));
+      expect(checkedPorts, [5554, 5555]);
+      expect(runner.stopped, ['emulator-5554']);
+    });
+
+    test('cancellation aborts waiting while owned cleanup still works', () async {
+      await emulators.up([testEmulators.last]);
+      stoppedDevices = () => ok('List of devices attached\nemulator-5554\toffline\n');
+      onSleep = () { cancelled = true; };
+      await expectLater(emulators.ensure(testEmulators.first), throwsA(same(cancellation)));
+      await emulators.stop(testEmulators.last);
+      expect(runner.stopped, ['emulator-5554', 'emulator-5556']);
+      expect(emulators.cleanupFailures, isEmpty);
+      expect(clock, DateTime(2026).add(const Duration(seconds: 1)));
+    });
+
+    test('up still refuses a foreign holder appearing after the barrier', () async {
+      await emulators.ensure(testEmulators.first);
+      expect(checkedPorts, [5554, 5555]);
+      stoppedDevices = () => ok('List of devices attached\nemulator-5554\tdevice\n');
+      consoleName = 'flutter_emulator';
+      await expectLater(emulators.up(testEmulators), throwsA(isA<EmulatorFailure>()
+        .having((error) => error.kind, 'kind', EmulatorFailureKind.serialConflict)));
+      expect(runner.detached, hasLength(1));
+      expect(runner.stopped, ['emulator-5554']);
+    });
+
+    test('cached snapshot does not inspect registry or ports', () async {
+      writeSnapshot(home);
+      await emulators.ensure(testEmulators.first);
+      expect(runner.calls, hasLength(1));
+      expect(portChecks, 0);
+      expect(checkedPorts, isEmpty);
+      expect(runner.detached, isEmpty);
+      expect(runner.stopped, isEmpty);
+    });
+  });
+
   for (final kind in ['avd_list_exit', 'avd_create_exit', 'avd_devices_exit',
     'avd_console_exit', 'avd_console_invalid', 'avd_serial_conflict',
     'avd_config_missing', 'avd_config_mismatch', 'avd_snapshot_exit', 'avd_snapshot_missing']) {

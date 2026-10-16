@@ -213,7 +213,10 @@ class Emulators {
       if (launched) await _stopQuietly([spec]);
       rethrow;
     }
-    if (launched) await stop(spec);
+    if (launched) {
+      await stop(spec);
+      await _waitStopped(spec);
+    }
   }
 
   void _validateConfig(EmulatorSpec spec) {
@@ -265,6 +268,27 @@ class Emulators {
       if (result.exitCode == 0 && (result.stdout as String).trim() == '1') return;
       if (!_now().isBefore(deadline)) {
         throw TimeoutException('${spec.serial} did not finish booting within ${bootTimeout.inSeconds} s');
+      }
+      await _sleep(pollInterval);
+    }
+  }
+
+  /// Native exit can precede adb unregistering the serial and releasing its ports.
+  Future<void> _waitStopped(EmulatorSpec spec) async {
+    final deadline = _now().add(bootTimeout);
+    while (true) {
+      if (!(await devices()).containsKey(spec.serial)) {
+        try {
+          await _checkPort(spec.port);
+          await _checkPort(spec.port + 1);
+          checkCancelled?.call();
+          return;
+        } on SocketException {
+          // A listener still holds a port; observe it without signaling its owner.
+        }
+      }
+      if (!_now().isBefore(deadline)) {
+        throw TimeoutException('${spec.serial} did not finish stopping within ${bootTimeout.inSeconds} s');
       }
       await _sleep(pollInterval);
     }
