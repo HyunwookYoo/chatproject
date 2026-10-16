@@ -51,6 +51,29 @@ Map<String, String> parseAdbDevices(String output) {
   return devices;
 }
 
+enum EmulatorFailureKind {
+  listExit('avd_list_exit'),
+  createExit('avd_create_exit'),
+  devicesExit('avd_devices_exit'),
+  consoleExit('avd_console_exit'),
+  consoleInvalid('avd_console_invalid'),
+  serialConflict('avd_serial_conflict'),
+  configMissing('avd_config_missing'),
+  configMismatch('avd_config_mismatch'),
+  snapshotExit('avd_snapshot_exit'),
+  snapshotMissing('avd_snapshot_missing');
+
+  const EmulatorFailureKind(this.value);
+  final String value;
+}
+
+/// Finite public metadata; the original StateError message stays private.
+class EmulatorFailure extends StateError {
+  EmulatorFailure(this.kind, String message, [this.code]) : super(message);
+  final EmulatorFailureKind kind;
+  final int? code;
+}
+
 class Emulators {
   Emulators({
     required this.sdk,
@@ -107,8 +130,8 @@ class Emulators {
     return result;
   }
 
-  void _requireSuccess(ProcessResult result, String operation) {
-    if (result.exitCode != 0) throw StateError('$operation failed (${result.exitCode}): ${result.stderr}');
+  void _requireSuccess(ProcessResult result, String operation, EmulatorFailureKind kind) {
+    if (result.exitCode != 0) throw EmulatorFailure(kind, '$operation failed (${result.exitCode}): ${result.stderr}', result.exitCode);
   }
 
   Future<void> _start(EmulatorSpec spec, List<String> args) async {
@@ -132,7 +155,7 @@ class Emulators {
 
   Future<Map<String, String>> devices() async {
     final result = await _run(sdk.adb, ['devices']);
-    _requireSuccess(result, 'adb devices');
+    _requireSuccess(result, 'adb devices', EmulatorFailureKind.devicesExit);
     return parseAdbDevices(result.stdout as String);
   }
 
@@ -143,7 +166,9 @@ class Emulators {
     final result = await _run(sdk.adb, ['-s', spec.serial, 'emu', 'avd', 'name']);
     final name = (result.stdout as String).split(RegExp(r'\r?\n')).first.trim();
     if (result.exitCode != 0 || name.isEmpty || name == 'OK') {
-      throw StateError('${spec.serial} has a dead console; use manual adb diagnosis (adb -s <serial> emu avd name).');
+      throw EmulatorFailure(result.exitCode != 0 ? EmulatorFailureKind.consoleExit : EmulatorFailureKind.consoleInvalid,
+        '${spec.serial} has a dead console; use manual adb diagnosis (adb -s <serial> emu avd name).',
+        result.exitCode != 0 ? result.exitCode : null);
     }
     return name;
   }
@@ -154,7 +179,7 @@ class Emulators {
     final name = await runningAvd(spec);
     if (name == null) return false;
     if (name != spec.avd) {
-      throw StateError('${spec.serial} is taken by AVD "$name" or has a dead console; use manual adb diagnosis before retrying.');
+      throw EmulatorFailure(EmulatorFailureKind.serialConflict, '${spec.serial} is taken by AVD "$name" or has a dead console; use manual adb diagnosis before retrying.');
     }
     return true;
   }
@@ -165,12 +190,12 @@ class Emulators {
   /// Creates the AVD and its clean snapshot when they are missing.
   Future<void> ensure(EmulatorSpec spec) async {
     final list = await _run(sdk.emulator, ['-list-avds']);
-    _requireSuccess(list, 'list-avds');
+    _requireSuccess(list, 'list-avds', EmulatorFailureKind.listExit);
     final avds = (list.stdout as String).split(RegExp(r'\r?\n')).map((line) => line.trim()).toSet();
     if (!avds.contains(spec.avd)) {
       final created = await _run(sdk.avdmanager,
         ['create', 'avd', '--name', spec.avd, '--package', config.package], stdin: 'no\n');
-      _requireSuccess(created, 'create ${spec.avd}');
+      _requireSuccess(created, 'create ${spec.avd}', EmulatorFailureKind.createExit);
     }
     _validateConfig(spec);
     if (hasCleanSnapshot(spec)) return;
@@ -182,8 +207,8 @@ class Emulators {
       // snapshot never captures a half-booted state.
       await waitBooted(spec);
       final saved = await _run(sdk.adb, ['-s', spec.serial, 'emu', 'avd', 'snapshot', 'save', cleanSnapshot]);
-      _requireSuccess(saved, 'snapshot save');
-      if (!hasCleanSnapshot(spec)) throw StateError('Snapshot save did not create the clean snapshot directory');
+      _requireSuccess(saved, 'snapshot save', EmulatorFailureKind.snapshotExit);
+      if (!hasCleanSnapshot(spec)) throw EmulatorFailure(EmulatorFailureKind.snapshotMissing, 'Snapshot save did not create the clean snapshot directory');
     } catch (_) {
       if (launched) await _stopQuietly([spec]);
       rethrow;
@@ -193,7 +218,7 @@ class Emulators {
 
   void _validateConfig(EmulatorSpec spec) {
     final file = File(p.join(avdHome, '${spec.avd}.avd', 'config.ini'));
-    if (!file.existsSync()) throw StateError('Missing config.ini for ${spec.avd}');
+    if (!file.existsSync()) throw EmulatorFailure(EmulatorFailureKind.configMissing, 'Missing config.ini for ${spec.avd}');
     final values = <String, String>{};
     for (final line in file.readAsLinesSync()) {
       final separator = line.indexOf('=');
@@ -203,7 +228,7 @@ class Emulators {
     final relative = 'system-images/android-${config.api}/${config.flavor}/${config.abi}';
     final absolute = sdk.systemImage(config).replaceAll('\\', '/');
     if ((image != relative && image != absolute) || values['abi.type'] != config.abi || values['hw.cpu.arch'] != config.abi) {
-      throw StateError('${spec.avd} has the wrong image or ABI; expected ${config.package}. Existing AVD was preserved.');
+      throw EmulatorFailure(EmulatorFailureKind.configMismatch, '${spec.avd} has the wrong image or ABI; expected ${config.package}. Existing AVD was preserved.');
     }
   }
 

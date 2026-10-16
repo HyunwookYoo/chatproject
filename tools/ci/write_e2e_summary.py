@@ -10,7 +10,14 @@ PHASES = set('preflight build_node build_windows build_android gradle_stop relay
              'avd_create avd_boot adb_reverse android_install android_launch android_pid '
              'android_participant node_start node_participant scenario cleanup complete'.split())
 FAILURE_KINDS = set('cleanup command_exit timeout cancelled socket filesystem process_spawn '
-                    'state argument unsupported format other'.split())
+                    'state argument unsupported format other avd_list_exit avd_create_exit '
+                    'avd_devices_exit avd_console_exit avd_console_invalid avd_serial_conflict '
+                    'avd_config_missing avd_config_mismatch avd_snapshot_exit avd_snapshot_missing '
+                    'owned_relay_exit owned_emulator_exit owned_chat_node_exit owned_windows_exit '
+                    'owned_child_exit'.split())
+EXIT_KINDS = set('command_exit avd_list_exit avd_create_exit avd_devices_exit avd_console_exit '
+                 'avd_snapshot_exit owned_relay_exit owned_emulator_exit owned_chat_node_exit '
+                 'owned_windows_exit owned_child_exit'.split())
 
 
 def main():
@@ -44,13 +51,13 @@ def main():
                 raise ValueError()
             if code is not None and type(code) is not int:  # bool is not an exit code.
                 raise ValueError()
-            if (kind == 'command_exit') != (code is not None):
+            if (kind in EXIT_KINDS) != (code is not None):
                 raise ValueError()
             safe = {'phase': phase, 'failure_kind': kind, 'command_exit_code': code}
         except (OSError, ValueError):
             parser.error('Invalid safe diagnostic')
     # Reconstruct only fixed keys and validated values; never copy log/error text.
-    value = {'schema_version': 2, 'profile': args.profile, 'stage': args.stage,
+    value = {'schema_version': 3, 'profile': args.profile, 'stage': args.stage,
              'outcome': args.outcome, 'exitCode': args.exit_code, 'peak_rss_kib': peak,
              **safe}
     args.output.write_text(json.dumps(value, indent=2) + '\n', encoding='utf-8')

@@ -23,7 +23,7 @@ class SummaryTests(unittest.TestCase):
                                '--exit-code', '17', '--memory-file', str(source))
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(json.loads((root / 'summary.json').read_text()), {
-                'schema_version': 2, 'profile': 'android', 'stage': 'scenario', 'outcome': 'failure',
+                'schema_version': 3, 'profile': 'android', 'stage': 'scenario', 'outcome': 'failure',
                 'exitCode': 17, 'peak_rss_kib': 1234,
                 'phase': None, 'failure_kind': None, 'command_exit_code': None})
 
@@ -57,6 +57,42 @@ class SummaryTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertNotIn('PRIVATE_TOKEN', result.stdout + result.stderr)
                 self.assertFalse((root / 'summary.json').exists())
+
+    def test_closed_avd_and_owned_failure_kinds_require_exact_exit_pairing(self):
+        exit_kinds = ('command_exit avd_list_exit avd_create_exit avd_devices_exit '
+                      'avd_console_exit avd_snapshot_exit owned_relay_exit owned_emulator_exit '
+                      'owned_chat_node_exit owned_windows_exit owned_child_exit').split()
+        state_kinds = ('avd_console_invalid avd_serial_conflict avd_config_missing '
+                       'avd_config_mismatch avd_snapshot_missing').split()
+        cases = [(kind, code, True) for kind in exit_kinds for code in (-9, 0, 17)]
+        cases += [(kind, None, True) for kind in state_kinds]
+        cases += [(kind, None, False) for kind in exit_kinds]
+        cases += [(kind, 17, False) for kind in [*state_kinds, 'state']]
+        cases += [(kind, code, False) for kind in exit_kinds for code in (True, '17', 1.5)]
+        cases += [(kind, 17, False) for kind in ('PRIVATE_TOKEN_exit', 'chat_relay_exit')]
+        cases += [(kind, None, False) for kind in (True, 17, [], {})]
+        for kind, code, accepted in cases:
+            with self.subTest(kind=kind, code=code), tempfile.TemporaryDirectory() as directory:
+                root = pathlib.Path(directory)
+                diagnostic = root / 'diagnostic.json'
+                value = {'phase': 'avd_create', 'failure_kind': kind, 'command_exit_code': code}
+                diagnostic.write_text(json.dumps(value))
+                result = self.call(root, '--profile', 'android', '--stage', 'scenario',
+                                   '--outcome', 'failure', '--exit-code', '1',
+                                   '--diagnostic-file', str(diagnostic))
+                if accepted:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    summary = json.loads((root / 'summary.json').read_text())
+                    self.assertEqual(len(summary), 9)
+                    self.assertEqual(summary['schema_version'], 3)
+                    self.assertEqual(summary['outcome'], 'failure')
+                    self.assertEqual(summary['exitCode'], 1)
+                    self.assertEqual({key: summary[key] for key in value}, value)
+                else:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn('Invalid safe diagnostic', result.stderr)
+                    self.assertNotIn('PRIVATE_TOKEN', result.stdout + result.stderr)
+                    self.assertFalse((root / 'summary.json').exists())
 
     def test_missing_memory_is_null(self):
         with tempfile.TemporaryDirectory() as directory:

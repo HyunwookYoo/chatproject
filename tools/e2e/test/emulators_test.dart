@@ -83,6 +83,63 @@ ProcessResult listLaunched(FakeRunner runner, Set<String> killed) {
 }
 
 void main() {
+  for (final kind in ['avd_list_exit', 'avd_create_exit', 'avd_devices_exit',
+    'avd_console_exit', 'avd_console_invalid', 'avd_serial_conflict',
+    'avd_config_missing', 'avd_config_mismatch', 'avd_snapshot_exit', 'avd_snapshot_missing']) {
+    test('$kind carries finite metadata at its real throw site', () async {
+      final home = await Directory.systemTemp.createTemp('avd_diagnostic_');
+      addTearDown(() => home.delete(recursive: true));
+      if (kind != 'avd_config_missing') {
+        writeConfig(home, image: kind == 'avd_config_mismatch' ? 'google_apis' : 'google_apis_playstore');
+      }
+      final runner = FakeRunner((exe, args) {
+        if (args.contains('-list-avds')) {
+          if (kind == 'avd_list_exit') return ProcessResult(0, -9, '', 'PRIVATE_TOKEN');
+          return ok(kind == 'avd_create_exit' ? '' : 'chat_e2e_1\n');
+        }
+        if (args.contains('create')) return ProcessResult(0, -9, '', 'PRIVATE_TOKEN');
+        if (args.first == 'devices') {
+          if (kind == 'avd_devices_exit') return ProcessResult(0, -9, '', 'PRIVATE_TOKEN');
+          return ok('List of devices attached\n${kind.startsWith('avd_console') || kind == 'avd_serial_conflict' ? 'emulator-5554\tdevice\n' : ''}');
+        }
+        if (args.contains('name')) {
+          if (kind == 'avd_console_exit') return ProcessResult(0, -9, 'chat_e2e_1\n', 'PRIVATE_TOKEN');
+          return ok(kind == 'avd_console_invalid' ? 'OK\n' : 'PRIVATE_TOKEN\nOK\n');
+        }
+        if (args.contains('getprop')) return ok('1\n');
+        if (args.contains('save') && kind == 'avd_snapshot_exit') return ProcessResult(0, -9, '', 'PRIVATE_TOKEN');
+        return ok('');
+      });
+      Object? caught;
+      try {
+        await emulatorsWith(runner, avdHome: home.path).ensure(testEmulators.first);
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught, isA<StateError>());
+      final dynamic error = caught;
+      // Dynamic access keeps RED behavioral before the typed error exists.
+      expect(() => error.kind.value, returnsNormally);
+      expect(error.kind.value, kind);
+      expect(error.code, kind.endsWith('_exit') ? -9 : null);
+      final message = switch (kind) {
+        'avd_list_exit' => 'list-avds failed (-9): PRIVATE_TOKEN',
+        'avd_create_exit' => 'create chat_e2e_1 failed (-9): PRIVATE_TOKEN',
+        'avd_devices_exit' => 'adb devices failed (-9): PRIVATE_TOKEN',
+        'avd_console_exit' || 'avd_console_invalid' => 'emulator-5554 has a dead console; use manual adb diagnosis (adb -s <serial> emu avd name).',
+        'avd_serial_conflict' => 'emulator-5554 is taken by AVD "PRIVATE_TOKEN" or has a dead console; use manual adb diagnosis before retrying.',
+        'avd_config_missing' => 'Missing config.ini for chat_e2e_1',
+        'avd_config_mismatch' => 'chat_e2e_1 has the wrong image or ABI; expected system-images;android-36;google_apis_playstore;x86_64. Existing AVD was preserved.',
+        'avd_snapshot_exit' => 'snapshot save failed (-9): PRIVATE_TOKEN',
+        _ => 'Snapshot save did not create the clean snapshot directory',
+      };
+      expect((caught as StateError).message, message);
+      expect(caught.toString(), StateError(message).toString());
+      expect(runner.stopped, kind.startsWith('avd_snapshot') ? ['emulator-5554'] : isEmpty);
+      expect(File('${home.path}/chat_e2e_1.avd/config.ini').existsSync(), kind != 'avd_config_missing');
+    });
+  }
+
   test('a bound port fails preflight without killing its holder', () async {
     final holder = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
     final subscription = holder.listen((socket) => socket.destroy());

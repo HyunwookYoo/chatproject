@@ -554,6 +554,20 @@ class _CommandFailure extends StateError {
   final int code;
 }
 
+class _OwnedChildFailure extends StateError {
+  _OwnedChildFailure(this.code, String executable, List<String> args)
+    : kind = switch (p.basename(executable)) {
+        'chat_node' || 'chat_node.exe' => args.isNotEmpty && args.first == 'relay'
+            ? 'owned_relay_exit' : 'owned_chat_node_exit',
+        'emulator' || 'emulator.exe' => 'owned_emulator_exit',
+        'chat_app' || 'chat_app.exe' => 'owned_windows_exit',
+        _ => 'owned_child_exit',
+      },
+      super('Owned child exited ($code)');
+  final int code;
+  final String kind;
+}
+
 class _Run extends IoProcessRunner {
   _Run(this.logs) {
     unawaited(
@@ -587,6 +601,8 @@ class _Run extends IoProcessRunner {
       'failure_kind': switch (error) {
         null => 'cleanup',
         _CommandFailure() => 'command_exit',
+        EmulatorFailure() => error.kind.value,
+        _OwnedChildFailure() => error.kind,
         TimeoutException() => 'timeout',
         RunCancelled() => 'cancelled',
         SocketException() => 'socket',
@@ -598,7 +614,12 @@ class _Run extends IoProcessRunner {
         FormatException() => 'format',
         _ => 'other',
       },
-      'command_exit_code': error is _CommandFailure ? error.code : null,
+      'command_exit_code': switch (error) {
+        _CommandFailure() => error.code,
+        EmulatorFailure() => error.code,
+        _OwnedChildFailure() => error.code,
+        _ => null,
+      },
     };
   }
 
@@ -770,7 +791,7 @@ class _Run extends IoProcessRunner {
           (code) {
             if (!stopping.contains(process)) {
               fail(
-                StateError('Owned child exited ($code)'),
+                _OwnedChildFailure(code, executable, args),
                 StackTrace.current,
               );
             }

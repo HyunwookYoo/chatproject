@@ -3,8 +3,10 @@ import 'dart:io';
 import 'dart:mirrors';
 
 import 'package:test/test.dart';
+import 'package:chat_e2e/src/emulators.dart';
 
 import '../bin/run.dart' as cli;
+import 'emulators_test.dart' as fixtures;
 
 void main() {
   final library =
@@ -36,6 +38,76 @@ void main() {
     await runner.owned.close();
     await logs.delete(recursive: true);
   });
+
+  test('AVD throw metadata projects before cleanup and keeps original stack', () async {
+    final runner = run.reflectee as dynamic;
+    phase('avd_create');
+    final emulatorRunner = fixtures.FakeRunner(
+      (_, _) => ProcessResult(0, -9, '', 'PRIVATE_TOKEN'),
+    );
+    Object? original;
+    StackTrace? originalStack;
+    final work = fixtures.emulatorsWith(emulatorRunner).ensure(testEmulators.first)
+        .catchError((Object error, StackTrace stack) {
+      original = error;
+      originalStack = stack;
+      Error.throwWithStackTrace(error, stack);
+    });
+    try {
+      await runner.wait(work);
+      fail('ensure should fail');
+    } catch (error, stack) {
+      expect(error, same(original));
+      expect(stack.toString(), originalStack.toString());
+      expect(error, isA<StateError>());
+    }
+    phase('cleanup');
+    runner.recordFailure(const FileSystemException('PRIVATE_TOKEN'));
+    expect(projection(), {
+      'phase': 'avd_create', 'failure_kind': 'avd_list_exit', 'command_exit_code': -9,
+    });
+  });
+
+  for (final entry in <(String, List<String>, String, int)>[
+    ('chat_node', ['relay', 'PRIVATE_TOKEN'], 'owned_relay_exit', 1),
+    ('chat_node', ['PRIVATE_TOKEN', 'relay'], 'owned_chat_node_exit', 1),
+    ('emulator', ['PRIVATE_TOKEN'], 'owned_emulator_exit', 1),
+    ('chat_app', ['PRIVATE_TOKEN'], 'owned_windows_exit', 1),
+    ('chat_relay', ['PRIVATE_TOKEN'], 'owned_child_exit', 1),
+    ('dart', [], 'owned_child_exit', 0),
+  ]) {
+    test('unexpected persistent ${entry.$3}/${entry.$4} uses only fixed metadata', () async {
+      final runner = run.reflectee as dynamic;
+      phase('avd_create');
+      // Tiny native fixtures exercise the real asynchronous exit callback.
+      final source = Platform.isWindows
+          ? '${Platform.environment['SystemRoot']}/System32/where.exe' : '/bin/false';
+      final executable = entry.$4 == 0 ? File(Platform.resolvedExecutable) : await File(source).copy(
+        '${logs.path}/${entry.$1}${Platform.isWindows ? '.exe' : ''}',
+      );
+      if (!Platform.isWindows && entry.$4 != 0) {
+        expect((await Process.run('chmod', ['+x', executable.path])).exitCode, 0);
+      }
+      final args = entry.$4 == 0
+          ? [(File('${logs.path}/PRIVATE_TOKEN.dart')..writeAsStringSync('void main() {}')).path]
+          : entry.$2;
+      final failure = expectLater(runner.fatal.future, throwsA(isA<StateError>()
+          .having((e) => e.message, 'private message', 'Owned child exited (${entry.$4})')
+          .having((e) => e.toString(), 'toString', StateError('Owned child exited (${entry.$4})').toString())));
+      final process = await runner.acquire(executable.path, args, persistent: true);
+      await failure;
+      expect(await process.exitCode, entry.$4);
+      phase('cleanup');
+      runner.recordFailure(const FileSystemException('PRIVATE_TOKEN'));
+      expect(projection(), {
+        'phase': 'avd_create', 'failure_kind': entry.$3, 'command_exit_code': entry.$4,
+      });
+      expect(projection().toString(), isNot(contains('PRIVATE_TOKEN')));
+      await runner.stop(process);
+      expect(runner.active, isEmpty);
+      expect(runner.processes, isEmpty);
+    });
+  }
 
   test(
     'wait records the original error before cancellation callbacks',
