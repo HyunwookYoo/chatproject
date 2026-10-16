@@ -64,7 +64,9 @@ import 'dart:io';
 Future<void> main(List<String> args) async {
   final server = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
   stdout.writeln('real child alive');
-  File(args[0]).writeAsStringSync('\${server.port}');
+  File('\${args[0]}.staging')
+    ..writeAsStringSync('\${server.port}')
+    ..renameSync(args[0]);
   server.listen((socket) { socket.listen((bytes) {
     if (utf8.decode(bytes) == 'exit') exit(0);
     socket.add(utf8.encode('alive'));
@@ -594,7 +596,9 @@ void main(List<String> args) { stdout.writeln(jsonEncode(args)); stderr.write('n
 import 'dart:io';
 Future<void> main(List<String> args) async {
   final server = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
-  File(args[0]).writeAsStringSync('\${server.port}');
+  File('\${args[0]}.staging')
+    ..writeAsStringSync('\${server.port}')
+    ..renameSync(args[0]);
   server.listen((socket) => socket.destroy());
 }
 ''');
@@ -632,7 +636,9 @@ import 'dart:io';
 Future<void> main(List<String> args) async {
   final server = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
   server.listen((socket) => socket.destroy());
-  File(args[0]).writeAsStringSync('\${server.port}');
+  File('\${args[0]}.staging')
+    ..writeAsStringSync('\${server.port}')
+    ..renameSync(args[0]);
   Timer(const Duration(seconds: 7), () => exit(0));
 }
 ''');
