@@ -66,7 +66,7 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
   String get codegenVersion => '2.11.1';
 
   @override
-  int get rustContentHash => 365380977;
+  int get rustContentHash => -629877347;
 
   static const kDefaultExternalLibraryLoaderConfig =
       ExternalLibraryLoaderConfig(
@@ -77,13 +77,33 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
 }
 
 abstract class RustLibApi extends BaseApi {
+  Future<PeerInfo> crateApiChatConnectPeer({required String target});
+
   Future<CoreInfo> crateApiChatCoreStart({required String dataDir});
 
   String crateApiChatCoreVersion();
 
+  Future<void> crateApiChatDisconnectPeer({required String peerId});
+
   Stream<ChatEvent> crateApiChatEvents();
 
   Future<void> crateApiChatInitApp();
+
+  Future<NetworkInfo> crateApiChatNetworkInfo();
+
+  Future<NetworkInfo> crateApiChatNetworkStart();
+
+  Future<void> crateApiChatNetworkStop();
+
+  Future<void> crateApiChatSendProbeText({
+    required String peerId,
+    required String text,
+  });
+
+  Future<void> crateApiChatTestHooksStart({
+    required String controlUrl,
+    required String name,
+  });
 }
 
 class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
@@ -95,6 +115,34 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   });
 
   @override
+  Future<PeerInfo> crateApiChatConnectPeer({required String target}) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(target, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 1,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_peer_info,
+          decodeErrorData: sse_decode_core_error,
+        ),
+        constMeta: kCrateApiChatConnectPeerConstMeta,
+        argValues: [target],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiChatConnectPeerConstMeta =>
+      const TaskConstMeta(debugName: "connect_peer", argNames: ["target"]);
+
+  @override
   Future<CoreInfo> crateApiChatCoreStart({required String dataDir}) {
     return handler.executeNormal(
       NormalTask(
@@ -104,7 +152,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 1,
+            funcId: 2,
             port: port_,
           );
         },
@@ -128,7 +176,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       SyncTask(
         callFfi: () {
           final serializer = SseSerializer(generalizedFrbRustBinding);
-          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 2)!;
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 3)!;
         },
         codec: SseCodec(
           decodeSuccessData: sse_decode_String,
@@ -145,6 +193,34 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       const TaskConstMeta(debugName: "core_version", argNames: []);
 
   @override
+  Future<void> crateApiChatDisconnectPeer({required String peerId}) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(peerId, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 4,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_unit,
+          decodeErrorData: sse_decode_core_error,
+        ),
+        constMeta: kCrateApiChatDisconnectPeerConstMeta,
+        argValues: [peerId],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiChatDisconnectPeerConstMeta =>
+      const TaskConstMeta(debugName: "disconnect_peer", argNames: ["peerId"]);
+
+  @override
   Stream<ChatEvent> crateApiChatEvents() {
     final sink = RustStreamSink<ChatEvent>();
     unawaited(
@@ -156,7 +232,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
             pdeCallFfi(
               generalizedFrbRustBinding,
               serializer,
-              funcId: 3,
+              funcId: 5,
               port: port_,
             );
           },
@@ -185,7 +261,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 4,
+            funcId: 6,
             port: port_,
           );
         },
@@ -202,6 +278,155 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   TaskConstMeta get kCrateApiChatInitAppConstMeta =>
       const TaskConstMeta(debugName: "init_app", argNames: []);
+
+  @override
+  Future<NetworkInfo> crateApiChatNetworkInfo() {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 7,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_network_info,
+          decodeErrorData: sse_decode_core_error,
+        ),
+        constMeta: kCrateApiChatNetworkInfoConstMeta,
+        argValues: [],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiChatNetworkInfoConstMeta =>
+      const TaskConstMeta(debugName: "network_info", argNames: []);
+
+  @override
+  Future<NetworkInfo> crateApiChatNetworkStart() {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 8,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_network_info,
+          decodeErrorData: sse_decode_core_error,
+        ),
+        constMeta: kCrateApiChatNetworkStartConstMeta,
+        argValues: [],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiChatNetworkStartConstMeta =>
+      const TaskConstMeta(debugName: "network_start", argNames: []);
+
+  @override
+  Future<void> crateApiChatNetworkStop() {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 9,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_unit,
+          decodeErrorData: sse_decode_core_error,
+        ),
+        constMeta: kCrateApiChatNetworkStopConstMeta,
+        argValues: [],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiChatNetworkStopConstMeta =>
+      const TaskConstMeta(debugName: "network_stop", argNames: []);
+
+  @override
+  Future<void> crateApiChatSendProbeText({
+    required String peerId,
+    required String text,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(peerId, serializer);
+          sse_encode_String(text, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 10,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_unit,
+          decodeErrorData: sse_decode_core_error,
+        ),
+        constMeta: kCrateApiChatSendProbeTextConstMeta,
+        argValues: [peerId, text],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiChatSendProbeTextConstMeta => const TaskConstMeta(
+    debugName: "send_probe_text",
+    argNames: ["peerId", "text"],
+  );
+
+  @override
+  Future<void> crateApiChatTestHooksStart({
+    required String controlUrl,
+    required String name,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(controlUrl, serializer);
+          sse_encode_String(name, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 11,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_unit,
+          decodeErrorData: sse_decode_core_error,
+        ),
+        constMeta: kCrateApiChatTestHooksStartConstMeta,
+        argValues: [controlUrl, name],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiChatTestHooksStartConstMeta => const TaskConstMeta(
+    debugName: "test_hooks_start",
+    argNames: ["controlUrl", "name"],
+  );
 
   @protected
   AnyhowException dco_decode_AnyhowException(dynamic raw) {
@@ -234,6 +459,24 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  NetworkInfo dco_decode_box_autoadd_network_info(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return dco_decode_network_info(raw);
+  }
+
+  @protected
+  PeerInfo dco_decode_box_autoadd_peer_info(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return dco_decode_peer_info(raw);
+  }
+
+  @protected
+  BigInt dco_decode_box_autoadd_u_64(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return dco_decode_u_64(raw);
+  }
+
+  @protected
   ChatEvent dco_decode_chat_event(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     switch (raw[0]) {
@@ -247,6 +490,20 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
         return ChatEvent_Error(
           code: dco_decode_error_code(raw[1]),
           detail: dco_decode_String(raw[2]),
+        );
+      case 2:
+        return ChatEvent_NetworkChanged(
+          info: dco_decode_box_autoadd_network_info(raw[1]),
+        );
+      case 3:
+        return ChatEvent_PeerChanged(
+          revision: dco_decode_u_64(raw[1]),
+          peer: dco_decode_box_autoadd_peer_info(raw[2]),
+        );
+      case 4:
+        return ChatEvent_ProbeTextReceived(
+          peerId: dco_decode_String(raw[1]),
+          text: dco_decode_String(raw[2]),
         );
       default:
         throw Exception("unreachable");
@@ -290,9 +547,42 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  List<PeerInfo> dco_decode_list_peer_info(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return (raw as List<dynamic>).map(dco_decode_peer_info).toList();
+  }
+
+  @protected
   Uint8List dco_decode_list_prim_u_8_strict(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return raw as Uint8List;
+  }
+
+  @protected
+  NetworkInfo dco_decode_network_info(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 5)
+      throw Exception('unexpected arr length: expect 5 but see ${arr.length}');
+    return NetworkInfo(
+      revision: dco_decode_u_64(arr[0]),
+      state: dco_decode_network_state(arr[1]),
+      endpointId: dco_decode_opt_String(arr[2]),
+      ticket: dco_decode_opt_String(arr[3]),
+      peers: dco_decode_list_peer_info(arr[4]),
+    );
+  }
+
+  @protected
+  NetworkState dco_decode_network_state(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return NetworkState.values[raw as int];
+  }
+
+  @protected
+  String? dco_decode_opt_String(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return raw == null ? null : dco_decode_String(raw);
   }
 
   @protected
@@ -302,9 +592,48 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  BigInt? dco_decode_opt_box_autoadd_u_64(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return raw == null ? null : dco_decode_box_autoadd_u_64(raw);
+  }
+
+  @protected
+  PeerInfo dco_decode_peer_info(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 5)
+      throw Exception('unexpected arr length: expect 5 but see ${arr.length}');
+    return PeerInfo(
+      peerId: dco_decode_String(arr[0]),
+      phase: dco_decode_peer_phase(arr[1]),
+      path: dco_decode_peer_path(arr[2]),
+      connectMs: dco_decode_opt_box_autoadd_u_64(arr[3]),
+      directMs: dco_decode_opt_box_autoadd_u_64(arr[4]),
+    );
+  }
+
+  @protected
+  PeerPath dco_decode_peer_path(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return PeerPath.values[raw as int];
+  }
+
+  @protected
+  PeerPhase dco_decode_peer_phase(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return PeerPhase.values[raw as int];
+  }
+
+  @protected
   int dco_decode_u_32(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return raw as int;
+  }
+
+  @protected
+  BigInt dco_decode_u_64(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return dcoDecodeU64(raw);
   }
 
   @protected
@@ -354,6 +683,26 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  NetworkInfo sse_decode_box_autoadd_network_info(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return (sse_decode_network_info(deserializer));
+  }
+
+  @protected
+  PeerInfo sse_decode_box_autoadd_peer_info(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return (sse_decode_peer_info(deserializer));
+  }
+
+  @protected
+  BigInt sse_decode_box_autoadd_u_64(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return (sse_decode_u_64(deserializer));
+  }
+
+  @protected
   ChatEvent sse_decode_chat_event(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
 
@@ -372,6 +721,17 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
         var var_code = sse_decode_error_code(deserializer);
         var var_detail = sse_decode_String(deserializer);
         return ChatEvent_Error(code: var_code, detail: var_detail);
+      case 2:
+        var var_info = sse_decode_box_autoadd_network_info(deserializer);
+        return ChatEvent_NetworkChanged(info: var_info);
+      case 3:
+        var var_revision = sse_decode_u_64(deserializer);
+        var var_peer = sse_decode_box_autoadd_peer_info(deserializer);
+        return ChatEvent_PeerChanged(revision: var_revision, peer: var_peer);
+      case 4:
+        var var_peerId = sse_decode_String(deserializer);
+        var var_text = sse_decode_String(deserializer);
+        return ChatEvent_ProbeTextReceived(peerId: var_peerId, text: var_text);
       default:
         throw UnimplementedError('');
     }
@@ -407,10 +767,57 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  List<PeerInfo> sse_decode_list_peer_info(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    var len_ = sse_decode_i_32(deserializer);
+    var ans_ = <PeerInfo>[];
+    for (var idx_ = 0; idx_ < len_; ++idx_) {
+      ans_.add(sse_decode_peer_info(deserializer));
+    }
+    return ans_;
+  }
+
+  @protected
   Uint8List sse_decode_list_prim_u_8_strict(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     var len_ = sse_decode_i_32(deserializer);
     return deserializer.buffer.getUint8List(len_);
+  }
+
+  @protected
+  NetworkInfo sse_decode_network_info(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_revision = sse_decode_u_64(deserializer);
+    var var_state = sse_decode_network_state(deserializer);
+    var var_endpointId = sse_decode_opt_String(deserializer);
+    var var_ticket = sse_decode_opt_String(deserializer);
+    var var_peers = sse_decode_list_peer_info(deserializer);
+    return NetworkInfo(
+      revision: var_revision,
+      state: var_state,
+      endpointId: var_endpointId,
+      ticket: var_ticket,
+      peers: var_peers,
+    );
+  }
+
+  @protected
+  NetworkState sse_decode_network_state(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var inner = sse_decode_i_32(deserializer);
+    return NetworkState.values[inner];
+  }
+
+  @protected
+  String? sse_decode_opt_String(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    if (sse_decode_bool(deserializer)) {
+      return (sse_decode_String(deserializer));
+    } else {
+      return null;
+    }
   }
 
   @protected
@@ -425,9 +832,57 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  BigInt? sse_decode_opt_box_autoadd_u_64(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    if (sse_decode_bool(deserializer)) {
+      return (sse_decode_box_autoadd_u_64(deserializer));
+    } else {
+      return null;
+    }
+  }
+
+  @protected
+  PeerInfo sse_decode_peer_info(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_peerId = sse_decode_String(deserializer);
+    var var_phase = sse_decode_peer_phase(deserializer);
+    var var_path = sse_decode_peer_path(deserializer);
+    var var_connectMs = sse_decode_opt_box_autoadd_u_64(deserializer);
+    var var_directMs = sse_decode_opt_box_autoadd_u_64(deserializer);
+    return PeerInfo(
+      peerId: var_peerId,
+      phase: var_phase,
+      path: var_path,
+      connectMs: var_connectMs,
+      directMs: var_directMs,
+    );
+  }
+
+  @protected
+  PeerPath sse_decode_peer_path(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var inner = sse_decode_i_32(deserializer);
+    return PeerPath.values[inner];
+  }
+
+  @protected
+  PeerPhase sse_decode_peer_phase(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var inner = sse_decode_i_32(deserializer);
+    return PeerPhase.values[inner];
+  }
+
+  @protected
   int sse_decode_u_32(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return deserializer.buffer.getUint32();
+  }
+
+  @protected
+  BigInt sse_decode_u_64(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return deserializer.buffer.getBigUint64();
   }
 
   @protected
@@ -486,6 +941,30 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_box_autoadd_network_info(
+    NetworkInfo self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_network_info(self, serializer);
+  }
+
+  @protected
+  void sse_encode_box_autoadd_peer_info(
+    PeerInfo self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_peer_info(self, serializer);
+  }
+
+  @protected
+  void sse_encode_box_autoadd_u_64(BigInt self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_u_64(self, serializer);
+  }
+
+  @protected
   void sse_encode_chat_event(ChatEvent self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     switch (self) {
@@ -502,6 +981,17 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
         sse_encode_i_32(1, serializer);
         sse_encode_error_code(code, serializer);
         sse_encode_String(detail, serializer);
+      case ChatEvent_NetworkChanged(info: final info):
+        sse_encode_i_32(2, serializer);
+        sse_encode_box_autoadd_network_info(info, serializer);
+      case ChatEvent_PeerChanged(revision: final revision, peer: final peer):
+        sse_encode_i_32(3, serializer);
+        sse_encode_u_64(revision, serializer);
+        sse_encode_box_autoadd_peer_info(peer, serializer);
+      case ChatEvent_ProbeTextReceived(peerId: final peerId, text: final text):
+        sse_encode_i_32(4, serializer);
+        sse_encode_String(peerId, serializer);
+        sse_encode_String(text, serializer);
     }
   }
 
@@ -532,6 +1022,18 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_list_peer_info(
+    List<PeerInfo> self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_i_32(self.length, serializer);
+    for (final item in self) {
+      sse_encode_peer_info(item, serializer);
+    }
+  }
+
+  @protected
   void sse_encode_list_prim_u_8_strict(
     Uint8List self,
     SseSerializer serializer,
@@ -539,6 +1041,32 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_i_32(self.length, serializer);
     serializer.buffer.putUint8List(self);
+  }
+
+  @protected
+  void sse_encode_network_info(NetworkInfo self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_u_64(self.revision, serializer);
+    sse_encode_network_state(self.state, serializer);
+    sse_encode_opt_String(self.endpointId, serializer);
+    sse_encode_opt_String(self.ticket, serializer);
+    sse_encode_list_peer_info(self.peers, serializer);
+  }
+
+  @protected
+  void sse_encode_network_state(NetworkState self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_i_32(self.index, serializer);
+  }
+
+  @protected
+  void sse_encode_opt_String(String? self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    sse_encode_bool(self != null, serializer);
+    if (self != null) {
+      sse_encode_String(self, serializer);
+    }
   }
 
   @protected
@@ -552,9 +1080,47 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_opt_box_autoadd_u_64(BigInt? self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    sse_encode_bool(self != null, serializer);
+    if (self != null) {
+      sse_encode_box_autoadd_u_64(self, serializer);
+    }
+  }
+
+  @protected
+  void sse_encode_peer_info(PeerInfo self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_String(self.peerId, serializer);
+    sse_encode_peer_phase(self.phase, serializer);
+    sse_encode_peer_path(self.path, serializer);
+    sse_encode_opt_box_autoadd_u_64(self.connectMs, serializer);
+    sse_encode_opt_box_autoadd_u_64(self.directMs, serializer);
+  }
+
+  @protected
+  void sse_encode_peer_path(PeerPath self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_i_32(self.index, serializer);
+  }
+
+  @protected
+  void sse_encode_peer_phase(PeerPhase self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_i_32(self.index, serializer);
+  }
+
+  @protected
   void sse_encode_u_32(int self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     serializer.buffer.putUint32(self);
+  }
+
+  @protected
+  void sse_encode_u_64(BigInt self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    serializer.buffer.putBigUint64(self);
   }
 
   @protected

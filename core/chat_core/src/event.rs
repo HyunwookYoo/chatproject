@@ -1,9 +1,12 @@
 use std::sync::{Arc, Mutex};
 
+use serde::{Deserialize, Serialize};
+
 use crate::error::ErrorCode;
+use crate::transport::{NetworkInfo, PeerInfo};
 
 /// What this device is connected to right now (design 12.1 `ConnectionState`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectionSnapshot {
     pub direct_peers: u32,
     pub mailbox_ok: bool,
@@ -15,22 +18,28 @@ impl ConnectionSnapshot {
     pub const OFFLINE: Self = Self { direct_peers: 0, mailbox_ok: false, queue_ok: None };
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CoreEvent {
     ConnectionState(ConnectionSnapshot),
     Error { code: ErrorCode, detail: String },
+    NetworkChanged(NetworkInfo),
+    PeerChanged { revision: u64, peer: PeerInfo },
+    ProbeTextReceived { peer_id: String, text: String },
 }
 
 /// Receives core events. Return `false` once the receiver is gone; the bus then drops it.
+/// Callbacks must be nonblocking and must not reenter the event bus or core slot:
+/// they run while the bus lock (and possibly the core slot lock) is held.
 pub trait EventSink: Send + Sync + 'static {
     fn send(&self, event: CoreEvent) -> bool;
 }
 
 /// Fans out core events to every subscriber in publish order. A subscriber that joins
 /// late first gets the latest connection state; other events are not replayed.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct EventBus {
-    state: Mutex<BusState>,
+    state: Arc<Mutex<BusState>>,
 }
 
 #[derive(Default)]
@@ -99,6 +108,24 @@ mod tests {
 
     fn error(detail: &str) -> CoreEvent {
         CoreEvent::Error { code: ErrorCode::InvalidConfig, detail: detail.to_string() }
+    }
+
+    #[test]
+    fn clone_shares_subscribers_and_latest_snapshot() {
+        let bus = EventBus::new();
+        let cloned = bus.clone();
+        let sink = Arc::new(RecordingSink::default());
+        bus.subscribe(sink.clone());
+        cloned.publish(state(2));
+        assert_eq!(sink.events(), vec![state(2)]);
+        assert_eq!(cloned.subscriber_count(), 1);
+        let late_sink = Arc::new(RecordingSink::default());
+        cloned.subscribe(late_sink.clone());
+        assert_eq!(late_sink.events(), vec![state(2)]);
+        sink.closed.store(true, Ordering::SeqCst);
+        cloned.publish(state(3));
+        assert_eq!(bus.subscriber_count(), 1);
+        assert_eq!(late_sink.events(), vec![state(2), state(3)]);
     }
 
     #[test]

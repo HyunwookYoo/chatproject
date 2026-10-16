@@ -3,3 +3,6 @@
 -keep class * extends com.sun.jna.** { *; }
 -keep class uniffi.** { *; }
 -dontwarn java.awt.**
+-keepclasseswithmembernames class dev.chatproject.chat_app.MainActivity {
+    native <methods>;
+}

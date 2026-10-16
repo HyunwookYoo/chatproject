@@ -1,8 +1,8 @@
 //! Conversions between chat_core types and the types Dart sees.
 
-use std::sync::Mutex;
-
-use crate::api::chat::{ChatEvent, CoreError, CoreInfo, ErrorCode};
+use crate::api::chat::{
+    ChatEvent, CoreError, CoreInfo, ErrorCode, NetworkInfo, NetworkState, PeerInfo, PeerPath, PeerPhase,
+};
 use crate::frb_generated::StreamSink;
 
 impl From<chat_core::CoreInfo> for CoreInfo {
@@ -16,6 +16,16 @@ impl From<chat_core::ErrorCode> for ErrorCode {
         match code {
             chat_core::ErrorCode::InvalidConfig => Self::InvalidConfig,
             chat_core::ErrorCode::AlreadyStartedDifferentConfig => Self::AlreadyStartedDifferentConfig,
+            chat_core::ErrorCode::CoreNotStarted => Self::CoreNotStarted,
+            chat_core::ErrorCode::NetworkNotStarted => Self::NetworkNotStarted,
+            chat_core::ErrorCode::InvalidPeerAddress => Self::InvalidPeerAddress,
+            chat_core::ErrorCode::SelfConnection => Self::SelfConnection,
+            chat_core::ErrorCode::PeerNotConnected => Self::PeerNotConnected,
+            chat_core::ErrorCode::MessageTooLarge => Self::MessageTooLarge,
+            chat_core::ErrorCode::Busy => Self::Busy,
+            chat_core::ErrorCode::NetworkTimeout => Self::NetworkTimeout,
+            chat_core::ErrorCode::TransportFailed => Self::TransportFailed,
+            chat_core::ErrorCode::NotAvailable => Self::NotAvailable,
         }
     }
 }
@@ -23,6 +33,62 @@ impl From<chat_core::ErrorCode> for ErrorCode {
 impl From<chat_core::CoreError> for CoreError {
     fn from(err: chat_core::CoreError) -> Self {
         Self { code: err.code.into(), detail: err.detail }
+    }
+}
+
+impl From<chat_core::NetworkState> for NetworkState {
+    fn from(value: chat_core::NetworkState) -> Self {
+        match value {
+            chat_core::NetworkState::Stopped => Self::Stopped,
+            chat_core::NetworkState::Starting => Self::Starting,
+            chat_core::NetworkState::Online => Self::Online,
+            chat_core::NetworkState::Failed => Self::Failed,
+        }
+    }
+}
+
+impl From<chat_core::PeerPhase> for PeerPhase {
+    fn from(value: chat_core::PeerPhase) -> Self {
+        match value {
+            chat_core::PeerPhase::Connecting => Self::Connecting,
+            chat_core::PeerPhase::Connected => Self::Connected,
+            chat_core::PeerPhase::Reconnecting => Self::Reconnecting,
+            chat_core::PeerPhase::Disconnected => Self::Disconnected,
+        }
+    }
+}
+
+impl From<chat_core::PeerPath> for PeerPath {
+    fn from(value: chat_core::PeerPath) -> Self {
+        match value {
+            chat_core::PeerPath::Unknown => Self::Unknown,
+            chat_core::PeerPath::Relay => Self::Relay,
+            chat_core::PeerPath::Direct => Self::Direct,
+        }
+    }
+}
+
+impl From<chat_core::PeerInfo> for PeerInfo {
+    fn from(peer: chat_core::PeerInfo) -> Self {
+        Self {
+            peer_id: peer.peer_id,
+            phase: peer.phase.into(),
+            path: peer.path.into(),
+            connect_ms: peer.connect_ms,
+            direct_ms: peer.direct_ms,
+        }
+    }
+}
+
+impl From<chat_core::NetworkInfo> for NetworkInfo {
+    fn from(info: chat_core::NetworkInfo) -> Self {
+        Self {
+            revision: info.revision,
+            state: info.state.into(),
+            endpoint_id: info.endpoint_id,
+            ticket: info.ticket,
+            peers: info.peers.into_iter().map(PeerInfo::from).collect(),
+        }
     }
 }
 
@@ -35,17 +101,23 @@ impl From<chat_core::CoreEvent> for ChatEvent {
                 queue_ok: s.queue_ok,
             },
             chat_core::CoreEvent::Error { code, detail } => Self::Error { code: code.into(), detail },
+            chat_core::CoreEvent::NetworkChanged(info) => Self::NetworkChanged { info: info.into() },
+            chat_core::CoreEvent::PeerChanged { revision, peer } => {
+                Self::PeerChanged { revision, peer: peer.into() }
+            }
+            chat_core::CoreEvent::ProbeTextReceived { peer_id, text } => {
+                Self::ProbeTextReceived { peer_id, text }
+            }
         }
     }
 }
 
 /// Forwards core events into a Dart stream. A closed Dart stream ends the subscription.
-pub(crate) struct FrbSink(pub(crate) Mutex<StreamSink<ChatEvent>>);
+pub(crate) struct FrbSink(pub(crate) StreamSink<ChatEvent>);
 
 impl chat_core::EventSink for FrbSink {
     fn send(&self, event: chat_core::CoreEvent) -> bool {
-        let sink = self.0.lock().expect("stream sink lock poisoned");
-        sink.add(ChatEvent::from(event)).is_ok()
+        self.0.add(event.into()).is_ok()
     }
 }
 
@@ -67,10 +139,141 @@ mod tests {
     }
 
     #[test]
-    fn error_keeps_code_and_detail() {
-        let err = chat_core::CoreError::new(chat_core::ErrorCode::AlreadyStartedDifferentConfig, "x");
-        let converted = CoreError::from(err);
-        assert_eq!(converted.code, ErrorCode::AlreadyStartedDifferentConfig);
-        assert_eq!(converted.detail, "x");
+    fn network_snapshot_keeps_revision_and_peer() {
+        let peer = chat_core::PeerInfo {
+            peer_id: "a".repeat(64),
+            phase: chat_core::PeerPhase::Connected,
+            path: chat_core::PeerPath::Relay,
+            connect_ms: Some(12),
+            direct_ms: None,
+        };
+        let info = chat_core::NetworkInfo {
+            revision: 7,
+            state: chat_core::NetworkState::Online,
+            endpoint_id: None,
+            ticket: None,
+            peers: vec![peer],
+        };
+        let ChatEvent::NetworkChanged { info } =
+            ChatEvent::from(chat_core::CoreEvent::NetworkChanged(info)) else {
+                panic!("wrong event")
+            };
+        assert_eq!(info.revision, 7);
+        assert_eq!(info.state, NetworkState::Online);
+        assert_eq!(info.endpoint_id, None);
+        assert_eq!(info.ticket, None);
+        assert_eq!(info.peers, vec![PeerInfo {
+            peer_id: "a".repeat(64),
+            phase: PeerPhase::Connected,
+            path: PeerPath::Relay,
+            connect_ms: Some(12),
+            direct_ms: None,
+        }]);
+        let identified = NetworkInfo::from(chat_core::NetworkInfo {
+            revision: 8,
+            state: chat_core::NetworkState::Starting,
+            endpoint_id: Some("b".repeat(64)),
+            ticket: Some("ticket".into()),
+            peers: vec![],
+        });
+        assert_eq!(identified.endpoint_id, Some("b".repeat(64)));
+        assert_eq!(identified.ticket.as_deref(), Some("ticket"));
+        assert!(identified.peers.is_empty());
+    }
+
+    #[test]
+    fn peer_changed_keeps_revision_and_every_field() {
+        let peer = chat_core::PeerInfo {
+            peer_id: "c".repeat(64),
+            phase: chat_core::PeerPhase::Reconnecting,
+            path: chat_core::PeerPath::Direct,
+            connect_ms: None,
+            direct_ms: Some(25),
+        };
+        assert_eq!(
+            ChatEvent::from(chat_core::CoreEvent::PeerChanged { revision: u64::MAX, peer }),
+            ChatEvent::PeerChanged {
+                revision: u64::MAX,
+                peer: PeerInfo {
+                    peer_id: "c".repeat(64),
+                    phase: PeerPhase::Reconnecting,
+                    path: PeerPath::Direct,
+                    connect_ms: None,
+                    direct_ms: Some(25),
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn probe_text_keeps_peer_and_unicode_body() {
+        assert_eq!(
+            ChatEvent::from(chat_core::CoreEvent::ProbeTextReceived {
+                peer_id: "d".repeat(64),
+                text: "\u{c548}\u{b155} \u{1f30f}".into(),
+            }),
+            ChatEvent::ProbeTextReceived {
+                peer_id: "d".repeat(64),
+                text: "\u{c548}\u{b155} \u{1f30f}".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn every_network_enum_keeps_its_variant() {
+        for (core, ffi) in [
+            (chat_core::NetworkState::Stopped, NetworkState::Stopped),
+            (chat_core::NetworkState::Starting, NetworkState::Starting),
+            (chat_core::NetworkState::Online, NetworkState::Online),
+            (chat_core::NetworkState::Failed, NetworkState::Failed),
+        ] {
+            assert_eq!(NetworkState::from(core), ffi);
+        }
+        for (core, ffi) in [
+            (chat_core::PeerPhase::Connecting, PeerPhase::Connecting),
+            (chat_core::PeerPhase::Connected, PeerPhase::Connected),
+            (chat_core::PeerPhase::Reconnecting, PeerPhase::Reconnecting),
+            (chat_core::PeerPhase::Disconnected, PeerPhase::Disconnected),
+        ] {
+            assert_eq!(PeerPhase::from(core), ffi);
+        }
+        for (core, ffi) in [
+            (chat_core::PeerPath::Unknown, PeerPath::Unknown),
+            (chat_core::PeerPath::Relay, PeerPath::Relay),
+            (chat_core::PeerPath::Direct, PeerPath::Direct),
+        ] {
+            assert_eq!(PeerPath::from(core), ffi);
+        }
+    }
+
+    #[test]
+    fn every_error_code_keeps_its_variant() {
+        use chat_core::ErrorCode as C;
+        use crate::api::chat::ErrorCode as F;
+        let pairs = [
+            (C::InvalidConfig, F::InvalidConfig),
+            (C::AlreadyStartedDifferentConfig, F::AlreadyStartedDifferentConfig),
+            (C::CoreNotStarted, F::CoreNotStarted),
+            (C::NetworkNotStarted, F::NetworkNotStarted),
+            (C::InvalidPeerAddress, F::InvalidPeerAddress),
+            (C::SelfConnection, F::SelfConnection),
+            (C::PeerNotConnected, F::PeerNotConnected),
+            (C::MessageTooLarge, F::MessageTooLarge),
+            (C::Busy, F::Busy), (C::NetworkTimeout, F::NetworkTimeout),
+            (C::TransportFailed, F::TransportFailed),
+            (C::NotAvailable, F::NotAvailable),
+        ];
+        for (core, ffi) in pairs {
+            assert_eq!(F::from(core), ffi);
+            let converted = CoreError::from(chat_core::CoreError::new(core, "safe detail"));
+            assert_eq!(converted.code, ffi);
+            assert_eq!(converted.detail, "safe detail");
+            assert_eq!(
+                ChatEvent::from(chat_core::CoreEvent::Error {
+                    code: core, detail: "safe detail".into(),
+                }),
+                ChatEvent::Error { code: ffi, detail: "safe detail".into() }
+            );
+        }
     }
 }

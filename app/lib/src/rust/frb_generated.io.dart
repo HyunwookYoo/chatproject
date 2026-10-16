@@ -34,6 +34,15 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   bool dco_decode_box_autoadd_bool(dynamic raw);
 
   @protected
+  NetworkInfo dco_decode_box_autoadd_network_info(dynamic raw);
+
+  @protected
+  PeerInfo dco_decode_box_autoadd_peer_info(dynamic raw);
+
+  @protected
+  BigInt dco_decode_box_autoadd_u_64(dynamic raw);
+
+  @protected
   ChatEvent dco_decode_chat_event(dynamic raw);
 
   @protected
@@ -49,13 +58,40 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   int dco_decode_i_32(dynamic raw);
 
   @protected
+  List<PeerInfo> dco_decode_list_peer_info(dynamic raw);
+
+  @protected
   Uint8List dco_decode_list_prim_u_8_strict(dynamic raw);
+
+  @protected
+  NetworkInfo dco_decode_network_info(dynamic raw);
+
+  @protected
+  NetworkState dco_decode_network_state(dynamic raw);
+
+  @protected
+  String? dco_decode_opt_String(dynamic raw);
 
   @protected
   bool? dco_decode_opt_box_autoadd_bool(dynamic raw);
 
   @protected
+  BigInt? dco_decode_opt_box_autoadd_u_64(dynamic raw);
+
+  @protected
+  PeerInfo dco_decode_peer_info(dynamic raw);
+
+  @protected
+  PeerPath dco_decode_peer_path(dynamic raw);
+
+  @protected
+  PeerPhase dco_decode_peer_phase(dynamic raw);
+
+  @protected
   int dco_decode_u_32(dynamic raw);
+
+  @protected
+  BigInt dco_decode_u_64(dynamic raw);
 
   @protected
   int dco_decode_u_8(dynamic raw);
@@ -81,6 +117,15 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   bool sse_decode_box_autoadd_bool(SseDeserializer deserializer);
 
   @protected
+  NetworkInfo sse_decode_box_autoadd_network_info(SseDeserializer deserializer);
+
+  @protected
+  PeerInfo sse_decode_box_autoadd_peer_info(SseDeserializer deserializer);
+
+  @protected
+  BigInt sse_decode_box_autoadd_u_64(SseDeserializer deserializer);
+
+  @protected
   ChatEvent sse_decode_chat_event(SseDeserializer deserializer);
 
   @protected
@@ -96,13 +141,40 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   int sse_decode_i_32(SseDeserializer deserializer);
 
   @protected
+  List<PeerInfo> sse_decode_list_peer_info(SseDeserializer deserializer);
+
+  @protected
   Uint8List sse_decode_list_prim_u_8_strict(SseDeserializer deserializer);
+
+  @protected
+  NetworkInfo sse_decode_network_info(SseDeserializer deserializer);
+
+  @protected
+  NetworkState sse_decode_network_state(SseDeserializer deserializer);
+
+  @protected
+  String? sse_decode_opt_String(SseDeserializer deserializer);
 
   @protected
   bool? sse_decode_opt_box_autoadd_bool(SseDeserializer deserializer);
 
   @protected
+  BigInt? sse_decode_opt_box_autoadd_u_64(SseDeserializer deserializer);
+
+  @protected
+  PeerInfo sse_decode_peer_info(SseDeserializer deserializer);
+
+  @protected
+  PeerPath sse_decode_peer_path(SseDeserializer deserializer);
+
+  @protected
+  PeerPhase sse_decode_peer_phase(SseDeserializer deserializer);
+
+  @protected
   int sse_decode_u_32(SseDeserializer deserializer);
+
+  @protected
+  BigInt sse_decode_u_64(SseDeserializer deserializer);
 
   @protected
   int sse_decode_u_8(SseDeserializer deserializer);
@@ -132,6 +204,21 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_box_autoadd_bool(bool self, SseSerializer serializer);
 
   @protected
+  void sse_encode_box_autoadd_network_info(
+    NetworkInfo self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_box_autoadd_peer_info(
+    PeerInfo self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_box_autoadd_u_64(BigInt self, SseSerializer serializer);
+
+  @protected
   void sse_encode_chat_event(ChatEvent self, SseSerializer serializer);
 
   @protected
@@ -147,16 +234,43 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_i_32(int self, SseSerializer serializer);
 
   @protected
+  void sse_encode_list_peer_info(List<PeerInfo> self, SseSerializer serializer);
+
+  @protected
   void sse_encode_list_prim_u_8_strict(
     Uint8List self,
     SseSerializer serializer,
   );
 
   @protected
+  void sse_encode_network_info(NetworkInfo self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_network_state(NetworkState self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_opt_String(String? self, SseSerializer serializer);
+
+  @protected
   void sse_encode_opt_box_autoadd_bool(bool? self, SseSerializer serializer);
 
   @protected
+  void sse_encode_opt_box_autoadd_u_64(BigInt? self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_peer_info(PeerInfo self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_peer_path(PeerPath self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_peer_phase(PeerPhase self, SseSerializer serializer);
+
+  @protected
   void sse_encode_u_32(int self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_u_64(BigInt self, SseSerializer serializer);
 
   @protected
   void sse_encode_u_8(int self, SseSerializer serializer);

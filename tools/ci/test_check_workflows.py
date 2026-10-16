@@ -1,7 +1,10 @@
 import pathlib
+import contextlib
+import io
+import tempfile
 import unittest
 
-from check_workflows import check
+from check_workflows import check, main
 
 PINNED = "apple-actions/upload-testflight-build@14df18fee5a4ff3b76971dd382f033494a0194e9"
 
@@ -174,6 +177,104 @@ class CiTest(unittest.TestCase):
         del doc["jobs"]["ios-release"]
         problems = check(pathlib.Path("ci.yaml"), doc)
         self.assertTrue(any("ios-release is missing" in p for p in problems), problems)
+
+
+class PolicyTest(unittest.TestCase):
+    def workflow(self, **overrides):
+        doc = {"on": "push", "permissions": {"contents": "read"}, "jobs": {"test": {"steps": []}}}
+        doc.update(overrides)
+        return doc
+
+    def test_default_trigger_allowlist_and_e2e_schedule_exception(self):
+        for event in ("push", "pull_request", "workflow_dispatch", "schedule", "issues",
+                      "pull_request_target", "workflow_run", "workflow_call"):
+            for filename in ("ordinary.yml", "e2e.yml", "E2E.YAML"):
+                with self.subTest(event=event, filename=filename):
+                    allowed = (event in ("push", "pull_request", "workflow_dispatch")
+                               if filename == "ordinary.yml" else event in ("schedule", "workflow_dispatch"))
+                    problems = check(pathlib.Path(filename), self.workflow(on={event: None}))
+                    self.assertEqual(problems == [], allowed, problems)
+
+    def test_runner_context_is_unavailable_in_job_env_but_allowed_in_step_env(self):
+        for value in ('${{ runner.temp }}/chatproject-123-1-android', "${{ runner['temp'] }}"):
+            with self.subTest(value=value):
+                doc = self.workflow()
+                job = doc['jobs']['test']
+                job['env'] = {'GRADLE_USER_HOME': value}
+                problems = check(pathlib.Path('ordinary.yml'), doc)
+                self.assertTrue(any('runner context is unavailable in job env' in p for p in problems), problems)
+                del job['env']
+                job['steps'] = [{'env': {'GRADLE_USER_HOME': value}, 'run': 'echo ready'}]
+                self.assertEqual(check(pathlib.Path('ordinary.yml'), doc), [])
+
+    def test_job_permissions_may_only_narrow_top_level_read(self):
+        for permissions, allowed in ((None, True), ({}, True), ({"contents": "read"}, True),
+                                     ({"contents": "none"}, True), ({"contents": "write"}, False),
+                                     ({"issues": "read"}, False), ("read-all", False), ("write-all", False)):
+            with self.subTest(permissions=permissions):
+                doc = self.workflow()
+                if permissions is not None:
+                    doc["jobs"]["test"]["permissions"] = permissions
+                self.assertEqual(check(pathlib.Path("ordinary.yml"), doc) == [], allowed)
+
+    def test_local_actions_and_pinned_reusable_workflows(self):
+        for uses, reusable, allowed in (("./tools/action", False, True),
+                                        ("owner/action@v1", False, False),
+                                        ("owner/action@" + "a" * 40, False, True),
+                                        ("./.github/workflows/shared.yml", True, True),
+                                        ("owner/repo/.github/workflows/shared.yml@main", True, False),
+                                        ("owner/repo/.github/workflows/shared.yml@" + "a" * 40, True, True)):
+            with self.subTest(uses=uses):
+                job = {"uses": uses} if reusable else {"steps": [{"uses": uses}]}
+                doc = self.workflow(jobs={"test": job})
+                self.assertEqual(check(pathlib.Path("ordinary.yml"), doc) == [], allowed)
+
+    def test_checkout_requires_disabled_credentials_even_when_pinned(self):
+        doc = self.workflow(jobs={"test": {"steps": [{"uses": "actions/checkout@" + "a" * 40}]}})
+        self.assertTrue(any("persist-credentials" in p for p in check(pathlib.Path("ordinary.yml"), doc)))
+
+    def test_top_level_permissions_and_toolchain_contracts(self):
+        for overrides in ({"permissions": {}}, {"permissions": {"contents": "read", "issues": "read"}},
+                          {"env": {"CARGOKIT_TOOLCHAIN": "stable", "RUST_TOOLCHAIN": "1.92.0"}}):
+            with self.subTest(overrides=overrides):
+                self.assertTrue(check(pathlib.Path("ordinary.yml"), self.workflow(**overrides)))
+
+    def test_non_mapping_documents_have_one_filename_diagnostic(self):
+        for doc in (None, "workflow", ["push"], 42):
+            with self.subTest(doc=doc):
+                problems = check(pathlib.Path("broken.yaml"), doc)
+                self.assertEqual(len(problems), 1)
+                self.assertIn("broken.yaml", problems[0])
+
+    def test_discovery_accepts_yaml_extensions_case_insensitively(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = pathlib.Path(folder)
+            workflows = root / ".github/workflows"
+            workflows.mkdir(parents=True)
+            for suffix in ("yml", "yaml", "YML", "YAML"):
+                (workflows / ("ordinary." + suffix)).write_text(
+                    "on: push\npermissions: {contents: read}\njobs: {}\n", encoding="utf-8")
+                with contextlib.redirect_stdout(io.StringIO()) as output:
+                    self.assertEqual(main(root), 0)
+                self.assertEqual(output.getvalue(), "workflows ok\n")
+                (workflows / ("ordinary." + suffix)).unlink()
+
+    def test_missing_files_and_malformed_yaml_report_without_traceback(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = pathlib.Path(folder)
+            workflows = root / ".github/workflows"
+            workflows.mkdir(parents=True)
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(main(root), 1)
+            self.assertIn("no workflow files", output.getvalue())
+            for contents in ("", "42", "- push", "on: [push"):
+                with self.subTest(contents=contents):
+                    (workflows / "broken.yaml").write_text(contents, encoding="utf-8")
+                    with contextlib.redirect_stdout(io.StringIO()) as output:
+                        self.assertEqual(main(root), 1)
+                    self.assertEqual(len(output.getvalue().splitlines()), 1)
+                    self.assertIn("broken.yaml:", output.getvalue())
+                    self.assertNotIn("Traceback", output.getvalue())
 
 
 if __name__ == "__main__":

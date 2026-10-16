@@ -1,0 +1,5 @@
+cargo:
+  debug:
+    extra_flags:
+      - --features
+      - test-hooks
