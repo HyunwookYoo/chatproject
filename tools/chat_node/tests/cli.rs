@@ -177,6 +177,65 @@ async fn relay_readiness_and_graceful_owned_shutdown() {
 }
 
 #[tokio::test]
+async fn saved_address_without_relay_cannot_use_a_later_added_relay_hint() {
+    let alpn = b"chatproject/m2/1";
+    let receiver = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .relay_mode(iroh::RelayMode::Custom(iroh::RelayMap::empty()))
+        .clear_ip_transports()
+        .alpns(vec![alpn.to_vec()])
+        .bind().await.unwrap();
+    // Owned address snapshots prove route-hint consequences; serialization is
+    // covered by the actual manager test, not this SDK-only characterization.
+    let old = receiver.addr();
+    assert!(old.addrs.is_empty());
+    assert!(tokio::time::timeout(Duration::from_millis(30), receiver.online()).await.is_err());
+    let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = reservation.local_addr().unwrap();
+    drop(reservation);
+    let mut relay_child = relay(&addr.to_string()).await;
+    let url: iroh::RelayUrl = format!("http://{addr}").parse().unwrap();
+    let map = iroh::RelayMap::from_iter([url.clone()]);
+    receiver.insert_relay(url.clone(), map.get(&url).unwrap()).await;
+    tokio::time::timeout(Duration::from_secs(10), receiver.online()).await.unwrap();
+    let current = receiver.addr();
+    assert!(current.addrs.contains(&iroh::TransportAddr::Relay(url)));
+    assert!(old.addrs.is_empty());
+    let sender = || iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .relay_mode(iroh::RelayMode::Custom(map.clone()))
+        .clear_ip_transports();
+    let old_sender = sender().bind().await.unwrap();
+    assert!(tokio::time::timeout(Duration::from_secs(2), old_sender.connect(old, alpn)).await.unwrap().is_err());
+    old_sender.close().await;
+    let fresh_sender = sender().bind().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let (dialed, accepted) = tokio::join!(fresh_sender.connect(current, alpn), async {
+            receiver.accept().await.unwrap().await.unwrap()
+        });
+        let dialed = dialed.unwrap();
+        let mut send = dialed.open_uni().await.unwrap();
+        send.write_all(b"CPM2").await.unwrap();
+        let body = "fresh relay";
+        send.write_all(&(body.len() as u32).to_be_bytes()).await.unwrap();
+        send.write_all(body.as_bytes()).await.unwrap();
+        let mut recv = accepted.accept_uni().await.unwrap();
+        let mut magic = [0; 4];
+        recv.read_exact(&mut magic).await.unwrap();
+        assert_eq!(&magic, b"CPM2");
+        let mut length = [0; 4];
+        recv.read_exact(&mut length).await.unwrap();
+        assert_eq!(u32::from_be_bytes(length), body.len() as u32);
+        let mut received = vec![0; body.len()];
+        recv.read_exact(&mut received).await.unwrap();
+        assert_eq!(received, body.as_bytes());
+        assert!(dialed.paths().iter().any(|path| path.is_selected() && matches!(path.remote_addr(), iroh::TransportAddr::Relay(_))));
+    }).await.unwrap();
+    fresh_sender.close().await;
+    receiver.close().await;
+    stop(&mut relay_child).await;
+    assert!(TcpListener::bind(addr).is_ok());
+}
+
+#[tokio::test]
 async fn hooked_pair_exchanges_utf8_and_actual_core_selects_relay_without_direct_peers() {
     use serde_json::json;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:47000")

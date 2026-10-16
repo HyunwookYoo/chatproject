@@ -5,7 +5,8 @@ use super::{
     session::{self, Prepared, Reply, Session, SessionTag, Write},
 };
 use crate::{ConnectionSnapshot, CoreError, CoreEvent, ErrorCode, EventBus};
-use iroh::{Endpoint, EndpointAddr, SecretKey, endpoint::Incoming};
+use futures_util::StreamExt;
+use iroh::{Endpoint, EndpointAddr, SecretKey, Watcher, endpoint::Incoming};
 use std::{
     collections::BTreeMap,
     sync::{
@@ -94,6 +95,9 @@ pub(crate) enum Note {
     Bound {
         epoch: u64,
         result: Result<Endpoint, CoreError>,
+    },
+    OwnAddress {
+        epoch: u64,
     },
     Incoming {
         epoch: u64,
@@ -641,6 +645,16 @@ impl Manager {
                         self.info.endpoint_id = Some(endpoint.id().to_string());
                         self.info.ticket = Some(endpoint_ticket(&endpoint, &self.profile));
                         self.info.state = NetworkState::Online;
+                        let mut addresses = endpoint.watch_addr().stream();
+                        let cancel = self.cancel.child_token();
+                        let notes = self.notes.clone();
+                        self.tasks.spawn(async move {
+                            // Closing an Endpoint does not end watch_addr; Stop cancels it.
+                            loop {
+                                tokio::select! { biased; _ = cancel.cancelled() => break, address = addresses.next() => if address.is_none() { break; } }
+                                session::notify(&notes, &cancel, Note::OwnAddress { epoch }).await;
+                            }
+                        });
                         let accept_endpoint = endpoint.clone();
                         let accepted = self.accepted.clone();
                         let cancel = self.cancel.clone();
@@ -674,6 +688,18 @@ impl Manager {
                     }
                 }
                 self.publish(None);
+            }
+            Note::OwnAddress { epoch }
+                if epoch == self.epoch && self.info.state == NetworkState::Online =>
+            {
+                if let Some(endpoint) = &self.endpoint {
+                    // Resample so queued notifications cannot restore an older address.
+                    let ticket = endpoint_ticket(endpoint, &self.profile);
+                    if self.info.ticket.as_ref() != Some(&ticket) {
+                        self.info.ticket = Some(ticket);
+                        self.publish(None);
+                    }
+                }
             }
             Note::Incoming {
                 epoch,
@@ -992,6 +1018,148 @@ mod tests {
         fn send(&self, event: CoreEvent) -> bool {
             self.0.try_send(event).is_ok()
         }
+    }
+    async fn advertise(endpoint: &Endpoint, added: std::net::SocketAddr) {
+        endpoint.add_external_addr(added).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut addresses = endpoint.watch_addr();
+            while !addresses.get().ip_addrs().any(|addr| *addr == added) {
+                addresses.updated().await.unwrap();
+            }
+        }).await.unwrap();
+    }
+    #[tokio::test]
+    async fn own_ticket_follows_live_endpoint_address() {
+        // Public is only the serializer policy: never Start/bind a Public endpoint.
+        let bus = EventBus::new();
+        let (events, mut received_events) = mpsc::channel(64);
+        bus.subscribe(Arc::new(Sink(events)));
+        let mut manager = Manager::new(NetworkProfile::Public, bus);
+        let endpoint = bind_endpoint(
+            &NetworkProfile::Local { relay: None },
+            manager.key.clone(),
+        )
+        .await
+        .unwrap();
+        manager.note(Note::Bound { epoch: 0, result: Ok(endpoint.clone()) }).await;
+        let initial = manager.info.clone();
+        let added = "127.0.0.1:42001".parse().unwrap();
+        assert!(!parse_target(manager.info.ticket.as_ref().unwrap()).unwrap().ip_addrs().any(|addr| *addr == added));
+        let (commands, receiver) = mpsc::channel(64);
+        let handle = NetworkHandle { commands };
+        let actor = tokio::spawn(manager.run(receiver));
+        advertise(&endpoint, added).await;
+        let fresh = tokio::time::timeout(Duration::from_millis(300), async {
+            loop {
+                let NetworkReply::Info(info) = handle.execute(NetworkOp::Info).await.unwrap() else { unreachable!() };
+                if parse_target(info.ticket.as_ref().unwrap()).unwrap() == endpoint.addr() {
+                    break info;
+                }
+                tokio::task::yield_now().await;
+            }
+        }).await;
+        handle.execute(NetworkOp::Stop).await.unwrap();
+        drop(handle);
+        actor.await.unwrap();
+        assert!(fresh.is_ok(), "manager Info kept the initial ticket after the SDK advertised the added address");
+        let fresh = fresh.unwrap();
+        assert_eq!(fresh.state, NetworkState::Online);
+        assert_eq!(fresh.endpoint_id, initial.endpoint_id);
+        assert_eq!(fresh.peers, initial.peers);
+        assert!(fresh.revision > initial.revision);
+        let mut published = false;
+        while let Ok(event) = received_events.try_recv() {
+            if let CoreEvent::NetworkChanged(info) = event {
+                published |= info == fresh;
+            }
+        }
+        assert!(published, "the current ticket must reach consumers in a full snapshot");
+    }
+    #[tokio::test]
+    async fn own_address_revision_changes_once_and_ignores_obsolete_epochs() {
+        // Only the serialization policy is Public; both injected endpoints are Local.
+        let bus = EventBus::new();
+        let (events, mut received_events) = mpsc::channel(64);
+        bus.subscribe(Arc::new(Sink(events)));
+        let mut manager = Manager::new(NetworkProfile::Public, bus);
+        let local = NetworkProfile::Local { relay: None };
+        let endpoint = bind_endpoint(&local, manager.key.clone()).await.unwrap();
+        manager.note(Note::Bound { epoch: 0, result: Ok(endpoint.clone()) }).await;
+        let added = "127.0.0.1:42002".parse().unwrap();
+        advertise(&endpoint, added).await;
+        while received_events.try_recv().is_ok() {}
+        let before = manager.info.revision;
+        manager.note(Note::OwnAddress { epoch: 0 }).await;
+        assert_eq!(manager.info.revision, before + 1);
+        assert!(parse_target(manager.info.ticket.as_ref().unwrap()).unwrap().ip_addrs().any(|addr| *addr == added));
+        assert!(matches!(received_events.try_recv().unwrap(), CoreEvent::NetworkChanged(info) if info == manager.info));
+        assert!(matches!(received_events.try_recv().unwrap(), CoreEvent::ConnectionState(state) if state.direct_peers == 0));
+        assert!(received_events.try_recv().is_err());
+        let current = manager.info.clone();
+        manager.note(Note::OwnAddress { epoch: 0 }).await;
+        assert_eq!(manager.info, current);
+        assert!(received_events.try_recv().is_err());
+
+        manager.stop().await;
+        let stopped = manager.info.clone();
+        manager.note(Note::OwnAddress { epoch: 0 }).await;
+        manager.note(Note::OwnAddress { epoch: manager.epoch }).await;
+        assert_eq!(manager.info, stopped);
+        assert!(manager.info.ticket.is_none());
+
+        // Reproduce a new Start's epoch and Bound, without ever binding Public.
+        manager.epoch += 1;
+        manager.cancel = CancellationToken::new();
+        manager.info.state = NetworkState::Starting;
+        let replacement = bind_endpoint(&local, manager.key.clone()).await.unwrap();
+        let epoch = manager.epoch;
+        manager.note(Note::Bound { epoch, result: Ok(replacement.clone()) }).await;
+        assert_eq!(manager.info.endpoint_id, current.endpoint_id);
+        let rebound = manager.info.clone();
+        advertise(&replacement, added).await;
+        manager.note(Note::OwnAddress { epoch: 0 }).await;
+        assert_eq!(manager.info, rebound);
+        manager.note(Note::OwnAddress { epoch }).await;
+        assert_eq!(manager.info.revision, rebound.revision + 1);
+        assert!(parse_target(manager.info.ticket.as_ref().unwrap()).unwrap() == replacement.addr());
+        tokio::time::timeout(Duration::from_secs(2), manager.stop()).await.unwrap();
+        assert!(manager.tasks.is_empty());
+    }
+    #[tokio::test]
+    async fn own_address_watch_stop_joins_while_pending_or_note_queue_full() {
+        for full in [false, true] {
+            let mut manager = Manager::new(NetworkProfile::Local { relay: None }, EventBus::new());
+            let endpoint = bind_endpoint(&manager.profile, manager.key.clone()).await.unwrap();
+            manager.note(Note::Bound { epoch: 0, result: Ok(endpoint.clone()) }).await;
+            // The initial watcher item proves the tracked child has started.
+            let initial = tokio::time::timeout(Duration::from_secs(2), manager.received.recv()).await.unwrap().unwrap();
+            assert!(matches!(initial, Note::OwnAddress { epoch: 0 }));
+            manager.note(initial).await;
+            if full {
+                while manager.notes.try_send(Note::OwnAddress { epoch: 0 }).is_ok() {}
+                assert_eq!(manager.notes.capacity(), 0);
+                advertise(&endpoint, "127.0.0.1:42003".parse().unwrap()).await;
+                tokio::task::yield_now().await;
+                assert_eq!(manager.notes.capacity(), 0);
+            }
+            tokio::time::timeout(Duration::from_secs(2), manager.stop()).await.unwrap();
+            assert!(manager.tasks.is_empty());
+            assert!(manager.received.try_recv().is_err());
+            assert_eq!(manager.info.state, NetworkState::Stopped);
+        }
+    }
+    #[tokio::test]
+    async fn local_direct_ticket_keeps_bound_loopback_sockets_after_address_update() {
+        let mut manager = Manager::new(NetworkProfile::Local { relay: None }, EventBus::new());
+        let endpoint = bind_endpoint(&manager.profile, manager.key.clone()).await.unwrap();
+        manager.note(Note::Bound { epoch: 0, result: Ok(endpoint.clone()) }).await;
+        let initial = manager.info.clone();
+        let address = parse_target(initial.ticket.as_ref().unwrap()).unwrap();
+        assert!(address.ip_addrs().all(|addr| addr.ip().is_loopback()));
+        advertise(&endpoint, "127.0.0.1:42004".parse().unwrap()).await;
+        manager.note(Note::OwnAddress { epoch: 0 }).await;
+        assert_eq!(manager.info, initial);
+        tokio::time::timeout(Duration::from_secs(2), manager.stop()).await.unwrap();
     }
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     #[tokio::test]
