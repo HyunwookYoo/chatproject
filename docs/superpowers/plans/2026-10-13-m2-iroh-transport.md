@@ -10,7 +10,7 @@
 
 **Spec:** [승인된 M2 설계](../specs/2026-10-12-m2-iroh-transport-design.md). 승인 날짜는 한국 시간 2026-10-13이다. 아래 작업별 PASS는 계획 당시 기대 결과이며 실제 실행 판정은 [현재 검증 결과](../results/2026-10-16-m2-transport.md)를 따른다.
 
-**Status (2026-10-16):** 설계·계획 승인 후 Tasks 1–12 구현·검토 완료, Task 13 코드 지적 수정 완료/실제 Android 야간 게이트 대기, Task 14 진행 중. 실제 기기 전체 행렬·성능 미달 판단·signed M2 iPhone·최종 전체 브랜치 검토와 통합은 미완료다. [남은 일과 39개 대조표](2026-10-13-m2-carry-forward.md)를 참조한다. M2 완료 선언이 아니다.
+**Status (2026-10-17):** 설계·계획 승인 후 Tasks 1–12 구현·검토 완료, Task 13 코드 지적 수정과 7a 두 야간 성공/최신 일반 CI Android 최종 결과 대기, Task 14 진행 중. 751 ARM64 본문·복귀·이동·해제·재시작은 확인했다. 현재 제품 EE의 연결 목표 미달 RCA·수용 판단/실패한 fresh-client DHT 등 방향별 공개망, 최신 일반 CI의 Android 최종 결과, signed M2 iPhone·최종 전체 브랜치 검토와 통합은 미완료다. [남은 일과 39개 대조표](2026-10-13-m2-carry-forward.md)를 참조한다. M2 완료 선언이 아니다.
 
 ## Global Constraints
 
@@ -720,4 +720,4 @@ env:
 
 ## 계획 자체 검토 기록
 
-이 절은 구현 완료 체크가 아니다. 승인 설계 각 절과 M1a28개/M1b11개를 위 표로 대조했다. 14개 작업에 Files/Interfaces와 실패→구현→성공 단계를 넣고 링크·코드 fence·미정 표식을 검사했다. 검토 중 수정한 항목은 Local integration test의 feature 조건, control-ready를 기다리는 비동기 bootstrap, core instance별 순번 보존, Release 자동 시험의 공용망 부작용 제거, 동일 시계의 실제 연결 측정값이다. codegen 실제 출력도 `flutter_rust_bridge_codegen 2.11.1`로 확인했다. 이 문단의 검토는 계획 작성 시점의 기록이다. 이후 구현·실행 결과와 잔여 의존성은 문서 머리의 2026-10-16 상태 및 연결된 결과/인계 문서를 따른다. 계획 승인과 코드 지적 수정은 전체 브랜치 최종 검토·실제 기기 검증의 완료를 뜻하지 않는다.
+이 절은 구현 완료 체크가 아니다. 승인 설계 각 절과 M1a28개/M1b11개를 위 표로 대조했다. 14개 작업에 Files/Interfaces와 실패→구현→성공 단계를 넣고 링크·코드 fence·미정 표식을 검사했다. 검토 중 수정한 항목은 Local integration test의 feature 조건, control-ready를 기다리는 비동기 bootstrap, core instance별 순번 보존, Release 자동 시험의 공용망 부작용 제거, 동일 시계의 실제 연결 측정값이다. codegen 실제 출력도 `flutter_rust_bridge_codegen 2.11.1`로 확인했다. 이 문단의 검토는 계획 작성 시점의 기록이다. 이후 구현·실행 결과와 잔여 의존성은 문서 머리의 2026-10-17 상태 및 연결된 결과/인계 문서를 따른다. 계획 승인과 코드 지적 수정은 전체 브랜치 최종 검토·실제 기기 검증의 완료를 뜻하지 않는다.

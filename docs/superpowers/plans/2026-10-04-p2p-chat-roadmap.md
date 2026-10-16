@@ -86,7 +86,7 @@ ChatProject/
 
 ### M2 — iroh 1:1 직접 연결
 
-2026-10-16 현재 구현·항목별 검증은 진행됐으나 M2는 미완료다. [현재 결과](../results/2026-10-16-m2-transport.md)와 [39개 인계 대조표·남은 일](2026-10-13-m2-carry-forward.md)에 실제 CI·실패·물리 측정과 유예를 기록했다. 최신 일반 CI 전체·Android2 야간, 실제 기기 전체 행렬·성능 미달 판단, 서명된 iPhone 전경 검증과 전체 브랜치 최종 검토가 남아 있다.
+2026-10-17 현재 구현·항목별 검증은 진행됐으나 M2는 미완료다. [현재 결과](../results/2026-10-16-m2-transport.md)와 [39개 인계 대조표·남은 일](2026-10-13-m2-carry-forward.md)에 실제 CI·실패·물리 측정과 유예를 기록했다. 751 실제 본문·복귀·이동·해제·재시작과 378 일반 CI 9/9는 확인했다. 7a Windows·Android 야간도 성공해 Xmx8G를 유지한다. EE 짧은 양방향 본문/10회 측정 뒤 연결 목표 1회 미달의 RCA·수용 판단과 실제 실패한 fresh-client DHT 등 방향별 공개망, 최신 일반 CI Android 최종 결과·서명된 iPhone·전체 브랜치 최종 검토는 남아 있다.
 
 - 범위: `chat_core`에 tokio 런타임과 iroh 1.3 엔드포인트. 최소 구성(n0 preset 아님, `dns.iroh.link` 안 씀), n0 공개 릴레이(`RelayMode::Default`), pkarr에는 홈 릴레이 URL만 게시(`AddrFilter::relay_only`). 저장·MLS 없음. Android `JNI_OnLoad`는 VM을 저장하고, 명시적 JNI 초기화가 유지된 실제 applicationContext로 `iroh::dns::install_android_jni_context`를 Flutter/Endpoint 생성 전에 호출한다.
 - 여러 기기 시험 장치(자동 테스트 설계 4절): 지휘 프로그램(`tools/e2e` 시나리오 실행), Rust 조종 루프(`chat_core`의 `test-hooks`, 디버그 빌드에만), `chat_node`(조종 참가자 + 로컬 릴레이), 앱 조종 모드 실행 인자(Android 인텐트 추가 값, Windows 실행 인자), CI 매일 밤 작업, 릴리스 표식 검사.
