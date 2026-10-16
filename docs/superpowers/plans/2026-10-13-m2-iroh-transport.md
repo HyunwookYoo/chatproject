@@ -10,7 +10,7 @@
 
 **Spec:** [승인된 M2 설계](../specs/2026-10-12-m2-iroh-transport-design.md). 승인 날짜는 한국 시간 2026-10-13이다. 아래 작업별 PASS는 계획 당시 기대 결과이며 실제 실행 판정은 [현재 검증 결과](../results/2026-10-16-m2-transport.md)를 따른다.
 
-**Status (2026-10-17):** 설계·계획 승인 후 Tasks 1–12 구현·검토 완료, Task 13 코드 지적 수정과 7a 두 야간 성공/최신 일반 CI Android 최종 결과 대기, Task 14 진행 중. 751 ARM64 본문·복귀·이동·해제·재시작은 확인했다. 현재 제품 EE의 연결 목표 미달 RCA·수용 판단/실패한 fresh-client ID-only DHT 연결 확인 등 공개망, 최신 일반 CI의 Android 최종 결과, signed M2 iPhone·최종 전체 브랜치 검토와 통합은 미완료다. [남은 일과 39개 대조표](2026-10-13-m2-carry-forward.md)를 참조한다. M2 완료 선언이 아니다.
+**Status (2026-10-17):** Tasks 1–12와 Task 13 코드 지적 수정은 검토 완료, 7a 두 야간 성공/일반 Android 90분 취소로 native 전체 게이트 대기, Task14 진행 중. 새 c434021 CI 관찰기는 로컬 확인만 마친 미push/실제 실행 전이다. shipping EE는 바뀌지 않았고 사설 Windows/Android 진단은 별도 산출물이다. 일반 EE의 DHT 두 실패·580 ms 및 Windows 진단 5회 미달, 500 ms 목표 추가 RCA·일반 EE의 ID-only/DNS/새 글·실제 재시작/newID/수동 새 주소 연결·signed iPhone·최종 전체 검토가 남아 있다. Relay 표시는 확인했으며 강제 fallback·반대 fresh-publisher DHT를 필수 범위로 추가하지 않는다. [남은 일과 39개 대조표](2026-10-13-m2-carry-forward.md)를 참조한다. M2 완료 선언이 아니다.
 
 ## Global Constraints
 

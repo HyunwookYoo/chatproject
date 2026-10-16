@@ -1,6 +1,6 @@
 # M2 검증 현황과 남긴 일
 
-2026-10-17 한국 시간 기준, 10월 16–17일 세션의 현황이다. 구현 Tasks 1–12와 Task 13 코드 지적 수정은 검토를 마쳤다. 7a Windows·Android 야간은 통과했으며 Task 13 native 전체 최종 판정에는 최신 일반 CI Android 결과가 남아 있다. Task 14의 EE 성능 수용 판단·실제 실패한 fresh-client DHT 등 공개망·서명된 iPhone·최종 브랜치 검토는 열려 있다. 751 물리 본문/복귀/이동/해제/재시작 결과와 EE 영향 경로는 분리한다. **M2 완료 선언이 아니다.** 실행별 범위·실패·산출물 정체성은 [현재 결과](../results/2026-10-16-m2-transport.md)에 기록했다.
+2026-10-17 한국 시간 기준, 10월 16–17일 세션의 현황이다. 구현 Tasks 1–12와 Task 13 코드 지적 수정은 검토를 마쳤다. 7a 야간 두 플랫폼은 성공했지만 일반 CI는 8개 성공/Android 90분 제한 취소로 native 전체 게이트가 남아 있다. c434021 CI 리소스 관찰기는 로컬 확인만 마쳤고 미push·실제 CI 미실행이다. shipping 제품은 계속 EE이며 사설 진단은 별도 고정 EE 기반이다. 일반 EE의 DHT 두 실패·580 ms 미달과 Windows 진단의 5회 미달을 유지한다. Android 진단 1회 성공과 v2 offline capture 성공은 일반 EE 수용을 닫지 않는다. **M2 완료 선언이 아니다.** 실행별 범위·실패·산출물 정체성은 [현재 결과](../results/2026-10-16-m2-transport.md)에 기록했다.
 
 아래 A1–A28은 [M1a M2 #1–28](2026-10-05-m1a-carry-forward.md#m2), B1–B11은 [M1b M2 #1–11](2026-10-11-m1b-carry-forward.md#m2)과 같은 번호다. 완료는 해당 인계 요구의 구현·시험 근거를 뜻하며 전체 마일스톤이나 모든 실제 기기 검증의 완료를 뜻하지 않는다. **39개 중 36개 완료, 대기 0개, 3개 유예(A10/A11/B8)**다. A28은 실제 두 AVD 야간 성공·별도 RSS 측정과 Xmx8G 유지 판단으로 항목별 완료했다. A5는 원래 ARM 빌드·ARM64 실제 실행 요구 범위에서 완료하며, 승인된 ARMv7 실제 실행 유예와 별도의 Task 14 공개망·성능 게이트를 유지한다. 부분 완료와 별도 게이트를 아래에 남긴다. 로컬 비공개 증거는 `build/e2e/`에 보존하며 공개 링크로 제공하지 않는다.
 
@@ -35,7 +35,7 @@
 | A25 | 시스템 이미지 고정 — 완료 | [avd_config.json](../../../tools/e2e/avd_config.json), emulator image/ABI/CPU 검사와 wrong-image 거절 시험. 로컬 API36 Play Store/CI API36 google_apis 구분. 실제 Android 야간 실패는 면제하지 않음. |
 | A26 | 단일 AVD 설정·cache — 완료 | avd_config.json, [ci.yml](../../../.github/workflows/ci.yml), [e2e.yml](../../../.github/workflows/e2e.yml); API/target/arch와 hash cache key를 같은 설정에서 파생. |
 | A27 | Windows integration 전체 폴더 — 완료 | ci.yml의 정렬된 각 파일 개별 실행과 [integration_test](../../../app/integration_test); core 3/network 4 PASS 및 ordinary Windows 성공. Flutter log-reader 우회이며 SDK 수정 없음; Android/Release 전용 skip은 별도. |
-| A28 | Android2 야간·Gradle 메모리 — 완료 | e2e.yml의 빌드 선행/소유 Gradle 정리/GNU time·RSS, [gradle.properties](../../../app/android/gradle.properties)의 Xmx8G 유지. 378 scenario timeout/820 console exit 1 기록은 보존; 7a Android2 실제 scenario exit 0/성공, max-child RSS 3,323,684 KiB와 별도 owned Gradle 표본 peak 3,082,424 KiB, OOM/137/143/lost 없음. 필요 시 조정 판단 결과 Xmx8G 유지. 수치는 heap/동시 총량 아님·합산 금지·향후 하드웨어 보장 아님. |
+| A28 | Android2 야간·Gradle 메모리 — 완료 | e2e.yml의 빌드 선행/소유 Gradle 정리/GNU time·RSS, [gradle.properties](../../../app/android/gradle.properties)의 Xmx8G 유지. 378 scenario timeout/820 console exit 1 기록은 보존; 7a Android2 실제 scenario exit 0/성공, max-child RSS 3,323,684 KiB와 별도 owned Gradle 표본 peak 3,082,424 KiB, OOM/137/143/lost 없음. 필요 시 조정 판단 결과 Xmx8G 유지. 수치는 heap/동시 총량 아님·합산 금지·향후 하드웨어 보장 아님. 일반 Release 90분 job의 메모리/완료 증거로 확대하지 않음. |
 
 ## M1b에서 받은 11개
 
@@ -55,7 +55,7 @@
 
 ## 남은 실행·판단과 유예 책임
 
-- **현재 검증 게이트:** 378 일반 CI 9/9,820 native 8개 작업과 7a flutter의 tools166/app57·analyze 성공은 확보했다. 최신 7a 일반 CI는 8작업 성공/Android 진행 중이며 두 야간은 모두 성공했다. EE 10회는 연결 1회 미달/Direct 전부 목표 충족, 추가 RCA 뒤 판단이라는 사용자 선택을 유지한다. EE fresh-client ID-only는 전경/Awake·빈 cache 조건의 첫 시도와 retry 모두 실제 transportFailed, 반대 fresh-publisher 방향은 추가 계획 사례로 미실행이며 필수 요건을 늘리지 않는다. 원인·승인 계획의 별도 ID-only DHT 연결 확인과 hostname/Relay 검증, signed M2 TestFlight/iPhone 전경·LAN 거절/복구·Rust 로그와 전체 브랜치 최종 검토/통합이 남아 있다. 751 DHT 두 timeout의 전경/절전 한계도 보존하며 Task 14/M2를 닫지 않는다.
+- **현재 검증 게이트:** 7a 일반 CI는 8개 성공/Android 90분 취소로 첫 APK·후속 계약/표식/emulator 미완료다. 새 c434021 관찰기는 미push/새 native CI 미실행이다. 7a 두 야간 성공과 A28 Xmx8G 유지 판단은 별도다. 일반 EE 연결 580 ms와 임시 Windows v1의 5/10 미달은 500 ms 목표 유지·추가 RCA/수용 판단 대기다. 일반 EE ID-only 두 transportFailed는 보존하며 임시 Android의 one-call success로 통과 처리하지 않는다. 일반 EE 두 기능 사례(ID-only+새 글, 실제 재시작/newID/수동새ticket+새 글)는 host 준비만 했고 미실행이다. EE Relay 표시는 이미 충족해 강제 fallback은 불필요하다. 반대 fresh-publisher 방향과 v2 2회/최대 3회 phase/RTT 연결은 미실행 추가 계획이다. signed M2 iPhone/LAN/Rust 로그·전체 브랜치 최종 검토/통합도 남아 있다. 폰은 released이며 현재 상태를 가정하지 않고 Task14/M2를 닫지 않는다.
 - **M4:** A11의 데이터 폴더 독점 정책을 DB open 전에 결정·구현한다.
 - **M7:** Release Kotlin/JNA/UniFFI push 진입점 검증과 기존 M1b NSE 견고성·측정용 코드 정리는 유지한다. M2 전경 채팅은 과거 APNs/NSE 측정이나 백그라운드 보장을 대체하지 않는다.
 - **배포 전:** ARMv7 호환 기기 실행 검증을 확보한다. 64비트 전용 SM-F971N 결과로 대체하지 않는다. 기존 배포 서명 과제도 유지한다.
