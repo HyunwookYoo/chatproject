@@ -1,6 +1,6 @@
 # M2 전송 검증 현황과 남은 게이트
 
-2026-10-17 한국 시간 기준, 10월 16–17일 검증 세션의 진행 기록이다(파일명은 최초 실행일 16일 유지). Tasks 1–12와 Task 13 코드 지적 수정은 검토를 마쳤다. 7a의 Windows·Android 야간은 모두 성공했고 최신 일반 CI는 Android 한 작업만 진행 중이다. 751 기준 물리 본문·복귀·이동·수동 해제·재시작과 EE 짧은 양방향 본문·10회 측정은 확보했으나 EE 새 client ID-only DHT 두 시도는 실패했다. 성능 미달 원인/수용 판단·방향별 공개망 검증·signed M2 iPhone·전체 브랜치 최종 검토는 남아 있다. Task 13 native 전체 최종 판정·Task 14·M2 완료 선언은 아니다. [39개 인계 항목과 후속 책임](../plans/2026-10-13-m2-carry-forward.md)을 함께 읽는다.
+2026-10-17 한국 시간 기준, 10월 16–17일 검증 세션의 진행 기록이다(파일명은 최초 실행일 16일 유지). Tasks 1–12와 Task 13 코드 지적 수정은 검토를 마쳤다. 7a의 Windows·Android 야간은 모두 성공했고 최신 일반 CI는 Android 한 작업만 진행 중이다. 751 기준 물리 본문·복귀·이동·수동 해제·재시작과 EE 짧은 양방향 본문·10회 측정은 확보했으나 EE 새 client ID-only DHT 두 시도는 실패했다. 성능 미달 원인/수용 판단·실패한 ID-only DHT 연결 확인 등 공개망 검증·signed M2 iPhone·전체 브랜치 최종 검토는 남아 있다. Task 13 native 전체 최종 판정·Task 14·M2 완료 선언은 아니다. [39개 인계 항목과 후속 책임](../plans/2026-10-13-m2-carry-forward.md)을 함께 읽는다.
 
 최초 제품 기준 [`751bb17`](https://github.com/HyunwookYoo/chatproject/commit/751bb173623b627b85d8b688df99bccd8ba65bdf)의 산출물·측정은 그대로 보존한다. 현재 제품은 티켓 주소 갱신을 수정한 [`ee9485c`](https://github.com/HyunwookYoo/chatproject/commit/ee9485cf90342170bf11e610557cf6aee5e87783)다. 중간 `3691396`/`41e7954`는 ready-file 시험, `21e806f`는 AVD 진단, `3780025`는 Android AVD 홈 준비를 바꿨다. EE 이후 `820f53b`는 유한 시나리오 진단, `1930853`은 시험 응답 deadline, `7a4c2b0`는 소유 snapshot 준비 후 종료 관찰 barrier를 수정했으며 제품은 EE와 같다. **751과 EE 바이너리·실제 측정은 서로 다른 기준**이다. scoped 수정 승인과 실제 CI/물리 통과도 구분한다.
 
@@ -82,4 +82,4 @@ Android 야간의 이전 751 재시도도 이미지 설치 뒤 `avd_create/state
 
 TestFlight Environment는 `main` 또는 `testflight-*` tag와 매 실행 owner review를 요구한다. M2 tag·upload 승인은 아직 없고 feature dispatch를 게시 가능으로 간주하지 않는다. 실제 서명된 후보를 검토·승인한 뒤 Windows↔iPhone 전경/LAN 거절·복구와 signed Rust 1.92 로그를 확보해야 한다. 기존 M1b iPhone/NSE/APNs 수치는 [기존 APNs 결과](../../../spikes/c-push/RESULTS.md)에 남는 별도 측정이며 M2 채팅 성공으로 합산하지 않는다. iOS 백그라운드 수신 보장은 없다.
 
-남은 필수 게이트는 최신 7a 일반 CI의 Android/전체 최종 결과, EE 성능 미달 추가 RCA·수용 판단, 실패한 fresh-client DHT의 원인/수정·반대 방향의 새 publisher 검증과 별도 hostname DNS/Relay 검증, signed iPhone, 전체 브랜치 최종 검토다. 751 완료 항목을 EE에서 다시 실행했다고 기록하지 않는다. M4 폴더 독점 잠금, M7 Release Kotlin/JNA/UniFFI push 진입점, ARMv7 실제 실행, Apple entitlement 신청 유예는 [인계 문서](../plans/2026-10-13-m2-carry-forward.md)에 유지했다.
+남은 필수 게이트는 최신 7a 일반 CI의 Android/전체 최종 결과, EE 성능 미달 추가 RCA·수용 판단, 실패한 fresh-client DHT의 원인/수정과 승인 계획의 별도 ID-only DHT 연결 확인·hostname DNS/Relay 검증, signed iPhone, 전체 브랜치 최종 검토다. Windows→새 Android publisher는 미실행인 추가 계획 사례이며 양방향 DHT나 새 publisher 전파를 필수 요건으로 추가하지 않는다. 프로세스 재시작·새 ID·수동 새 주소 입력의 원래 의무는 유지한다. 751 완료 항목을 EE에서 다시 실행했다고 기록하지 않는다. M4 폴더 독점 잠금, M7 Release Kotlin/JNA/UniFFI push 진입점, ARMv7 실제 실행, Apple entitlement 신청 유예는 [인계 문서](../plans/2026-10-13-m2-carry-forward.md)에 유지했다.

@@ -55,7 +55,7 @@
 
 ## 남은 실행·판단과 유예 책임
 
-- **현재 검증 게이트:** 378 일반 CI 9/9,820 native 8개 작업과 7a flutter의 tools166/app57·analyze 성공은 확보했다. 최신 7a 일반 CI는 8작업 성공/Android 진행 중이며 두 야간은 모두 성공했다. EE 10회는 연결 1회 미달/Direct 전부 목표 충족, 추가 RCA 뒤 판단이라는 사용자 선택을 유지한다. EE fresh-client ID-only는 전경/Awake·빈 cache 조건의 첫 시도와 retry 모두 실제 transportFailed, 반대 fresh-publisher 방향은 미실행이다. 원인·방향별 DHT/hostname/Relay 검증, signed M2 TestFlight/iPhone 전경·LAN 거절/복구·Rust 로그와 전체 브랜치 최종 검토/통합이 남아 있다. 751 DHT 두 timeout의 전경/절전 한계도 보존하며 Task 14/M2를 닫지 않는다.
+- **현재 검증 게이트:** 378 일반 CI 9/9,820 native 8개 작업과 7a flutter의 tools166/app57·analyze 성공은 확보했다. 최신 7a 일반 CI는 8작업 성공/Android 진행 중이며 두 야간은 모두 성공했다. EE 10회는 연결 1회 미달/Direct 전부 목표 충족, 추가 RCA 뒤 판단이라는 사용자 선택을 유지한다. EE fresh-client ID-only는 전경/Awake·빈 cache 조건의 첫 시도와 retry 모두 실제 transportFailed, 반대 fresh-publisher 방향은 추가 계획 사례로 미실행이며 필수 요건을 늘리지 않는다. 원인·승인 계획의 별도 ID-only DHT 연결 확인과 hostname/Relay 검증, signed M2 TestFlight/iPhone 전경·LAN 거절/복구·Rust 로그와 전체 브랜치 최종 검토/통합이 남아 있다. 751 DHT 두 timeout의 전경/절전 한계도 보존하며 Task 14/M2를 닫지 않는다.
 - **M4:** A11의 데이터 폴더 독점 정책을 DB open 전에 결정·구현한다.
 - **M7:** Release Kotlin/JNA/UniFFI push 진입점 검증과 기존 M1b NSE 견고성·측정용 코드 정리는 유지한다. M2 전경 채팅은 과거 APNs/NSE 측정이나 백그라운드 보장을 대체하지 않는다.
 - **배포 전:** ARMv7 호환 기기 실행 검증을 확보한다. 64비트 전용 SM-F971N 결과로 대체하지 않는다. 기존 배포 서명 과제도 유지한다.
