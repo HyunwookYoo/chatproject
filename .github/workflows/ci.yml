@@ -233,6 +233,9 @@ jobs:
         run: |
           # The default step shell is `bash -e` without pipefail; tee would hide a failed build.
           set -o pipefail
+          python3 -u ../tools/ci/sample_android_release_resources.py &
+          resource_probe_pid=$!
+          trap 'build_status=$?; trap - EXIT; kill "$resource_probe_pid" 2>/dev/null || :; wait "$resource_probe_pid" 2>/dev/null || :; exit "$build_status"' EXIT
           flutter pub get
           test "$CARGOKIT_TOOLCHAIN" = '1.92.0'
           flutter build apk --release --target lib/main.dart -v 2>&1 | tee "$RUNNER_TEMP/apk.log"
