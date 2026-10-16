@@ -21,6 +21,9 @@ class Fixture {
   String? fault;
   var restarted = false;
   String? failedText;
+  (String, String)? suppressReply;
+  String? suppressStop;
+  final stopping = Completer<void>();
 
   Future<List<Participant>> start() async {
     logs = await Directory.systemTemp.createTemp('scenario-');
@@ -50,6 +53,7 @@ class Fixture {
 
   Future<Participant> restart(Participant old) async {
     restarted = true;
+    if (fault == 'replacement RPC') suppressReply = ('node', 'network_start');
     if (fault == 'late replay') {
       peers['windows']!.event({
         'kind': 'probe_text_received',
@@ -142,10 +146,16 @@ class FakeCore {
     final op = record['op'] as String;
     final args = record['args'] as Map<String, dynamic>;
     fixture.commands.add((name, op, args));
+    if (fixture.suppressReply == (name, op)) return;
+    if (op == 'network_stop' && fixture.suppressStop == name) {
+      if (!fixture.stopping.isCompleted) fixture.stopping.complete();
+      return;
+    }
     Object? value;
     String? error;
     switch (op) {
       case 'network_start':
+        if (fixture.fault == 'missing Online') starting = true;
         value = info;
         event({'kind': 'network_changed', ...info});
       case 'network_info':
@@ -170,7 +180,7 @@ class FakeCore {
       case 'set_offline':
         offline = args['offline'] as bool;
         revision++;
-        if (offline) {
+        if (offline && fixture.fault != 'missing offline') {
           for (final peer in fixture.peers.values.where(
             (p) => p.connected.contains(endpoint),
           )) {
@@ -233,6 +243,7 @@ class FakeCore {
           final remote = fixture.peers.values.singleWhere(
             (p) => p.endpoint == args['peer_id'],
           );
+          if (fixture.fault == 'missing selected probe' && name == 'android' && remote.name == 'node') break;
           remote.event({
             'kind': 'probe_text_received',
             'peer_id': fixture.fault == 'wrong peer' ? 'impostor' : endpoint,
@@ -259,6 +270,113 @@ class FakeCore {
 
 void main() {
   const short = Duration(milliseconds: 40);
+  for (final entry in <(String?, (String, String)?, String?, String, String)>[
+    (null, ('android', 'network_start'), 'windows', 'scenario_app2', 'timeout_network_start'),
+    (null, ('windows', 'network_info'), null, 'scenario_app1', 'timeout_network_info'),
+    (null, ('android', 'connect_peer'), null, 'scenario_app2', 'timeout_connect_peer'),
+    (null, ('android', 'send_probe_text'), null, 'scenario_app2', 'timeout_send_probe_text'),
+    (null, ('android', 'set_offline'), null, 'scenario_app2', 'timeout_set_offline'),
+    (null, ('android', 'disconnect_peer'), null, 'scenario_app2', 'timeout_disconnect_peer'),
+    ('replacement RPC', null, null, 'scenario_node', 'timeout_network_start'),
+    ('missing selected probe', null, null, 'scenario_app2_to_node', 'timeout_probe_event'),
+    ('wrong body', null, null, 'scenario_app1_to_app2', 'timeout_probe_event'),
+    ('unknown path', null, null, 'scenario_app2_to_app1', 'timeout_state_event'),
+    ('missing Online', null, null, 'scenario_app1', 'timeout_state_event'),
+    ('missing offline', null, null, 'scenario_app2_to_app1', 'timeout_offline_event'),
+    (null, null, 'node', 'scenario_node', 'timeout_network_stop'),
+  ]) {
+    test('origin ${entry.$4}/${entry.$5} survives final stops', () async {
+      final fixture = Fixture()
+        ..fault = entry.$1
+        ..suppressReply = entry.$2
+        ..suppressStop = entry.$3;
+      final participants = await fixture.start();
+      final library =
+          (reflect(harness.main) as ClosureMirror).function.owner
+              as LibraryMirror;
+      final type =
+          library.declarations[MirrorSystem.getSymbol('_Run', library)]
+              as ClassMirror;
+      final run = type.newInstance(const Symbol(''), [fixture.logs]);
+      final runner = run.reflectee as dynamic;
+      final phases =
+          (library.declarations[MirrorSystem.getSymbol('_Phase', library)]
+                      as ClassMirror)
+                  .getField(const Symbol('values'))
+                  .reflectee
+              as List;
+      run.setField(
+        const Symbol('phase'),
+        phases.singleWhere((v) => v.value == 'scenario'),
+      );
+      Object? original;
+      StackTrace? originalStack;
+      final captures = <Object>[];
+      void capture(Object error, String? failurePhase, String? timeoutKind) {
+        captures.add(error);
+        runner.recordFailure(
+          error,
+          failurePhase: failurePhase,
+          timeoutKind: timeoutKind,
+        );
+      }
+
+      final work = runScenario(
+        fixture.controller,
+        participants,
+        restart: fixture.restart,
+        timeout: short,
+        onFailure: capture,
+      );
+      final observed = work.catchError((Object error, StackTrace stack) {
+        original = error;
+        originalStack = stack;
+        Error.throwWithStackTrace(error, stack);
+      });
+      final awaited = runner
+          .wait(observed)
+          .then<void>(
+            (_) => fail('expected timeout'),
+            onError: (Object error, StackTrace stack) {
+              expect(error, same(original));
+              expect(stack.toString(), originalStack.toString());
+              expect(error, isA<TimeoutException>());
+            },
+          );
+      try {
+        if (entry.$3 == 'windows') {
+          await fixture.stopping.future;
+          // Cleanup is still awaiting its distinct timeout: origin must exist now.
+          expect(run.getField(#safeFailure).reflectee, {
+            'phase': entry.$4,
+            'failure_kind': entry.$5,
+            'command_exit_code': null,
+          });
+          runner.recordFailure(const FileSystemException('PRIVATE_TOKEN'));
+          runner.recordFailure(
+            TimeoutException('monitor'),
+            failurePhase: 'android_pid_monitor',
+          );
+          runner.recordFailure(
+            TimeoutException('outer'),
+            failurePhase: 'scenario',
+          );
+        }
+        await awaited;
+        expect(run.getField(#safeFailure).reflectee, {
+          'phase': entry.$4,
+          'failure_kind': entry.$5,
+          'command_exit_code': null,
+        });
+        expect(captures, [same(original)]);
+        expect(originalStack.toString(), contains('scenario.dart'));
+      } finally {
+        await awaited;
+        await fixture.close();
+      }
+    });
+  }
+
   test(
     'failed inherited drain retains ownership but never blocks remaining cleanup',
     () async {
@@ -539,13 +657,16 @@ Future<void> main(List<String> args) async {
     () async {
       final fixture = Fixture();
       final participants = await fixture.start();
+      final failures = <Object>[];
       try {
         await runScenario(
           fixture.controller,
           participants,
           restart: fixture.restart,
           timeout: short,
+          onFailure: (error, _, _) => failures.add(error),
         );
+        expect(failures, isEmpty); // Expected offline error and absence expiries.
         final sends = fixture.commands
             .where((c) => c.$2 == 'send_probe_text')
             .toList();
@@ -593,6 +714,7 @@ Future<void> main(List<String> args) async {
       () async {
         final fixture = Fixture()..fault = fault;
         final participants = await fixture.start();
+        final failures = <(Object, String?, String?)>[];
         try {
           await expectLater(
             runScenario(
@@ -600,6 +722,8 @@ Future<void> main(List<String> args) async {
               participants,
               restart: fixture.restart,
               timeout: short,
+              onFailure: (error, phase, kind) =>
+                  failures.add((error, phase, kind)),
             ),
             throwsA(switch (fault) {
               'wrong body' ||
@@ -632,6 +756,12 @@ Future<void> main(List<String> args) async {
               ),
             }),
           );
+          expect(failures, hasLength(1));
+          if (fault == 'command') {
+            expect(failures.single.$1, isA<RpcError>());
+            expect(failures.single.$2, isNull);
+            expect(failures.single.$3, isNull);
+          }
           final wire = await File(
             '${fixture.logs.path}/wire.jsonl',
           ).readAsString();

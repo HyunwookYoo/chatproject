@@ -39,6 +39,38 @@ void main() {
     await logs.delete(recursive: true);
   });
 
+  for (final origin in ['android_pid_monitor', 'scenario']) {
+    test('$origin deadline keeps immutable origin during node restart phase', () async {
+      final runner = run.reflectee as dynamic;
+      phase('node_participant');
+      const deadline = Duration(milliseconds: 20);
+      final method = origin == 'scenario' ? #wait : #command;
+      final arguments = <Symbol, dynamic>{
+        #timeout: deadline,
+        #failurePhase: origin,
+      };
+      final release = Completer<void>();
+      final source = File('${logs.path}/waiting.dart')
+        ..writeAsStringSync("import 'dart:async'; void main() { Timer.periodic(Duration(seconds: 1), (_) {}); }");
+      final lifecycle = runner.token.cancelled.then<void>((_) {
+        phase('cleanup');
+        runner.fail(const FileSystemException('PRIVATE_TOKEN'), StackTrace.current);
+      });
+      final work = run.invoke(method, origin == 'scenario'
+          ? [release.future] : [Platform.resolvedExecutable, [source.path]], arguments).reflectee as Future;
+      try {
+        await expectLater(work, throwsA(isA<TimeoutException>()));
+        await lifecycle;
+        runner.recordFailure(const FileSystemException('PRIVATE_TOKEN'));
+        expect(projection(), {
+          'phase': origin, 'failure_kind': 'timeout', 'command_exit_code': null,
+        });
+      } finally {
+        release.complete();
+      }
+    });
+  }
+
   test('AVD throw metadata projects before cleanup and keeps original stack', () async {
     final runner = run.reflectee as dynamic;
     phase('avd_create');

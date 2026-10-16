@@ -94,6 +94,40 @@ class SummaryTests(unittest.TestCase):
                     self.assertNotIn('PRIVATE_TOKEN', result.stdout + result.stderr)
                     self.assertFalse((root / 'summary.json').exists())
 
+    def test_closed_scenario_timeout_origins(self):
+        phases = ('scenario_app1 scenario_app2 scenario_node scenario_app1_to_app2 '
+                  'scenario_app1_to_node scenario_app2_to_app1 scenario_app2_to_node '
+                  'scenario_node_to_app1 scenario_node_to_app2 android_pid_monitor').split()
+        kinds = ('timeout_network_start timeout_network_info timeout_connect_peer '
+                 'timeout_send_probe_text timeout_set_offline timeout_disconnect_peer '
+                 'timeout_network_stop timeout_state_event timeout_probe_event timeout_offline_event').split()
+        cases = [(phase, 'timeout', None, True) for phase in phases]
+        cases += [('scenario_app1', kind, None, True) for kind in kinds]
+        cases += [('scenario_app1', kind, code, False) for kind in kinds for code in (17, True, '17', 1.5)]
+        cases += [(phase, 'timeout', None, False) for phase in ('scenario_PRIVATE_TOKEN', True, 17, [], {})]
+        cases += [('scenario_app1', kind, None, False) for kind in ('timeout_PRIVATE_TOKEN', True, 17, [], {})]
+        for phase, kind, code, accepted in cases:
+            with self.subTest(phase=phase, kind=kind, code=code), tempfile.TemporaryDirectory() as directory:
+                root = pathlib.Path(directory)
+                diagnostic = root / 'diagnostic.json'
+                value = {'phase': phase, 'failure_kind': kind, 'command_exit_code': code}
+                diagnostic.write_text(json.dumps(value))
+                result = self.call(root, '--profile', 'android', '--stage', 'scenario',
+                                   '--outcome', 'failure', '--exit-code', '1',
+                                   '--diagnostic-file', str(diagnostic))
+                if accepted:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    summary = json.loads((root / 'summary.json').read_text())
+                    self.assertEqual(set(summary), {'schema_version', 'profile', 'stage', 'outcome',
+                                                    'exitCode', 'peak_rss_kib', *value})
+                    self.assertEqual(summary['schema_version'], 3)
+                    self.assertEqual({key: summary[key] for key in value}, value)
+                else:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn('Invalid safe diagnostic', result.stderr)
+                    self.assertNotIn('PRIVATE_TOKEN', result.stdout + result.stderr)
+                    self.assertFalse((root / 'summary.json').exists())
+
     def test_missing_memory_is_null(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)

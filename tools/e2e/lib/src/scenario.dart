@@ -9,11 +9,39 @@ Future<void> runScenario(
   List<Participant> participants, {
   required Future<Participant> Function(Participant) restart,
   Duration timeout = const Duration(seconds: 15),
+  void Function(Object, String?, String?)? onFailure,
 }) async {
   if (participants.length != 3) {
     throw ArgumentError('Three participants required');
   }
   final current = participants.toList();
+  var reported = false;
+  void report(Object error, [String? phase, String? kind]) {
+    if (reported) return;
+    reported = true;
+    onFailure?.call(error, phase, kind);
+  }
+
+  // Slots follow positions, including a replacement node, never private names.
+  const slots = ['scenario_app1', 'scenario_app2', 'scenario_node'];
+  String slot(Participant peer) => slots[current.indexOf(peer)];
+  String pair(Participant subject, Participant observer) => const {
+    (0, 1): 'scenario_app1_to_app2',
+    (0, 2): 'scenario_app1_to_node',
+    (1, 0): 'scenario_app2_to_app1',
+    (1, 2): 'scenario_app2_to_node',
+    (2, 0): 'scenario_node_to_app1',
+    (2, 1): 'scenario_node_to_app2',
+  }[(current.indexOf(subject), current.indexOf(observer))]!;
+  Future<T> positive<T>(Future<T> work, String phase, String kind) async {
+    try {
+      return await work;
+    } on TimeoutException catch (error) {
+      report(error, phase, kind);
+      rethrow;
+    }
+  }
+
   final addresses = <String, Map<String, Object?>>{};
   final token = DateTime.now().microsecondsSinceEpoch;
   var counter = 0;
@@ -22,7 +50,17 @@ Future<void> runScenario(
     Participant peer,
     String op, [
     Map<String, Object?> args = const {},
-  ]) => peer.call(op, args, timeout: timeout);
+  ]) =>
+      positive(peer.call(op, args, timeout: timeout), slot(peer), switch (op) {
+        'network_start' => 'timeout_network_start',
+        'network_info' => 'timeout_network_info',
+        'connect_peer' => 'timeout_connect_peer',
+        'send_probe_text' => 'timeout_send_probe_text',
+        'set_offline' => 'timeout_set_offline',
+        'disconnect_peer' => 'timeout_disconnect_peer',
+        'network_stop' => 'timeout_network_stop',
+        _ => throw ArgumentError('Unsupported scenario operation'),
+      });
   Map<String, Object?> object(Object? value) =>
       (value as Map).cast<String, Object?>();
   Future<Map<String, Object?>> online(Participant peer, Object? result) async {
@@ -30,12 +68,16 @@ Future<void> runScenario(
     final deadline = DateTime.now().add(timeout);
     while (info['state'] != 'Online') {
       final revision = info['revision'] as int;
-      await peer.expectEvent(
-        (e) =>
-            e['kind'] == 'network_changed' &&
-            e['state'] == 'Online' &&
-            (e['revision'] as int) >= revision,
-        timeout: deadline.difference(DateTime.now()),
+      await positive(
+        peer.expectEvent(
+          (e) =>
+              e['kind'] == 'network_changed' &&
+              e['state'] == 'Online' &&
+              (e['revision'] as int) >= revision,
+          timeout: deadline.difference(DateTime.now()),
+        ),
+        slot(peer),
+        'timeout_state_event',
       );
       info = object(await call(peer, 'network_info'));
     }
@@ -64,12 +106,16 @@ Future<void> runScenario(
       'peer_id': addresses[receiver.name]!['endpoint_id'],
       'text': body,
     });
-    await receiver.expectEvent(
-      (e) =>
-          e['kind'] == 'probe_text_received' &&
-          e['peer_id'] == addresses[sender.name]!['endpoint_id'] &&
-          e['text'] == body,
-      timeout: timeout,
+    await positive(
+      receiver.expectEvent(
+        (e) =>
+            e['kind'] == 'probe_text_received' &&
+            e['peer_id'] == addresses[sender.name]!['endpoint_id'] &&
+            e['text'] == body,
+        timeout: timeout,
+      ),
+      pair(sender, receiver),
+      'timeout_probe_event',
     );
   }
 
@@ -84,12 +130,16 @@ Future<void> runScenario(
       final info = object(await call(peer, 'network_info'));
       if ((info['peers'] as List).any((v) => known(object(v)))) return;
       final revision = info['revision'] as int;
-      await peer.expectEvent(
-        (e) =>
-            e['kind'] == 'peer_changed' &&
-            (e['revision'] as int) >= revision &&
-            known(object(e['peer'])),
-        timeout: deadline.difference(DateTime.now()),
+      await positive(
+        peer.expectEvent(
+          (e) =>
+              e['kind'] == 'peer_changed' &&
+              (e['revision'] as int) >= revision &&
+              known(object(e['peer'])),
+          timeout: deadline.difference(DateTime.now()),
+        ),
+        pair(remote, peer),
+        'timeout_state_event',
       );
       // Re-read: a later snapshot may have superseded this buffered path event.
     }
@@ -142,14 +192,18 @@ Future<void> runScenario(
     } on RpcError catch (error) {
       if (error.code != 'PeerNotConnected') rethrow;
     }
-    await owner.expectEvent(
-      (e) =>
-          e['kind'] == 'peer_changed' &&
-          (e['revision'] as int) > ownerRevision &&
-          object(e['peer'])['peer_id'] ==
-              addresses[remote.name]!['endpoint_id'] &&
-          ['Reconnecting', 'Disconnected'].contains(object(e['peer'])['phase']),
-      timeout: timeout,
+    await positive(
+      owner.expectEvent(
+        (e) =>
+            e['kind'] == 'peer_changed' &&
+            (e['revision'] as int) > ownerRevision &&
+            object(e['peer'])['peer_id'] ==
+                addresses[remote.name]!['endpoint_id'] &&
+            ['Reconnecting', 'Disconnected'].contains(object(e['peer'])['phase']),
+        timeout: timeout,
+      ),
+      pair(remote, owner),
+      'timeout_offline_event',
     );
     addresses[remote.name] = await online(
       remote,
@@ -235,6 +289,7 @@ Future<void> runScenario(
           : const Duration(seconds: 1),
     );
   } catch (error, stack) {
+    report(error);
     failure = error;
     failureStack = stack;
   } finally {
@@ -242,6 +297,7 @@ Future<void> runScenario(
       try {
         await call(peer, 'network_stop');
       } catch (error, stack) {
+        if (failure == null) report(error);
         failure ??= error;
         failureStack ??= stack;
       }

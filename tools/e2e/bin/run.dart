@@ -328,7 +328,7 @@ Future<void> main(List<String> arguments) async {
                 'shell',
                 'pidof',
                 package,
-              ], requireSuccess: false);
+              ], requireSuccess: false, failurePhase: 'android_pid_monitor');
               if ((result.stdout as String).trim() != appPid) {
                 throw StateError('Android owned activity exited');
               }
@@ -403,8 +403,14 @@ Future<void> main(List<String> arguments) async {
     participants.add(await launchNode());
     run.phase = _Phase.scenario;
     await run.wait(
-      runScenario(control, participants, restart: launchNode),
+      runScenario(
+        control, participants, restart: launchNode,
+        onFailure: (error, phase, kind) => run.recordFailure(
+          error, failurePhase: phase, timeoutKind: kind,
+        ),
+      ),
       timeout: const Duration(minutes: 4),
+      failurePhase: 'scenario',
     );
   } catch (error, stack) {
     run.recordFailure(error);
@@ -595,15 +601,17 @@ class _Run extends IoProcessRunner {
   _Phase phase = _Phase.preflight;
   Map<String, Object?>? safeFailure;
 
-  void recordFailure(Object? error) {
+  void recordFailure(
+    Object? error, {String? failurePhase, String? timeoutKind}
+  ) {
     safeFailure ??= {
-      'phase': phase.value,
+      'phase': failurePhase ?? phase.value,
       'failure_kind': switch (error) {
         null => 'cleanup',
         _CommandFailure() => 'command_exit',
         EmulatorFailure() => error.kind.value,
         _OwnedChildFailure() => error.kind,
-        TimeoutException() => 'timeout',
+        TimeoutException() => timeoutKind ?? 'timeout',
         RunCancelled() => 'cancelled',
         SocketException() => 'socket',
         FileSystemException() => 'filesystem',
@@ -662,6 +670,7 @@ class _Run extends IoProcessRunner {
     Duration timeout = const Duration(seconds: 30),
     bool cleanup = false,
     bool nativeLifetime = false,
+    String? failurePhase,
   }) async {
     if (cleanup) return work.timeout(timeout);
     // A native lifetime may never finish after failed stop/output draining.
@@ -687,7 +696,7 @@ class _Run extends IoProcessRunner {
         token.cancelled.then<T>((_) => throw RunCancelled()),
       ]).timeout(timeout);
     } catch (error) {
-      recordFailure(error);
+      recordFailure(error, failurePhase: failurePhase);
       token.cancel();
       rethrow;
     }
@@ -886,6 +895,7 @@ class _Run extends IoProcessRunner {
     Duration timeout = const Duration(seconds: 30),
     bool requireSuccess = true,
     bool cleanup = false,
+    String? failurePhase,
   }) async {
     final process = await acquire(
       executable,
@@ -901,6 +911,7 @@ class _Run extends IoProcessRunner {
         timeout: timeout,
         cleanup: cleanup,
         nativeLifetime: true,
+        failurePhase: failurePhase,
       );
       final result = ProcessResult(
         process.pid,
@@ -913,7 +924,7 @@ class _Run extends IoProcessRunner {
       }
       return result;
     } catch (error) {
-      recordFailure(error);
+      recordFailure(error, failurePhase: failurePhase);
       primary = error;
       rethrow;
     } finally {

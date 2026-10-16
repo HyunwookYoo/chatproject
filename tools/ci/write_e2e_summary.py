@@ -8,13 +8,18 @@ import re
 PHASES = set('preflight build_node build_windows build_android gradle_stop relay_ready '
              'controller_start windows_start windows_participant sdk_preflight avd_preflight '
              'avd_create avd_boot adb_reverse android_install android_launch android_pid '
-             'android_participant node_start node_participant scenario cleanup complete'.split())
+             'android_participant node_start node_participant scenario cleanup complete '
+             'scenario_app1 scenario_app2 scenario_node scenario_app1_to_app2 '
+             'scenario_app1_to_node scenario_app2_to_app1 scenario_app2_to_node '
+             'scenario_node_to_app1 scenario_node_to_app2 android_pid_monitor'.split())
 FAILURE_KINDS = set('cleanup command_exit timeout cancelled socket filesystem process_spawn '
                     'state argument unsupported format other avd_list_exit avd_create_exit '
                     'avd_devices_exit avd_console_exit avd_console_invalid avd_serial_conflict '
                     'avd_config_missing avd_config_mismatch avd_snapshot_exit avd_snapshot_missing '
                     'owned_relay_exit owned_emulator_exit owned_chat_node_exit owned_windows_exit '
-                    'owned_child_exit'.split())
+                    'owned_child_exit timeout_network_start timeout_network_info timeout_connect_peer '
+                    'timeout_send_probe_text timeout_set_offline timeout_disconnect_peer '
+                    'timeout_network_stop timeout_state_event timeout_probe_event timeout_offline_event'.split())
 EXIT_KINDS = set('command_exit avd_list_exit avd_create_exit avd_devices_exit avd_console_exit '
                  'avd_snapshot_exit owned_relay_exit owned_emulator_exit owned_chat_node_exit '
                  'owned_windows_exit owned_child_exit'.split())
