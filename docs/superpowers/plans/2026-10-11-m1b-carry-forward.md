@@ -6,6 +6,8 @@ M1b를 만들고 최종 리뷰하는 동안 찾았지만 일부러 뒤로 미룬
 
 ## M2
 
+**M2 검증 진행 중 (2026-10-16).** 아래 번호·문구는 원래 요구의 이력이다. #1–7·9–11은 항목별 완료, #8은 a–e 완료/f(upstream yanked 경고) 유예다. #1의 기본 트리거 허용 목록은 유지하면서 승인된 e2e 야간 workflow에만 schedule 예외를 두었다. #11의 실제 Windows·Simulator·unsigned iOS Rust 1.92 로그는 확보했지만 signed M2 TestFlight/iPhone 실행·로그는 별도 대기다. 상세 근거는 [39개 대조표 B1–B11](2026-10-13-m2-carry-forward.md#m1b에서-받은-11개), 현재 CI·야간·물리 기기·성능·최종 검토 게이트는 [검증 결과](../results/2026-10-16-m2-transport.md)에 있다. 전체 M2 완료 선언은 아니다.
+
 ### 워크플로 검사기 (`tools/ci/check_workflows.py`)
 
 1. **트리거를 허용 목록으로 검사한다.** `push`, `pull_request`, `workflow_dispatch`만 허용하고 나머지는 모두 막는다.
