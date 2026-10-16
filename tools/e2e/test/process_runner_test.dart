@@ -337,7 +337,9 @@ Future<void> main() async {
 import 'dart:io';
 Future<void> main(List<String> args) async {
   final server = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
-  File(args[0]).writeAsStringSync('\${server.port}');
+  File('\${args[0]}.staging')
+    ..writeAsStringSync('\${server.port}')
+    ..renameSync(args[0]);
   server.listen((socket) { socket.listen((_) => exit(0)); });
 }
 ''');
