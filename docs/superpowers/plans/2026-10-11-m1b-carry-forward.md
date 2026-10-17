@@ -6,7 +6,7 @@ M1b를 만들고 최종 리뷰하는 동안 찾았지만 일부러 뒤로 미룬
 
 ## M2
 
-**M2 검증 진행 중 (2026-10-17).** 아래 번호·문구는 원래 요구의 이력이다. #1–7·9–11은 항목별 완료, #8은 a–e 완료/f(upstream yanked 경고) 유예다. #1의 기본 트리거 허용 목록은 유지하면서 승인된 e2e 야간 workflow에만 schedule 예외를 두었다. #11의 751/EE 실제 Windows·ARM 빌드 로그와 Simulator·unsigned iOS Rust 1.92 로그, 820 native CI 성공은 확보했지만 signed M2 TestFlight/iPhone 실행·로그는 별도 대기다. 최신 7a 일반 CI Android는 90분 제한으로 취소됐으며 새 CI 관찰기는 로컬 확인만 마친 미push/미실행 상태로 native 최종 게이트가 남아 있다. 일반 EE Phase A의 두 기능 사례와 사설 B의 두 진단 연결은 별도 증거로 추가했으며 성능 미달·과거 DHT 원인 미확정은 유지한다. 상세 근거는 [39개 대조표 B1–B11](2026-10-13-m2-carry-forward.md#m1b에서-받은-11개), 현재 CI·야간·물리 기기·성능·최종 검토 게이트는 [검증 결과](../results/2026-10-16-m2-transport.md)에 있다. 전체 M2 완료 선언은 아니다.
+**M2 검증 진행 중 (2026-10-17).** 아래 번호·문구는 원래 요구의 이력이다. #1–7·9–11은 항목별 완료, #8은 a–e 완료/f(upstream yanked 경고) 유예다. #1의 기본 트리거 허용 목록은 유지하면서 승인된 e2e 야간 workflow에만 schedule 예외를 두었다. #11의751/EE Windows·ARM/Simulator·unsigned iOS Rust1.92 로그와 후속 exact06d 일반 CI9/9 native 성공을 확보했다. 과거7a Android90분 취소 원인은 미확정이다. 승인된 signed TestFlight build2는 IPA/서명 검사·upload·ASC VALID/IN_BETA_TESTING·사용자 설치 보고를 확보했고 NSE Rust1.92 Release compile도 보인다. signed app chat_ffi Cargokit argv/toolchain 직접 실행 로그는 미확인이다. 일반 Phase A·사설 B/v3·iPhone 짧은 양방향 부분 관찰은 분리하며 엄격500 ms 미달/수용 판단·LAN 거절/복구·전경 증거 한계·최종 검토/통합은 남는다. v3 반복은 종료했고 과거 DHT·관찰된 global networkTimeout 원인을 확정하지 않는다. 상세 근거는 [39개 대조표 B1–B11](2026-10-13-m2-carry-forward.md#m1b에서-받은-11개)과 [검증 결과](../results/2026-10-16-m2-transport.md)에 있다. 전체 M2 완료 선언은 아니다.
 
 ### 워크플로 검사기 (`tools/ci/check_workflows.py`)
 

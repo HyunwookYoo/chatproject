@@ -10,7 +10,7 @@
 
 **Spec:** [승인된 M2 설계](../specs/2026-10-12-m2-iroh-transport-design.md). 승인 날짜는 한국 시간 2026-10-13이다. 아래 작업별 PASS는 계획 당시 기대 결과이며 실제 실행 판정은 [현재 검증 결과](../results/2026-10-16-m2-transport.md)를 따른다.
 
-**Status (2026-10-17):** Tasks 1–12/Task 13 코드 지적 수정·7a 두 야간 확인, 일반 Android 90분 취소/후속 c434021 미push·새 native 실행 전, Task 14 진행 중. 일반 EE Phase A의 ID-only/DNS·새 본문과 실제 재시작/newID/수동새ticket 연결·새 본문은 확인했다. 과거 두 DHT 실패 원인은 미확정이며 새 기능 성공이 수정·신뢰성 확립을 뜻하지 않는다. B 사설 두 연결/추정 RTT는 별도 기록이고 추가 세 번째는 미실행이다. 500 ms 목표 등 모든 성능 미달의 추가 RCA·수용 판단·native CI·signed iPhone·최종 전체 검토는 남아 있다. 폰 released/v2 Windows 협력 종료 뒤 추가 상태를 가정하지 않는다. [남은 일과 39개 대조표](2026-10-13-m2-carry-forward.md)를 참조한다. M2 완료 선언이 아니다.
+**Status (2026-10-17):** Tasks1–12/Task13 코드 지적 수정·7a 두 야간 확인 뒤 exact06d 일반 CI9/9로 native 게이트를 확인했으며 Task14는 진행 중이다. 과거7a90분 취소 원인은 미확정이다. 일반 EE Phase A의 ID-only/DNS·새 본문과 실제 재시작/newID/수동새ticket·새 본문은 확인했으나 과거 DHT 원인·신뢰성 한계는 남는다. B 두 진단/추정 RTT와 v3 단일521/676 ms를 별도 보존하며 v3 반복은 종료했다. 승인된 signed TestFlight build2·iPhone 짧은 양방향 부분 관찰은 확보했다. 엄격500 ms 수용 판단, iPhone 전경 증거 한계/LAN 거절·복구, signed chat_ffi 직접 Rust 실행 로그, 최종 전체 검토·통합은 남는다. global networkTimeout은 원인 미귀속 관찰이며 수정 주장·새 수용 조건으로 삼지 않는다. 폰 released·소유 v3/ordinary Windows 협력 종료 뒤 추가 상태를 가정하지 않는다. [현재 결과](../results/2026-10-16-m2-transport.md)와 [39개 대조표](2026-10-13-m2-carry-forward.md)를 참조한다. M2 완료 선언이 아니다.
 
 ## Global Constraints
 

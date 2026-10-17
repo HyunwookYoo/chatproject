@@ -33,7 +33,7 @@ M1a를 만들고 최종 리뷰하는 동안 찾았지만 일부러 뒤로 미룬
 
 ## M2
 
-**M2 검증 진행 중 (2026-10-17).** 아래 원래 번호·요구는 이력으로 보존한다. #1–9·12–28은 항목별 완료, 이 중 #5는 751/EE 두 ARM 실제 빌드와 ARM64 실제 실행으로 완료하되 ARMv7 실제 실행은 승인된 예외로 배포 전 유예, #10은 전역 형식 정책 후속 유예, #11은 M4 DB open 전 폴더 독점 정책으로 유예, #28은 7a 실제 Android2 야간 성공·별도 RSS 확인 후 Xmx8G 유지 판단으로 완료했다(수치 합산/heap·향후 하드웨어 보장 아님, 일반 Release 메모리 증거 아님). JNI는 OnLoad에서 VM을 저장하고 명시적 JNI 호출로 applicationContext를 Flutter/Endpoint 전에 설치한다. 상세 소스·시험 근거는 [39개 대조표 A1–A28](2026-10-13-m2-carry-forward.md#m1a에서-받은-28개), 실행별 증거와 남은 게이트는 [현재 결과](../results/2026-10-16-m2-transport.md)에 있다. 7a 일반 CI Android의 90분 취소와 새 CI 관찰기의 미실행을 기록했다. Relay 표시에 이어 일반 EE Phase A의 ID-only/DNS·새 글과 실제 재시작/새 주소 연결·새 글도 확인했다. 이전 DHT 실패 원인은 미확정이고 사설 B의 두 연결은 별도 진단이며, 모든 500 ms 초과의 RCA/수용 판단·일반 Android native·signed iPhone·최종 검토가 남아 M2 전체는 아직 완료하지 않았다.
+**M2 검증 진행 중 (2026-10-17).** 아래 원래 번호·요구는 이력으로 보존한다. #1–9·12–28은 항목별 완료, 이 중 #5는 751/EE 두 ARM 실제 빌드와 ARM64 실제 실행으로 완료하되 ARMv7 실제 실행은 승인된 예외로 배포 전 유예, #10은 전역 형식 정책 후속 유예, #11은 M4 DB open 전 폴더 독점 정책으로 유예, #28은 7a 실제 Android2 야간 성공·별도 RSS 확인 후 Xmx8G 유지 판단으로 완료했다(수치 합산/heap·향후 하드웨어 보장 아님, 일반 Release 메모리 증거 아님). JNI는 OnLoad에서 VM을 저장하고 명시적 JNI 호출로 applicationContext를 Flutter/Endpoint 전에 설치한다. 상세 소스·시험 근거는 [39개 대조표 A1–A28](2026-10-13-m2-carry-forward.md#m1a에서-받은-28개), 실행별 증거와 남은 게이트는 [현재 결과](../results/2026-10-16-m2-transport.md)에 있다. 7a 일반 Android90분 취소 원인은 보존하되 후속 exact06d CI9/9로 실제 Linux lifecycle·Android/Windows native·iOS 자동 게이트를 확인했다. 일반 EE Phase A의 ID-only/DNS·새 글과 실제 재시작/새 주소·새 글을 확인했으나 과거 DHT 원인은 미확정이다. 사설 B와 v3 단일521/676 ms의 미달을 보존하고 v3 반복은 종료했다. 승인된 signed TestFlight build2·iPhone 짧은 양방향 부분 관찰을 확보했으나 엄격500 ms 수용 판단·전경 증거 한계/LAN 거절·복구·signed chat_ffi 직접 Rust 로그·최종 검토/통합이 남아 M2 전체는 미완료다.
 
 ### Android와 릴리스 빌드
 
