@@ -40,6 +40,7 @@ Future<int> runDevices(List<String> arguments, {
   String? avdHome,
   Directory? logDir,
   RunCancellation? cancellation,
+  Duration commandTimeout = const Duration(seconds: 30),
 }) async {
   final separator = arguments.indexOf('--');
   final forwarded = separator < 0 ? <String>[] : arguments.sublist(separator + 1);
@@ -72,12 +73,14 @@ Future<int> runDevices(List<String> arguments, {
   final token = cancellation ?? RunCancellation();
   final active = <OwnedProcess>[];
   final interruptFailures = <String>[];
+  final commands = _Commands(runner, runDir, token, owned, ownership, interruptFailures, commandTimeout);
   StreamSubscription<ProcessSignal>? signal;
   var finished = false;
   Future<void>? interruptCleanup;
   token.cancelled.then((_) {
     if (finished) return;
     interruptCleanup = () async {
+      await commands.interrupt();
       for (final process in active.reversed.toList()) {
         try { await process.stop(); } catch (error) { interruptFailures.add('interrupt cleanup: $error'); }
       }
@@ -91,7 +94,7 @@ Future<int> runDevices(List<String> arguments, {
   final specs = testEmulators.take(int.parse(options['count'] as String)).toList();
   late final Emulators emulators;
   emulators = Emulators(
-    sdk: sdk, runner: runner, avdHome: avdHome ?? defaultAvdHome(), logDir: runDir,
+    sdk: sdk, runner: commands, avdHome: avdHome ?? defaultAvdHome(), logDir: runDir,
     checkCancelled: token.check,
     retainOutput: options.rest.single == 'up' || options['keep'] as bool,
     onStarted: (spec, process) async {
@@ -124,7 +127,7 @@ Future<int> runDevices(List<String> arguments, {
         await emulators.up(specs);
         for (final spec in specs) {
           for (final port in [47000, 3340]) {
-            await _reverse(runner, sdk, spec, port, token, owned, ownership);
+            await _reverse(commands, sdk, spec, port, token, owned, ownership);
           }
         }
         token.check();
@@ -141,7 +144,7 @@ Future<int> runDevices(List<String> arguments, {
         ownership.processes.add({'pid': process.pid, 'path': executable});
         ownership.save();
         token.check();
-        // Only this terminal wait races cancellation. The body itself unwinds
+        // This terminal wait races cancellation. The body itself unwinds
         // before final cleanup, and no later acquisition remains behind it.
         code = await Future.any([process.exitCode, token.cancelled.then((_) => 130)]);
         if (token.isCancelled) code = 130;
@@ -165,7 +168,8 @@ Future<int> runDevices(List<String> arguments, {
     // Retention is only for successful up / explicitly requested --keep.
     // Remove emulator cleanup callbacks by making their stop a no-op below.
     if (retainEmulators) emulators.retainOwned();
-    final failures = [...interruptFailures, ...emulators.cleanupFailures, ...await owned.close()];
+    final cleanup = await owned.close();
+    final failures = [...interruptFailures, ...emulators.cleanupFailures, ...cleanup];
     if (failures.isNotEmpty) {
       File(p.join(runDir.path, 'cleanup.log')).writeAsStringSync(failures.join('\n'));
       stderr.writeln('Resource cleanup failed; ownership records and diagnostics were retained.');
@@ -175,7 +179,7 @@ Future<int> runDevices(List<String> arguments, {
   return code;
 }
 
-Future<void> _reverse(ProcessRunner runner, AndroidSdk sdk, EmulatorSpec spec, int port,
+Future<void> _reverse(_Commands runner, AndroidSdk sdk, EmulatorSpec spec, int port,
     RunCancellation token, OwnedResources owned, _Ownership ownership) async {
   final endpoint = 'tcp:$port';
   token.check();
@@ -190,18 +194,112 @@ Future<void> _reverse(ProcessRunner runner, AndroidSdk sdk, EmulatorSpec spec, i
     }
   }
   token.check();
-  final added = await runner.run(sdk.adb, ['-s', spec.serial, 'reverse', '--no-rebind', endpoint, endpoint]);
+  final ProcessResult added;
+  try {
+    added = await runner.run(sdk.adb, ['-s', spec.serial, 'reverse', '--no-rebind', endpoint, endpoint]);
+  } catch (error, stack) {
+    // An interrupted add may have applied, but never remove an unconfirmed
+    // mapping: a concurrent foreign no-rebind acquisition must stay protected.
+    ownership.reverse.add({'serial': spec.serial, 'local': endpoint, 'remote': endpoint, 'uncertain': true});
+    try { ownership.save(); } catch (secondary) { runner.failures.add('uncertain reverse ownership: $secondary'); }
+    Error.throwWithStackTrace(error, stack);
+  }
   if (added.exitCode != 0) throw StateError('adb reverse add failed (${added.exitCode})');
   final entry = <String, Object>{'serial': spec.serial, 'local': endpoint, 'remote': endpoint};
   ownership.reverse.add(entry);
   owned.add('adb reverse', () async {
-    final result = await runner.run(sdk.adb, ['-s', spec.serial, 'reverse', '--remove', endpoint]);
+    final result = await runner.command(sdk.adb, ['-s', spec.serial, 'reverse', '--remove', endpoint], cleanup: true);
     if (result.exitCode != 0) throw StateError('adb reverse remove failed (${result.exitCode})');
     ownership.reverse.remove(entry);
     ownership.save();
   });
   ownership.save();
   token.check();
+}
+
+/// Short commands keep exact managed handles until reclamation is confirmed.
+/// Acquisition itself is awaited so a late handle cannot outlive final unwind.
+class _Commands implements ProcessRunner {
+  _Commands(this.runner, this.logs, this.token, this.owned, this.ownership, this.failures, this.timeout);
+  final ProcessRunner runner;
+  final Directory logs;
+  final RunCancellation token;
+  final OwnedResources owned;
+  final _Ownership ownership;
+  final List<String> failures;
+  final Duration timeout;
+  final active = <OwnedProcess>[];
+
+  void track(OwnedProcess process, String executable, {required bool cleanup}) {
+    active.add(process);
+    ownership.processes.add({'pid': process.pid, 'path': executable});
+    if (!cleanup) owned.add('command', () => stop(process));
+    ownership.save();
+  }
+
+  Future<void> stop(OwnedProcess process) async {
+    if (!active.contains(process)) return;
+    await process.stop();
+    active.remove(process);
+    ownership.processes.removeWhere((entry) => entry['pid'] == process.pid && entry['avd'] == null);
+    ownership.save();
+  }
+
+  Future<void> interrupt() async {
+    for (final process in active.reversed.toList()) {
+      try { await stop(process); } catch (error) { failures.add('command interrupt: $error'); }
+    }
+  }
+
+  Future<ProcessResult> command(String executable, List<String> arguments, {
+    String? stdin, String? workingDirectory, bool cleanup = false,
+  }) async {
+    if (!cleanup) token.check();
+    final OwnedProcess process;
+    try {
+      process = await runner.start(executable, arguments, logDir: logs,
+        stdin: stdin, workingDirectory: workingDirectory);
+    } on OwnedProcessStartFailure catch (failure) {
+      failures.add('command startup stop: ${failure.cleanupFailure}');
+      if (failure.diagnosticFailure != null) failures.add('command startup diagnostic: ${failure.diagnosticFailure}');
+      try { track(failure.process, executable, cleanup: cleanup); }
+      catch (error) { failures.add('command startup ownership: $error'); }
+      Error.throwWithStackTrace(failure.primary, failure.primaryStack);
+    }
+    Object? primary;
+    try {
+      track(process, executable, cleanup: cleanup);
+      if (!cleanup) token.check();
+      final code = await (cleanup ? process.exitCode : Future.any<int>([
+        process.exitCode, token.cancelled.then<int>((_) => throw RunCancelled()),
+      ])).timeout(timeout);
+      return ProcessResult(process.pid, code,
+        File(p.join(logs.path, '${process.pid}.stdout.log')).readAsStringSync(),
+        File(p.join(logs.path, '${process.pid}.stderr.log')).readAsStringSync());
+    } catch (error) {
+      primary = error;
+      rethrow;
+    } finally {
+      try { await stop(process); } catch (error) {
+        if (primary == null) rethrow;
+        failures.add('command stop: $error');
+      }
+    }
+  }
+
+  @override
+  Future<ProcessResult> run(String executable, List<String> arguments, {String? stdin, String? workingDirectory}) =>
+    command(executable, arguments, stdin: stdin, workingDirectory: workingDirectory);
+  @override
+  Future<OwnedProcess> start(String executable, List<String> arguments, {required Directory logDir,
+    String? workingDirectory, String? stdin, bool retainOutput = false}) =>
+    runner.start(executable, arguments, logDir: logDir, workingDirectory: workingDirectory,
+      stdin: stdin, retainOutput: retainOutput);
+  @override
+  Future<void> startDetached(String executable, List<String> arguments) => runner.startDetached(executable, arguments);
+  @override
+  Future<int> runInherited(String executable, List<String> arguments, {String? workingDirectory}) =>
+    runner.runInherited(executable, arguments, workingDirectory: workingDirectory);
 }
 
 class _Ownership {

@@ -35,6 +35,7 @@ class CliRunner implements ProcessRunner {
   bool failCleanup = false;
   bool existing = true;
   Future<OwnedProcess> Function(List<String>)? startChild;
+  Future<OwnedProcess?> Function(List<String>)? shortChild;
   @override
   Future<ProcessResult> run(
     String executable,
@@ -70,6 +71,15 @@ class CliRunner implements ProcessRunner {
     String? stdin,
     bool retainOutput = false,
   }) async {
+    if (!arguments.contains('-avd') && arguments.first != 'test') {
+      final controlled = await shortChild?.call(arguments);
+      if (controlled != null) return controlled;
+      final result = await run(executable, arguments, stdin: stdin, workingDirectory: workingDirectory);
+      final childPid = 1000 + commands.length;
+      File('${logDir.path}/$childPid.stdout.log').writeAsStringSync(result.stdout as String);
+      File('${logDir.path}/$childPid.stderr.log').writeAsStringSync(result.stderr as String);
+      return CliChild(childPid, code: result.exitCode);
+    }
     launches.add(arguments);
     return startChild == null ? CliChild(100, code: code) : await startChild!(arguments);
   }
@@ -201,6 +211,121 @@ void main() {
     expect(runner.commands.any((args) => args.contains('reverse')), isFalse);
   });
 
+  for (final failStop in [false, true]) {
+    test('cancel pending short acquisition retains ownership until stop confirmed ($failStop)', () async {
+      final token = RunCancellation();
+      final ready = Completer<void>();
+      final release = Completer<void>();
+      var lists = 0;
+      var stops = 0;
+      final child = CliChild(202, onStop: () {
+        stops++;
+        if (failStop) throw StateError('identity unavailable');
+      });
+      runner.shortChild = (args) async {
+        if (!args.contains('--list') || ++lists != 2) return null;
+        ready.complete();
+        await release.future;
+        return child;
+      };
+      final result = run(['test'], cancellation: token);
+      await ready.future;
+      token.cancel();
+      release.complete();
+      try {
+        expect(await result.timeout(const Duration(seconds: 1)), 130);
+        expect(stops, greaterThan(0));
+        expect(runner.removed, ['tcp:47000']);
+        expect(runner.launches, isEmpty);
+        final records = logs.listSync(recursive: true).whereType<File>().where((file) => file.path.endsWith('ownership.json')).toList();
+        if (failStop) {
+          expect(records, hasLength(1));
+          final record = jsonDecode(records.single.readAsStringSync()) as Map<String, dynamic>;
+          expect((record['processes'] as List).single['pid'], 202);
+          expect(record['reverse'], isEmpty);
+        } else {
+          expect(records, isEmpty);
+        }
+      } finally {
+        if (!child.done.isCompleted) child.done.complete(-1);
+        await result;
+      }
+    });
+  }
+
+  test('failed short startup retains exact child and original failure despite cancellation', () async {
+    final token = RunCancellation();
+    final child = CliChild(203, onStop: () => throw StateError('identity unavailable'));
+    runner.shortChild = (args) async {
+      if (!args.contains('--list')) return null;
+      token.cancel();
+      throw OwnedProcessStartFailure(StateError('original input failure'), StackTrace.current,
+        child, StateError('identity unavailable'), StateError('diagnostic failure'));
+    };
+    try {
+      expect(await run(['test'], cancellation: token), 1);
+      final recordFile = logs.listSync(recursive: true).whereType<File>().singleWhere((file) => file.path.endsWith('ownership.json'));
+      final record = jsonDecode(recordFile.readAsStringSync()) as Map<String, dynamic>;
+      expect((record['processes'] as List).single['pid'], 203);
+      expect(File('${recordFile.parent.path}/failure.log').readAsStringSync(), startsWith('Bad state: original input failure'));
+      expect(File('${recordFile.parent.path}/cleanup.log').readAsStringSync(), contains('diagnostic failure'));
+      expect(runner.launches, isEmpty);
+    } finally {
+      child.done.complete(-1);
+    }
+  });
+
+  test('interrupted unconfirmed reverse add is retained without removing a foreign mapping', () async {
+    final token = RunCancellation();
+    final ready = Completer<void>();
+    final child = CliChild(204);
+    runner.shortChild = (args) async {
+      if (!args.contains('--no-rebind') || args.last != 'tcp:3340') return null;
+      // Another owner may have won the no-rebind race; an interrupted command
+      // gives the CLI no successful claim over this mapping.
+      runner.mappings.add('tcp:3340');
+      ready.complete();
+      return child;
+    };
+    final result = run(['test'], cancellation: token);
+    await ready.future;
+    token.cancel();
+    expect(await result, 130);
+    expect(await child.exitCode, -1);
+    expect(runner.removed, ['tcp:47000']);
+    expect(runner.mappings, contains('tcp:3340'));
+    final recordFile = logs.listSync(recursive: true).whereType<File>().singleWhere((file) => file.path.endsWith('ownership.json'));
+    final record = jsonDecode(recordFile.readAsStringSync()) as Map<String, dynamic>;
+    expect(record['processes'], isEmpty);
+    expect((record['reverse'] as List).single, {
+      'serial': 'emulator-5554', 'local': 'tcp:3340', 'remote': 'tcp:3340', 'uncertain': true,
+    });
+  });
+
+  test('cleanup startup failure retains secondary diagnostics and still removes later reverse', () async {
+    runner.code = 23;
+    final child = CliChild(205, onStop: () => throw StateError('identity unavailable'));
+    runner.shortChild = (args) async {
+      if (!args.contains('--remove') || args.last != 'tcp:3340') return null;
+      throw OwnedProcessStartFailure(StateError('cleanup input failure'), StackTrace.current,
+        child, StateError('cleanup identity unavailable'), StateError('cleanup diagnostic failure'));
+    };
+    try {
+      expect(await run(['test']), 23);
+      expect(runner.removed, ['tcp:47000']);
+      final recordFile = logs.listSync(recursive: true).whereType<File>().singleWhere((file) => file.path.endsWith('ownership.json'));
+      final record = jsonDecode(recordFile.readAsStringSync()) as Map<String, dynamic>;
+      expect((record['processes'] as List).single['pid'], 205);
+      expect((record['reverse'] as List).single['local'], 'tcp:3340');
+      final diagnostic = File('${recordFile.parent.path}/cleanup.log').readAsStringSync();
+      expect(diagnostic, contains('cleanup input failure'));
+      expect(diagnostic, contains('cleanup identity unavailable'));
+      expect(diagnostic, contains('cleanup diagnostic failure'));
+    } finally {
+      child.done.complete(-1);
+    }
+  });
+
   group('real CLI subprocess with fake command executables', () {
     late Directory fixture;
     late File executable;
@@ -224,6 +349,7 @@ void main() {
       bool failCleanup = false,
       bool wait = false,
       bool existing = true,
+      String hang = '',
     }) async {
       File('${temp.path}/chat_e2e_1.avd/config.ini').writeAsStringSync(
         'image.sysdir.1=system-images/android-36/google_apis_playstore/x86_64/\nabi.type=x86_64\nhw.cpu.arch=x86_64\n',
@@ -258,6 +384,7 @@ void main() {
         'FAKE_CLEANUP_FAIL': '$failCleanup',
         'FAKE_WAIT': '$wait',
         'FAKE_EXISTING': '$existing',
+        'FAKE_HANG': hang,
       };
     }
 
@@ -267,12 +394,22 @@ void main() {
       final cliUri = File('bin/devices.dart').absolute.uri;
       return File('${temp.path}/entry.dart')..writeAsStringSync('''
 import 'dart:io';
+import 'dart:async';
 import '$cliUri';
 import 'package:chat_e2e/src/android_sdk.dart';
 import 'package:chat_e2e/src/process_runner.dart';
+import 'package:chat_e2e/src/owned_resources.dart';
 Future<void> main(List<String> args) async {
+  final cancellation = RunCancellation();
+  final timer = Timer.periodic(const Duration(milliseconds: 10), (_) {
+    if (Platform.environment['FAKE_HANG'] == 'list' &&
+        File(Platform.environment['FAKE_STATE']! + '/hang.json').existsSync()) cancellation.cancel();
+  });
+  try {
   exit(await runDevices(args, runner: const IoProcessRunner(), sdk: AndroidSdk.locate(),
-    logDir: Directory(Platform.environment['FAKE_STATE']! + '/logs')));
+    logDir: Directory(Platform.environment['FAKE_STATE']! + '/logs'), cancellation: cancellation,
+    commandTimeout: const Duration(milliseconds: 500)));
+  } finally { timer.cancel(); }
 }
 ''');
     }
@@ -325,6 +462,60 @@ Future<void> main(List<String> args) async {
       expect(result.stderr, contains('following arguments literally'));
       expect(File('${temp.path}/commands.log').existsSync(), isFalse);
     });
+
+    for (final scenario in [('list', 23), ('remove', 23), ('remove', 0)]) {
+      final (hang, primary) = scenario;
+      test('hung reverse $hang with primary $primary reclaims its child and attempts later cleanup', () async {
+        final env = await environment(code: primary, hang: hang);
+        final entry = await entryPoint();
+        final process = await Process.start(Platform.resolvedExecutable, [
+          '--packages=${File('.dart_tool/package_config.json').absolute.path}', entry.path, 'test',
+        ], environment: env);
+        final out = process.stdout.drain<void>();
+        final err = process.stderr.transform(utf8.decoder).join();
+        final hung = File('${temp.path}/hang.json');
+        try {
+          final deadline = DateTime.now().add(const Duration(seconds: 15));
+          while (!hung.existsSync()) {
+            if (DateTime.now().isAfter(deadline)) fail('Fake short command never reached the hang');
+            await Future<void>.delayed(const Duration(milliseconds: 10));
+          }
+          final state = jsonDecode(hung.readAsStringSync()) as Map<String, dynamic>;
+          final port = state['port'] as int;
+          expect(await process.exitCode.timeout(const Duration(seconds: 3)), hang == 'list' ? 130 : primary == 0 ? 1 : primary);
+          await out;
+          await err;
+          await expectLater(Socket.connect(InternetAddress.loopbackIPv4, port), throwsA(isA<SocketException>()));
+          final trace = File('${temp.path}/commands.log').readAsStringSync();
+          expect(trace, contains('"--remove","tcp:47000"'));
+          if (hang == 'list') {
+            expect(trace, isNot(contains('"--no-rebind","tcp:3340"')));
+            expect(File('${temp.path}/flutter-args.json').existsSync(), isFalse);
+          } else {
+            final records = logs.listSync(recursive: true).whereType<File>().where((file) => file.path.endsWith('ownership.json')).toList();
+            expect(records, hasLength(1));
+            final record = jsonDecode(records.single.readAsStringSync()) as Map<String, dynamic>;
+            expect(record['processes'], isEmpty, reason: 'The timed-out native child must actually be reclaimed');
+            expect((record['reverse'] as List).single['local'], 'tcp:3340');
+            expect(File('${records.single.parent.path}/cleanup.log').readAsStringSync(), contains('TimeoutException'));
+          }
+        } finally {
+          // A release protocol owns the fixture even against the broken CLI.
+          if (hung.existsSync()) {
+            final state = jsonDecode(hung.readAsStringSync()) as Map<String, dynamic>;
+            try {
+              final socket = await Socket.connect(InternetAddress.loopbackIPv4, state['port'] as int);
+              socket.write('release');
+              await socket.flush();
+              await socket.close();
+            } on SocketException { /* Production already reclaimed this exact child. */ }
+          }
+          await process.exitCode.timeout(const Duration(seconds: 15));
+          await out;
+          await err;
+        }
+      });
+    }
 
     for (final args in [
       <String>['up'],
@@ -494,6 +685,15 @@ import 'dart:io';
 Future<void> main(List<String> args) async {
   final root = Platform.environment['FAKE_STATE']!;
   File('$root/commands.log').writeAsStringSync('${jsonEncode(args)}\n', mode: FileMode.append, flush: true);
+  if ((Platform.environment['FAKE_HANG'] == 'list' && args.contains('--list') && File('$root/first-reverse').existsSync()) ||
+      (Platform.environment['FAKE_HANG'] == 'remove' && args.contains('--remove') && args.last == 'tcp:3340')) {
+    final server = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+    File('$root/hang.staging').writeAsStringSync(jsonEncode({'pid': pid, 'port': server.port}));
+    File('$root/hang.staging').renameSync('$root/hang.json');
+    server.listen((socket) { socket.listen((_) => exit(0)); });
+    return;
+  }
+  if (args.contains('--no-rebind') && args.last == 'tcp:47000') File('$root/first-reverse').writeAsStringSync('acquired');
   if (args.first == '-list-avds') { print('chat_e2e_1'); return; }
   if (args.first == 'devices') {
     print(Platform.environment['FAKE_EXISTING'] == 'false' ? 'List of devices attached' : 'List of devices attached\nemulator-5554\tdevice');
