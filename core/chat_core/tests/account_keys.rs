@@ -172,7 +172,7 @@ fn random_secret_produces_independent_recoverable_entropy() {
     );
 }
 
-#[cfg(feature = "test-hooks")]
+#[cfg(all(feature = "test-hooks", debug_assertions))]
 #[test]
 fn fake_clock_controls_wall_and_monotonic_time_independently() {
     use chat_core::account::clock::{Clock, FakeClock};

@@ -30,10 +30,10 @@ impl Clock for SystemClock {
     }
 }
 
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(any(test, all(feature = "test-hooks", debug_assertions)))]
 pub use fake::FakeClock;
 
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(any(test, all(feature = "test-hooks", debug_assertions)))]
 mod fake {
     use std::sync::atomic::{AtomicU64, Ordering};
 
