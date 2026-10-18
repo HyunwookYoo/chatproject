@@ -59,9 +59,19 @@ pub enum PairPhase {
     Active,
     Observed,
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum PairRole { Existing, New }
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PairResumeView {
+    pub transaction: super::TxId,
+    pub role: PairRole,
+}
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PairView {
     pub flow: FlowId,
+    pub local_role: PairRole,
+    pub remote_installation: Option<super::InstallationId>,
+    pub remote_kind: Option<super::DeviceKind>,
     pub direction: PairDirection,
     pub phase: PairPhase,
     pub sas: Option<String>,

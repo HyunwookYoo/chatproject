@@ -25,6 +25,7 @@ account.AccountView view(
   ),
   disclosurePossible: false,
   pendingPairTransactions: [],
+    pairResumes: [],
   pendingImportRequiresRemoteRevoke: false,
 );
 

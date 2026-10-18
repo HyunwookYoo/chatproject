@@ -44,6 +44,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   bool dco_decode_box_autoadd_bool(dynamic raw);
 
   @protected
+  DeviceKind dco_decode_box_autoadd_device_kind(dynamic raw);
+
+  @protected
   ErrorCode dco_decode_box_autoadd_error_code(dynamic raw);
 
   @protected
@@ -104,6 +107,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   List<Uint8List> dco_decode_list_list_prim_u_8_strict(dynamic raw);
 
   @protected
+  List<PairResumeView> dco_decode_list_pair_resume_view(dynamic raw);
+
+  @protected
   List<PeerInfo> dco_decode_list_peer_info(dynamic raw);
 
   @protected
@@ -131,6 +137,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   bool? dco_decode_opt_box_autoadd_bool(dynamic raw);
 
   @protected
+  DeviceKind? dco_decode_opt_box_autoadd_device_kind(dynamic raw);
+
+  @protected
   ErrorCode? dco_decode_opt_box_autoadd_error_code(dynamic raw);
 
   @protected
@@ -153,6 +162,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   PairPhase dco_decode_pair_phase(dynamic raw);
+
+  @protected
+  PairResumeView dco_decode_pair_resume_view(dynamic raw);
+
+  @protected
+  PairRole dco_decode_pair_role(dynamic raw);
 
   @protected
   PairView dco_decode_pair_view(dynamic raw);
@@ -226,6 +241,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   bool sse_decode_box_autoadd_bool(SseDeserializer deserializer);
 
   @protected
+  DeviceKind sse_decode_box_autoadd_device_kind(SseDeserializer deserializer);
+
+  @protected
   ErrorCode sse_decode_box_autoadd_error_code(SseDeserializer deserializer);
 
   @protected
@@ -288,6 +306,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  List<PairResumeView> sse_decode_list_pair_resume_view(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   List<PeerInfo> sse_decode_list_peer_info(SseDeserializer deserializer);
 
   @protected
@@ -319,6 +342,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   bool? sse_decode_opt_box_autoadd_bool(SseDeserializer deserializer);
 
   @protected
+  DeviceKind? sse_decode_opt_box_autoadd_device_kind(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   ErrorCode? sse_decode_opt_box_autoadd_error_code(
     SseDeserializer deserializer,
   );
@@ -345,6 +373,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   PairPhase sse_decode_pair_phase(SseDeserializer deserializer);
+
+  @protected
+  PairResumeView sse_decode_pair_resume_view(SseDeserializer deserializer);
+
+  @protected
+  PairRole sse_decode_pair_role(SseDeserializer deserializer);
 
   @protected
   PairView sse_decode_pair_view(SseDeserializer deserializer);
@@ -420,6 +454,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_box_autoadd_bool(bool self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_box_autoadd_device_kind(
+    DeviceKind self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_box_autoadd_error_code(
@@ -506,6 +546,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_list_pair_resume_view(
+    List<PairResumeView> self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_list_peer_info(List<PeerInfo> self, SseSerializer serializer);
 
   @protected
@@ -542,6 +588,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_opt_box_autoadd_bool(bool? self, SseSerializer serializer);
 
   @protected
+  void sse_encode_opt_box_autoadd_device_kind(
+    DeviceKind? self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_opt_box_autoadd_error_code(
     ErrorCode? self,
     SseSerializer serializer,
@@ -576,6 +628,15 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_pair_phase(PairPhase self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_pair_resume_view(
+    PairResumeView self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_pair_role(PairRole self, SseSerializer serializer);
 
   @protected
   void sse_encode_pair_view(PairView self, SseSerializer serializer);

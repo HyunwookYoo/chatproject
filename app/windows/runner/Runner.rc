@@ -90,12 +90,12 @@ BEGIN
         BLOCK "040904e4"
         BEGIN
             VALUE "CompanyName", "dev.chatproject" "\0"
-            VALUE "FileDescription", "chat_app" "\0"
+            VALUE "FileDescription", "ChatProject" "\0"
             VALUE "FileVersion", VERSION_AS_STRING "\0"
-            VALUE "InternalName", "chat_app" "\0"
+            VALUE "InternalName", "ChatProject" "\0"
             VALUE "LegalCopyright", "Copyright (C) 2026 dev.chatproject. All rights reserved." "\0"
             VALUE "OriginalFilename", "chat_app.exe" "\0"
-            VALUE "ProductName", "chat_app" "\0"
+            VALUE "ProductName", "ChatProject" "\0"
             VALUE "ProductVersion", VERSION_AS_STRING "\0"
         END
     END

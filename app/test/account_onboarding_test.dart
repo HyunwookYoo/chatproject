@@ -7,6 +7,7 @@ import 'package:chat_app/src/rust/api/account.dart' as a;
 import 'package:chat_app/src/rust/api/chat.dart' as r;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter/scheduler.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 // Public invalid fixture words, never a real mnemonic.
@@ -52,6 +53,7 @@ class ScreenClient implements AccountClient {
     ),
     disclosurePossible: false,
     pendingPairTransactions: [],
+    pairResumes: [],
     pendingImportRequiresRemoteRevoke: false,
   );
   void emit() {
@@ -225,7 +227,29 @@ Future<void> tapText(WidgetTester t, String label) async {
   await t.pumpAndSettle();
 }
 
+int fixtureFrame = 10;
+
+Future<void> completeSensitiveRaster(WidgetTester t) async {
+  t.binding.platformDispatcher.onReportTimings?.call([
+    FrameTiming(
+      vsyncStart: 0,
+      buildStart: 1,
+      buildFinish: 2,
+      rasterStart: 3,
+      rasterFinish: 4,
+      rasterFinishWallTime: 5,
+      frameNumber: fixtureFrame - 1,
+    ),
+  ]);
+  await t.pump();
+}
+
 void main() {
+  setUp(() {
+    fixtureFrame = 10;
+    SensitiveScreen.frameNumberForTesting = () => fixtureFrame++;
+  });
+  tearDown(() => SensitiveScreen.frameNumberForTesting = null);
   for (final dispose in [false, true]) {
     testWidgets(
       'deferred invalid confirmation ${dispose ? 'disposal' : 'back'} eventually cancels exact native flow',
@@ -473,6 +497,7 @@ void main() {
       expect(calls.last, isTrue);
       t.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
       await t.pumpAndSettle();
+      await completeSensitiveRaster(t);
       expect(calls.last, isFalse);
       expect(find.textContaining('public-marker'), findsNothing);
       expect(find.text('새 계정 만들기'), findsOneWidget);
@@ -529,6 +554,7 @@ void main() {
     expect(calls, isNot(contains(false)));
     await t.pumpWidget(const SizedBox());
     await t.pumpAndSettle();
+    await completeSensitiveRaster(t);
     expect(calls.last, isFalse);
   });
   testWidgets(

@@ -1,6 +1,7 @@
 package dev.chatproject.chat_app
 
 import android.content.Context
+import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.os.Bundle
 import android.view.WindowManager
@@ -14,12 +15,29 @@ class MainActivity : FlutterActivity() {
     private external fun initializeNetworkContext(context: Context): Boolean
     private external fun initializeAccountKeyStore(store: AccountKeyStore): Boolean
     private lateinit var accountKeys: AccountKeyStore
+    private var accountChannel: MethodChannel? = null
+    private var pendingInvite: String? = null
+    private fun receiveInvite(intent: Intent?) {
+        val value = intent?.dataString ?: return
+        if (!value.startsWith("chatproject:identity-invite/")) return
+        pendingInvite = value
+        accountChannel?.invokeMethod("identityInvite", value, object : MethodChannel.Result {
+            override fun success(result: Any?) { if (result == true && pendingInvite == value) pendingInvite = null }
+            override fun error(code: String, message: String?, details: Any?) {}
+            override fun notImplemented() {}
+        })
+    }
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        receiveInvite(intent)
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         System.loadLibrary("chat_ffi")
         check(initializeNetworkContext(applicationContext)) { "Network context initialization failed" }
         accountKeys = AccountKeyStore(applicationContext)
         check(initializeAccountKeyStore(accountKeys)) { "Account key protection initialization failed" }
+        receiveInvite(intent)
         super.onCreate(savedInstanceState)
     }
 
@@ -40,10 +58,11 @@ class MainActivity : FlutterActivity() {
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
-        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "chat_app/account_storage")
-            .setMethodCallHandler { call, result ->
+        accountChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "chat_app/account_storage")
+        accountChannel?.setMethodCallHandler { call, result ->
                 try {
                     when (call.method) {
+                        "takeIdentityInvite" -> { result.success(pendingInvite); pendingInvite = null }
                         "storageRoot" -> result.success(accountKeys.storageRoot(call.argument<String>("existing")))
                         "protectionLevel" -> {
                             val hex = call.argument<String>("storeId") ?: ""

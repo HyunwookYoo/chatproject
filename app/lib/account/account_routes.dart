@@ -4,7 +4,10 @@ import 'package:flutter/foundation.dart' show listEquals;
 import '../src/rust/api/account.dart' as a;
 import 'account_model.dart';
 import 'sensitive_screen.dart';
+import 'invite_links.dart';
 import 'screens/welcome_screen.dart';
+import 'screens/pair_screen.dart';
+import 'screens/devices_screen.dart';
 import 'screens/recovery_words_screen.dart';
 import 'screens/recovery_confirm_screen.dart';
 import 'screens/recover_screen.dart';
@@ -40,6 +43,8 @@ class _AccountRoutesState extends State<AccountRoutes>
   a.InvitePreview? _preview;
   a.ContactView? _contact;
   ({a.SafetyDisplay display, List<int> local, List<int> peer})? _safety;
+  final _links = InviteLinks();
+  String? _incomingInvite;
   int _ticket = 0;
   bool _working = false;
   String? _routeError;
@@ -49,6 +54,12 @@ class _AccountRoutesState extends State<AccountRoutes>
     super.initState();
     model.addListener(_changed);
     WidgetsBinding.instance.addObserver(this);
+    unawaited(
+      _links.start((payload) {
+        _incomingInvite = payload;
+        _consumeInvite();
+      }),
+    );
   }
 
   @override
@@ -59,8 +70,34 @@ class _AccountRoutesState extends State<AccountRoutes>
     }
   }
 
+  void _consumeInvite() {
+    if (!mounted ||
+        model.busy ||
+        _working ||
+        ![_Page.home, _Page.invite].contains(_page) ||
+        ![
+          a.AccountPhase.active,
+          a.AccountPhase.localReady,
+          a.AccountPhase.publishPending,
+          a.AccountPhase.conflict,
+        ].contains(model.snapshot?.phase)) {
+      return;
+    }
+    final payload = _incomingInvite;
+    if (payload == null) return;
+    _incomingInvite = null;
+    final ticket = _ticket;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_current(ticket) && [_Page.home, _Page.invite].contains(_page)) {
+        unawaited(_parse(payload));
+      }
+    });
+    WidgetsBinding.instance.scheduleFrame();
+  }
+
   void _changed() {
     if (!mounted) return;
+    _consumeInvite();
     setState(() {
       final safety = _safety;
       if (safety != null &&
@@ -115,6 +152,8 @@ class _AccountRoutesState extends State<AccountRoutes>
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     model.removeListener(_changed);
+    _links.dispose();
+    _incomingInvite = null;
     ++_ticket;
     final flow = _flow;
     final confirmation = _confirmation;
@@ -264,6 +303,16 @@ class _AccountRoutesState extends State<AccountRoutes>
     });
   }
 
+  void _pair([a.PairResumeView? resume]) => Navigator.of(context).push(
+    MaterialPageRoute<void>(
+      builder: (_) => PairScreen(model: model, resume: resume),
+    ),
+  );
+  void _devices() => Navigator.of(context).push(
+    MaterialPageRoute<void>(
+      builder: (_) => DevicesScreen(model: model, onPair: _pair),
+    ),
+  );
   Widget _contactDetail() => Column(
     crossAxisAlignment: CrossAxisAlignment.stretch,
     children: [
@@ -283,6 +332,7 @@ class _AccountRoutesState extends State<AccountRoutes>
   Widget _contacts(a.AccountView view) => Column(
     crossAxisAlignment: CrossAxisAlignment.stretch,
     children: [
+      TextButton(onPressed: _devices, child: const Text('내 기기')),
       Text('연락처', style: Theme.of(context).textTheme.headlineMedium),
       const SizedBox(height: 16),
       if (view.phase == a.AccountPhase.publishPending ||
@@ -379,11 +429,26 @@ class _AccountRoutesState extends State<AccountRoutes>
       ),
       _Page.home =>
         unconfigured
-            ? WelcomeScreen(
-                busy: busy,
-                onCreate: _begin,
-                onRecover: () => _go(_Page.recover),
-                onPair: widget.onPair,
+            ? Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  if (view?.pendingPairTransactions.isNotEmpty == true) ...[
+                    const Text('중단된 기기 연결이 있어요. 새 QR로 재개하거나 로컬 연결을 버릴 수 있어요.'),
+                    TextButton(onPressed: _devices, child: const Text('내 기기')),
+                  ] else ...[
+                    WelcomeScreen(
+                      busy: busy,
+                      onCreate: _begin,
+                      onRecover: () => _go(_Page.recover),
+                      onPair: widget.onPair ?? _pair,
+                    ),
+                    if (view?.phase == a.AccountPhase.candidate)
+                      TextButton(
+                        onPressed: _devices,
+                        child: const Text('내 기기'),
+                      ),
+                  ],
+                ],
               )
             : _contacts(view),
     };

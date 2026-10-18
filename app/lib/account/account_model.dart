@@ -156,9 +156,9 @@ class AccountModel extends ChangeNotifier {
     final generation = _generation;
     final secretGeneration = _secretGeneration;
     final reply = await _result(() => client.pairBegin(direction, resume));
-    if (!_current(generation) ||
-        secretGeneration != _secretGeneration ||
-        reply == null) {
+    if (!_current(generation) || reply == null) return null;
+    if (secretGeneration != _secretGeneration) {
+      await cancelAbandonedPair(reply.flow);
       return null;
     }
     pairDisplay = reply;
@@ -228,7 +228,55 @@ class AccountModel extends ChangeNotifier {
       _command(() => client.revokeDevice(target));
   Future<bool> confirmRecordConflict(List<int> baseHash) =>
       _command(() => client.confirmRecordConflict(baseHash));
-  Future<bool> pairScan(String qr) => _command(() => client.pairScan(qr));
+  Future<Uint8List?> pairScan(String qr, {List<int>? expectedResume}) async {
+    final generation = _generation;
+    final secretGeneration = _secretGeneration;
+    final flow = await _result(() async {
+      final scanned = await client.pairScan(qr);
+      if (expectedResume == null) return scanned;
+      try {
+        final next = await client.snapshot();
+        if (_current(generation) && secretGeneration == _secretGeneration) {
+          applySnapshot(next);
+          final pair = snapshot?.pair;
+          if (pair != null &&
+              listEquals(pair.flow, scanned) &&
+              listEquals(pair.transaction, expectedResume)) {
+            return scanned;
+          }
+        }
+      } catch (_) {
+        // No approval on missing coherent metadata; no error in a newer route.
+      }
+      await cancelAbandonedPair(scanned);
+      return null;
+    });
+    if (!_current(generation) || flow == null) return null;
+    if (secretGeneration != _secretGeneration) {
+      await cancelAbandonedPair(flow);
+      return null;
+    }
+    return flow;
+  }
+
+  /// Exact abandoned pair only: cancellation cannot undo durable disclosure.
+  /// No secret clearing or error publication into a replacement route.
+  Future<bool> cancelAbandonedPair(
+    List<int> flow, {
+    Future<Object?>? afterOperation,
+  }) async {
+    final generation = _generation;
+    final captured = List<int>.of(flow);
+    if (afterOperation != null) await afterOperation;
+    if (!_current(generation)) return false;
+    try {
+      await client.pairCancel(captured);
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
   Future<bool> pairConfirmCode(List<int> flow, bool matches) =>
       _command(() => client.pairConfirmCode(flow, matches));
   Future<bool> pairApprove(List<int> flow) =>
@@ -296,6 +344,7 @@ account.AccountView lockedAccountView(
   publishIntents: [],
   disclosurePossible: previous?.disclosurePossible ?? false,
   pendingPairTransactions: previous?.pendingPairTransactions ?? [],
+  pairResumes: previous?.pairResumes ?? [],
   pendingImportRequiresRemoteRevoke:
       previous?.pendingImportRequiresRemoteRevoke ?? false,
   publication: account.PublicationView(

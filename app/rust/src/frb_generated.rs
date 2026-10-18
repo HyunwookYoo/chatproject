@@ -1434,6 +1434,8 @@ impl SseDecode for crate::api::account::AccountView {
         let mut var_publication = <crate::api::account::PublicationView>::sse_decode(deserializer);
         let mut var_disclosurePossible = <bool>::sse_decode(deserializer);
         let mut var_pendingPairTransactions = <Vec<Vec<u8>>>::sse_decode(deserializer);
+        let mut var_pairResumes =
+            <Vec<crate::api::account::PairResumeView>>::sse_decode(deserializer);
         let mut var_pendingImportRequiresRemoteRevoke = <bool>::sse_decode(deserializer);
         return crate::api::account::AccountView {
             revision: var_revision,
@@ -1448,6 +1450,7 @@ impl SseDecode for crate::api::account::AccountView {
             publication: var_publication,
             disclosure_possible: var_disclosurePossible,
             pending_pair_transactions: var_pendingPairTransactions,
+            pair_resumes: var_pairResumes,
             pending_import_requires_remote_revoke: var_pendingImportRequiresRemoteRevoke,
         };
     }
@@ -1733,6 +1736,20 @@ impl SseDecode for Vec<Vec<u8>> {
     }
 }
 
+impl SseDecode for Vec<crate::api::account::PairResumeView> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut len_ = <i32>::sse_decode(deserializer);
+        let mut ans_ = vec![];
+        for idx_ in 0..len_ {
+            ans_.push(<crate::api::account::PairResumeView>::sse_decode(
+                deserializer,
+            ));
+        }
+        return ans_;
+    }
+}
+
 impl SseDecode for Vec<crate::api::chat::PeerInfo> {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
@@ -1833,6 +1850,17 @@ impl SseDecode for Option<bool> {
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
         if (<bool>::sse_decode(deserializer)) {
             return Some(<bool>::sse_decode(deserializer));
+        } else {
+            return None;
+        }
+    }
+}
+
+impl SseDecode for Option<crate::api::account::DeviceKind> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        if (<bool>::sse_decode(deserializer)) {
+            return Some(<crate::api::account::DeviceKind>::sse_decode(deserializer));
         } else {
             return None;
         }
@@ -1940,11 +1968,39 @@ impl SseDecode for crate::api::account::PairPhase {
     }
 }
 
+impl SseDecode for crate::api::account::PairResumeView {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut var_transaction = <Vec<u8>>::sse_decode(deserializer);
+        let mut var_role = <crate::api::account::PairRole>::sse_decode(deserializer);
+        return crate::api::account::PairResumeView {
+            transaction: var_transaction,
+            role: var_role,
+        };
+    }
+}
+
+impl SseDecode for crate::api::account::PairRole {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut inner = <i32>::sse_decode(deserializer);
+        return match inner {
+            0 => crate::api::account::PairRole::Existing,
+            1 => crate::api::account::PairRole::New,
+            _ => unreachable!("Invalid variant for PairRole: {}", inner),
+        };
+    }
+}
+
 impl SseDecode for crate::api::account::PairView {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
         let mut var_flow = <Vec<u8>>::sse_decode(deserializer);
         let mut var_direction = <crate::api::account::PairDirection>::sse_decode(deserializer);
+        let mut var_localRole = <crate::api::account::PairRole>::sse_decode(deserializer);
+        let mut var_remoteInstallation = <Option<Vec<u8>>>::sse_decode(deserializer);
+        let mut var_remoteKind =
+            <Option<crate::api::account::DeviceKind>>::sse_decode(deserializer);
         let mut var_phase = <crate::api::account::PairPhase>::sse_decode(deserializer);
         let mut var_sas = <Option<String>>::sse_decode(deserializer);
         let mut var_expiresAt = <u64>::sse_decode(deserializer);
@@ -1953,6 +2009,9 @@ impl SseDecode for crate::api::account::PairView {
         return crate::api::account::PairView {
             flow: var_flow,
             direction: var_direction,
+            local_role: var_localRole,
+            remote_installation: var_remoteInstallation,
+            remote_kind: var_remoteKind,
             phase: var_phase,
             sas: var_sas,
             expires_at: var_expiresAt,
@@ -2274,6 +2333,7 @@ impl flutter_rust_bridge::IntoDart for crate::api::account::AccountView {
             self.publication.into_into_dart().into_dart(),
             self.disclosure_possible.into_into_dart().into_dart(),
             self.pending_pair_transactions.into_into_dart().into_dart(),
+            self.pair_resumes.into_into_dart().into_dart(),
             self.pending_import_requires_remote_revoke
                 .into_into_dart()
                 .into_dart(),
@@ -2669,11 +2729,53 @@ impl flutter_rust_bridge::IntoIntoDart<crate::api::account::PairPhase>
     }
 }
 // Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::api::account::PairResumeView {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        [
+            self.transaction.into_into_dart().into_dart(),
+            self.role.into_into_dart().into_dart(),
+        ]
+        .into_dart()
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive
+    for crate::api::account::PairResumeView
+{
+}
+impl flutter_rust_bridge::IntoIntoDart<crate::api::account::PairResumeView>
+    for crate::api::account::PairResumeView
+{
+    fn into_into_dart(self) -> crate::api::account::PairResumeView {
+        self
+    }
+}
+// Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::api::account::PairRole {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        match self {
+            Self::Existing => 0.into_dart(),
+            Self::New => 1.into_dart(),
+            _ => unreachable!(),
+        }
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive for crate::api::account::PairRole {}
+impl flutter_rust_bridge::IntoIntoDart<crate::api::account::PairRole>
+    for crate::api::account::PairRole
+{
+    fn into_into_dart(self) -> crate::api::account::PairRole {
+        self
+    }
+}
+// Codec=Dco (DartCObject based), see doc to use other codecs
 impl flutter_rust_bridge::IntoDart for crate::api::account::PairView {
     fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
         [
             self.flow.into_into_dart().into_dart(),
             self.direction.into_into_dart().into_dart(),
+            self.local_role.into_into_dart().into_dart(),
+            self.remote_installation.into_into_dart().into_dart(),
+            self.remote_kind.into_into_dart().into_dart(),
             self.phase.into_into_dart().into_dart(),
             self.sas.into_into_dart().into_dart(),
             self.expires_at.into_into_dart().into_dart(),
@@ -2975,6 +3077,7 @@ impl SseEncode for crate::api::account::AccountView {
         <crate::api::account::PublicationView>::sse_encode(self.publication, serializer);
         <bool>::sse_encode(self.disclosure_possible, serializer);
         <Vec<Vec<u8>>>::sse_encode(self.pending_pair_transactions, serializer);
+        <Vec<crate::api::account::PairResumeView>>::sse_encode(self.pair_resumes, serializer);
         <bool>::sse_encode(self.pending_import_requires_remote_revoke, serializer);
     }
 }
@@ -3212,6 +3315,16 @@ impl SseEncode for Vec<Vec<u8>> {
     }
 }
 
+impl SseEncode for Vec<crate::api::account::PairResumeView> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <i32>::sse_encode(self.len() as _, serializer);
+        for item in self {
+            <crate::api::account::PairResumeView>::sse_encode(item, serializer);
+        }
+    }
+}
+
 impl SseEncode for Vec<crate::api::chat::PeerInfo> {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
@@ -3297,6 +3410,16 @@ impl SseEncode for Option<bool> {
         <bool>::sse_encode(self.is_some(), serializer);
         if let Some(value) = self {
             <bool>::sse_encode(value, serializer);
+        }
+    }
+}
+
+impl SseEncode for Option<crate::api::account::DeviceKind> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <bool>::sse_encode(self.is_some(), serializer);
+        if let Some(value) = self {
+            <crate::api::account::DeviceKind>::sse_encode(value, serializer);
         }
     }
 }
@@ -3400,11 +3523,38 @@ impl SseEncode for crate::api::account::PairPhase {
     }
 }
 
+impl SseEncode for crate::api::account::PairResumeView {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <Vec<u8>>::sse_encode(self.transaction, serializer);
+        <crate::api::account::PairRole>::sse_encode(self.role, serializer);
+    }
+}
+
+impl SseEncode for crate::api::account::PairRole {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <i32>::sse_encode(
+            match self {
+                crate::api::account::PairRole::Existing => 0,
+                crate::api::account::PairRole::New => 1,
+                _ => {
+                    unimplemented!("");
+                }
+            },
+            serializer,
+        );
+    }
+}
+
 impl SseEncode for crate::api::account::PairView {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
         <Vec<u8>>::sse_encode(self.flow, serializer);
         <crate::api::account::PairDirection>::sse_encode(self.direction, serializer);
+        <crate::api::account::PairRole>::sse_encode(self.local_role, serializer);
+        <Option<Vec<u8>>>::sse_encode(self.remote_installation, serializer);
+        <Option<crate::api::account::DeviceKind>>::sse_encode(self.remote_kind, serializer);
         <crate::api::account::PairPhase>::sse_encode(self.phase, serializer);
         <Option<String>>::sse_encode(self.sas, serializer);
         <u64>::sse_encode(self.expires_at, serializer);

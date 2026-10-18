@@ -6,6 +6,8 @@ import 'package:flutter/material.dart';
 import 'core_client.dart';
 import 'account/account_client.dart';
 import 'account/account_model.dart';
+import 'account/screens/devices_screen.dart';
+import 'account/screens/pair_screen.dart';
 import 'src/rust/api/account.dart' as account;
 import 'main.dart';
 import 'network/network_client.dart';
@@ -163,6 +165,36 @@ class _AccountGateState extends State<AccountGate> {
                       mainAxisSize: MainAxisSize.min,
                       children: [
                         const Text('계정 보호 저장을 열 수 없어요.'),
+                        if (widget
+                                .model
+                                .snapshot!
+                                .pendingPairTransactions
+                                .isNotEmpty ||
+                            widget
+                                .model
+                                .snapshot!
+                                .pendingImportRequiresRemoteRevoke)
+                          Builder(
+                            builder: (context) => TextButton(
+                              onPressed: () => Navigator.of(context).push(
+                                MaterialPageRoute<void>(
+                                  builder: (routeContext) => DevicesScreen(
+                                    model: widget.model,
+                                    onPair: (resume) =>
+                                        Navigator.of(routeContext).push(
+                                          MaterialPageRoute<void>(
+                                            builder: (_) => PairScreen(
+                                              model: widget.model,
+                                              resume: resume,
+                                            ),
+                                          ),
+                                        ),
+                                  ),
+                                ),
+                              ),
+                              child: const Text('중단된 연결 상태 확인'),
+                            ),
+                          ),
                         const SizedBox(height: 16),
                         Text(
                           widget.model.error ??

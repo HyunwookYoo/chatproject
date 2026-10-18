@@ -5,6 +5,8 @@
 #include <flutter/flutter_view_controller.h>
 
 #include <memory>
+#include <flutter/method_channel.h>
+#include <flutter/encodable_value.h>
 
 #include "win32_window.h"
 
@@ -23,6 +25,26 @@ class FlutterWindow : public Win32Window {
                          LPARAM const lparam) noexcept override;
 
  private:
+  bool SetSensitive(bool value);
+  HRESULT DrawPrivateBitmap(HWND window, int width, int height, bool thumbnail);
+  void PrivacyFailed();
+  bool sensitive_ = false;
+  bool protection_ready_ = false;
+  bool saved_attributes_ = false;
+  bool baseline_ready_ = false;
+  BOOL force_value_ = FALSE;
+  BOOL bitmap_value_ = FALSE;
+  HRESULT force_result_ = E_PENDING;
+  HRESULT bitmap_result_ = E_PENDING;
+  BOOL previous_force_ = FALSE;
+  BOOL previous_bitmap_ = FALSE;
+  HRESULT thumbnail_result_ = E_PENDING;
+  HRESULT preview_result_ = E_PENDING;
+#ifndef NDEBUG
+  std::string privacy_failure_;
+#endif
+  std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>> account_channel_;
+  std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>> privacy_events_;
   // The project to run.
   flutter::DartProject project_;
 

@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'bootstrap.dart';
 import 'account/account_model.dart';
 import 'account/account_routes.dart';
+import 'account/invite_links.dart';
 import 'core_client.dart';
 import 'home/home_screen.dart';
 import 'network/network_client.dart';
@@ -12,9 +13,12 @@ import 'theme/app_theme.dart';
 
 Future<void> main(List<String> arguments) async {
   WidgetsFlutterBinding.ensureInitialized();
+  for (final argument in arguments) {
+    if (InviteLinks.isPublicInvite(argument)) InviteLinks.initial = argument;
+  }
   runApp(
     await bootstrap(
-      arguments,
+      arguments.where((value) => !value.startsWith('chatproject:')).toList(),
       initializeRust: RustLib.init,
       createClient: (dataDir) => FrbCoreClient(dataDir: dataDir),
     ),

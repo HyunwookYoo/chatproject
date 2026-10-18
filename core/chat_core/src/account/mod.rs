@@ -40,6 +40,6 @@ pub use types::{EndpointHint, InvitePreview, ContactView, SafetyDisplay};
 pub use safety::{safety_digest, safety_display};
 
 pub(crate) mod pair;
-pub use pair::{PairDirection, PairDisplay, PairPhase, PairView};
+pub use pair::{PairDirection, PairDisplay, PairPhase, PairView, PairRole, PairResumeView};
 #[cfg(all(feature="test-hooks",debug_assertions))]
 pub use pair::PairTestStop;

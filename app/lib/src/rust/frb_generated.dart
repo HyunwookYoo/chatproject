@@ -143,7 +143,7 @@ abstract class RustLibApi extends BaseApi {
     required bool matches,
   });
 
-  Future<void> crateApiAccountPairScan({required String qr});
+  Future<Uint8List> crateApiAccountPairScan({required String qr});
 
   Future<PairView?> crateApiAccountPairView();
 
@@ -898,7 +898,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
-  Future<void> crateApiAccountPairScan({required String qr}) {
+  Future<Uint8List> crateApiAccountPairScan({required String qr}) {
     return handler.executeNormal(
       NormalTask(
         callFfi: (port_) {
@@ -912,7 +912,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           );
         },
         codec: SseCodec(
-          decodeSuccessData: sse_decode_unit,
+          decodeSuccessData: sse_decode_list_prim_u_8_strict,
           decodeErrorData: sse_decode_core_error,
         ),
         constMeta: kCrateApiAccountPairScanConstMeta,
@@ -1323,8 +1323,8 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   AccountView dco_decode_account_view(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     final arr = raw as List<dynamic>;
-    if (arr.length != 13)
-      throw Exception('unexpected arr length: expect 13 but see ${arr.length}');
+    if (arr.length != 14)
+      throw Exception('unexpected arr length: expect 14 but see ${arr.length}');
     return AccountView(
       revision: dco_decode_u_64(arr[0]),
       phase: dco_decode_account_phase(arr[1]),
@@ -1338,7 +1338,8 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       publication: dco_decode_publication_view(arr[9]),
       disclosurePossible: dco_decode_bool(arr[10]),
       pendingPairTransactions: dco_decode_list_list_prim_u_8_strict(arr[11]),
-      pendingImportRequiresRemoteRevoke: dco_decode_bool(arr[12]),
+      pairResumes: dco_decode_list_pair_resume_view(arr[12]),
+      pendingImportRequiresRemoteRevoke: dco_decode_bool(arr[13]),
     );
   }
 
@@ -1358,6 +1359,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   bool dco_decode_box_autoadd_bool(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return raw as bool;
+  }
+
+  @protected
+  DeviceKind dco_decode_box_autoadd_device_kind(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return dco_decode_device_kind(raw);
   }
 
   @protected
@@ -1565,6 +1572,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  List<PairResumeView> dco_decode_list_pair_resume_view(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return (raw as List<dynamic>).map(dco_decode_pair_resume_view).toList();
+  }
+
+  @protected
   List<PeerInfo> dco_decode_list_peer_info(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return (raw as List<dynamic>).map(dco_decode_peer_info).toList();
@@ -1628,6 +1641,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  DeviceKind? dco_decode_opt_box_autoadd_device_kind(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return raw == null ? null : dco_decode_box_autoadd_device_kind(raw);
+  }
+
+  @protected
   ErrorCode? dco_decode_opt_box_autoadd_error_code(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return raw == null ? null : dco_decode_box_autoadd_error_code(raw);
@@ -1683,19 +1702,40 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  PairResumeView dco_decode_pair_resume_view(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 2)
+      throw Exception('unexpected arr length: expect 2 but see ${arr.length}');
+    return PairResumeView(
+      transaction: dco_decode_list_prim_u_8_strict(arr[0]),
+      role: dco_decode_pair_role(arr[1]),
+    );
+  }
+
+  @protected
+  PairRole dco_decode_pair_role(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return PairRole.values[raw as int];
+  }
+
+  @protected
   PairView dco_decode_pair_view(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     final arr = raw as List<dynamic>;
-    if (arr.length != 7)
-      throw Exception('unexpected arr length: expect 7 but see ${arr.length}');
+    if (arr.length != 10)
+      throw Exception('unexpected arr length: expect 10 but see ${arr.length}');
     return PairView(
       flow: dco_decode_list_prim_u_8_strict(arr[0]),
       direction: dco_decode_pair_direction(arr[1]),
-      phase: dco_decode_pair_phase(arr[2]),
-      sas: dco_decode_opt_String(arr[3]),
-      expiresAt: dco_decode_u_64(arr[4]),
-      disclosurePossible: dco_decode_bool(arr[5]),
-      transaction: dco_decode_opt_list_prim_u_8_strict(arr[6]),
+      localRole: dco_decode_pair_role(arr[2]),
+      remoteInstallation: dco_decode_opt_list_prim_u_8_strict(arr[3]),
+      remoteKind: dco_decode_opt_box_autoadd_device_kind(arr[4]),
+      phase: dco_decode_pair_phase(arr[5]),
+      sas: dco_decode_opt_String(arr[6]),
+      expiresAt: dco_decode_u_64(arr[7]),
+      disclosurePossible: dco_decode_bool(arr[8]),
+      transaction: dco_decode_opt_list_prim_u_8_strict(arr[9]),
     );
   }
 
@@ -1886,6 +1926,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var var_pendingPairTransactions = sse_decode_list_list_prim_u_8_strict(
       deserializer,
     );
+    var var_pairResumes = sse_decode_list_pair_resume_view(deserializer);
     var var_pendingImportRequiresRemoteRevoke = sse_decode_bool(deserializer);
     return AccountView(
       revision: var_revision,
@@ -1900,6 +1941,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       publication: var_publication,
       disclosurePossible: var_disclosurePossible,
       pendingPairTransactions: var_pendingPairTransactions,
+      pairResumes: var_pairResumes,
       pendingImportRequiresRemoteRevoke: var_pendingImportRequiresRemoteRevoke,
     );
   }
@@ -1920,6 +1962,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   bool sse_decode_box_autoadd_bool(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return (sse_decode_bool(deserializer));
+  }
+
+  @protected
+  DeviceKind sse_decode_box_autoadd_device_kind(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return (sse_decode_device_kind(deserializer));
   }
 
   @protected
@@ -2156,6 +2204,20 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  List<PairResumeView> sse_decode_list_pair_resume_view(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    var len_ = sse_decode_i_32(deserializer);
+    var ans_ = <PairResumeView>[];
+    for (var idx_ = 0; idx_ < len_; ++idx_) {
+      ans_.add(sse_decode_pair_resume_view(deserializer));
+    }
+    return ans_;
+  }
+
+  @protected
   List<PeerInfo> sse_decode_list_peer_info(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
 
@@ -2256,6 +2318,19 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  DeviceKind? sse_decode_opt_box_autoadd_device_kind(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    if (sse_decode_bool(deserializer)) {
+      return (sse_decode_box_autoadd_device_kind(deserializer));
+    } else {
+      return null;
+    }
+  }
+
+  @protected
   ErrorCode? sse_decode_opt_box_autoadd_error_code(
     SseDeserializer deserializer,
   ) {
@@ -2338,10 +2413,30 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  PairResumeView sse_decode_pair_resume_view(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_transaction = sse_decode_list_prim_u_8_strict(deserializer);
+    var var_role = sse_decode_pair_role(deserializer);
+    return PairResumeView(transaction: var_transaction, role: var_role);
+  }
+
+  @protected
+  PairRole sse_decode_pair_role(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var inner = sse_decode_i_32(deserializer);
+    return PairRole.values[inner];
+  }
+
+  @protected
   PairView sse_decode_pair_view(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     var var_flow = sse_decode_list_prim_u_8_strict(deserializer);
     var var_direction = sse_decode_pair_direction(deserializer);
+    var var_localRole = sse_decode_pair_role(deserializer);
+    var var_remoteInstallation = sse_decode_opt_list_prim_u_8_strict(
+      deserializer,
+    );
+    var var_remoteKind = sse_decode_opt_box_autoadd_device_kind(deserializer);
     var var_phase = sse_decode_pair_phase(deserializer);
     var var_sas = sse_decode_opt_String(deserializer);
     var var_expiresAt = sse_decode_u_64(deserializer);
@@ -2350,6 +2445,9 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     return PairView(
       flow: var_flow,
       direction: var_direction,
+      localRole: var_localRole,
+      remoteInstallation: var_remoteInstallation,
+      remoteKind: var_remoteKind,
       phase: var_phase,
       sas: var_sas,
       expiresAt: var_expiresAt,
@@ -2571,6 +2669,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       self.pendingPairTransactions,
       serializer,
     );
+    sse_encode_list_pair_resume_view(self.pairResumes, serializer);
     sse_encode_bool(self.pendingImportRequiresRemoteRevoke, serializer);
   }
 
@@ -2590,6 +2689,15 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   void sse_encode_box_autoadd_bool(bool self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_bool(self, serializer);
+  }
+
+  @protected
+  void sse_encode_box_autoadd_device_kind(
+    DeviceKind self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_device_kind(self, serializer);
   }
 
   @protected
@@ -2803,6 +2911,18 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_list_pair_resume_view(
+    List<PairResumeView> self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_i_32(self.length, serializer);
+    for (final item in self) {
+      sse_encode_pair_resume_view(item, serializer);
+    }
+  }
+
+  @protected
   void sse_encode_list_peer_info(
     List<PeerInfo> self,
     SseSerializer serializer,
@@ -2897,6 +3017,19 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_opt_box_autoadd_device_kind(
+    DeviceKind? self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    sse_encode_bool(self != null, serializer);
+    if (self != null) {
+      sse_encode_box_autoadd_device_kind(self, serializer);
+    }
+  }
+
+  @protected
   void sse_encode_opt_box_autoadd_error_code(
     ErrorCode? self,
     SseSerializer serializer,
@@ -2979,10 +3112,29 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_pair_resume_view(
+    PairResumeView self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_list_prim_u_8_strict(self.transaction, serializer);
+    sse_encode_pair_role(self.role, serializer);
+  }
+
+  @protected
+  void sse_encode_pair_role(PairRole self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_i_32(self.index, serializer);
+  }
+
+  @protected
   void sse_encode_pair_view(PairView self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_list_prim_u_8_strict(self.flow, serializer);
     sse_encode_pair_direction(self.direction, serializer);
+    sse_encode_pair_role(self.localRole, serializer);
+    sse_encode_opt_list_prim_u_8_strict(self.remoteInstallation, serializer);
+    sse_encode_opt_box_autoadd_device_kind(self.remoteKind, serializer);
     sse_encode_pair_phase(self.phase, serializer);
     sse_encode_opt_String(self.sas, serializer);
     sse_encode_u_64(self.expiresAt, serializer);

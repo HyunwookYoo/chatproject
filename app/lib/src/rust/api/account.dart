@@ -8,7 +8,7 @@ import 'chat.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
 // These functions are ignored because they are not marked as `pub`: `handle`, `id`
-// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`
+// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`
 
 Future<void> openAccount() => RustLib.instance.api.crateApiAccountOpenAccount();
 
@@ -90,7 +90,7 @@ Future<PairDisplay> pairBegin({
   resume: resume,
 );
 
-Future<void> pairScan({required String qr}) =>
+Future<Uint8List> pairScan({required String qr}) =>
     RustLib.instance.api.crateApiAccountPairScan(qr: qr);
 
 Future<void> pairConfirmCode({
@@ -154,6 +154,7 @@ class AccountView {
   final PublicationView publication;
   final bool disclosurePossible;
   final List<Uint8List> pendingPairTransactions;
+  final List<PairResumeView> pairResumes;
   final bool pendingImportRequiresRemoteRevoke;
 
   const AccountView({
@@ -169,6 +170,7 @@ class AccountView {
     required this.publication,
     required this.disclosurePossible,
     required this.pendingPairTransactions,
+    required this.pairResumes,
     required this.pendingImportRequiresRemoteRevoke,
   });
 
@@ -186,6 +188,7 @@ class AccountView {
       publication.hashCode ^
       disclosurePossible.hashCode ^
       pendingPairTransactions.hashCode ^
+      pairResumes.hashCode ^
       pendingImportRequiresRemoteRevoke.hashCode;
 
   @override
@@ -205,6 +208,7 @@ class AccountView {
           publication == other.publication &&
           disclosurePossible == other.disclosurePossible &&
           pendingPairTransactions == other.pendingPairTransactions &&
+          pairResumes == other.pairResumes &&
           pendingImportRequiresRemoteRevoke ==
               other.pendingImportRequiresRemoteRevoke;
 }
@@ -364,9 +368,32 @@ enum PairPhase {
   observed,
 }
 
+class PairResumeView {
+  final Uint8List transaction;
+  final PairRole role;
+
+  const PairResumeView({required this.transaction, required this.role});
+
+  @override
+  int get hashCode => transaction.hashCode ^ role.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is PairResumeView &&
+          runtimeType == other.runtimeType &&
+          transaction == other.transaction &&
+          role == other.role;
+}
+
+enum PairRole { existing, new_ }
+
 class PairView {
   final Uint8List flow;
   final PairDirection direction;
+  final PairRole localRole;
+  final Uint8List? remoteInstallation;
+  final DeviceKind? remoteKind;
   final PairPhase phase;
   final String? sas;
   final BigInt expiresAt;
@@ -376,6 +403,9 @@ class PairView {
   const PairView({
     required this.flow,
     required this.direction,
+    required this.localRole,
+    this.remoteInstallation,
+    this.remoteKind,
     required this.phase,
     this.sas,
     required this.expiresAt,
@@ -387,6 +417,9 @@ class PairView {
   int get hashCode =>
       flow.hashCode ^
       direction.hashCode ^
+      localRole.hashCode ^
+      remoteInstallation.hashCode ^
+      remoteKind.hashCode ^
       phase.hashCode ^
       sas.hashCode ^
       expiresAt.hashCode ^
@@ -400,6 +433,9 @@ class PairView {
           runtimeType == other.runtimeType &&
           flow == other.flow &&
           direction == other.direction &&
+          localRole == other.localRole &&
+          remoteInstallation == other.remoteInstallation &&
+          remoteKind == other.remoteKind &&
           phase == other.phase &&
           sas == other.sas &&
           expiresAt == other.expiresAt &&

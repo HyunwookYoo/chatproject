@@ -26,7 +26,7 @@ abstract interface class AccountClient {
     account.PairDirection direction,
     Uint8List? resume,
   );
-  Future<void> pairScan(String qr);
+  Future<Uint8List> pairScan(String qr);
   Future<void> pairConfirmCode(List<int> flow, bool matches);
   Future<void> pairApprove(List<int> flow);
   Future<void> pairCancel(List<int> flow);
@@ -90,7 +90,7 @@ class FrbAccountClient implements AccountClient {
     Uint8List? resume,
   ) => account.pairBegin(direction: direction, resume: resume);
   @override
-  Future<void> pairScan(String qr) => account.pairScan(qr: qr);
+  Future<Uint8List> pairScan(String qr) => account.pairScan(qr: qr);
   @override
   Future<void> pairConfirmCode(List<int> flow, bool matches) =>
       account.pairConfirmCode(flow: flow, matches: matches);

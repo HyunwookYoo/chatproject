@@ -1,5 +1,7 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter/scheduler.dart';
 import '../core_client.dart';
 
 /// Shared protection: covered routes cannot disable a newer route.
@@ -10,6 +12,8 @@ class SensitiveScreen extends StatefulWidget {
     this.onHidden,
     this.onProtectionFailure,
   });
+  @visibleForTesting
+  static int Function()? frameNumberForTesting;
   final Widget child;
   final VoidCallback? onHidden;
   final VoidCallback? onProtectionFailure;
@@ -20,8 +24,85 @@ class SensitiveScreen extends StatefulWidget {
 class _SensitiveScreenState extends State<SensitiveScreen>
     with WidgetsBindingObserver {
   static int _references = 0;
+  static const _events = MethodChannel('chat_app/privacy_events');
+  static final _screens = <_SensitiveScreenState>{};
+  void _nativeFailure() {
+    if (!mounted) return;
+    setState(() {
+      _failed = true;
+      _ready = false;
+    });
+    widget.onProtectionFailure?.call();
+  }
+
   static final _lifecycle = _ProtectionLifecycle();
   static Future<void>? _queue;
+  static int _releaseTicket = 0;
+  static TimingsCallback? _releaseTiming;
+  static bool _watchingLifecycle = false;
+  static void _cancelRelease() {
+    ++_releaseTicket;
+    final callback = _releaseTiming;
+    if (callback != null) {
+      SchedulerBinding.instance.removeTimingsCallback(callback);
+    }
+    _releaseTiming = null;
+  }
+
+  static void _releaseAfterRaster() {
+    _cancelRelease();
+    if (_references != 0 || _lifecycle.background) return;
+    final binding = WidgetsBinding.instance;
+    final removedFrame =
+        SensitiveScreen.frameNumberForTesting?.call() ??
+        binding.platformDispatcher.frameData.frameNumber;
+    if (removedFrame < 0) return; // No frame identity: keep native protection.
+    final ticket = _releaseTicket;
+    int? replacementFrame;
+    void completed(List<FrameTiming> frames) {
+      if (replacementFrame == null ||
+          !frames.any((frame) => frame.frameNumber == replacementFrame)) {
+        return;
+      }
+      if (ticket != _releaseTicket ||
+          _references != 0 ||
+          _lifecycle.background) {
+        return;
+      }
+      _cancelRelease();
+      unawaited(
+        _native(false)
+            .then((_) {
+              if (_references == 0 && !_lifecycle.background) {
+                binding.removeObserver(_lifecycle);
+                _watchingLifecycle = false;
+              }
+            })
+            .catchError((Object _) {}),
+      );
+    }
+
+    _releaseTiming = completed;
+    binding.addTimingsCallback(completed);
+    binding.addPostFrameCallback((_) {
+      if (ticket != _releaseTicket) return;
+      // Identify the next complete build, not an older timing delivered later.
+      binding.addPostFrameCallback((_) {
+        if (ticket != _releaseTicket) return;
+        final frame =
+            SensitiveScreen.frameNumberForTesting?.call() ??
+            binding.platformDispatcher.frameData.frameNumber;
+        if (frame <= removedFrame) {
+          _cancelRelease(); // Unknown/non-advancing metadata stays protected.
+          return;
+        }
+        replacementFrame = frame;
+      });
+      binding.scheduleFrame();
+    });
+    binding.scheduleFrame();
+  }
+
   bool _ready = false, _hidden = false, _failed = false;
   static Future<void> _native(bool value) {
     final previous = _queue;
@@ -42,8 +123,20 @@ class _SensitiveScreenState extends State<SensitiveScreen>
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    _screens.add(this);
+    _events.setMethodCallHandler((call) async {
+      if (call.method == 'protectionFailed') {
+        for (final screen in _screens.toList()) {
+          screen._nativeFailure();
+        }
+      }
+    });
+    _cancelRelease();
     if (_references++ == 0) {
-      WidgetsBinding.instance.addObserver(_lifecycle);
+      if (!_watchingLifecycle) {
+        WidgetsBinding.instance.addObserver(_lifecycle);
+        _watchingLifecycle = true;
+      }
       _lifecycle.background =
           WidgetsBinding.instance.lifecycleState != null &&
           WidgetsBinding.instance.lifecycleState != AppLifecycleState.resumed;
@@ -84,10 +177,11 @@ class _SensitiveScreenState extends State<SensitiveScreen>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _screens.remove(this);
+    if (_screens.isEmpty) _events.setMethodCallHandler(null);
     _references--;
     if (_references == 0 && !_lifecycle.background) {
-      WidgetsBinding.instance.removeObserver(_lifecycle);
-      unawaited(_native(false).catchError((Object _) {}));
+      _releaseAfterRaster();
     }
     super.dispose();
   }
@@ -113,9 +207,10 @@ class _ProtectionLifecycle extends WidgetsBindingObserver {
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     background = state != AppLifecycleState.resumed;
-    if (!background && _SensitiveScreenState._references == 0) {
-      WidgetsBinding.instance.removeObserver(this);
-      unawaited(_SensitiveScreenState._native(false).catchError((Object _) {}));
+    if (background) {
+      _SensitiveScreenState._cancelRelease();
+    } else if (_SensitiveScreenState._references == 0) {
+      _SensitiveScreenState._releaseAfterRaster();
     }
   }
 }

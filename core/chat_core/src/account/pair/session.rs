@@ -124,6 +124,18 @@ impl Session {
     pub(crate) fn view(&self) -> PairView {
         PairView {
             flow: self.qr.flow,
+            local_role: if self.role == Role::Existing { super::PairRole::Existing } else { super::PairRole::New },
+            remote_installation: self.channel.as_ref().map(|c| c.remote.installation),
+            remote_kind: self.channel.as_ref().and_then(|c| {
+                if self.role == Role::Existing {
+                    c.candidate_kind
+                } else {
+                    c.existing_record.as_ref().and_then(|record| record.record.devices.iter()
+                        .find(|device| device.installation_id == c.remote.installation
+                            && device.transport_public_key == c.remote.transport)
+                        .map(|device| device.kind))
+                }
+            }),
             direction: self.qr.direction,
             phase: self.phase.unwrap_or(if self.approved {
                 PairPhase::Approved

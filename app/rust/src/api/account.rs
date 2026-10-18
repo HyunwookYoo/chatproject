@@ -92,10 +92,17 @@ pub struct ContactView {
     pub new_device: bool,
     pub device_unverified: bool,
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairRole { Existing, New }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairResumeView { pub transaction: Vec<u8>, pub role: PairRole }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PairView {
     pub flow: Vec<u8>,
     pub direction: PairDirection,
+    pub local_role: PairRole,
+    pub remote_installation: Option<Vec<u8>>,
+    pub remote_kind: Option<DeviceKind>,
     pub phase: PairPhase,
     pub sas: Option<String>,
     pub expires_at: u64,
@@ -116,6 +123,7 @@ pub struct AccountView {
     pub publication: PublicationView,
     pub disclosure_possible: bool,
     pub pending_pair_transactions: Vec<Vec<u8>>,
+    pub pair_resumes: Vec<PairResumeView>,
     pub pending_import_requires_remote_revoke: bool,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -309,12 +317,13 @@ pub async fn pair_begin(
         expires_at: display.expires_at,
     })
 }
-pub async fn pair_scan(qr: String) -> Result<(), CoreError> {
+pub async fn pair_scan(qr: String) -> Result<Vec<u8>, CoreError> {
     let mut qr = zeroize::Zeroizing::new(qr);
     let account = handle()?;
     account
         .pair_scan(std::mem::take(&mut *qr))
         .await
+        .map(|flow| flow.0.to_vec())
         .map_err(Into::into)
 }
 pub async fn pair_confirm_code(flow: Vec<u8>, matches: bool) -> Result<(), CoreError> {

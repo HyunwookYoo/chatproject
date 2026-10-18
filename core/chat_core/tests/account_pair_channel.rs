@@ -136,6 +136,9 @@ async fn connected(direction: PairDirection) -> (Fixture, Fixture, FlowId, Strin
         (&e, &n)
     };
     let d = owner.a.pair_begin(direction, None).await.unwrap();
+    let waiting = owner.a.pair_view().await.unwrap().unwrap();
+    assert_eq!(waiting.remote_installation, None);
+    assert_eq!(waiting.remote_kind, None);
     scanner.route_to(owner).await;
     scanner.a.pair_scan(d.qr.clone()).await.unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -154,6 +157,12 @@ async fn connected(direction: PairDirection) -> (Fixture, Fixture, FlowId, Strin
     })
     .await
     .unwrap();
+    let eview = e.a.pair_view().await.unwrap().unwrap();
+    let nview = n.a.pair_view().await.unwrap().unwrap();
+    assert_eq!(eview.remote_installation, n.a.snapshot().await.unwrap().installation);
+    assert_eq!(nview.remote_installation, e.a.snapshot().await.unwrap().installation);
+    assert_eq!(eview.remote_kind, Some(chat_core::account::DeviceKind::Desktop));
+    assert_eq!(nview.remote_kind, Some(chat_core::account::DeviceKind::Desktop));
     (e, n, d.flow, d.qr.clone())
 }
 async fn confirmations(e: &Fixture, n: &Fixture, f: FlowId) {
@@ -288,9 +297,7 @@ async fn three_bad_psk_handshakes_destroy_qr_in_both_directions() {
         scanner.route_to(owner).await;
         for attempt in 0..3 {
             assert!(scanner.a.pair_scan(altered_psk(&d.qr)).await.is_err());
-            if let Some(v) = scanner.a.pair_view().await.unwrap() {
-                scanner.a.pair_cancel(v.flow).await.unwrap();
-            }
+            assert!(scanner.a.snapshot().await.unwrap().pair.is_none());
             if attempt < 2 {
                 assert!(owner.a.pair_view().await.unwrap().is_some());
             }
@@ -585,6 +592,9 @@ async fn forged_installation_proof_never_reaches_code_comparison() {
             .await
             .unwrap();
     assert!(raw_new(&e, &d.qr, Mutation::BadProof).await.is_none());
+    let view = e.a.pair_view().await.unwrap().unwrap();
+    assert_eq!(view.remote_installation, None);
+    assert_eq!(view.remote_kind, None);
     assert_eq!(
         e.a.pair_view().await.unwrap().unwrap().phase,
         PairPhase::WaitingQr
@@ -660,6 +670,9 @@ async fn failed_candidate_cannot_be_replaced_but_same_candidate_can_retry() {
                 .await
                 .unwrap();
         assert!(raw_new(&e, &d.qr, Mutation::BadProof).await.is_none());
+    let view = e.a.pair_view().await.unwrap().unwrap();
+    assert_eq!(view.remote_installation, None);
+    assert_eq!(view.remote_kind, None);
         assert!(raw_new(&e, &d.qr, mutation).await.is_none());
         let _raw = raw_new(&e, &d.qr, Mutation::None).await.unwrap();
         assert_eq!(
@@ -753,6 +766,9 @@ async fn replayed_noise_frame_is_rejected_and_new_qr_is_independent() {
             .await
             .unwrap();
     assert_ne!(fresh.flow, d.flow);
+    let waiting = e.a.pair_view().await.unwrap().unwrap();
+    assert_eq!(waiting.remote_installation, None);
+    assert_eq!(waiting.remote_kind, None);
     assert!(raw_new(&e, &d.qr, Mutation::None).await.is_none());
     assert!(e.a.pair_confirm_code(d.flow, true).await.is_err());
 }

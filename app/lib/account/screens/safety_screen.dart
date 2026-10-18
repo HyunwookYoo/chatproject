@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import '../qr_input.dart';
 import '../../src/rust/api/account.dart';
 
 class SafetyScreen extends StatefulWidget {
@@ -29,6 +30,7 @@ class _SafetyScreenState extends State<SafetyScreen> {
         textDirection: TextDirection.ltr,
         style: const TextStyle(fontFamily: 'monospace'),
       ),
+      QrPayload(payload: widget.display.qr),
       CheckboxListTile(
         contentPadding: EdgeInsets.zero,
         value: _compared,

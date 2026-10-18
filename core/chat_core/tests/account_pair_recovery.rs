@@ -315,7 +315,7 @@ async fn connected(direction: PairDirection) -> (Fixture, Fixture, FlowId, Strin
     };
     let d = owner.a.pair_begin(direction, None).await.unwrap();
     scanner.route_to(owner).await;
-    scanner.a.pair_scan(d.qr.clone()).await.unwrap();
+    assert_eq!(scanner.a.pair_scan(d.qr.clone()).await.unwrap(), d.flow);
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if owner
@@ -362,6 +362,8 @@ async fn durable_transfer_activates_exact_candidate() {
         loop {
             let view = n.a.snapshot().await.unwrap();
             if view.phase == chat_core::account::AccountPhase::Active {
+                assert_eq!(view.pair_resumes.len(), 1);
+                assert_eq!(view.pair_resumes[0].role, chat_core::account::PairRole::New);
                 assert_eq!(view.installation, Some(candidate));
                 assert_eq!(view.public_peer_id, Some(peer));
                 assert_eq!(view.publication.accepted.unwrap().devices.len(), 2);
@@ -436,6 +438,10 @@ async fn resume_same_pins_fresh_approval_only() {
     let e = e.restart().await;
     let n = n.restart().await;
     assert!(e.a.snapshot().await.unwrap().disclosure_possible);
+    for (fixture, role) in [(&e, chat_core::account::PairRole::Existing), (&n, chat_core::account::PairRole::New)] {
+        let view = fixture.a.snapshot().await.unwrap();
+        assert!(view.pair_resumes.iter().any(|resume| resume.transaction == tx && resume.role == role));
+    }
     let new_flow = fresh(&e, &n, Some(tx)).await;
     assert_ne!(new_flow, f);
     assert!(e.a.pair_approve(f).await.is_err());

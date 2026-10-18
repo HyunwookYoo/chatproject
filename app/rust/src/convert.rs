@@ -233,6 +233,7 @@ impl From<chat_core::account::AccountView> for crate::api::account::AccountView 
                 .map(|p| p.0.to_vec())
                 .collect(),
             pending_import_requires_remote_revoke: v.pending_import_requires_remote_revoke,
+            pair_resumes: v.pair_resumes.into_iter().map(|r| crate::api::account::PairResumeView { transaction: r.transaction.0.to_vec(), role: r.role.into() }).collect(),
         }
     }
 }
@@ -271,6 +272,9 @@ impl From<chat_core::account::PairView> for crate::api::account::PairView {
         Self {
             flow: v.flow.0.to_vec(),
             direction: v.direction.into(),
+            local_role: v.local_role.into(),
+            remote_installation: v.remote_installation.map(|id| id.0.to_vec()),
+            remote_kind: v.remote_kind.map(Into::into),
             phase: v.phase.into(),
             sas: v.sas,
             expires_at: v.expires_at,
@@ -314,9 +318,37 @@ impl From<chat_core::account::PublicationView> for crate::api::account::Publicat
     }
 }
 
+impl From<chat_core::account::PairRole> for crate::api::account::PairRole {
+    fn from(v: chat_core::account::PairRole) -> Self {
+        match v { chat_core::account::PairRole::Existing => Self::Existing, chat_core::account::PairRole::New => Self::New }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_pair_metadata_keeps_verified_binding_and_absence() {
+        use chat_core::account as c;
+        use crate::api::account as f;
+        let core = c::PairView {
+            flow: c::FlowId([1; 16]), local_role: c::PairRole::New,
+            direction: c::PairDirection::ExistingDisplays, phase: c::PairPhase::Comparing,
+            remote_installation: Some(c::InstallationId([2; 32])), remote_kind: Some(c::DeviceKind::Mobile),
+            sas: Some("PUBLIC-SAS".into()), expires_at: 123, disclosure_possible: false,
+            transaction: Some(c::TxId([3; 16])),
+        };
+        let converted = f::PairView::from(core.clone());
+        assert_eq!(converted.local_role, f::PairRole::New);
+        assert_eq!(converted.remote_installation, Some(vec![2; 32]));
+        assert_eq!(converted.remote_kind, Some(f::DeviceKind::Mobile));
+        assert_eq!(converted.transaction, Some(vec![3; 16]));
+        let absent = f::PairView::from(c::PairView { remote_installation: None, remote_kind: None, sas: None, ..core });
+        assert_eq!(absent.remote_installation, None);
+        assert_eq!(absent.remote_kind, None);
+        assert_eq!(absent.sas, None);
+    }
 
     #[test]
     fn account_status_and_cache_are_distinct_public_events() {

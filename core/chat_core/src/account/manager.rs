@@ -41,6 +41,7 @@ pub enum PublishIntent {
 pub struct AccountView {
     pub disclosure_possible: bool,
     pub pending_pair_transactions: Vec<super::TxId>,
+    pub pair_resumes: Vec<super::PairResumeView>,
     pub pending_import_requires_remote_revoke: bool,
     pub revision: u64,
     pub phase: AccountPhase,
@@ -69,7 +70,7 @@ enum Command {
     PairTestReached(oneshot::Sender<Result<Option<super::PairTestStop>,CoreError>>),
     DiscardPending(oneshot::Sender<Result<(),CoreError>>),
     PairBegin(super::PairDirection,Option<super::TxId>,oneshot::Sender<Result<super::PairDisplay,CoreError>>),
-    PairScan(Zeroizing<String>,oneshot::Sender<Result<(),CoreError>>),
+    PairScan(Zeroizing<String>,oneshot::Sender<Result<FlowId,CoreError>>),
     PairConfirm(FlowId,bool,oneshot::Sender<Result<(),CoreError>>),
     PairApprove(FlowId,oneshot::Sender<Result<(),CoreError>>),
     PairCancel(FlowId,oneshot::Sender<Result<(),CoreError>>),
@@ -126,7 +127,8 @@ impl Command {
             Self::PairFixtureSend(_,_,reply)=>{let _=reply.send(Err(error));}
             #[cfg(all(feature="test-hooks",debug_assertions))]
             Self::PairFixtureReceived(_,reply)=>{let _=reply.send(Err(error));}
-            Self::PairScan(_,reply)|Self::PairConfirm(_,_,reply)|Self::PairApprove(_,reply)|Self::PairCancel(_,reply)=>{let _=reply.send(Err(error));}
+            Self::PairScan(_,reply)=>{let _=reply.send(Err(error));}
+            Self::PairConfirm(_,_,reply)|Self::PairApprove(_,reply)|Self::PairCancel(_,reply)=>{let _=reply.send(Err(error));}
             Self::CreateInvite(_, reply) => {
                 let _ = reply.send(Err(error));
             }
@@ -403,6 +405,18 @@ impl Manager {
                 .collect(),
             _ => vec![],
         }
+    }
+    fn pair_resumes(&self) -> Vec<super::PairResumeView> {
+        use super::{PairResumeView, PairRole};
+        let mut entries: Vec<_> = self.pending_pairs().into_iter().map(|transaction| PairResumeView {
+            transaction,
+            role: if matches!(self.state, Some(AccountState::Active(_))) { PairRole::Existing } else { PairRole::New },
+        }).collect();
+        if let Some(AccountState::Active(local)) = &self.state
+            && let Some(origin) = &local.pairs.origin {
+            entries.push(PairResumeView { transaction: origin.tx, role: PairRole::New });
+        }
+        entries
     }
     fn pair_view(&self) -> Option<super::PairView> {
         self.pair.current.as_ref().map(|s| s.view())
@@ -1587,6 +1601,7 @@ impl Manager {
         let mut view = AccountView {
             disclosure_possible: self.state.as_ref().is_some_and(|s|matches!(s,AccountState::Active(l) if !l.pairs.existing.is_empty())),
             pending_pair_transactions: self.pending_pairs(),
+            pair_resumes: self.pair_resumes(),
             pending_import_requires_remote_revoke: matches!(self.state,Some(AccountState::CandidatePinned(_) | AccountState::PendingImport(_))),
             revision: self.public_revision,
             lock_error: None,
@@ -3004,7 +3019,7 @@ impl AccountHandle {
         self.send(|reply| Command::PairBegin(direction, resume, reply))
             .await
     }
-    pub async fn pair_scan(&self, qr: String) -> Result<(), CoreError> {
+    pub async fn pair_scan(&self, qr: String) -> Result<FlowId, CoreError> {
         self.send(|reply| Command::PairScan(Zeroizing::new(qr), reply))
             .await
     }
@@ -3157,7 +3172,7 @@ impl Manager {
         self.revision += 1;
         Ok(display)
     }
-    async fn pair_scan(&mut self, text: &str) -> Result<(), CoreError> {
+    async fn pair_scan(&mut self, text: &str) -> Result<FlowId, CoreError> {
         use super::pair::{
             session::Session,
             wire::{Qr, Role},
@@ -3189,13 +3204,22 @@ impl Manager {
         if let Some(relay) = &qr.relay {
             target = target.with_relay_url(relay.parse().map_err(|_| super::wire::invalid())?);
         }
-        self.pair.current = Some(Session::new(qr, role, true, &*self.services.clock));
+        let flow = qr.flow;
         let request = self.ready()?;
+        self.pair.current = Some(Session::new(qr, role, true, &*self.services.clock));
         let connection = self
             .service(request, Box::pin(self.shared.network.dial_pair(target)))
             .await;
         match connection {
-            Ok(conn) => self.pair_handshake(conn).await,
+            Ok(conn) => {
+                let result = self.pair_handshake(conn).await;
+                if result.is_err() && self.pair.current.as_ref().is_some_and(|s| s.qr.flow == flow) {
+                    // A failed initiator has no display/reply owner to cancel it.
+                    // Session drop cancels its tasks; the owner keeps its retry budget.
+                    self.pair.current = None;
+                }
+                result.map(|_| flow)
+            },
             Err(e) => {
                 self.pair.current = None;
                 Err(e)

@@ -2,6 +2,13 @@ import Flutter
 import UIKit
 
 class SceneDelegate: FlutterSceneDelegate {
+  override func scene(_ scene: UIScene, willConnectTo session: UISceneSession, options connectionOptions: UIScene.ConnectionOptions) {
+    super.scene(scene, willConnectTo: session, options: connectionOptions)
+    for context in connectionOptions.urlContexts { AppDelegate.receiveInvitation(context.url) }
+  }
+  override func scene(_ scene: UIScene, openURLContexts URLContexts: Set<UIOpenURLContext>) {
+    for context in URLContexts { AppDelegate.receiveInvitation(context.url) }
+  }
   private static var sensitive = false
   private var privacyOverlay: UIView?
   private var lifecycleGeneration: UInt64 = 0

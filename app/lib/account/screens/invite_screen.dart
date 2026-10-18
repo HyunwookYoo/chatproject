@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'package:flutter/material.dart';
+import '../qr_input.dart';
 
 class InviteScreen extends StatefulWidget {
   const InviteScreen({
@@ -18,6 +19,8 @@ class InviteScreen extends StatefulWidget {
 class _InviteScreenState extends State<InviteScreen> {
   final _input = TextEditingController();
   String? _invite, _error;
+  bool _scan = false;
+  int _scanTicket = 0;
   @override
   void dispose() {
     _input.dispose();
@@ -31,6 +34,21 @@ class _InviteScreenState extends State<InviteScreen> {
       Text('초대', style: Theme.of(context).textTheme.headlineSmall),
       const Text('초대 링크를 붙여넣어 확인해 주세요. 상대의 실제 신원은 안전번호로 따로 확인해요.'),
       const SizedBox(height: 16),
+      TextButton(
+        onPressed: widget.busy
+            ? null
+            : () => setState(() {
+                _scan = !_scan;
+                ++_scanTicket;
+              }),
+        child: const Text('QR 스캔'),
+      ),
+      if (_scan)
+        QrInput(
+          key: ValueKey(_scanTicket),
+          busy: widget.busy,
+          onPayload: widget.onParse,
+        ),
       TextField(
         controller: _input,
         decoration: InputDecoration(
@@ -57,8 +75,7 @@ class _InviteScreenState extends State<InviteScreen> {
               },
         child: const Text('내 초대 만들기'),
       ),
-      if (_invite != null)
-        SelectableText(_invite!, textDirection: TextDirection.ltr),
+      if (_invite != null) QrPayload(payload: _invite!),
     ],
   );
 }

@@ -4,6 +4,18 @@ import UserNotifications
 
 @main
 @objc class AppDelegate: FlutterAppDelegate, FlutterImplicitEngineDelegate {
+  static var invitationChannel: FlutterMethodChannel?
+  static var pendingInvitation: String?
+  static func receiveInvitation(_ url: URL) {
+    let text = url.absoluteString
+    guard text.hasPrefix("chatproject:identity-invite/") else { return }
+    pendingInvitation = text
+    invitationChannel?.invokeMethod("identityInvite", arguments: text) { result in
+      if result as? Bool == true, pendingInvitation == text {
+        pendingInvitation = nil
+      }
+    }
+  }
   /// Hex APNs device token for the M1b probe screen, set once iOS registers the app.
   private var apnsToken: String?
   /// Why iOS could not register the app, for the probe screen: TestFlight has no console to read it from.
@@ -22,8 +34,12 @@ import UserNotifications
     GeneratedPluginRegistrant.register(with: engineBridge.pluginRegistry)
     guard let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "ChatProbe") else { return }
     let accountChannel = FlutterMethodChannel(name: "chat_app/account_storage", binaryMessenger: registrar.messenger())
+    Self.invitationChannel = accountChannel
     accountChannel.setMethodCallHandler { call, result in
       switch call.method {
+      case "takeIdentityInvite":
+        result(Self.pendingInvitation)
+        Self.pendingInvitation = nil
       case "storageRoot":
         do {
           let args = call.arguments as? [String: Any]
