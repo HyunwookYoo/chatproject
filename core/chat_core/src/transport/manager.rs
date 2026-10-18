@@ -62,6 +62,8 @@ pub(crate) struct Gate {
     fail_bind: std::sync::atomic::AtomicBool,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     hold_bind: Mutex<Option<Arc<tokio::sync::Notify>>>,
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    token_window: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
 }
 impl Gate {
     pub(crate) fn desired_suspend(&self) -> bool { self.desired_suspend.load(Ordering::Acquire) }
@@ -103,7 +105,8 @@ impl NetworkHandle {
         handle.spawn(manager.run(receiver));
         Self { commands, controls, gate }
     }
-    /// Serial diagnostic-to-installation transition. A different installation cannot replace it.
+    /// Serial installation-key transition. The account actor authorizes state
+    /// changes (including active-account refusal) before persisting and calling this.
     pub async fn activate_key(&self, key: SecretKey) -> Result<(), CoreError> {
         let current = self.gate.revision.load(Ordering::Acquire);
         if self.gate.desired_suspend() || current & 1 != 0 || self.gate.revision.compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire).is_err() {
@@ -131,6 +134,13 @@ impl NetworkHandle {
         let (reply, received) = oneshot::channel();
         self.controls.send(Control::Quiesce { reply }).await.map_err(|_| err(ErrorCode::TransportFailed))?;
         received.await.map_err(|_| err(ErrorCode::TransportFailed))?
+    }
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    pub fn hold_next_token_replacement_for_test(&self) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (entered, received) = std::sync::mpsc::channel();
+        let (release, resumed) = std::sync::mpsc::channel();
+        *self.gate.token_window.lock().unwrap() = Some((entered, resumed));
+        (received, release)
     }
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     pub fn hold_next_bind_for_test(&self) -> Arc<tokio::sync::Notify> {
@@ -248,7 +258,6 @@ struct Peer {
 struct Manager {
     controls: Option<mpsc::Receiver<Control>>,
     gate: Arc<Gate>,
-    installed: bool,
     activation: Option<(u64, oneshot::Sender<Result<(), CoreError>>)>,
     profile: NetworkProfile,
     bus: EventBus,
@@ -276,7 +285,6 @@ impl Manager {
         Self {
             controls: None,
             gate: Arc::default(),
-            installed: false,
             activation: None,
             profile,
             bus,
@@ -328,15 +336,8 @@ impl Manager {
                     let _ = reply.send(Err(err(ErrorCode::Busy)));
                     return;
                 }
-                if self.installed && self.key.public() != key.public() {
-                    self.stop().await;
-                    let _ = self.gate.revision.compare_exchange(ticket, ticket + 1, Ordering::AcqRel, Ordering::Acquire);
-                    let _ = reply.send(Err(err(ErrorCode::AccountRestricted)));
-                    return;
-                }
                 self.stop().await;
                 self.key = key;
-                self.installed = true;
                 self.peers.clear();
                 self.info.peers.clear();
                 self.info.endpoint_id = Some(self.key.public().to_string());
@@ -544,12 +545,25 @@ impl Manager {
             NetworkState::Stopped | NetworkState::Failed
         ) {
             self.cancel = CancellationToken::new();
-            {
+            let published_revision = {
                 let mut shared = self.gate.cancel.lock().unwrap();
                 *shared = self.cancel.clone();
                 let expected = self.activation.as_ref().map(|(ticket, _)| *ticket);
                 let revision = self.gate.revision.load(Ordering::Acquire);
+                #[cfg(all(feature = "test-hooks", debug_assertions))]
+                if let Some((entered, resumed)) = self.gate.token_window.lock().unwrap().take() {
+                    // Only the test-owned actor pauses. Dropped test channels or
+                    // this finite deadline release it even after an assertion fails.
+                    if entered.send(()).is_ok() { let _ = resumed.recv_timeout(Duration::from_secs(5)); }
+                }
                 if revision & 1 != 0 && expected != Some(revision) { self.cancel.cancel(); }
+                revision
+            };
+            // A lifecycle caller advances the revision before its nonblocking
+            // try_lock. If it missed this replacement mutex, observe its durable
+            // revision now; after unlock, later callers can cancel the new token.
+            if self.gate.revision.load(Ordering::Acquire) != published_revision {
+                self.cancel.cancel();
             }
             self.epoch += 1;
             self.info.state = NetworkState::Starting;

@@ -449,3 +449,44 @@ fn opaque_unprotect_failure_does_not_regenerate_candidate() {
         before
     );
 }
+
+#[tokio::test]
+async fn suspend_inside_token_replacement_settles_without_releasing_bind() {
+    let dir = tempfile::tempdir().unwrap();
+    let slot = core(dir.path());
+    let net = slot.network().unwrap();
+    net.configure_local(None).await.unwrap();
+    let account = slot.open_account(support::protector()).unwrap();
+    settled(&account).await;
+    let held_bind = net.hold_next_bind_for_test();
+    let (entered, release_window) = net.hold_next_token_replacement_for_test();
+    let worker = account.clone();
+    // The account/network actors run on CoreSlot's runtime; this runtime can
+    // synchronously wait for the exact token-mutex window without starving them.
+    let prepare = worker.prepare_candidate();
+    tokio::pin!(prepare);
+    assert!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(prepare.as_mut().poll(cx).is_pending()))
+            .await
+    );
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    let start = std::time::Instant::now();
+    assert_eq!(slot.account_suspend(), 1);
+    assert!(start.elapsed() < Duration::from_millis(100));
+    assert_eq!(
+        net.execute(NetworkOp::Start).await.unwrap_err().code,
+        ErrorCode::Busy
+    );
+    release_window.send(()).unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(3), prepare)
+            .await
+            .unwrap()
+            .is_err()
+    );
+    settled(&account).await;
+    assert_eq!(slot.account_suspend(), 0);
+    assert_eq!(info(&net).await.state, NetworkState::Stopped);
+    // Do not notify held_bind: cancellation must resolve activation and suspend.
+    drop(held_bind);
+}

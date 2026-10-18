@@ -244,3 +244,130 @@ impl Manager {
         Ok(candidate)
     }
 }
+
+#[cfg(all(test, feature = "test-hooks", debug_assertions))]
+mod tests {
+    use super::*;
+    use crate::account::{Secret32, StoreId};
+    use crate::{CoreConfig, CoreSlot, EventBus, NetworkOp, NetworkReply, NetworkState};
+
+    struct Protector;
+    impl KeyProtector for Protector {
+        fn protect(&self, _: StoreId, secret: &Secret32) -> Result<Vec<u8>, CoreError> {
+            Ok(secret.as_bytes().iter().map(|byte| byte ^ 0xa7).collect())
+        }
+        fn unprotect(&self, _: StoreId, blob: &[u8]) -> Result<Secret32, CoreError> {
+            assert_eq!(blob.len(), 32);
+            Ok(Secret32::from(std::array::from_fn(|i| blob[i] ^ 0xa7)))
+        }
+        fn delete(&self, _: StoreId) -> Result<(), CoreError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn persisted_never_active_candidate_can_change_key_in_same_core() {
+        let dir = tempfile::tempdir().unwrap();
+        let slot = CoreSlot::new();
+        slot.start(
+            CoreConfig {
+                data_dir: dir.path().into(),
+            },
+            &EventBus::new(),
+        )
+        .unwrap();
+        let network = slot.network().unwrap();
+        network.configure_local(None).await.unwrap();
+        let ticket = network.begin_account();
+        let request = Request {
+            ticket,
+            suspend: false,
+        };
+        let (requests, _) = watch::channel(request);
+        let shared = Arc::new(Shared {
+            network: network.clone(),
+            requests,
+            status: AtomicU64::new(ticket << 2),
+        });
+        let mut manager = Manager {
+            store: Store::open(dir.path(), Arc::new(Protector)).unwrap(),
+            state: None,
+            shared,
+        };
+        let restored = manager.lifecycle(request).await;
+        manager.complete(request, restored);
+        let first = manager.prepare().await.unwrap();
+        let persisted = manager.store.load().unwrap().unwrap();
+        assert_eq!(
+            AccountState::decode(&persisted)
+                .unwrap()
+                .device()
+                .installation_id(),
+            first.installation_id
+        );
+
+        let remote = NetworkHandle::spawn(
+            &tokio::runtime::Handle::current(),
+            crate::transport::NetworkProfile::Local { relay: None },
+            EventBus::new(),
+        );
+        remote.execute(NetworkOp::Start).await.unwrap();
+        let remote_info = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let NetworkReply::Info(info) = remote.execute(NetworkOp::Info).await.unwrap()
+                else {
+                    panic!()
+                };
+                if info.state == NetworkState::Online {
+                    break info;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        network
+            .execute(NetworkOp::Connect {
+                target: remote_info.ticket.unwrap(),
+            })
+            .await
+            .unwrap();
+        let instance = slot.info().unwrap().instance_id;
+
+        // Fixture represents only the future actor's authorized never-active
+        // decision. A5 must test actual recovery policy and fresh DeviceSeed.
+        // Use the same real Store/handler/network; no second writer or public reset.
+        let replacement = AccountState::Candidate(derive_device(random_secret().unwrap()).unwrap());
+        manager.store.commit(&replacement.encode()).unwrap();
+        manager.state = Some(replacement);
+        let second = manager.prepare().await.unwrap();
+        assert_ne!(second.endpoint_id, first.endpoint_id);
+        assert_ne!(second.installation_id, first.installation_id);
+        assert_eq!(slot.info().unwrap().instance_id, instance);
+        let persisted = manager.store.load().unwrap().unwrap();
+        assert_eq!(
+            AccountState::decode(&persisted)
+                .unwrap()
+                .device()
+                .installation_id(),
+            second.installation_id
+        );
+        let NetworkReply::Info(info) = network.execute(NetworkOp::Info).await.unwrap() else {
+            panic!()
+        };
+        assert_eq!(info.state, NetworkState::Online);
+        assert_eq!(info.endpoint_id, Some(second.endpoint_id));
+        assert!(info.peers.is_empty());
+        assert!(
+            network
+                .execute(NetworkOp::Send {
+                    peer_id: remote_info.endpoint_id.unwrap(),
+                    text: "old session".into()
+                })
+                .await
+                .is_err()
+        );
+        network.execute(NetworkOp::Stop).await.unwrap();
+        remote.execute(NetworkOp::Stop).await.unwrap();
+    }
+}
