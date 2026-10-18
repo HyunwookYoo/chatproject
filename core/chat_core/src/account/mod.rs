@@ -1,4 +1,5 @@
 pub mod clock;
+pub mod storage;
 mod keys;
 mod types;
 
