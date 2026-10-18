@@ -55,6 +55,7 @@ enum Control {
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     AccountTarget { target: EndpointAddr, reply: oneshot::Sender<Result<(),CoreError>> },
     Activate { key: Box<SecretKey>, start: bool, ticket: u64, reply: oneshot::Sender<Result<(), CoreError>> },
+    ForgetPending { reply: oneshot::Sender<Result<(),CoreError>> },
     Quiesce { reply: oneshot::Sender<Result<(), CoreError>> },
 }
 #[derive(Default)]
@@ -158,6 +159,14 @@ impl NetworkHandle {
         let (reply, received) = oneshot::channel();
         self.controls.send(Control::Quiesce { reply }).await.map_err(|_| err(ErrorCode::TransportFailed))?;
         received.await.map_err(|_| err(ErrorCode::TransportFailed))?
+    }
+    /// Only the account actor may call this after proving a never-active import.
+    /// The gate remains blocked until a subsequent authorized key installation.
+    pub(crate) async fn forget_pending_key(&self)->Result<(),CoreError>{
+        self.block();
+        let(reply,result)=oneshot::channel();
+        self.controls.send(Control::ForgetPending{reply}).await.map_err(|_|err(ErrorCode::TransportFailed))?;
+        result.await.map_err(|_|err(ErrorCode::TransportFailed))?
     }
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     pub fn hold_next_token_replacement_for_test(&self) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
@@ -383,6 +392,15 @@ impl Manager {
                 self.stop().await;
                 let _ = reply.send(Ok(()));
             }
+            Control::ForgetPending{reply}=>{
+                self.stop().await;
+                let result=crate::account::random_secret().map(|seed|{
+                    self.key=SecretKey::from_bytes(seed.as_bytes());
+                    self.peers.clear();self.info.peers.clear();self.info.endpoint_id=None;
+                    self.publish(None);
+                });
+                let _=reply.send(result);
+            },
             Control::Activate { key, start, ticket, reply } => {
                 if self.gate.revision.load(Ordering::Acquire) != ticket {
                     let _ = reply.send(Err(err(ErrorCode::Busy)));

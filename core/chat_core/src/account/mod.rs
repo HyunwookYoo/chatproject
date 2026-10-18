@@ -41,3 +41,5 @@ pub use safety::{safety_digest, safety_display};
 
 pub(crate) mod pair;
 pub use pair::{PairDirection, PairDisplay, PairPhase, PairView};
+#[cfg(all(feature="test-hooks",debug_assertions))]
+pub use pair::PairTestStop;

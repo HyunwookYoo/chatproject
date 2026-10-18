@@ -39,6 +39,9 @@ pub enum PublishIntent {
 /// Public data only. No recovery display or private keys can enter this view.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountView {
+    pub disclosure_possible: bool,
+    pub pending_pair_transactions: Vec<super::TxId>,
+    pub pending_import_requires_remote_revoke: bool,
     pub revision: u64,
     pub phase: AccountPhase,
     pub public_peer_id: Option<PeerId>,
@@ -56,6 +59,11 @@ pub struct CandidateInfo {
     pub endpoint_id: String,
 }
 enum Command {
+    #[cfg(all(feature="test-hooks",debug_assertions))]
+    PairTestStop(super::PairTestStop,oneshot::Sender<Result<(),CoreError>>),
+    #[cfg(all(feature="test-hooks",debug_assertions))]
+    PairTestBytes(oneshot::Sender<Result<(usize,usize),CoreError>>),
+    DiscardPending(oneshot::Sender<Result<(),CoreError>>),
     PairBegin(super::PairDirection,Option<super::TxId>,oneshot::Sender<Result<super::PairDisplay,CoreError>>),
     PairScan(Zeroizing<String>,oneshot::Sender<Result<(),CoreError>>),
     PairConfirm(FlowId,bool,oneshot::Sender<Result<(),CoreError>>),
@@ -100,6 +108,11 @@ struct Queued {
 impl Command {
     fn reject(self, error: CoreError) {
         match self {
+            #[cfg(all(feature="test-hooks",debug_assertions))]
+            Self::PairTestStop(_,reply)=>{let _=reply.send(Err(error));}
+            #[cfg(all(feature="test-hooks",debug_assertions))]
+            Self::PairTestBytes(reply)=>{let _=reply.send(Err(error));}
+            Self::DiscardPending(reply)=>{let _=reply.send(Err(error));}
             Self::PairBegin(_,_,reply)=>{let _=reply.send(Err(error));}
             Self::PairView(reply)=>{let _=reply.send(Err(error));}
             #[cfg(all(feature="test-hooks",debug_assertions))]
@@ -160,6 +173,10 @@ fn unavailable(code: ErrorCode) -> CoreError {
 }
 
 impl AccountHandle {
+    #[cfg(all(feature="test-hooks",debug_assertions))]
+    pub async fn pair_test_stop(&self,stop:super::PairTestStop)->Result<(),CoreError>{self.send(|reply|Command::PairTestStop(stop,reply)).await}
+    #[cfg(all(feature="test-hooks",debug_assertions))]
+    pub async fn pair_test_bytes(&self)->Result<(usize,usize),CoreError>{self.send(Command::PairTestBytes).await}
     pub(crate) fn open(
         runtime: &tokio::runtime::Handle,
         root: &Path,
@@ -178,6 +195,8 @@ impl AccountHandle {
         let revision = match &state {
             Some(AccountState::Active(local)) => local.revision,
             Some(AccountState::Candidate(_)) => 1,
+            Some(AccountState::CandidatePinned(p)) => p.revision,
+            Some(AccountState::PendingImport(p)) => p.revision,
             None => 0,
         };
         let ticket = network.block();
@@ -209,6 +228,7 @@ impl AccountHandle {
                 store,
                 state,
                 creation: None,
+                cleanup_pending: false,
                 revision,
                 shared: shared.clone(),
                 services,
@@ -221,6 +241,11 @@ impl AccountHandle {
     /// membership, identity, certificate, or QR authorization is implied.
     pub async fn prepare_candidate(&self) -> Result<CandidateInfo, CoreError> {
         self.send(Command::Prepare).await
+    }
+    /// Discard only a never-active candidate/import. Public membership requires
+    /// separate revocation on an existing device; remote disclosure is retained.
+    pub async fn discard_pending_import(&self) -> Result<(), CoreError> {
+        self.send(Command::DiscardPending).await
     }
     async fn send<T>(
         &self,
@@ -332,11 +357,672 @@ struct Manager {
     store: Store,
     state: Option<AccountState>,
     creation: Option<Creation>,
+    cleanup_pending: bool,
     revision: u64,
     shared: Arc<Shared>,
     services: AccountServices,
 }
 impl Manager {
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    fn pair_checkpoint(&mut self, at: super::PairTestStop) -> Result<(), CoreError> {
+        if self.pair.stop == Some(at) {
+            self.pair.stop = None;
+            self.pair.current = None;
+            return Err(unavailable(ErrorCode::NotAvailable));
+        }
+        Ok(())
+    }
+    fn pending_pairs(&self) -> Vec<super::TxId> {
+        use super::pair::transaction::Stage;
+        match &self.state {
+            Some(AccountState::CandidatePinned(p)) => vec![p.envelope.tx],
+            Some(AccountState::PendingImport(p)) => vec![p.receipt.tx],
+            Some(AccountState::Active(l)) => l
+                .pairs
+                .existing
+                .iter()
+                .filter(|t| t.stage != Stage::Observed)
+                .filter_map(|t| t.envelope().ok().map(|e| e.tx))
+                .collect(),
+            _ => vec![],
+        }
+    }
+    fn pair_view(&self) -> Option<super::PairView> {
+        self.pair.current.as_ref().map(|s| s.view())
+    }
+    fn validate_pair_role(
+        &self,
+        role: super::pair::wire::Role,
+        tx: Option<super::TxId>,
+    ) -> Result<(), CoreError> {
+        use super::pair::wire::Role;
+        if let Some(tx) = tx {
+            if super::pair::resume::role(self.state.as_ref().ok_or_else(super::wire::invalid)?, tx)?
+                != role
+            {
+                return Err(super::wire::invalid());
+            }
+        } else if match role {
+            Role::Existing => !matches!(self.state, Some(AccountState::Active(_))),
+            Role::New => !matches!(self.state, None | Some(AccountState::Candidate(_))),
+        } {
+            return Err(unavailable(ErrorCode::AccountRestricted));
+        }
+        Ok(())
+    }
+    fn commit_pair_state(
+        &mut self,
+        state: AccountState,
+        request: Request,
+    ) -> Result<(), CoreError> {
+        let result = self.persist(&state, request);
+        self.state = Some(state);
+        if result.is_ok() {
+            self.revision += 1;
+        }
+        result
+    }
+    async fn discard_pending(&mut self) -> Result<(), CoreError> {
+        let request = if self.cleanup_pending {
+            *self.shared.requests.borrow()
+        } else {
+            self.ready()?
+        };
+        if request.suspend || self.shared.network.desired_suspend() {
+            return Err(unavailable(ErrorCode::StorageLocked));
+        }
+        if !matches!(
+            self.state,
+            Some(
+                AccountState::Candidate(_)
+                    | AccountState::CandidatePinned(_)
+                    | AccountState::PendingImport(_)
+            )
+        ) {
+            return Err(unavailable(ErrorCode::AccountRestricted));
+        }
+        self.cleanup_pending = true;
+        self.pair.current = None;
+        self.creation = None;
+        self.shared.network.forget_pending_key().await?;
+        if !self.current(request) || self.shared.network.desired_suspend() {
+            return Err(unavailable(ErrorCode::StorageLocked));
+        }
+        self.store.discard_pending()?;
+        // Successful cleanup includes OS resource, wrapping blob and all snapshots.
+        self.state = None;
+        self.cleanup_pending = false;
+        self.revision += 1;
+        // An explicit completed cleanup can resolve this actor's earlier failed
+        // cleanup/lifecycle ticket. Transport stays blocked until new setup.
+        self.shared
+            .status
+            .store((request.ticket << 2) | 1, Ordering::Release);
+        Ok(())
+    }
+    async fn start_transfer(&mut self, flow: FlowId) -> Result<(), CoreError> {
+        use super::pair::{
+            transaction::{ExistingPin, PairTransaction, Stage},
+            transfer::{self, Payload},
+        };
+        let request = self.ready()?;
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        self.pair_checkpoint(super::PairTestStop::EBeforeDisclosure)?;
+        let s = self
+            .pair
+            .current
+            .as_ref()
+            .ok_or_else(super::wire::invalid)?;
+        if s.transaction.is_some() {
+            return Ok(());
+        }
+        let channel = s.channel.as_ref().ok_or_else(super::wire::invalid)?;
+        let resume = s.qr.resume;
+        let handshake = channel.hash;
+        let local = self.local()?;
+        let base = local
+            .records
+            .accepted
+            .as_ref()
+            .ok_or_else(super::wire::invalid)?;
+        let (tx, payload) = if let Some(tx) = resume {
+            let t = local
+                .pairs
+                .existing
+                .iter()
+                .find(|t| t.envelope().is_ok_and(|e| e.tx == tx))
+                .ok_or_else(super::wire::invalid)?;
+            let p = Payload::decode(&t.payload)?;
+            let included = base.record.devices.iter().any(|d| {
+                d.installation_id == p.cert.installation_id
+                    && d.transport_public_key == p.cert.transport_public_key
+                    && d.kind == p.cert.kind
+            });
+            if base.record.generation != p.generation
+                || (!included && (base.hash != p.base || base.record.devices.len() >= 5))
+            {
+                return Err(unavailable(ErrorCode::RecordConflict));
+            }
+            (tx, Zeroizing::new(t.payload.to_vec()))
+        } else {
+            if base.record.devices.len() >= 5 {
+                return Err(unavailable(ErrorCode::DeviceLimit));
+            }
+            if !local.records.pending.is_empty()
+                || local.pairs.existing.len() + local.records.pending.len() >= 31
+            {
+                return Err(unavailable(ErrorCode::StorageFull));
+            }
+            let mut tx = super::TxId([0; 16]);
+            getrandom::fill(&mut tx.0).map_err(|_| super::wire::invalid())?;
+            let cert = super::certificate::sign_cert_public(
+                &local.keys,
+                channel.remote.installation,
+                channel.remote.transport,
+                channel.candidate_kind.ok_or_else(super::wire::invalid)?,
+                self.services.clock.unix_seconds(),
+            )?;
+            (
+                tx,
+                Payload::encode_parts(
+                    tx,
+                    &local.keys,
+                    &cert,
+                    base.record.generation,
+                    base.hash,
+                    &local.contacts,
+                ),
+            )
+        };
+        let mut state = self.state.take().ok_or_else(super::wire::invalid)?;
+        let AccountState::Active(local) = &mut state else {
+            unreachable!()
+        };
+        if let Some(t) = local
+            .pairs
+            .existing
+            .iter_mut()
+            .find(|t| t.envelope().is_ok_and(|e| e.tx == tx))
+        {
+            t.approved_flow = flow;
+            t.approved_hash = handshake;
+        } else {
+            local.pairs.existing.push(PairTransaction {
+                pin: ExistingPin {
+                    peer: local.keys.peer_id(),
+                    installation: local.device.installation_id(),
+                    transport: local.device.transport_public_key(),
+                },
+                payload: Zeroizing::new(payload.to_vec()),
+                approved_flow: flow,
+                approved_hash: handshake,
+                stage: Stage::DisclosurePossible,
+                receipt: None,
+                publication: None,
+            });
+        }
+        local.revision = self.revision + 1;
+        // Any ambiguous Store error closes the actor; no permit or first frame exists yet.
+        self.commit_pair_state(state, request)?;
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        self.pair_checkpoint(super::PairTestStop::EAfterDisclosure)?;
+        if !self.local_authorized() {
+            return Err(unavailable(ErrorCode::AccountRestricted));
+        }
+        let t = self
+            .local()?
+            .pairs
+            .existing
+            .iter()
+            .find(|t| t.envelope().is_ok_and(|e| e.tx == tx))
+            .ok_or_else(super::wire::invalid)?;
+        let permit = self
+            .pair
+            .current
+            .as_ref()
+            .ok_or_else(super::wire::invalid)?
+            .committed_permit(
+                t,
+                self.local()?
+                    .records
+                    .accepted
+                    .as_ref()
+                    .ok_or_else(super::wire::invalid)?,
+            )?;
+        let envelope = t.envelope()?;
+        let clock = self.services.clock.clone();
+        let mut session = self.pair.current.take().ok_or_else(super::wire::invalid)?;
+        session.transaction = Some(tx);
+        session.disclosure_possible = true;
+        session.phase = Some(super::PairPhase::DisclosurePossible);
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        let stop_first = self.pair.stop == Some(super::PairTestStop::EAfterFirstChunk);
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        if stop_first {
+            self.pair.stop = None;
+        }
+        let mut sent = 0;
+        let result = self
+            .service(
+                request,
+                Box::pin(async {
+                    sent += session
+                        .send_gated(&*clock, &permit, || Zeroizing::new(envelope.bytes()))
+                        .await?;
+                    for (index, bytes) in payload.chunks(transfer::CHUNK).enumerate() {
+                        sent += session
+                            .send_gated(&*clock, &permit, || {
+                                transfer::chunk(tx, index as u64, bytes)
+                            })
+                            .await?;
+                        #[cfg(all(feature = "test-hooks", debug_assertions))]
+                        if stop_first {
+                            return Err(unavailable(ErrorCode::NotAvailable));
+                        }
+                    }
+                    Ok(())
+                }),
+            )
+            .await;
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        {
+            self.pair.bytes.0 += sent;
+        }
+        let _ = sent;
+        if result.is_ok() && session.live(&*clock) {
+            self.pair.current = Some(session);
+        }
+        result
+    }
+    async fn pair_plain(&mut self, flow: FlowId, plain: &[u8]) -> Result<(), CoreError> {
+        use super::pair::{
+            transaction::{CandidatePinned, PendingImport},
+            transfer::{Envelope, Payload, Receipt, Receiving},
+            wire::Role,
+        };
+        let request = self.ready()?;
+        let s = self
+            .pair
+            .current
+            .as_ref()
+            .ok_or_else(super::wire::invalid)?;
+        if s.role == Role::Existing {
+            return self.accept_receipt(flow, plain).await;
+        }
+        let pin = super::pair::resume::existing(
+            &s.channel.as_ref().ok_or_else(super::wire::invalid)?.remote,
+        )?;
+        if s.receiving.is_none() {
+            let envelope = Envelope::decode(plain)?;
+            super::pair::resume::envelope_matches(
+                self.state.as_ref().ok_or_else(super::wire::invalid)?,
+                pin,
+                envelope,
+            )?;
+            if let Some(expected) = s.qr.resume
+                && expected != envelope.tx
+            {
+                return Err(super::wire::invalid());
+            }
+            if matches!(self.state, Some(AccountState::Candidate(_))) {
+                let Some(AccountState::Candidate(device)) = self.state.take() else {
+                    unreachable!()
+                };
+                self.commit_pair_state(
+                    AccountState::CandidatePinned(Box::new(CandidatePinned {
+                        device,
+                        revision: self.revision + 1,
+                        pin,
+                        envelope,
+                    })),
+                    request,
+                )?;
+            }
+            let s = self
+                .pair
+                .current
+                .as_mut()
+                .ok_or_else(super::wire::invalid)?;
+            s.transaction = Some(envelope.tx);
+            s.receiving = Some(Receiving::new(envelope));
+            return Ok(());
+        }
+        let s = self
+            .pair
+            .current
+            .as_mut()
+            .ok_or_else(super::wire::invalid)?;
+        let Some(payload) = s
+            .receiving
+            .as_mut()
+            .ok_or_else(super::wire::invalid)?
+            .push(plain)?
+        else {
+            return Ok(());
+        };
+        let parsed = Payload::decode(&payload)?;
+        if Some(parsed.tx) != s.transaction {
+            return Err(super::wire::invalid());
+        }
+        let device = self
+            .state
+            .as_ref()
+            .ok_or_else(super::wire::invalid)?
+            .device();
+        let kind = if cfg!(any(target_os = "ios", target_os = "android")) {
+            super::DeviceKind::Mobile
+        } else {
+            super::DeviceKind::Desktop
+        };
+        if parsed.keys.peer_id() != pin.peer
+            || !parsed.matches_device(device)
+            || parsed.cert.kind != kind
+            || parsed.cert.created_at > self.services.clock.unix_seconds().saturating_add(300)
+        {
+            return Err(super::wire::invalid());
+        }
+        let channel = s.channel.as_ref().ok_or_else(super::wire::invalid)?;
+        let receipt = Receipt::sign(
+            parsed.tx,
+            super::pair::transfer::hash(&payload),
+            device,
+            flow,
+            channel.hash,
+        );
+        let accepted = channel
+            .existing_record
+            .clone()
+            .ok_or_else(super::wire::invalid)?;
+        if accepted.record.generation != parsed.generation {
+            return Err(super::wire::invalid());
+        }
+        match self.state.as_ref().ok_or_else(super::wire::invalid)? {
+            AccountState::PendingImport(p) if p.payload != payload => {
+                return Err(super::wire::invalid());
+            }
+            AccountState::Active(l)
+                if l.pairs
+                    .origin
+                    .as_ref()
+                    .is_none_or(|o| o.hash != receipt.payload_hash || o.tx != receipt.tx) =>
+            {
+                return Err(super::wire::invalid());
+            }
+            _ => {}
+        }
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        self.pair_checkpoint(super::PairTestStop::NBeforeImport)?;
+        let state = self.state.take().ok_or_else(super::wire::invalid)?;
+        let state = match state {
+            AccountState::CandidatePinned(p) => {
+                let records = RecordState {
+                    generation: parsed.generation,
+                    observed_seq: accepted.seq,
+                    accepted: Some(accepted),
+                    conflict: None,
+                    allocated_seq: 0,
+                    tombstones: vec![],
+                    pending: vec![],
+                    state: PublicationState::LocalBlocked,
+                };
+                AccountState::PendingImport(Box::new(PendingImport {
+                    device: p.device,
+                    revision: self.revision + 1,
+                    pin,
+                    payload,
+                    receipt: receipt.clone(),
+                    records,
+                }))
+            }
+            AccountState::PendingImport(mut p) => {
+                p.receipt = receipt.clone();
+                p.revision = self.revision + 1;
+                AccountState::PendingImport(p)
+            }
+            AccountState::Active(mut l) => {
+                l.pairs.origin.as_mut().unwrap().receipt = receipt.clone();
+                l.revision = self.revision + 1;
+                AccountState::Active(l)
+            }
+            _ => return Err(super::wire::invalid()),
+        };
+        // The exact import and newly channel-bound receipt become durable together.
+        self.commit_pair_state(state, request)?;
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        self.pair_checkpoint(super::PairTestStop::NAfterImport)?;
+        let clock = self.services.clock.clone();
+        let mut session = self.pair.current.take().ok_or_else(super::wire::invalid)?;
+        session.receiving = None;
+        session.phase = Some(if matches!(self.state, Some(AccountState::Active(_))) {
+            super::PairPhase::Active
+        } else {
+            super::PairPhase::ReceiptReady
+        });
+        let result = self
+            .service(request, Box::pin(session.send_receipt(&*clock, &receipt)))
+            .await;
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        if let Ok(bytes) = result {
+            self.pair.bytes.1 += bytes;
+        }
+        if result.is_ok() && session.live(&*clock) {
+            self.pair.current = Some(session);
+        }
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        self.pair_checkpoint(super::PairTestStop::NAfterAck)?;
+        result.map(|_| ())
+    }
+    async fn accept_receipt(&mut self, flow: FlowId, plain: &[u8]) -> Result<(), CoreError> {
+        use super::pair::{
+            transaction::Stage,
+            transfer::{Payload, Receipt},
+        };
+        let request = self.ready()?;
+        let r = Receipt::decode(plain)?;
+        let s = self
+            .pair
+            .current
+            .as_ref()
+            .ok_or_else(super::wire::invalid)?;
+        let c = s.channel.as_ref().ok_or_else(super::wire::invalid)?;
+        if !s.approved
+            || s.transaction != Some(r.tx)
+            || r.flow != flow
+            || r.handshake != c.hash
+            || r.installation != c.remote.installation
+        {
+            return Err(super::wire::invalid());
+        }
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        self.pair_checkpoint(super::PairTestStop::EBeforeReceipt)?;
+        let index = self
+            .local()?
+            .pairs
+            .existing
+            .iter()
+            .position(|t| {
+                t.envelope()
+                    .is_ok_and(|e| e.tx == r.tx && e.hash == r.payload_hash)
+            })
+            .ok_or_else(super::wire::invalid)?;
+        let mut state = self.state.take().ok_or_else(super::wire::invalid)?;
+        let AccountState::Active(l) = &mut state else {
+            unreachable!()
+        };
+        let t = &mut l.pairs.existing[index];
+        t.receipt = Some(r);
+        if t.stage == Stage::DisclosurePossible {
+            t.stage = Stage::ReceiptVerified;
+        }
+        l.revision = self.revision + 1;
+        self.commit_pair_state(state, request)?;
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        self.pair_checkpoint(super::PairTestStop::EAfterReceipt)?;
+        if let Some(s) = &mut self.pair.current {
+            s.phase = Some(super::PairPhase::ReceiptVerified);
+        }
+        // Fresh lookup after receipt commit rechecks E's membership/base/capacity.
+        self.publication(Action::Refresh).await?;
+        if !self.local_authorized() {
+            return Err(unavailable(ErrorCode::AccountRestricted));
+        }
+        let local = self.local()?;
+        let t = &local.pairs.existing[index];
+        let p = Payload::decode(&t.payload)?;
+        let mut records = local.records.clone();
+        let included = records.accepted.as_ref().is_some_and(|a| {
+            a.record.generation == p.generation
+                && a.record.devices.iter().any(|d| {
+                    d.installation_id == p.cert.installation_id
+                        && d.transport_public_key == p.cert.transport_public_key
+                        && d.kind == p.cert.kind
+                })
+        });
+        let packet = if included {
+            records.accepted.as_ref().unwrap().hash
+        } else if let Some(h) = t.publication {
+            if !records
+                .pending
+                .iter()
+                .any(|i| i.signed.hash == h && i.status == PacketStatus::Ready)
+            {
+                return Err(unavailable(ErrorCode::RecordConflict));
+            }
+            h
+        } else {
+            records.stage_add(
+                local,
+                &p.cert,
+                p.base,
+                p.generation,
+                self.services.clock.unix_seconds(),
+            )?
+        };
+        let mut state = self.state.take().ok_or_else(super::wire::invalid)?;
+        let AccountState::Active(l) = &mut state else {
+            unreachable!()
+        };
+        l.records = records;
+        l.pairs.existing[index].publication = Some(packet);
+        l.pairs.existing[index].stage = if included {
+            Stage::Observed
+        } else {
+            Stage::PublishPending
+        };
+        l.revision = self.revision + 1;
+        self.commit_pair_state(state, request)?;
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        self.pair_checkpoint(super::PairTestStop::EBeforePublish)?;
+        if !included {
+            self.publication(Action::Refresh).await?;
+            self.publication(Action::Refresh).await?;
+        }
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        self.pair_checkpoint(super::PairTestStop::EAfterPublish)?;
+        let observed = self
+            .local()?
+            .records
+            .accepted
+            .as_ref()
+            .is_some_and(|a| a.hash == packet);
+        if observed {
+            let mut state = self.state.take().ok_or_else(super::wire::invalid)?;
+            let AccountState::Active(l) = &mut state else {
+                unreachable!()
+            };
+            l.pairs.existing[index].stage = Stage::Observed;
+            l.revision = self.revision + 1;
+            self.commit_pair_state(state, request)?;
+        }
+        if let Some(s) = &mut self.pair.current {
+            s.phase = Some(if observed {
+                super::PairPhase::Observed
+            } else {
+                super::PairPhase::PublishPending
+            });
+        }
+        Ok(())
+    }
+    async fn refresh_import(&mut self) -> Result<(), CoreError> {
+        use super::pair::{transaction::PairState, transfer::Payload};
+        let request = self.ready()?;
+        let Some(AccountState::PendingImport(p)) = &self.state else {
+            return Err(unavailable(ErrorCode::AccountRestricted));
+        };
+        let pin = p.pin;
+        let backend = self.services.backend()?;
+        let super::Lookup::Found(packet) = self.service(request, backend.lookup(pin.peer)).await?
+        else {
+            return Err(unavailable(ErrorCode::RecordUnavailable));
+        };
+        let found = super::publication::SignedRecord::new(packet, pin.peer)?;
+        let now = self.services.clock.unix_seconds();
+        let Some(AccountState::PendingImport(p)) = &self.state else {
+            unreachable!()
+        };
+        let payload = Payload::decode(&p.payload)?;
+        let conflicting = found.seq < p.records.observed_seq
+            || p.records
+                .accepted
+                .as_ref()
+                .is_some_and(|a| a.seq == found.seq && a.hash != found.hash)
+            || found.record.generation != payload.generation
+            || p.records.conflict.is_some();
+        let current = found.current(now) && !found.record.is_expired(now);
+        let included = found.record.devices.iter().any(|d| {
+            d.installation_id == payload.cert.installation_id
+                && d.transport_public_key == payload.cert.transport_public_key
+                && d.kind == payload.cert.kind
+        });
+        let existing = found.record.devices.iter().any(|d| {
+            d.installation_id == pin.installation && d.transport_public_key == pin.transport
+        });
+        let Some(AccountState::PendingImport(mut p)) = self.state.take() else {
+            unreachable!()
+        };
+        p.records.observed_seq = p.records.observed_seq.max(found.seq);
+        p.revision = self.revision + 1;
+        if conflicting {
+            p.records.conflict = Some(found);
+            p.records.state = PublicationState::Conflict;
+            self.commit_pair_state(AccountState::PendingImport(p), request)?;
+            return Err(unavailable(ErrorCode::RecordConflict));
+        }
+        p.records.accepted = Some(found);
+        p.records.state = PublicationState::LocalBlocked;
+        if !current || !included || !existing {
+            self.commit_pair_state(AccountState::PendingImport(p), request)?;
+            if let Some(s) = &mut self.pair.current {
+                s.phase = Some(super::PairPhase::PublishPending);
+            }
+            return Err(unavailable(ErrorCode::AccountRestricted));
+        }
+        let origin = p.origin()?;
+        let mut payload = Payload::decode(&p.payload)?;
+        let keys = super::AccountKeys::from_identity(super::Secret32::from(
+            *payload.keys.identity().as_bytes(),
+        ));
+        p.records.state = PublicationState::Observed;
+        let local = super::storage::schema::LocalAccount {
+            keys,
+            device: p.device,
+            cert: payload.cert.clone(),
+            revision: self.revision + 1,
+            intent: PublishIntent::LocalCreate,
+            records: p.records,
+            remote: vec![],
+            contacts: std::mem::take(&mut payload.contacts),
+            pairs: PairState {
+                existing: vec![],
+                origin: Some(origin),
+            },
+        };
+        self.commit_pair_state(AccountState::Active(Box::new(local)), request)?;
+        if let Some(s) = &mut self.pair.current {
+            s.phase = Some(super::PairPhase::Active);
+        }
+        Ok(())
+    }
     async fn run(
         mut self,
         mut commands: mpsc::Receiver<Queued>,
@@ -347,6 +1033,7 @@ impl Manager {
         self.complete(initial, result);
         self.auto_refresh().await;
         let mut expiry = tokio::time::interval(Duration::from_millis(100));
+        let mut import_poll = tokio::time::interval(Duration::from_secs(1));
         let mut refresh = tokio::time::interval(Duration::from_secs(60));
         refresh.tick().await;
         loop {
@@ -359,6 +1046,7 @@ impl Manager {
                     self.auto_refresh().await;
                 }
                 _ = expiry.tick() => { self.restrict_grants(); self.expire_pair(); }
+                _ = import_poll.tick(), if self.pair.current.is_some() && matches!(self.state,Some(AccountState::PendingImport(_))) => {let _=self.refresh_import().await;}
                 Some(input)=self.pair.input.recv()=>{self.pair_input(input).await;}
                 Some(input) = self.auth.input.recv() => { self.auth_input(input).await; }
                 _ = refresh.tick() => { self.auto_refresh().await; }
@@ -369,12 +1057,17 @@ impl Manager {
                         continue;
                     }
                     match queued.command {
+                        #[cfg(all(feature="test-hooks",debug_assertions))]
+                        Command::PairTestStop(stop,reply)=>{self.pair.stop=Some(stop);let _=reply.send(Ok(()));}
+                        #[cfg(all(feature="test-hooks",debug_assertions))]
+                        Command::PairTestBytes(reply)=>{let _=reply.send(Ok(self.pair.bytes));}
+                        Command::DiscardPending(reply)=>{let result=self.discard_pending().await;let _=reply.send(result);}
                         Command::PairBegin(direction,resume,reply)=>{let result=self.pair_begin(direction,resume).await;let _=reply.send(result);}
                         Command::PairScan(qr,reply)=>{let result=self.pair_scan(&qr).await;let _=reply.send(result);}
                         Command::PairConfirm(flow,matches,reply)=>{let result=self.pair_confirm(flow,matches).await;let _=reply.send(result);}
                         Command::PairApprove(flow,reply)=>{let result=self.pair_approve(flow).await;let _=reply.send(result);}
                         Command::PairCancel(flow,reply)=>{let result=self.pair_cancel(flow);let _=reply.send(result);}
-                        Command::PairView(reply)=>{self.expire_pair();let result=self.ready().map(|_|self.pair.current.as_ref().map(|s|s.view()));let _=reply.send(result);}
+                        Command::PairView(reply)=>{self.expire_pair();let result=self.ready().map(|_|self.pair_view());let _=reply.send(result);}
                         #[cfg(all(feature="test-hooks",debug_assertions))]
                         Command::PairFixtureSend(flow,bytes,reply)=>{let result=self.pair_fixture_send(flow,bytes).await;let _=reply.send(result);}
                         #[cfg(all(feature="test-hooks",debug_assertions))]
@@ -392,7 +1085,9 @@ impl Manager {
                         Command::Recover(words, confirmed, reply) => { let result = self.recover(&words, confirmed).await; let _ = reply.send(result); }
                         Command::Snapshot(reply) => { self.expire_pair(); let _ = reply.send(Ok(self.view())); }
                         Command::Refresh(peer, reply) => {
-                            let result = if self.local().is_ok_and(|local| local.keys.peer_id() == peer) {
+                            let result = if matches!(&self.state,Some(AccountState::PendingImport(p)) if p.pin.peer==peer) {
+                                self.refresh_import().await
+                            } else if self.local().is_ok_and(|local| local.keys.peer_id() == peer) {
                                 self.publication(Action::Refresh).await
                             } else { self.remote_record(peer).await.map(|_|()) };
                             let _ = reply.send(result);
@@ -457,6 +1152,7 @@ impl Manager {
             return Err(unavailable(ErrorCode::Busy));
         }
         self.store.resume()?;
+        if self.cleanup_pending{return Err(unavailable(ErrorCode::StorageLocked));}
         let loaded = self
             .store
             .load()
@@ -501,13 +1197,14 @@ impl Manager {
                 .to_string(),
         };
         let key = iroh::SecretKey::from_bytes(device.transport().as_bytes());
-        self.shared.network.activate_key(key).await?;
+        self.shared.network.install_key(key, true, self.shared.network.block()).await?;
         self.ensure_ready(request)?;
         Ok(candidate)
     }
     fn ready(&self) -> Result<Request, CoreError> {
         let request = *self.shared.requests.borrow();
-        if request.suspend
+        if self.cleanup_pending
+            || request.suspend
             || self.shared.network.desired_suspend()
             || self.shared.status.load(Ordering::Acquire) != (request.ticket << 2) | 1
         {
@@ -522,7 +1219,7 @@ impl Manager {
         Ok(())
     }
     fn allow_setup(&self) -> Result<(), CoreError> {
-        if matches!(self.state, Some(AccountState::Active(_))) {
+        if matches!(self.state, Some(AccountState::Active(_) | AccountState::CandidatePinned(_) | AccountState::PendingImport(_))) {
             return Err(CoreError::new(
                 ErrorCode::AccountExists,
                 "Account already exists; use a separate empty storage folder for recovery",
@@ -591,7 +1288,7 @@ impl Manager {
         let device = self.state.as_ref().unwrap().device();
         self.shared
             .network
-            .activate_key(iroh::SecretKey::from_bytes(device.transport().as_bytes()))
+            .install_key(iroh::SecretKey::from_bytes(device.transport().as_bytes()), true, self.shared.network.block())
             .await?;
         self.ensure_ready(request)?;
         self.auto_refresh().await;
@@ -619,6 +1316,7 @@ impl Manager {
         }
     }
     async fn auto_refresh(&mut self) {
+        if self.ready().is_ok() && matches!(self.state,Some(AccountState::PendingImport(_))) {let _=self.refresh_import().await;}
         if self.ready().is_ok() && self.local().is_ok() {
             let _ = self.publication(Action::Refresh).await;
         }
@@ -653,6 +1351,11 @@ impl Manager {
             unreachable!()
         };
         local.records = records;
+        for t in &mut local.pairs.existing {
+            if t.stage == super::pair::transaction::Stage::PublishPending
+                && local.records.accepted.as_ref().is_some_and(|a|Some(a.hash)==t.publication)
+            {t.stage=super::pair::transaction::Stage::Observed;}
+        }
         local.revision = revision;
         let result = self.persist(&state, request);
         self.state = Some(state);
@@ -810,6 +1513,9 @@ impl Manager {
     }
     fn view(&self) -> AccountView {
         let mut view = AccountView {
+            disclosure_possible: self.state.as_ref().is_some_and(|s|matches!(s,AccountState::Active(l) if !l.pairs.existing.is_empty())),
+            pending_pair_transactions: self.pending_pairs(),
+            pending_import_requires_remote_revoke: matches!(self.state,Some(AccountState::CandidatePinned(_) | AccountState::PendingImport(_))),
             revision: self.revision,
             phase: AccountPhase::Unconfigured,
             public_peer_id: None,
@@ -825,6 +1531,12 @@ impl Manager {
             return view;
         }
         match &self.state {
+            Some(AccountState::CandidatePinned(p))=>{
+                view.phase=AccountPhase::PendingImport;view.installation=Some(p.device.installation_id());view.public_peer_id=Some(p.pin.peer);
+            },
+            Some(AccountState::PendingImport(p))=>{
+                view.phase=AccountPhase::PendingImport;view.installation=Some(p.device.installation_id());view.public_peer_id=Some(p.pin.peer);view.publication=p.records.view();
+            },
             Some(AccountState::Candidate(device)) => {
                 view.phase = AccountPhase::Candidate;
                 view.installation = Some(device.installation_id());
@@ -955,6 +1667,7 @@ mod tests {
             store: Store::open(dir.path(), Arc::new(Protector)).unwrap(),
             state: None,
             creation: None,
+                cleanup_pending: false,
             revision: 0,
             shared,
             services: AccountServices::new(backend.clone(), Arc::new(FakeClock::new(1000, 0))),
@@ -1005,6 +1718,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pair_disclosure_and_receipt_after_replace_error_are_durable_but_fail_closed() {
+        use crate::account::pair::{
+            transaction::{ExistingPin, PairTransaction, PendingImport, Stage},
+            transfer::{Payload, Receipt, hash},
+        };
+        for existing in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let slot = CoreSlot::new();
+            slot.start(
+                CoreConfig {
+                    data_dir: dir.path().into(),
+                },
+                &EventBus::new(),
+            )
+            .unwrap();
+            let network = slot.network().unwrap();
+            network.configure_local(None).await.unwrap();
+            let ticket = network.begin_account();
+            let request = Request {
+                ticket,
+                suspend: false,
+            };
+            let (requests, _) = watch::channel(request);
+            let mut manager = Manager {
+                pair: Default::default(),
+                auth: Default::default(),
+                bus: EventBus::new(),
+                store: Store::open(dir.path(), Arc::new(Protector)).unwrap(),
+                state: None,
+                creation: None,
+                cleanup_pending: false,
+                revision: 0,
+                shared: Arc::new(Shared {
+                    network: network.clone(),
+                    requests,
+                    status: AtomicU64::new(ticket << 2),
+                }),
+                services: offline_services(),
+            };
+            let result = manager.lifecycle(request).await;
+            manager.complete(request, result);
+            manager.prepare().await.unwrap();
+            let mut local = recovery::local_account(
+                super::super::derive_account(&Secret32::from([7; 32])).unwrap(),
+                PublishIntent::LocalCreate,
+                2,
+            )
+            .unwrap();
+            let device = derive_device(Secret32::from([8; 32])).unwrap();
+            let cert = super::super::sign_cert(
+                &local.keys,
+                &device,
+                super::super::DeviceKind::Desktop,
+                1000,
+            )
+            .unwrap();
+            let tx = super::super::TxId([4; 16]);
+            let flow = FlowId([5; 16]);
+            let payload = Payload::encode_parts(
+                tx,
+                &local.keys,
+                &cert,
+                local.records.generation,
+                [3; 32],
+                &[],
+            );
+            let pin = ExistingPin {
+                peer: local.keys.peer_id(),
+                installation: local.device.installation_id(),
+                transport: local.device.transport_public_key(),
+            };
+            let receipt = Receipt::sign(tx, hash(&payload), &device, flow, [6; 32]);
+            let state = if existing {
+                local.pairs.existing.push(PairTransaction {
+                    pin,
+                    payload,
+                    approved_flow: flow,
+                    approved_hash: [6; 32],
+                    stage: Stage::DisclosurePossible,
+                    receipt: None,
+                    publication: None,
+                });
+                AccountState::Active(Box::new(local))
+            } else {
+                AccountState::PendingImport(Box::new(PendingImport {
+                    device,
+                    revision: 2,
+                    pin,
+                    payload,
+                    receipt,
+                    records: local.records.clone(),
+                }))
+            };
+            // The thread-local failpoint surrounds exactly this synchronous
+            // Store commit, including real atomic replacement, on this thread.
+            let error = super::super::storage::with_after_replace_failure(|| {
+                manager.commit_pair_state(state, request)
+            })
+            .unwrap_err();
+            assert_eq!(error.code, ErrorCode::StorageFull);
+            assert_eq!(manager.view().phase, AccountPhase::Locked);
+            assert_eq!(manager.pair.bytes, (0, 0));
+            assert_eq!(
+                manager.start_transfer(flow).await.unwrap_err().code,
+                ErrorCode::StorageLocked
+            );
+            assert_eq!(
+                manager.pair_plain(flow, &[]).await.unwrap_err().code,
+                ErrorCode::StorageLocked
+            );
+            assert!(manager.begin().is_err());
+            let stored = manager.store.load().unwrap().unwrap();
+            let saved = AccountState::decode(&stored).unwrap();
+            match saved {
+                AccountState::Active(l) => {
+                    assert!(existing);
+                    assert_eq!(l.pairs.existing[0].envelope().unwrap().tx, tx);
+                    assert!(l.pairs.existing[0].receipt.is_none());
+                }
+                AccountState::PendingImport(p) => {
+                    assert!(!existing);
+                    assert_eq!(p.receipt.tx, tx);
+                    assert_eq!(p.receipt.payload_hash, hash(&p.payload));
+                }
+                _ => panic!("complete new snapshot was not preserved"),
+            }
+            for suspend in [true, false] {
+                let ticket = network.block();
+                let request = Request { ticket, suspend };
+                manager.shared.requests.send_replace(request);
+                manager.shared.status.store(ticket << 2, Ordering::Release);
+                let result = manager.lifecycle(request).await;
+                manager.complete(request, result);
+            }
+            assert!(manager.ready().is_ok());
+            assert_eq!(manager.pair.bytes, (0, 0));
+            assert!(manager.pair.current.is_none());
+            network.execute(NetworkOp::Stop).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn completed_replace_error_cannot_overwrite_established_account() {
         let dir = tempfile::tempdir().unwrap();
         let slot = CoreSlot::new();
@@ -1035,6 +1890,7 @@ mod tests {
             store: Store::open(dir.path(), Arc::new(Protector)).unwrap(),
             state: None,
             creation: None,
+                cleanup_pending: false,
             revision: 0,
             shared,
             services: offline_services(),
@@ -1124,6 +1980,7 @@ mod tests {
             store: Store::open(dir.path(), Arc::new(Protector)).unwrap(),
             state: None,
             creation: None,
+                cleanup_pending: false,
             revision: 0,
             shared,
             services: offline_services(),
@@ -1959,7 +2816,10 @@ impl Manager {
         use super::pair::wire::Role;
         self.ready()?;
         if role == Role::New {
-            self.prepare().await?;
+            if matches!(self.state,Some(AccountState::CandidatePinned(_) | AccountState::PendingImport(_) | AccountState::Active(_))) {
+                let device=self.state.as_ref().unwrap().device();
+                self.shared.network.install_key(iroh::SecretKey::from_bytes(device.transport().as_bytes()), true, self.shared.network.block()).await?;
+            }else{self.prepare().await?;}
         } else {
             self.publication(Action::Refresh).await?;
             if !self.local_authorized() {
@@ -2000,7 +2860,7 @@ impl Manager {
             wire::{Qr, Role},
         };
         self.expire_pair();
-        if self.pair.current.is_some() || resume.is_some() {
+        if self.pair.current.is_some() {
             return Err(unavailable(ErrorCode::Busy));
         }
         let role = if direction == super::PairDirection::NewDisplays {
@@ -2008,6 +2868,7 @@ impl Manager {
         } else {
             Role::Existing
         };
+        self.validate_pair_role(role,resume)?;
         self.pair_prepare(role).await?;
         let device = self
             .state
@@ -2051,14 +2912,18 @@ impl Manager {
             return Err(unavailable(ErrorCode::Busy));
         }
         let qr = Qr::parse(text, self.services.clock.unix_seconds())?;
-        if qr.resume.is_some() {
-            return Err(unavailable(ErrorCode::AccountRestricted));
-        }
         let role = if qr.owner() == Role::Existing {
             Role::New
         } else {
             Role::Existing
         };
+        // An unpinned durable candidate has received no transaction offer yet.
+        // E's resume QR can be its first offer, with all fresh B5 gates intact.
+        let first_offer = role == Role::New
+            && qr.direction == super::PairDirection::ExistingDisplays
+            && qr.resume.is_some()
+            && matches!(self.state, Some(AccountState::Candidate(_)));
+        if !first_offer { self.validate_pair_role(role,qr.resume)?; }
         self.pair_prepare(role).await?;
         let mut target = iroh::EndpointAddr::from(
             iroh::EndpointId::from_bytes(&qr.transport).map_err(|_| super::wire::invalid())?,
@@ -2177,6 +3042,9 @@ impl Manager {
                 )
                 .await?;
             self.ensure_ready(request)?;
+            if let Some(tx)=session.qr.resume {
+                super::pair::resume::validate(self.state.as_ref().ok_or_else(super::wire::invalid)?,tx,&channel.remote,channel.candidate_kind)?;
+            }
             if local_role == Role::Existing && !self.local_authorized() {
                 return Err(unavailable(ErrorCode::AccountRestricted));
             }
@@ -2235,8 +3103,11 @@ impl Manager {
                             .as_ref()
                             .is_some_and(|c| c.conn.stable_id() == connection)
                 }) {
-                    let result =
-                        body.and_then(|b| self.pair_session(flow)?.receive(connection, &b));
+                    let result = match body.and_then(|b| self.pair_session(flow)?.receive(connection, &b)) {
+                        Ok(Some(plain))=>self.pair_plain(flow,&plain).await,
+                        Ok(None)=>Ok(()),
+                        Err(error)=>Err(error),
+                    };
                     if result.is_err() {
                         self.pair.current = None;
                     }
@@ -2266,7 +3137,8 @@ impl Manager {
             return Err(unavailable(ErrorCode::AccountRestricted));
         }
         let clock = self.services.clock.clone();
-        self.pair_session(flow)?.approve(&*clock)
+        self.pair_session(flow)?.approve(&*clock)?;
+        self.start_transfer(flow).await
     }
     fn pair_cancel(&mut self, flow: FlowId) -> Result<(), CoreError> {
         self.pair_session(flow)?;
@@ -2295,7 +3167,7 @@ impl Manager {
         let result = self
             .service(
                 request,
-                Box::pin(session.send_gated(&*clock, permit, || bytes)),
+                Box::pin(session.send_gated(&*clock, &permit, || {let mut tagged=Zeroizing::new(Vec::with_capacity(bytes.len()+11));tagged.extend_from_slice(b"B5 fixture:");tagged.extend_from_slice(&bytes);tagged})),
             )
             .await;
         if result.is_ok() && session.live(&*clock) {

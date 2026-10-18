@@ -82,10 +82,26 @@ pub fn sign_cert(
     kind: DeviceKind,
     at: u64,
 ) -> Result<InstallationCert, CoreError> {
+    sign_cert_public(
+        keys,
+        device.installation_id(),
+        device.transport_public_key(),
+        kind,
+        at,
+    )
+}
+
+pub(crate) fn sign_cert_public(
+    keys: &AccountKeys,
+    installation_id: InstallationId,
+    transport_public_key: [u8; 32],
+    kind: DeviceKind,
+    at: u64,
+) -> Result<InstallationCert, CoreError> {
     let mut cert = InstallationCert {
         peer_id: keys.peer_id(),
-        installation_id: device.installation_id(),
-        transport_public_key: device.transport_public_key(),
+        installation_id,
+        transport_public_key,
         kind,
         created_at: at,
         sig: [0; 64],

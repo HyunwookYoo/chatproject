@@ -21,6 +21,8 @@ pub(crate) struct Channel {
     pub remote: Preface,
     pub hash: [u8; 32],
     pub sas: String,
+    pub candidate_kind: Option<crate::account::DeviceKind>,
+    pub existing_record: Option<crate::account::publication::SignedRecord>,
 }
 impl Drop for Channel {
     fn drop(&mut self) {
@@ -215,6 +217,8 @@ pub(crate) async fn establish(args: Establish<'_>) -> Result<(Channel, RecvStrea
         remote,
         hash,
         sas,
+        candidate_kind: None,
+        existing_record: None,
     };
     channel
         .send(&wire::proof(device, &local, &hash, &prologue_hash))
@@ -227,11 +231,13 @@ pub(crate) async fn establish(args: Establish<'_>) -> Result<(Channel, RecvStrea
         &prologue_hash,
     )?;
     channel
-        .send(
-            &cert
-                .map(InstallationCert::to_bytes)
-                .unwrap_or_else(|| vec![0xf6]),
-        )
+        .send(&cert.map(InstallationCert::to_bytes).unwrap_or_else(|| {
+            vec![
+                0x82,
+                1,
+                u8::from(cfg!(any(target_os = "ios", target_os = "android"))),
+            ]
+        }))
         .await?;
     let incoming = read_frame(&mut recv, MAX_FRAME).await?;
     let certificate = channel.receive(&incoming)?;
@@ -254,7 +260,7 @@ pub(crate) async fn establish(args: Establish<'_>) -> Result<(Channel, RecvStrea
             return Err(invalid());
         }
         let record = parse_record(&packet, peer, now)?;
-        if !crate::account::publication::SignedRecord::new(packet, peer)?.current(now) {
+        if !crate::account::publication::SignedRecord::new(packet.clone(), peer)?.current(now) {
             return Err(invalid());
         }
         if record.is_expired(now)
@@ -266,8 +272,15 @@ pub(crate) async fn establish(args: Establish<'_>) -> Result<(Channel, RecvStrea
         {
             return Err(invalid());
         }
-    } else if certificate.as_slice() != [0xf6] {
-        return Err(invalid());
+        channel.existing_record = Some(crate::account::publication::SignedRecord::new(
+            packet, peer,
+        )?);
+    } else {
+        channel.candidate_kind = Some(match certificate.as_slice() {
+            [0x82, 1, 0] => crate::account::DeviceKind::Desktop,
+            [0x82, 1, 1] => crate::account::DeviceKind::Mobile,
+            _ => return Err(invalid()),
+        });
     }
     Ok((channel, recv))
 }

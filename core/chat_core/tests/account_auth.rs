@@ -171,7 +171,7 @@ impl Fixture {
             .unwrap();
         let mut payload = minicbor::Encoder::new(Vec::new());
         payload
-            .array(10)
+            .array(11)
             .unwrap()
             .u8(1)
             .unwrap()
@@ -192,6 +192,8 @@ impl Fixture {
             .bytes(&[0x80])
             .unwrap()
             .bytes(&[0x80])
+            .unwrap()
+            .bytes(&[0x83,1,0x80,0xf6])
             .unwrap();
         {
             let mut store = Store::open(dir.path(), protector.clone()).unwrap();
@@ -407,7 +409,7 @@ fn durable_snapshot(root: &std::path::Path) -> StoredPlaintext {
 fn durable_tombstones(root: &std::path::Path) -> Vec<chat_core::account::RevokeIntent> {
     let state = durable_snapshot(root);
     let mut d = minicbor::Decoder::new(&state.payload);
-    assert_eq!(d.array().unwrap(), Some(10));
+    assert_eq!(d.array().unwrap(), Some(11));
     for _ in 0..7 {
         d.skip().unwrap();
     }
@@ -733,8 +735,8 @@ async fn remote_high_water_conflict_survives_store_reload() {
     assert!(a.account.connect_account(b.peer).await.is_err());
 }
 #[tokio::test]
-async fn previous_array8_and9_snapshots_are_rejected_without_file_mutation() {
-    for field_count in [8, 9] {
+async fn previous_array8_9_and10_snapshots_are_rejected_without_file_mutation() {
+    for field_count in [8, 9, 10] {
         let (a, _b, _backend) = pair().await;
         a.account.request_suspend();
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -1263,7 +1265,7 @@ async fn publish_conflict_without_signed_evidence_closes_and_denies_account_gran
 fn durable_remote(root: &std::path::Path, peer: PeerId) -> Option<(Vec<u8>, u64)> {
     let state = durable_snapshot(root);
     let mut d = minicbor::Decoder::new(&state.payload);
-    assert_eq!(d.array().unwrap(), Some(10));
+    assert_eq!(d.array().unwrap(), Some(11));
     for _ in 0..8 {
         d.skip().unwrap();
     }

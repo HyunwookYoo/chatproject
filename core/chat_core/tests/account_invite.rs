@@ -387,11 +387,13 @@ mod actor {
         .unwrap();
         let mut state = store.load().unwrap().unwrap();
         let mut d = minicbor::Decoder::new(&state.payload);
-        assert_eq!(d.array().unwrap(), Some(10));
+        assert_eq!(d.array().unwrap(), Some(11));
         for _ in 0..9 {
             d.skip().unwrap();
         }
         let end = d.position();
+        d.skip().unwrap();
+        let pair_state = d.bytes().unwrap().to_vec();
         let mut e = minicbor::Encoder::new(Vec::new());
         e.array(1000).unwrap();
         for n in 0u16..1000 {
@@ -415,6 +417,8 @@ mod actor {
         state.payload.truncate(end);
         minicbor::Encoder::new(&mut *state.payload)
             .bytes(&e.into_writer())
+            .unwrap()
+            .bytes(&pair_state)
             .unwrap();
         store.commit(&state).unwrap();
         drop(store);

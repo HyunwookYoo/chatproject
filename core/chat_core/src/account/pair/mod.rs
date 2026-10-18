@@ -1,6 +1,9 @@
 //! Ephemeral pairing. Durable identity import/disclosure belongs to B6.
 pub(crate) mod channel;
+pub(crate) mod resume;
 pub(crate) mod session;
+pub(crate) mod transaction;
+pub(crate) mod transfer;
 pub(crate) mod wire;
 use super::FlowId;
 use zeroize::Zeroize;
@@ -9,6 +12,21 @@ pub(crate) const ALPN: &[u8] = b"chatproject/pair/1";
 pub enum PairDirection {
     NewDisplays,
     ExistingDisplays,
+}
+/// Deterministic process-boundary fixture, absent from every Release build.
+#[cfg(all(feature = "test-hooks", debug_assertions))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairTestStop {
+    EBeforeDisclosure,
+    EAfterDisclosure,
+    EAfterFirstChunk,
+    NBeforeImport,
+    NAfterImport,
+    NAfterAck,
+    EBeforeReceipt,
+    EAfterReceipt,
+    EBeforePublish,
+    EAfterPublish,
 }
 /// One-shot QR response, deliberately neither Debug nor serializable.
 ///
@@ -33,6 +51,13 @@ pub enum PairPhase {
     WaitingQr,
     Comparing,
     Approved,
+    AwaitingApproval,
+    DisclosurePossible,
+    ReceiptReady,
+    ReceiptVerified,
+    PublishPending,
+    Active,
+    Observed,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PairView {
@@ -42,4 +67,5 @@ pub struct PairView {
     pub sas: Option<String>,
     pub expires_at: u64,
     pub disclosure_possible: bool,
+    pub transaction: Option<super::TxId>,
 }

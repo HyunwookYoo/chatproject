@@ -130,6 +130,7 @@ pub(crate) enum PacketOperation {
     Renew,
     Revoke,
     Resolve,
+    Add,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PacketStatus {
@@ -181,6 +182,54 @@ fn full() -> CoreError {
 }
 
 impl RecordState {
+    pub(crate) fn stage_add(
+        &mut self,
+        local: &LocalAccount,
+        cert: &super::InstallationCert,
+        base_hash: [u8; 32],
+        generation: Generation,
+        now: u64,
+    ) -> Result<[u8; 32], CoreError> {
+        let base = self.accepted.as_ref().ok_or_else(blocked)?;
+        if self.conflict.is_some()
+            || self.state == PublicationState::Conflict
+            || !base.current(now)
+            || base.record.is_expired(now)
+            || !self.owns(&base.record, local)
+            || self.removed(local)
+            || base.record.generation != generation
+        {
+            return Err(blocked());
+        }
+        if base.record.devices.iter().any(|d| {
+            d.installation_id == cert.installation_id
+                && d.transport_public_key == cert.transport_public_key
+                && d.kind == cert.kind
+        }) {
+            return Ok(base.hash);
+        }
+        if base.hash != base_hash || !self.pending.is_empty() {
+            return Err(conflict());
+        }
+        if base.record.devices.len() >= 5 {
+            return Err(CoreError::new(
+                ErrorCode::DeviceLimit,
+                "Device limit reached",
+            ));
+        }
+        if local.pairs.existing.len() + self.pending.len() >= 32 {
+            return Err(full());
+        }
+        let mut record = base.record.clone();
+        record.devices.push(super::RecordDevice {
+            installation_id: cert.installation_id,
+            transport_public_key: cert.transport_public_key,
+            kind: cert.kind,
+        });
+        record.devices.sort_by_key(|d| d.installation_id);
+        self.allocate(local, record, PacketOperation::Add, None, now)?;
+        Ok(self.pending.last().unwrap().signed.hash)
+    }
     pub(crate) fn new() -> Result<Self, CoreError> {
         let mut generation = [0; 16];
         getrandom::fill(&mut generation).map_err(|_| wire::invalid())?;
@@ -289,7 +338,7 @@ impl RecordState {
         revoke_nonce: Option<[u8; 16]>,
         now: u64,
     ) -> Result<(), CoreError> {
-        if self.pending.len() >= 32 {
+        if self.pending.len() + local.pairs.existing.len() >= 32 {
             return Err(full());
         }
         let seq = self.sequence(now)?;
@@ -709,6 +758,7 @@ impl RecordState {
                 2 => PacketOperation::Renew,
                 3 => PacketOperation::Revoke,
                 4 => PacketOperation::Resolve,
+                5 => PacketOperation::Add,
                 _ => return Err(wire::invalid()),
             };
             let status = match wire::uint(&mut d)? {

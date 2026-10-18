@@ -36,5 +36,6 @@ pub(super) fn local_account(
         records: super::publication::RecordState::new()?,
         remote: vec![],
         contacts: vec![],
+        pairs: Default::default(),
     })
 }

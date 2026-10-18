@@ -190,10 +190,8 @@ async fn same_sas_both_local_confirmations() {
         assert!(e.a.pair_approve(f).await.is_err());
         confirmations(&e, &n, f).await;
         approve(&e, f).await;
-        assert_eq!(
-            e.a.pair_view().await.unwrap().unwrap().phase,
-            PairPhase::Approved
-        );
+        assert!(matches!(e.a.pair_view().await.unwrap().unwrap().phase,
+            PairPhase::DisclosurePossible | PairPhase::ReceiptVerified | PairPhase::PublishPending | PairPhase::Observed));
     }
 }
 #[tokio::test]
@@ -550,7 +548,7 @@ async fn raw_new(e: &Fixture, qr: &str, mutation: Mutation) -> Option<Raw> {
     noise
         .read_message(&read_raw(&mut recv).await?, &mut out)
         .ok()?;
-    let size = noise.write_message(&[0xf6], &mut out).unwrap();
+    let size = noise.write_message(&[0x82,1,0], &mut out).unwrap();
     if send.write_all(&(size as u32).to_be_bytes()).await.is_err()
         || send.write_all(&out[..size]).await.is_err()
     {

@@ -112,6 +112,8 @@ pub(super) fn unseal(
 /// Private seed state never implements Debug, Clone, or serde.
 pub(crate) enum AccountState {
     Candidate(crate::account::DeviceKeys),
+    CandidatePinned(Box<crate::account::pair::transaction::CandidatePinned>),
+    PendingImport(Box<crate::account::pair::transaction::PendingImport>),
     /// Locally established keys; the publication intent is not public membership.
     Active(Box<LocalAccount>),
 }
@@ -124,10 +126,153 @@ pub(crate) struct LocalAccount {
     pub(crate) records: crate::account::publication::RecordState,
     pub(crate) remote: Vec<crate::account::connection::RemoteRecord>,
     pub(crate) contacts: Vec<crate::account::contacts::Contact>,
+    pub(crate) pairs: crate::account::pair::transaction::PairState,
+}
+impl Drop for LocalAccount {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        for c in &mut self.contacts {
+            c.alias.zeroize();c.peer.0.zeroize();c.verified_digest.zeroize();
+            if let Some(id)=&mut c.known_installation{id.0.zeroize();}
+        }
+    }
 }
 impl AccountState {
+    fn decode_pending(stored: &StoredPlaintext) -> Result<Self, CoreError> {
+        use crate::account::{
+            derive_device,
+            pair::{
+                transaction::{CandidatePinned, ExistingPin, PendingImport},
+                transfer::{Envelope, Payload, Receipt, hash},
+            },
+            publication::RecordState,
+        };
+        let mut d = minicbor::Decoder::new(&stored.payload);
+        crate::account::wire::array(&mut d, 8)?;
+        if d.u8().map_err(|_| corrupt())? != 1 {
+            return Err(corrupt());
+        }
+        let tag = d.u8().map_err(|_| corrupt())?;
+        let mut seed = Secret32::from([0; 32]);
+        let raw = d.bytes().map_err(|_| corrupt())?;
+        if raw.len() != 32 {
+            return Err(corrupt());
+        }
+        seed.as_mut_bytes().copy_from_slice(raw);
+        let device = derive_device(seed)?;
+        let revision = d.u64().map_err(|_| corrupt())?;
+        if revision == 0 {
+            return Err(corrupt());
+        }
+        let pin = ExistingPin::decode(&mut d)?;
+        let state = match tag {
+            2 => {
+                let tx = crate::account::TxId(crate::account::wire::bytes(&mut d)?);
+                let hash = crate::account::wire::bytes(&mut d)?;
+                let total = d.u64().map_err(|_| corrupt())?;
+                if total == 0 || total > FILE_LIMIT as u64 {
+                    return Err(corrupt());
+                }
+                Self::CandidatePinned(Box::new(CandidatePinned {
+                    device,
+                    revision,
+                    pin,
+                    envelope: Envelope {
+                        tx,
+                        total: total as usize,
+                        hash,
+                    },
+                }))
+            }
+            3 => {
+                let payload = Zeroizing::new(d.bytes().map_err(|_| corrupt())?.to_vec());
+                let p = Payload::decode(&payload)?;
+                let receipt = Receipt::decode(d.bytes().map_err(|_| corrupt())?)?;
+                let records = RecordState::decode(d.bytes().map_err(|_| corrupt())?, pin.peer)?;
+                if p.keys.peer_id() != pin.peer
+                    || !p.matches_device(&device)
+                    || receipt.tx != p.tx
+                    || receipt.payload_hash != hash(&payload)
+                    || receipt.installation != device.installation_id()
+                    || records.generation != p.generation
+                    || !records.pending.is_empty()
+                {
+                    return Err(corrupt());
+                }
+                Self::PendingImport(Box::new(PendingImport {
+                    device,
+                    revision,
+                    pin,
+                    payload,
+                    receipt,
+                    records,
+                }))
+            }
+            _ => return Err(corrupt()),
+        };
+        if state.encode().payload != stored.payload
+            || state.device().installation_id().0 != stored.installation
+        {
+            return Err(corrupt());
+        }
+        Ok(state)
+    }
+    fn encode_pending(&self) -> StoredPlaintext {
+        // Reserve before copying seeds, including oversized snapshots that Store
+        // will reject. A fixed FILE_LIMIT reserve could reallocate secret bytes.
+        let records = match self {
+            Self::PendingImport(p) => p.records.encode(),
+            _ => Vec::new(),
+        };
+        let capacity = match self {
+            Self::PendingImport(p) => p.payload.len() + records.len() + 512,
+            _ => 512,
+        };
+        let mut e = minicbor::Encoder::new(Vec::with_capacity(capacity));
+        e.array(8).unwrap().u8(1).unwrap();
+        match self {
+            Self::CandidatePinned(p) => {
+                e.u8(2)
+                    .unwrap()
+                    .bytes(p.device.seed().as_bytes())
+                    .unwrap()
+                    .u64(p.revision)
+                    .unwrap();
+                p.pin.encode(&mut e);
+                e.bytes(&p.envelope.tx.0)
+                    .unwrap()
+                    .bytes(&p.envelope.hash)
+                    .unwrap()
+                    .u64(p.envelope.total as u64)
+                    .unwrap();
+            }
+            Self::PendingImport(p) => {
+                e.u8(3)
+                    .unwrap()
+                    .bytes(p.device.seed().as_bytes())
+                    .unwrap()
+                    .u64(p.revision)
+                    .unwrap();
+                p.pin.encode(&mut e);
+                e.bytes(&p.payload)
+                    .unwrap()
+                    .bytes(&p.receipt.bytes())
+                    .unwrap()
+                    .bytes(&records)
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        StoredPlaintext {
+            installation: self.device().installation_id().0,
+            payload: Zeroizing::new(e.into_writer()),
+        }
+    }
     pub(crate) fn decode(stored: &StoredPlaintext) -> Result<Self, CoreError> {
-        if stored.payload.first() == Some(&0x8a) {
+        if stored.payload.first() == Some(&0x88) {
+            return Self::decode_pending(stored).map_err(|_| corrupt());
+        }
+        if stored.payload.first() == Some(&0x8b) {
             use crate::account::{
                 AccountKeys, InstallationCert, PublishIntent, derive_device, verify_cert,
             };
@@ -174,6 +319,7 @@ impl AccountState {
             .map_err(|_| corrupt())?;
             let remote = crate::account::connection::decode_cache(d.bytes().map_err(|_| corrupt())?, keys.peer_id()).map_err(|_| corrupt())?;
             let contacts = crate::account::contacts::decode(d.bytes().map_err(|_| corrupt())?, keys.peer_id()).map_err(|_| corrupt())?;
+            let pairs = crate::account::pair::transaction::PairState::decode(d.bytes().map_err(|_| corrupt())?, keys.peer_id(), &device, records.pending.len()).map_err(|_| corrupt())?;
             let state = Self::Active(Box::new(LocalAccount {
                 keys,
                 device,
@@ -183,6 +329,7 @@ impl AccountState {
                 records,
                 remote,
                 contacts,
+                pairs,
             }));
             if state.encode().payload != stored.payload
                 || state.device().installation_id().0 != stored.installation
@@ -205,10 +352,18 @@ impl AccountState {
         Ok(Self::Candidate(keys))
     }
     pub(crate) fn encode(&self) -> StoredPlaintext {
+        if matches!(self, Self::CandidatePinned(_) | Self::PendingImport(_)) {
+            return self.encode_pending();
+        }
         if let Self::Active(local) = self {
-            let mut payload = Zeroizing::new(Vec::with_capacity(384));
+            let records = local.records.encode();
+            let remote = crate::account::connection::encode_cache(&local.remote);
+            let contacts = Zeroizing::new(crate::account::contacts::encode(&local.contacts));
+            let pairs = local.pairs.encode();
+            let capacity = records.len() + remote.len() + contacts.len() + pairs.len() + 512;
+            let mut payload = Zeroizing::new(Vec::with_capacity(capacity));
             let mut e = minicbor::Encoder::new(&mut *payload);
-            e.array(10)
+            e.array(11)
                 .unwrap()
                 .u8(1)
                 .unwrap()
@@ -227,9 +382,10 @@ impl AccountState {
                     crate::account::PublishIntent::Replacement => 1,
                 })
                 .unwrap();
-            e.bytes(&local.records.encode()).unwrap();
-            e.bytes(&crate::account::connection::encode_cache(&local.remote)).unwrap();
-            e.bytes(&crate::account::contacts::encode(&local.contacts)).unwrap();
+            e.bytes(&records).unwrap();
+            e.bytes(&remote).unwrap();
+            e.bytes(&contacts).unwrap();
+            e.bytes(&pairs).unwrap();
             return StoredPlaintext {
                 installation: local.device.installation_id().0,
                 payload,
@@ -249,6 +405,8 @@ impl AccountState {
     pub(crate) fn device(&self) -> &crate::account::DeviceKeys {
         match self {
             Self::Candidate(keys) => keys,
+            Self::CandidatePinned(p) => &p.device,
+            Self::PendingImport(p) => &p.device,
             Self::Active(local) => &local.device,
         }
     }
@@ -269,7 +427,7 @@ mod account_tests {
         ));
         let stored = state.encode();
         let mut d = minicbor::Decoder::new(&stored.payload);
-        assert_eq!(d.array().unwrap(), Some(10));
+        assert_eq!(d.array().unwrap(), Some(11));
         assert_eq!(d.u8().unwrap(), 1);
         assert_eq!(d.u8().unwrap(), 1);
         let AccountState::Active(local) = &state else {

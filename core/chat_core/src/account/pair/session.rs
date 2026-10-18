@@ -20,6 +20,10 @@ pub(crate) enum Input {
     },
 }
 pub(crate) struct Runtime {
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    pub stop: Option<super::PairTestStop>,
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    pub bytes: (usize, usize),
     pub send: mpsc::Sender<Input>,
     pub input: mpsc::Receiver<Input>,
     pub current: Option<Session>,
@@ -28,6 +32,10 @@ impl Default for Runtime {
     fn default() -> Self {
         let (send, input) = mpsc::channel(8);
         Self {
+            #[cfg(all(feature = "test-hooks", debug_assertions))]
+            stop: None,
+            #[cfg(all(feature = "test-hooks", debug_assertions))]
+            bytes: (0, 0),
             send,
             input,
             current: None,
@@ -40,6 +48,7 @@ impl Default for Runtime {
 pub(crate) struct DisclosurePermit {
     flow: FlowId,
     handshake_hash: [u8; 32],
+    authority: Option<crate::account::publication::SignedRecord>,
 }
 pub(crate) struct Session {
     pub qr: Qr,
@@ -54,6 +63,9 @@ pub(crate) struct Session {
     pub remote_confirmed: bool,
     pub approved: bool,
     pub disclosure_possible: bool,
+    pub transaction: Option<crate::account::TxId>,
+    pub receiving: Option<super::transfer::Receiving>,
+    pub phase: Option<PairPhase>,
     pub cancel: CancellationToken,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     pub received: Zeroizing<Vec<u8>>,
@@ -81,6 +93,9 @@ impl Session {
             remote_confirmed: false,
             approved: false,
             disclosure_possible: false,
+            transaction: None,
+            receiving: None,
+            phase: None,
             cancel: CancellationToken::new(),
             #[cfg(all(feature = "test-hooks", debug_assertions))]
             received: Zeroizing::new(vec![]),
@@ -106,16 +121,19 @@ impl Session {
         PairView {
             flow: self.qr.flow,
             direction: self.qr.direction,
-            phase: if self.approved {
+            phase: self.phase.unwrap_or(if self.approved {
                 PairPhase::Approved
+            } else if self.role == Role::Existing && self.local_confirmed && self.remote_confirmed {
+                PairPhase::AwaitingApproval
             } else if self.channel.is_some() {
                 PairPhase::Comparing
             } else {
                 PairPhase::WaitingQr
-            },
+            }),
             sas: self.channel.as_ref().map(|c| c.sas.clone()),
             expires_at: self.qr.expires,
             disclosure_possible: self.disclosure_possible,
+            transaction: self.transaction.or(self.qr.resume),
         }
     }
     pub(crate) async fn confirm(&mut self) -> Result<(), CoreError> {
@@ -147,7 +165,11 @@ impl Session {
         }
         Ok(())
     }
-    pub(crate) fn receive(&mut self, connection: usize, cipher: &[u8]) -> Result<(), CoreError> {
+    pub(crate) fn receive(
+        &mut self,
+        connection: usize,
+        cipher: &[u8],
+    ) -> Result<Option<Zeroizing<Vec<u8>>>, CoreError> {
         let channel = self.channel.as_mut().ok_or_else(invalid)?;
         if channel.conn.stable_id() != connection {
             return Err(invalid());
@@ -158,27 +180,74 @@ impl Session {
                 return Err(invalid());
             }
             self.remote_confirmed = true;
-            return Ok(());
+            return Ok(None);
         }
         #[cfg(all(feature = "test-hooks", debug_assertions))]
         if self.role == Role::New
             && self.local_confirmed
             && self.remote_confirmed
             && plain.len() <= channel::MAX_PLAIN
+            && plain.starts_with(b"B5 fixture:")
         {
-            self.received.extend_from_slice(&plain);
+            self.received
+                .extend_from_slice(&plain[b"B5 fixture:".len()..]);
             if self.received.len() > channel::MAX_PLAIN {
                 return Err(invalid());
             }
-            return Ok(());
+            return Ok(None);
         }
-        Err(invalid())
+        if !self.local_confirmed || !self.remote_confirmed {
+            return Err(invalid());
+        }
+        Ok(Some(plain))
+    }
+    pub(crate) fn committed_permit(
+        &self,
+        t: &super::transaction::PairTransaction,
+        authority: &crate::account::publication::SignedRecord,
+    ) -> Result<DisclosurePermit, CoreError> {
+        let c = self.channel.as_ref().ok_or_else(invalid)?;
+        let p = super::transfer::Payload::decode(&t.payload)?;
+        if t.approved_flow != self.qr.flow
+            || t.approved_hash != c.hash
+            || p.cert.installation_id != c.remote.installation
+            || p.cert.transport_public_key != c.remote.transport
+            || Some(p.cert.kind) != c.candidate_kind
+        {
+            return Err(invalid());
+        }
+        Ok(DisclosurePermit {
+            flow: self.qr.flow,
+            handshake_hash: c.hash,
+            authority: Some(authority.clone()),
+        })
+    }
+    pub(crate) async fn send_receipt(
+        &mut self,
+        clock: &dyn Clock,
+        r: &super::transfer::Receipt,
+    ) -> Result<usize, CoreError> {
+        if !self.live(clock)
+            || self.role != Role::New
+            || !self.local_confirmed
+            || !self.remote_confirmed
+            || r.flow != self.qr.flow
+            || self.channel.as_ref().is_none_or(|c| c.hash != r.handshake)
+        {
+            return Err(invalid());
+        }
+        self.channel
+            .as_mut()
+            .ok_or_else(invalid)?
+            .send(&r.bytes())
+            .await
     }
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     pub(crate) fn fixture_permit(&self) -> Result<DisclosurePermit, CoreError> {
         Ok(DisclosurePermit {
             flow: self.qr.flow,
             handshake_hash: self.channel.as_ref().ok_or_else(invalid)?.hash,
+            authority: None,
         })
     }
     /// B6 must supply a durable disclosure commit before calling this gate. The
@@ -188,7 +257,7 @@ impl Session {
     pub(crate) async fn send_gated(
         &mut self,
         clock: &dyn Clock,
-        permit: DisclosurePermit,
+        permit: &DisclosurePermit,
         build: impl FnOnce() -> Zeroizing<Vec<u8>>,
     ) -> Result<usize, CoreError> {
         if !self.live(clock)
@@ -197,6 +266,9 @@ impl Session {
             || !self.remote_confirmed
             || !self.approved
             || permit.flow != self.qr.flow
+            || permit.authority.as_ref().is_some_and(|a| {
+                !a.current(clock.unix_seconds()) || a.record.is_expired(clock.unix_seconds())
+            })
         {
             return Err(invalid());
         }

@@ -773,7 +773,7 @@ async fn legacy_a5_snapshot_is_rejected_without_file_modification() {
         chat_core::account::storage::Store::open(dir.path(), support::protector()).unwrap();
     let mut stored = store.load().unwrap().unwrap();
     let mut decoder = minicbor::Decoder::new(&stored.payload);
-    assert_eq!(decoder.array().unwrap(), Some(10));
+    assert_eq!(decoder.array().unwrap(), Some(11));
     for _ in 0..7 {
         decoder.skip().unwrap();
     }
