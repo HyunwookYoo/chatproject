@@ -587,14 +587,13 @@ impl Manager {
         self.restrict_grants();
         if result.is_ok()
             && self.local()?.records.conflict.is_none()
+            && self.local()?.records.state != PublicationState::Conflict
             && let Some(record) = &self.local()?.records.accepted
             && Some(record.hash) != old_accepted
         {
-            self.auth.registry.sync_record(
-                self.local()?.keys.peer_id(),
-                record,
-                self.auth.cancel.child_token(),
-            );
+            self.auth
+                .registry
+                .sync_record(record, self.auth.cancel.child_token());
         }
         result
     }
@@ -604,6 +603,10 @@ impl Manager {
         request: Request,
     ) -> Result<(), CoreError> {
         self.ensure_ready(request)?;
+        let local = self.local()?;
+        if !local.records.can_publish(&signed.record, local) {
+            return Err(unavailable(ErrorCode::AccountRestricted));
+        }
         let now = self.services.clock.unix_seconds();
         if !signed.current(now) || signed.record.is_expired(now) {
             let mut records = self.local()?.records.clone();
@@ -616,6 +619,9 @@ impl Manager {
     async fn publication(&mut self, action: Action) -> Result<(), CoreError> {
         let request = self.ready()?;
         let local = self.local()?;
+        if local.records.removed(local) {
+            return Err(unavailable(ErrorCode::AccountRestricted));
+        }
         if matches!(action, Action::Revoke(target) if target == local.device.installation_id()) {
             return Err(unavailable(ErrorCode::AccountRestricted));
         }
@@ -636,7 +642,7 @@ impl Manager {
                 action,
             ),
             Err(error) => {
-                if records.conflict.is_none() {
+                if records.conflict.is_none() && records.state != PublicationState::Conflict {
                     records.state = PublicationState::LocalBlocked;
                 }
                 Err(error)
@@ -1132,6 +1138,7 @@ impl Manager {
         let now = self.services.clock.unix_seconds();
         self.ready().is_ok()
             && local.records.conflict.is_none()
+            && local.records.state != PublicationState::Conflict
             && record.seq >= local.records.observed_seq
             && record.record.generation == local.records.generation
             && record.current(now)
@@ -1175,6 +1182,7 @@ impl Manager {
         };
         if self.ready().is_err()
             || local.records.conflict.is_some()
+            || local.records.state == PublicationState::Conflict
             || own.record.generation != local.records.generation
             || !own.record.devices.iter().any(|d| {
                 d.installation_id == local.device.installation_id()
@@ -1263,6 +1271,36 @@ impl Manager {
         self.restrict_grants();
         result
     }
+    fn observe_remote(
+        &mut self,
+        peer: PeerId,
+        signed: super::publication::SignedRecord,
+        request: Request,
+    ) -> Result<(), CoreError> {
+        let mut remote = self.local()?.remote.clone();
+        let result = if let Some(existing) = remote.iter_mut().find(|r| r.peer == peer) {
+            existing.observe(signed, self.services.clock.unix_seconds())
+        } else {
+            if remote.len() >= 1000 {
+                return Err(unavailable(ErrorCode::StorageFull));
+            }
+            let conflict = if signed.current(self.services.clock.unix_seconds()) {
+                None
+            } else {
+                Some(signed.clone())
+            };
+            remote.push(super::connection::RemoteRecord {
+                peer,
+                floor: signed.seq,
+                accepted: signed,
+                conflict,
+            });
+            remote.sort_by_key(|r| r.peer);
+            Ok(())
+        };
+        self.commit_remote(remote, request)?;
+        result
+    }
     async fn remote_record(
         &mut self,
         peer: PeerId,
@@ -1277,33 +1315,11 @@ impl Manager {
         let backend = self.services.backend()?;
         let lookup = self.service(request, backend.lookup(peer)).await;
         self.ensure_ready(request)?;
-        let mut remote = self.local()?.remote.clone();
         let mut cached = false;
         match lookup {
             Ok(super::Lookup::Found(packet)) => {
                 let signed = super::publication::SignedRecord::new(packet, peer)?;
-                let result = if let Some(existing) = remote.iter_mut().find(|r| r.peer == peer) {
-                    existing.observe(signed, self.services.clock.unix_seconds())
-                } else {
-                    if remote.len() >= 1000 {
-                        return Err(unavailable(ErrorCode::StorageFull));
-                    }
-                    let conflict = if signed.current(self.services.clock.unix_seconds()) {
-                        None
-                    } else {
-                        Some(signed.clone())
-                    };
-                    remote.push(super::connection::RemoteRecord {
-                        peer,
-                        floor: signed.seq,
-                        accepted: signed,
-                        conflict,
-                    });
-                    remote.sort_by_key(|r| r.peer);
-                    Ok(())
-                };
-                self.commit_remote(remote, request)?;
-                result?;
+                self.observe_remote(peer, signed, request)?;
             }
             Ok(super::Lookup::CompletedAbsent) | Err(_) => {
                 cached = true;
@@ -1582,16 +1598,24 @@ impl Manager {
             .map(|s| (s.grant.clone(), s.ready))
             .ok_or_else(|| unavailable(ErrorCode::AuthFailed))?;
         if let Ok(bytes) = super::auth::payload(body, 2) {
-            if self.must_close(&grant) || grant.peer != self.local()?.keys.peer_id() {
+            if self.must_close(&grant) {
                 return Err(unavailable(ErrorCode::AccountRestricted));
             }
             let signed = super::publication::SignedRecord::decode(&bytes, grant.peer)?;
-            super::parse_record(
+            let current = super::parse_record(
                 &signed.packet,
                 grant.peer,
                 self.services.clock.unix_seconds(),
-            )?;
-            self.apply_record_change(&signed, request)?;
+            );
+            if grant.peer == self.local()?.keys.peer_id() {
+                current?;
+                self.apply_record_change(&signed, request)?;
+            } else {
+                // Verified future/rollback evidence must retain the same durable
+                // floor/conflict policy as lookup, even when unusable right now.
+                self.observe_remote(grant.peer, signed, request)?;
+                current?;
+            }
             return Ok(super::auth::envelope(
                 2,
                 self.local()?
@@ -1646,6 +1670,9 @@ impl Manager {
                 return Err(unavailable(ErrorCode::StorageFull));
             }
             records.tombstones.push(intent);
+            // Preserve exact signed packets and receipt obligations, but never
+            // retry a queued membership that the new tombstone invalidates.
+            records.restrict_pending(local);
             self.commit_records(records, request)?;
         }
         self.restrict_grants();

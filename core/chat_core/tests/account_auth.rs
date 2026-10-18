@@ -26,11 +26,14 @@ use zeroize::Zeroizing;
 #[path = "support/account_store.rs"]
 mod support;
 const NOW: u64 = 1_800_000_000;
+#[derive(Default)]
 struct Backend {
     packets: Mutex<BTreeMap<PeerId, SignedPacket>>,
     offline: AtomicBool,
     capture: Mutex<Option<(Vec<std::path::PathBuf>, chat_core::account::InstallationId)>>,
     observed: Mutex<Vec<Vec<chat_core::account::RevokeIntent>>>,
+    publish_error: Mutex<Option<ErrorCode>>,
+    publishes: Mutex<Vec<SignedPacket>>,
 }
 impl RecordBackend for Backend {
     fn lookup(&self, peer: PeerId) -> RecordFuture<'_, Lookup> {
@@ -53,6 +56,10 @@ impl RecordBackend for Backend {
     }
     fn publish<'a>(&'a self, packet: &'a SignedPacket) -> RecordFuture<'a, ()> {
         Box::pin(async move {
+            self.publishes.lock().unwrap().push(packet.clone());
+            if let Some(code) = *self.publish_error.lock().unwrap() {
+                return Err(CoreError::new(code, "injected publish failure"));
+            }
             if let Some((paths, target)) = self.capture.lock().unwrap().as_ref() {
                 let observed: Vec<_> = paths.iter().map(|path| durable_tombstones(path)).collect();
                 assert!(
@@ -273,6 +280,7 @@ async fn pair() -> (Fixture, Fixture, Arc<Backend>) {
         offline: AtomicBool::new(false),
         capture: Mutex::new(None),
         observed: Mutex::new(vec![]),
+        ..Default::default()
     });
     for (seed, p) in [(1, a.clone()), (2, b.clone())] {
         backend.packets.lock().unwrap().insert(
@@ -384,7 +392,7 @@ async fn own_removal_stops_account_activity() {
     assert!(a.account.connect_account(b.peer).await.is_err());
 }
 
-fn durable_tombstones(root: &std::path::Path) -> Vec<chat_core::account::RevokeIntent> {
+fn durable_snapshot(root: &std::path::Path) -> StoredPlaintext {
     // Copy the committed encrypted snapshot into an isolated read-only fixture.
     // Never open a second Store on a live actor's folder.
     let mirror = tempfile::tempdir().unwrap();
@@ -392,7 +400,10 @@ fn durable_tombstones(root: &std::path::Path) -> Vec<chat_core::account::RevokeI
         std::fs::copy(root.join(name), mirror.path().join(name)).unwrap();
     }
     let mut store = Store::open(mirror.path(), support::protector()).unwrap();
-    let state = store.load().unwrap().unwrap();
+    store.load().unwrap().unwrap()
+}
+fn durable_tombstones(root: &std::path::Path) -> Vec<chat_core::account::RevokeIntent> {
+    let state = durable_snapshot(root);
     let mut d = minicbor::Decoder::new(&state.payload);
     assert_eq!(d.array().unwrap(), Some(9));
     for _ in 0..7 {
@@ -442,6 +453,7 @@ async fn real_revoke_closes_target_then_confirms_remaining_peer_before_public_mu
         offline: AtomicBool::new(false),
         capture: Mutex::new(None),
         observed: Mutex::new(vec![]),
+        ..Default::default()
     });
     let a = Fixture::new(3, 21, &signed, backend.clone()).await;
     let order = Arc::new(ReceiptOrderProtector::default());
@@ -545,6 +557,7 @@ async fn replay_other_connection_role_nonce_rejected() {
             offline: AtomicBool::new(false),
             capture: Mutex::new(None),
             observed: Mutex::new(vec![]),
+            ..Default::default()
         });
         let a = Fixture::new(1, 11, &a_packet, backend).await;
         let raw = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
@@ -758,6 +771,7 @@ async fn previous_array8_snapshot_is_rejected_without_file_mutation() {
         offline: AtomicBool::new(true),
         capture: Mutex::new(None),
         observed: Mutex::new(vec![]),
+        ..Default::default()
     });
     assert!(
         slot.open_account_with_services(
@@ -799,6 +813,7 @@ async fn expired_session_accepts_public_record_sync_without_mutation_or_grant() 
         offline: AtomicBool::new(false),
         capture: Mutex::new(None),
         observed: Mutex::new(vec![]),
+        ..Default::default()
     });
     let a = Fixture::new(4, 31, &signed, backend.clone()).await;
     let b = Fixture::new(4, 32, &signed, backend.clone()).await;
@@ -864,6 +879,7 @@ async fn receiver_store_failure_keeps_real_notification_pending_and_never_publis
         offline: AtomicBool::new(false),
         capture: Mutex::new(None),
         observed: Mutex::new(vec![]),
+        ..Default::default()
     });
     let protector = Arc::new(FailingProtector(AtomicBool::new(false)));
     let mut seeds = [41, 42, 43];
@@ -933,4 +949,452 @@ async fn future_remote_observation_never_becomes_cache_authority_after_clock_cat
     a.clock.set_unix_seconds(NOW + 600);
     backend.offline.store(true, Ordering::SeqCst);
     assert!(a.account.refresh_record(b.peer).await.is_err());
+}
+
+// A separately owned loopback installation performs the actual exporter proof,
+// then can exercise controls a normal revoked target is deliberately not sent.
+async fn raw_peer(
+    receiver: &Fixture,
+    seed: u8,
+    device_seed: u8,
+    signed: SignedPacket,
+) -> (iroh::Endpoint, iroh::endpoint::Connection) {
+    use ed25519_dalek::{Signer, SigningKey};
+    let keys = derive_account(&Secret32::from([seed; 32])).unwrap();
+    let device = derive_device(Secret32::from([device_seed; 32])).unwrap();
+    let cert = sign_cert(&keys, &device, DeviceKind::Desktop, NOW).unwrap();
+    let peer = keys.peer_id();
+    let record = chat_core::account::parse_record(&signed, peer, NOW).unwrap();
+    let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .secret_key(iroh::SecretKey::from_bytes(&derive_seed(
+            device_seed,
+            b"ChatProject/device-keys/v1",
+            b"transport-ed25519",
+        )))
+        .relay_mode(iroh::RelayMode::Disabled)
+        .alpns(vec![b"chatproject/account/1".to_vec()])
+        .bind()
+        .await
+        .unwrap();
+    let addresses = endpoint.bound_sockets().into_iter().map(|mut socket| {
+        if socket.ip().is_unspecified() {
+            socket.set_ip(if socket.is_ipv4() {
+                std::net::Ipv4Addr::LOCALHOST.into()
+            } else {
+                std::net::Ipv6Addr::LOCALHOST.into()
+            });
+        }
+        iroh::TransportAddr::Ip(socket)
+    });
+    let ticket = iroh_tickets::endpoint::EndpointTicket::new(iroh::EndpointAddr::from_parts(
+        endpoint.id(),
+        addresses,
+    ))
+    .to_string();
+    receiver
+        .slot
+        .network()
+        .unwrap()
+        .account_target_for_test(ticket)
+        .await
+        .unwrap();
+    let raw = endpoint.clone();
+    let task = tokio::spawn(async move {
+        let conn = raw.accept().await.unwrap().await.unwrap();
+        let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+        let remote = hello_parts(&read_control(&mut recv).await);
+        let nonce = [87; 32];
+        let mut e = minicbor::Encoder::new(Vec::new());
+        e.array(5)
+            .unwrap()
+            .u8(1)
+            .unwrap()
+            .bytes(&peer.0)
+            .unwrap()
+            .bytes(&record.generation.0)
+            .unwrap();
+        let mut hello = e.into_writer();
+        hello.extend(cert.to_bytes());
+        minicbor::Encoder::new(&mut hello).bytes(&nonce).unwrap();
+        send_control(&mut send, &control(0, &hello)).await;
+        let _ = read_control(&mut recv).await;
+        send_control(&mut send, &control(2, signed.as_bytes())).await;
+        let own = (peer, record.generation, cert, nonce);
+        let mut e = minicbor::Encoder::new(Vec::new());
+        e.array(3).unwrap().u8(1).unwrap();
+        for (p, g, c, n) in [&remote, &own] {
+            e.array(6)
+                .unwrap()
+                .bytes(&p.0)
+                .unwrap()
+                .bytes(&c.transport_public_key)
+                .unwrap()
+                .bytes(&c.installation_id.0)
+                .unwrap()
+                .bytes(&c.hash())
+                .unwrap()
+                .bytes(&g.0)
+                .unwrap()
+                .bytes(n)
+                .unwrap();
+        }
+        let context = e.into_writer();
+        let mut exporter = [0; 32];
+        conn.export_keying_material(&mut exporter, b"ChatProject/account-exporter/v1", &context)
+            .unwrap();
+        let mut message = b"ChatProject/account-auth/v1".to_vec();
+        message.extend(context);
+        message.extend(exporter);
+        let sig = SigningKey::from_bytes(&derive_seed(
+            device_seed,
+            b"ChatProject/device-keys/v1",
+            b"installation-ed25519",
+        ))
+        .sign(&message)
+        .to_bytes();
+        let _ = read_control(&mut recv).await;
+        send_control(&mut send, &control(1, &sig)).await;
+        send.finish().unwrap();
+        conn
+    });
+    receiver.account.connect_account(peer).await.unwrap();
+    (endpoint, task.await.unwrap())
+}
+fn signed_revoke(
+    seed: u8,
+    signed: &SignedPacket,
+    target_seed: u8,
+) -> chat_core::account::RevokeIntent {
+    use ed25519_dalek::{Signer, SigningKey};
+    let peer = derive_account(&Secret32::from([seed; 32]))
+        .unwrap()
+        .peer_id();
+    let record = chat_core::account::parse_record(signed, peer, NOW).unwrap();
+    let target = derive_device(Secret32::from([target_seed; 32])).unwrap();
+    let mut e = minicbor::Encoder::new(Vec::new());
+    e.array(8)
+        .unwrap()
+        .u8(1)
+        .unwrap()
+        .bytes(&peer.0)
+        .unwrap()
+        .bytes(&record.generation.0)
+        .unwrap()
+        .bytes(&chat_core::account::record_hash(signed))
+        .unwrap()
+        .bytes(&target.installation_id().0)
+        .unwrap()
+        .bytes(&target.transport_public_key())
+        .unwrap()
+        .bytes(&[88; 16])
+        .unwrap()
+        .u64(NOW)
+        .unwrap();
+    let unsigned = e.into_writer();
+    let mut message = b"ChatProject/revoke/v1".to_vec();
+    message.push(1);
+    message.extend(&unsigned);
+    let sig = SigningKey::from_bytes(&derive_seed(
+        seed,
+        b"ChatProject/account-keys/v1",
+        b"identity-ed25519",
+    ))
+    .sign(&message)
+    .to_bytes();
+    let mut bytes = unsigned;
+    bytes[0] = 0x89;
+    minicbor::Encoder::new(&mut bytes).bytes(&sig).unwrap();
+    let intent = chat_core::account::RevokeIntent::from_bytes(&bytes).unwrap();
+    intent.verify(peer).unwrap();
+    intent
+}
+async fn reload(fixture: &Fixture) {
+    for suspend in [true, false] {
+        if suspend {
+            fixture.account.request_suspend();
+        } else {
+            fixture.account.request_resume();
+        }
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while fixture.account.lifecycle_status() == 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+    fixture.account.snapshot().await.unwrap();
+}
+#[tokio::test]
+async fn received_revoke_holds_ready_packet_after_reload() {
+    received_revoke_with_pending(false).await;
+}
+#[tokio::test]
+async fn received_own_removal_stops_ready_publication_after_reload() {
+    received_revoke_with_pending(true).await;
+}
+async fn received_revoke_with_pending(removes_receiver: bool) {
+    let signed = packet(6, &[51, 52, 53], 6, NOW, NOW + 600, NOW * 1_000_000);
+    let peer = derive_account(&Secret32::from([6; 32])).unwrap().peer_id();
+    let backend = Arc::new(Backend {
+        packets: Mutex::new(BTreeMap::from([(peer, signed.clone())])),
+        ..Default::default()
+    });
+    let receiver = Fixture::new(6, 51, &signed, backend.clone()).await;
+    let (raw, conn) = raw_peer(&receiver, 6, 52, signed.clone()).await;
+    backend.packets.lock().unwrap().remove(&peer);
+    *backend.publish_error.lock().unwrap() = Some(ErrorCode::RecordUnavailable);
+    assert!(receiver.account.refresh_record(peer).await.is_err());
+    assert_eq!(receiver.view().await.publication.pending_count, 1);
+    assert_eq!(backend.publishes.lock().unwrap().len(), 1);
+    backend.packets.lock().unwrap().insert(peer, signed.clone());
+    let intent = signed_revoke(6, &signed, if removes_receiver { 51 } else { 53 });
+    let frame = intent.to_frame();
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    send.write_all(&frame).await.unwrap();
+    send.finish().unwrap();
+    if removes_receiver {
+        tokio::time::timeout(Duration::from_secs(5), conn.closed())
+            .await
+            .unwrap();
+    } else {
+        assert_eq!(read_control(&mut recv).await, frame[4..]);
+    }
+    assert_eq!(durable_tombstones(receiver._dir.path()), vec![intent]);
+    backend.publishes.lock().unwrap().clear();
+    *backend.publish_error.lock().unwrap() = None;
+    for absent in [false, true] {
+        if absent {
+            backend.packets.lock().unwrap().remove(&peer);
+        }
+        let _ = receiver.account.refresh_record(peer).await;
+        assert!(
+            backend.publishes.lock().unwrap().is_empty(),
+            "stale Ready packet published after received revoke (own={removes_receiver}, absent={absent})"
+        );
+    }
+    reload(&receiver).await;
+    let _ = receiver.account.refresh_record(peer).await;
+    assert!(
+        backend.publishes.lock().unwrap().is_empty(),
+        "reload forgot publication restriction"
+    );
+    assert_eq!(receiver.view().await.publication.pending_count, 1);
+    raw.close().await;
+}
+
+#[tokio::test]
+async fn publish_conflict_without_signed_evidence_closes_and_denies_account_grants() {
+    let (a, b, backend) = pair().await;
+    a.account.connect_account(b.peer).await.unwrap();
+    let accepted = backend.packets.lock().unwrap().remove(&a.peer).unwrap();
+    *backend.publish_error.lock().unwrap() = Some(ErrorCode::RecordConflict);
+    assert_eq!(
+        a.account.refresh_record(a.peer).await.unwrap_err().code,
+        ErrorCode::RecordConflict
+    );
+    let view = a.view().await;
+    assert_eq!(
+        view.publication.state,
+        chat_core::account::PublicationState::Conflict
+    );
+    assert!(view.publication.conflict.is_none());
+    assert!(
+        a.events
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, CoreEvent::AccountAuthChanged { ready: false, .. })),
+        "known publish conflict retained the active grant"
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !b
+            .events
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, CoreEvent::AccountAuthChanged { ready: false, .. }))
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("conflicted connection was not closed");
+    assert!(a.account.connect_account(b.peer).await.is_err());
+    backend.offline.store(true, Ordering::SeqCst);
+    assert!(a.account.refresh_record(a.peer).await.is_err());
+    assert!(a.account.connect_account(b.peer).await.is_err());
+    assert_eq!(
+        a.view().await.publication.state,
+        chat_core::account::PublicationState::Conflict
+    );
+    backend.offline.store(false, Ordering::SeqCst);
+    backend.packets.lock().unwrap().insert(a.peer, accepted);
+    a.clock.set_unix_seconds(NOW - 600);
+    assert!(a.account.refresh_record(a.peer).await.is_err());
+    assert_eq!(
+        a.view().await.publication.state,
+        chat_core::account::PublicationState::Conflict,
+        "clock-only rejection erased known publication conflict"
+    );
+    a.clock.set_unix_seconds(NOW);
+    *backend.publish_error.lock().unwrap() = None;
+    let competing = packet(1, &[11], 1, NOW + 1, NOW + 601, (NOW + 1) * 1_000_000);
+    backend
+        .packets
+        .lock()
+        .unwrap()
+        .insert(a.peer, competing.clone());
+    assert!(a.account.refresh_record(a.peer).await.is_err());
+    a.account
+        .confirm_record_conflict(chat_core::account::record_hash(&competing))
+        .await
+        .unwrap();
+    a.account.refresh_record(a.peer).await.unwrap();
+    a.account.connect_account(b.peer).await.unwrap();
+}
+
+fn durable_remote(root: &std::path::Path, peer: PeerId) -> Option<(Vec<u8>, u64)> {
+    let state = durable_snapshot(root);
+    let mut d = minicbor::Decoder::new(&state.payload);
+    assert_eq!(d.array().unwrap(), Some(9));
+    for _ in 0..8 {
+        d.skip().unwrap();
+    }
+    let mut cache = minicbor::Decoder::new(d.bytes().unwrap());
+    for _ in 0..cache.array().unwrap().unwrap() {
+        assert_eq!(cache.array().unwrap(), Some(4));
+        let id = cache.bytes().unwrap();
+        let packet = cache.bytes().unwrap().to_vec();
+        let floor = cache.u64().unwrap();
+        cache.skip().unwrap();
+        if id == peer.0 {
+            return Some((packet, floor));
+        }
+    }
+    None
+}
+#[tokio::test]
+async fn different_accounts_exchange_expired_public_records_durably_before_fresh_proof() {
+    let (a, b, backend) = pair().await;
+    a.account.connect_account(b.peer).await.unwrap();
+    let ready = |fixture: &Fixture| {
+        fixture
+            .events
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e, CoreEvent::AccountAuthChanged { ready: true, .. }))
+            .count()
+    };
+    let before = (ready(&a), ready(&b));
+    a.clock.set_unix_seconds(NOW + 600);
+    b.clock.set_unix_seconds(NOW + 600);
+    assert!(a.account.connect_account(b.peer).await.is_err());
+    assert!(b.account.connect_account(a.peer).await.is_err());
+    backend.packets.lock().unwrap().remove(&a.peer);
+    backend.packets.lock().unwrap().remove(&b.peer);
+    a.account.refresh_record(a.peer).await.unwrap();
+    a.account.refresh_record(a.peer).await.unwrap();
+    let renewed_a = backend.packets.lock().unwrap()[&a.peer].clone();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if durable_remote(b._dir.path(), a.peer)
+                .is_some_and(|(bytes, _)| bytes.as_slice() == renewed_a.as_bytes().as_ref())
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("different-account public renewal never reached durable remote cache");
+    b.account.refresh_record(b.peer).await.unwrap();
+    b.account.refresh_record(b.peer).await.unwrap();
+    let renewed_b = backend.packets.lock().unwrap()[&b.peer].clone();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if durable_remote(a._dir.path(), b.peer)
+                .is_some_and(|(bytes, _)| bytes.as_slice() == renewed_b.as_bytes().as_ref())
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("reverse public renewal never reached durable remote cache");
+    for (receiver, peer, packet) in [(&a, b.peer, &renewed_b), (&b, a.peer, &renewed_a)] {
+        let (bytes, floor) = durable_remote(receiver._dir.path(), peer).unwrap();
+        assert_eq!(bytes.as_slice(), packet.as_bytes().as_ref());
+        assert_eq!(
+            floor,
+            u64::from_be_bytes(packet.as_bytes()[96..104].try_into().unwrap())
+        );
+        assert_eq!(receiver.view().await.publication.pending_count, 0);
+    }
+    assert_eq!(
+        (ready(&a), ready(&b)),
+        before,
+        "public-only exchange granted authority"
+    );
+    assert_eq!(
+        backend.publishes.lock().unwrap().len(),
+        2,
+        "remote observation allocated a mutation"
+    );
+    backend.offline.store(true, Ordering::SeqCst);
+    a.account.connect_account(b.peer).await.unwrap();
+    assert_eq!(ready(&a), before.0 + 1, "new proof did not grant readiness");
+}
+
+#[tokio::test]
+async fn cross_account_public_controls_bind_peer_and_preserve_observation_floor() {
+    for mode in ["rollback", "future", "wrong_peer"] {
+        let own = packet(1, &[11], 1, NOW, NOW + 600, NOW * 1_000_000);
+        let remote = packet(2, &[12], 2, NOW, NOW + 600, NOW * 1_000_000);
+        let a_peer = derive_account(&Secret32::from([1; 32])).unwrap().peer_id();
+        let b_peer = derive_account(&Secret32::from([2; 32])).unwrap().peer_id();
+        let backend = Arc::new(Backend {
+            packets: Mutex::new(BTreeMap::from([
+                (a_peer, own.clone()),
+                (b_peer, remote.clone()),
+            ])),
+            ..Default::default()
+        });
+        let a = Fixture::new(1, 11, &own, backend).await;
+        let (raw, conn) = raw_peer(&a, 2, 12, remote.clone()).await;
+        let renewal = packet(2, &[12], 2, NOW + 1, NOW + 601, (NOW + 1) * 1_000_000);
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        send_control(&mut send, &control(2, renewal.as_bytes())).await;
+        send.finish().unwrap();
+        let _ = read_control(&mut recv).await;
+        let unexpected = match mode {
+            "rollback" => remote,
+            "future" => packet(2, &[12], 2, NOW + 600, NOW + 1200, (NOW + 600) * 1_000_000),
+            _ => own,
+        };
+        let (mut send, _recv) = conn.open_bi().await.unwrap();
+        send_control(&mut send, &control(2, unexpected.as_bytes())).await;
+        send.finish().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), conn.closed())
+            .await
+            .unwrap();
+        let (accepted, floor) = durable_remote(a._dir.path(), b_peer).unwrap();
+        assert_eq!(accepted.as_slice(), renewal.as_bytes().as_ref());
+        let expected_floor = if mode == "future" {
+            (NOW + 600) * 1_000_000
+        } else {
+            (NOW + 1) * 1_000_000
+        };
+        assert_eq!(
+            floor, expected_floor,
+            "public control lost {mode} observation policy"
+        );
+        assert!(durable_remote(a._dir.path(), a_peer).is_none());
+        raw.close().await;
+    }
 }

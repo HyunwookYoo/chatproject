@@ -220,16 +220,40 @@ impl RecordState {
                 .collect(),
         }
     }
+    pub(crate) fn removed(&self, local: &LocalAccount) -> bool {
+        self.tombstones.iter().any(|t| {
+            t.target_installation == local.device.installation_id()
+                || t.target_transport == local.device.transport_public_key()
+        })
+    }
+    pub(crate) fn can_publish(&self, record: &IdentityRecord, local: &LocalAccount) -> bool {
+        self.owns(record, local)
+            && !record.devices.iter().any(|d| {
+                self.tombstones.iter().any(|t| {
+                    t.target_installation == d.installation_id
+                        || t.target_transport == d.transport_public_key
+                })
+            })
+    }
+    pub(crate) fn restrict_pending(&mut self, local: &LocalAccount) {
+        let mut held = false;
+        for index in 0..self.pending.len() {
+            if !self.can_publish(&self.pending[index].signed.record, local) {
+                self.pending[index].status = PacketStatus::Held;
+                held = true;
+            }
+        }
+        if held && self.state != PublicationState::Conflict {
+            self.state = PublicationState::LocalBlocked;
+        }
+    }
     fn owns(&self, record: &IdentityRecord, local: &LocalAccount) -> bool {
         record.generation == self.generation
             && record.devices.iter().any(|d| {
                 d.installation_id == local.device.installation_id()
                     && d.transport_public_key == local.device.transport_public_key()
             })
-            && !self
-                .tombstones
-                .iter()
-                .any(|t| t.target_installation == local.device.installation_id())
+            && !self.removed(local)
     }
     fn hold(&mut self, found: SignedRecord) -> CoreError {
         self.observed_seq = self.observed_seq.max(found.seq);
@@ -344,7 +368,7 @@ impl RecordState {
                 if initial_replacement {
                     self.state = PublicationState::LocalBlocked;
                 }
-            } else if self.conflict.is_none() {
+            } else if self.conflict.is_none() && self.state != PublicationState::Conflict {
                 // Local rollback alone must not invent a competing packet.
                 self.state = PublicationState::LocalBlocked;
             }
@@ -853,6 +877,63 @@ mod tests {
             .unwrap();
         assert_eq!(records.pending[0].recipients, Some(expected));
         assert!(RecordState::decode(&records.encode(), local.keys.peer_id()).is_ok());
+    }
+    #[test]
+    fn received_tombstone_holds_exact_packet_without_losing_receipt_obligation() {
+        let local = local();
+        let mut records = local.records.clone();
+        let mut base = records.first_record(&local);
+        let target = RecordDevice {
+            installation_id: InstallationId([4; 32]),
+            transport_public_key: [5; 32],
+            kind: local.cert.kind,
+        };
+        let removed = RecordDevice {
+            installation_id: InstallationId([8; 32]),
+            transport_public_key: [9; 32],
+            kind: local.cert.kind,
+        };
+        base.devices.extend([target.clone(), removed.clone()]);
+        base.devices.sort_by_key(|d| d.installation_id);
+        base.issued_at = 1000;
+        base.expires_at = 2000;
+        let packet = record_packet(&local.keys, &base, 1_000_000_000).unwrap();
+        records.accepted = Some(SignedRecord::new(packet.clone(), local.keys.peer_id()).unwrap());
+        records.observed_seq = 1_000_000_000;
+        records
+            .reconcile(
+                Lookup::Found(packet.clone()),
+                &local,
+                1000,
+                Action::Revoke(target.installation_id),
+            )
+            .unwrap();
+        records.pending[0].recipients = Some(vec![(
+            removed.installation_id,
+            removed.transport_public_key,
+        )]);
+        let before = records.pending[0].clone();
+        records.tombstones.push(
+            RevokeIntent::sign(
+                &local.keys,
+                records.generation,
+                record_hash(&packet),
+                &removed,
+                1000,
+            )
+            .unwrap(),
+        );
+        records.restrict_pending(&local);
+        assert!(records.pending[0].status == PacketStatus::Held);
+        let restored = RecordState::decode(&records.encode(), local.keys.peer_id()).unwrap();
+        assert_eq!(
+            restored.pending[0].signed.packet.as_bytes(),
+            before.signed.packet.as_bytes()
+        );
+        assert_eq!(restored.pending[0].signed.seq, before.signed.seq);
+        assert_eq!(restored.pending[0].recipients, before.recipients);
+        assert_eq!(restored.pending[0].revoke_nonce, before.revoke_nonce);
+        assert_eq!(restored.view().pending_notifications.len(), 1);
     }
     #[test]
     fn future_competitor_preserves_tombstone_and_holds_notification_in_snapshot() {

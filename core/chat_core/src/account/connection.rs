@@ -180,20 +180,8 @@ impl Registry {
         });
         removed
     }
-    pub(crate) fn sync_record(
-        &self,
-        peer: PeerId,
-        record: &SignedRecord,
-        cancel: CancellationToken,
-    ) {
-        let sessions: Vec<_> = self
-            .0
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|s| s.grant.peer == peer)
-            .cloned()
-            .collect();
+    pub(crate) fn sync_record(&self, record: &SignedRecord, cancel: CancellationToken) {
+        let sessions: Vec<_> = self.0.lock().unwrap().iter().cloned().collect();
         let body = auth::envelope(2, record.packet.as_bytes());
         for session in sessions {
             let body = body.clone();
