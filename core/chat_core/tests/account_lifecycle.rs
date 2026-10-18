@@ -9,6 +9,8 @@ use std::time::Duration;
 #[allow(dead_code)]
 #[path = "support/account_store.rs"]
 mod support;
+#[path = "support/account_services.rs"]
+mod services;
 
 async fn open(path: &std::path::Path) -> (CoreSlot, AccountHandle) {
     open_with_bus(path, &EventBus::new()).await
@@ -25,7 +27,7 @@ async fn open_with_bus(path: &std::path::Path, bus: &EventBus) -> (CoreSlot, Acc
     slot.network().unwrap().configure_local(None).await.unwrap();
     let account = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            match slot.open_account(support::protector()) {
+            match slot.open_account_with_services(support::protector(), services::offline()) {
                 Ok(account) => break account,
                 Err(e) if e.code == ErrorCode::WriterBusy => tokio::task::yield_now().await,
                 Err(e) => panic!("{e}"),

@@ -11,6 +11,8 @@ use std::time::Duration;
 #[allow(dead_code)]
 #[path = "support/account_store.rs"]
 mod support;
+#[path = "support/account_services.rs"]
+mod services;
 
 fn core(dir: &std::path::Path) -> CoreSlot {
     let core = CoreSlot::new();
@@ -64,7 +66,7 @@ async fn active_and_candidate_restart_keep_endpoint_new_instance() {
     net.configure_local(None).await.unwrap();
     let diagnostic = online(&net).await.endpoint_id;
     let instance = first.info().unwrap().instance_id;
-    let account = first.open_account(support::protector()).unwrap();
+    let account = first.open_account_with_services(support::protector(), services::offline()).unwrap();
     let candidate = account.prepare_candidate().await.unwrap();
     assert_ne!(Some(candidate.endpoint_id.clone()), diagnostic);
     assert_eq!(
@@ -81,7 +83,7 @@ async fn active_and_candidate_restart_keep_endpoint_new_instance() {
     net.configure_local(None).await.unwrap();
     let account = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            match second.open_account(support::protector()) {
+            match second.open_account_with_services(support::protector(), services::offline()) {
                 Ok(a) => break a,
                 Err(e) if e.code == ErrorCode::WriterBusy => tokio::task::yield_now().await,
                 Err(e) => panic!("{e}"),
@@ -115,7 +117,7 @@ async fn transition_closes_old_probe_and_ignores_old_epoch() {
     })
     .await
     .unwrap();
-    let account = slot.open_account(support::protector()).unwrap();
+    let account = slot.open_account_with_services(support::protector(), services::offline()).unwrap();
     let candidate = account.prepare_candidate().await.unwrap();
     assert_ne!(Some(candidate.endpoint_id.clone()), old.endpoint_id);
     assert!(
@@ -137,7 +139,7 @@ async fn transition_busy_and_bind_failure_keeps_saved_key() {
     let slot = core(dir.path());
     let net = slot.network().unwrap();
     net.configure_local(None).await.unwrap();
-    let account = slot.open_account(support::protector()).unwrap();
+    let account = slot.open_account_with_services(support::protector(), services::offline()).unwrap();
     net.fail_next_bind_for_test();
     assert_eq!(
         account.prepare_candidate().await.unwrap_err().code,
@@ -160,7 +162,7 @@ async fn suspend_blocks_immediately_and_failed_resume_keeps_ownership() {
     let slot = core(dir.path());
     let net = slot.network().unwrap();
     net.configure_local(None).await.unwrap();
-    let account = slot.open_account(support::protector()).unwrap();
+    let account = slot.open_account_with_services(support::protector(), services::offline()).unwrap();
     account.prepare_candidate().await.unwrap();
     competing_writer(dir.path());
     assert_eq!(account.request_suspend(), 1);
@@ -213,7 +215,7 @@ async fn suspend_interrupts_a_binding_transition_and_latest_request_wins() {
     let slot = core(dir.path());
     let net = slot.network().unwrap();
     net.configure_local(None).await.unwrap();
-    let account = slot.open_account(support::protector()).unwrap();
+    let account = slot.open_account_with_services(support::protector(), services::offline()).unwrap();
     settled(&account).await;
     let release = net.hold_next_bind_for_test();
     let worker = account.clone();
@@ -305,7 +307,7 @@ async fn lifecycle_gates_during_slow_open_without_waiting_for_protector() {
         first: true.into(),
     });
     let worker = slot.clone();
-    let thread = std::thread::spawn(move || worker.open_account(protector).unwrap());
+    let thread = std::thread::spawn(move || worker.open_account_with_services(protector, services::offline()).unwrap());
     wait.recv_timeout(Duration::from_secs(3)).unwrap();
     let start = std::time::Instant::now();
     assert_eq!(slot.account_suspend(), 1);
@@ -407,7 +409,7 @@ fn invalid_candidate_payload_never_replaces_existing_snapshot() {
         let before = std::fs::read(dir.path().join("account.bin")).unwrap();
         let slot = core(dir.path());
         assert_eq!(
-            slot.open_account(support::protector()).err().unwrap().code,
+            slot.open_account_with_services(support::protector(), services::offline()).err().unwrap().code,
             ErrorCode::StorageCorrupt
         );
         assert_eq!(
@@ -456,7 +458,7 @@ async fn suspend_inside_token_replacement_settles_without_releasing_bind() {
     let slot = core(dir.path());
     let net = slot.network().unwrap();
     net.configure_local(None).await.unwrap();
-    let account = slot.open_account(support::protector()).unwrap();
+    let account = slot.open_account_with_services(support::protector(), services::offline()).unwrap();
     settled(&account).await;
     let held_bind = net.hold_next_bind_for_test();
     let (entered, release_window) = net.hold_next_token_replacement_for_test();

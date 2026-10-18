@@ -1,14 +1,18 @@
 mod certificate;
 pub mod clock;
 mod creation;
+mod devices;
 mod keys;
 mod pkarr_backend;
+mod publication;
 mod record;
 mod recovery;
 pub mod storage;
 mod types;
 mod wire;
+pub use devices::{RevocationNotifier, RevokeIntent};
 pub use pkarr_backend::{Lookup, PkarrBackend, RecordBackend, RecordFuture};
+pub use publication::{AccountServices, PublicationState, PublicationView};
 
 pub use certificate::{InstallationCert, sign_cert, verify_cert};
 pub use record::{

@@ -169,6 +169,19 @@ pub fn parse_record(
     expected: PeerId,
     now: u64,
 ) -> Result<IdentityRecord, CoreError> {
+    let record = parse_stored_record(packet, expected)?;
+    if record.issued_at > now.saturating_add(300) {
+        return Err(wire::invalid());
+    }
+    Ok(record)
+}
+
+// An encrypted, accepted snapshot remains valid when the wall clock rolls back.
+// This verifies bytes/signature/shape only; it never grants current authorization.
+pub(crate) fn parse_stored_record(
+    packet: &SignedPacket,
+    expected: PeerId,
+) -> Result<IdentityRecord, CoreError> {
     check_packet_size(packet)?;
     let bytes = packet.as_bytes();
     if bytes[..32] != expected.0 {
@@ -233,9 +246,5 @@ pub fn parse_record(
     if BASE64URL_NOPAD.encode(&payload) != text {
         return Err(wire::invalid());
     }
-    let record = IdentityRecord::from_bytes(&payload)?;
-    if record.issued_at > now.saturating_add(300) {
-        return Err(wire::invalid());
-    }
-    Ok(record)
+    IdentityRecord::from_bytes(&payload)
 }

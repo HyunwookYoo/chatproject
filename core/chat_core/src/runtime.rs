@@ -109,13 +109,21 @@ impl CoreSlot {
         Ok(info)
     }
 
-    /// Opens the protected account once, without starting network IO.
+    /// Opens the protected account actor once. Established state refreshes after
+    /// lifecycle readiness; production DHT construction is lazy until that point.
     pub fn open_account(&self, protector: Arc<dyn KeyProtector>) -> Result<AccountHandle, CoreError> {
+        self.open_account_services(protector, crate::account::AccountServices::production())
+    }
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    pub fn open_account_with_services(&self, protector: Arc<dyn KeyProtector>, services: crate::account::AccountServices) -> Result<AccountHandle, CoreError> {
+        self.open_account_services(protector, services)
+    }
+    fn open_account_services(&self, protector: Arc<dyn KeyProtector>, services: crate::account::AccountServices) -> Result<AccountHandle, CoreError> {
         let core = self.running.lock().expect("core slot lock poisoned").clone()
             .ok_or_else(|| CoreError::new(ErrorCode::CoreNotStarted, "core not started"))?;
         let mut account = core.account.lock().expect("account slot lock poisoned");
         if let Some(account) = account.as_ref() { return Ok(account.clone()); }
-        let handle = AccountHandle::open(core.runtime.as_ref().unwrap().handle(), &core.info.data_dir, protector, core.network.clone())?;
+        let handle = AccountHandle::open(core.runtime.as_ref().unwrap().handle(), &core.info.data_dir, protector, core.network.clone(), services)?;
         *account = Some(handle.clone());
         Ok(handle)
     }

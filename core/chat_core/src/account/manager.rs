@@ -1,8 +1,11 @@
 //! Single owner of protected account state. A5 extends commands and AccountState.
 use super::{
-    FlowId, InstallationCert, InstallationId, PeerId, RecoveryDisplay,
+    AccountServices, FlowId, InstallationCert, InstallationId, PeerId, PublicationState,
+    PublicationView, RecoveryDisplay,
     creation::Creation,
-    derive_device, random_secret, recovery,
+    derive_device,
+    publication::{Action, PacketStatus, RecordState},
+    random_secret, recovery,
     storage::{KeyProtector, Store, schema::AccountState},
 };
 use crate::{CoreError, ErrorCode, NetworkHandle};
@@ -44,6 +47,7 @@ pub struct AccountView {
     pub contacts: Vec<PeerId>,
     pub pair: Option<FlowId>,
     pub publish_intents: Vec<PublishIntent>,
+    pub publication: PublicationView,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,6 +70,9 @@ enum Command {
         oneshot::Sender<Result<(), CoreError>>,
     ),
     Snapshot(oneshot::Sender<Result<AccountView, CoreError>>),
+    Refresh(PeerId, oneshot::Sender<Result<(), CoreError>>),
+    Revoke(InstallationId, oneshot::Sender<Result<(), CoreError>>),
+    Resolve([u8; 32], oneshot::Sender<Result<(), CoreError>>),
 }
 struct Queued {
     ticket: u64,
@@ -80,7 +87,12 @@ impl Command {
             Self::Begin(reply) => {
                 let _ = reply.send(Err(error));
             }
-            Self::Confirm(_, _, reply) | Self::Cancel(_, reply) | Self::Recover(_, _, reply) => {
+            Self::Confirm(_, _, reply)
+            | Self::Cancel(_, reply)
+            | Self::Recover(_, _, reply)
+            | Self::Refresh(_, reply)
+            | Self::Revoke(_, reply)
+            | Self::Resolve(_, reply) => {
                 let _ = reply.send(Err(error));
             }
             Self::Snapshot(reply) => {
@@ -116,6 +128,7 @@ impl AccountHandle {
         root: &Path,
         protector: Arc<dyn KeyProtector>,
         network: NetworkHandle,
+        services: AccountServices,
     ) -> Result<Self, CoreError> {
         network.begin_account();
         let mut store = Store::open(root, protector)?;
@@ -147,6 +160,7 @@ impl AccountHandle {
                 creation: None,
                 revision,
                 shared: shared.clone(),
+                services,
             }
             .run(input, received),
         );
@@ -196,6 +210,15 @@ impl AccountHandle {
     pub async fn snapshot(&self) -> Result<AccountView, CoreError> {
         self.send(Command::Snapshot).await
     }
+    pub async fn refresh_record(&self, peer: PeerId) -> Result<(), CoreError> {
+        self.send(|reply| Command::Refresh(peer, reply)).await
+    }
+    pub async fn revoke_device(&self, target: InstallationId) -> Result<(), CoreError> {
+        self.send(|reply| Command::Revoke(target, reply)).await
+    }
+    pub async fn confirm_record_conflict(&self, base_hash: [u8; 32]) -> Result<(), CoreError> {
+        self.send(|reply| Command::Resolve(base_hash, reply)).await
+    }
     /// ABI status: 0 completed, 1 pending, 2 failed. Never waits for file IO.
     pub fn lifecycle_status(&self) -> i32 {
         match self.shared.status.load(Ordering::Acquire) & 3 {
@@ -236,6 +259,7 @@ struct Manager {
     creation: Option<Creation>,
     revision: u64,
     shared: Arc<Shared>,
+    services: AccountServices,
 }
 impl Manager {
     async fn run(
@@ -246,6 +270,9 @@ impl Manager {
         let initial = *requests.borrow_and_update();
         let result = self.lifecycle(initial).await;
         self.complete(initial, result);
+        self.auto_refresh().await;
+        let mut refresh = tokio::time::interval(Duration::from_secs(60));
+        refresh.tick().await;
         loop {
             tokio::select! { biased;
                 changed = requests.changed() => {
@@ -253,7 +280,9 @@ impl Manager {
                     let request = *requests.borrow_and_update();
                     let result = self.lifecycle(request).await;
                     self.complete(request, result);
+                    self.auto_refresh().await;
                 }
+                _ = refresh.tick() => { self.auto_refresh().await; }
                 command = commands.recv() => {
                     let Some(queued) = command else { break; };
                     if !matches!(queued.command, Command::Snapshot(_)) && queued.ticket != self.shared.requests.borrow().ticket {
@@ -267,6 +296,14 @@ impl Manager {
                         Command::Cancel(flow, reply) => { let result = self.cancel(flow); let _ = reply.send(result); }
                         Command::Recover(words, confirmed, reply) => { let result = self.recover(&words, confirmed).await; let _ = reply.send(result); }
                         Command::Snapshot(reply) => { let _ = reply.send(Ok(self.view())); }
+                        Command::Refresh(peer, reply) => {
+                            let result = if self.local().is_ok_and(|local| local.keys.peer_id() == peer) {
+                                self.publication(Action::Refresh).await
+                            } else { Err(unavailable(ErrorCode::AccountRestricted)) };
+                            let _ = reply.send(result);
+                        }
+                        Command::Revoke(target, reply) => { let result = self.publication(Action::Revoke(target)).await; let _ = reply.send(result); }
+                        Command::Resolve(hash, reply) => { let result = self.publication(Action::Confirm(hash)).await; let _ = reply.send(result); }
                     }
                 }
             }
@@ -454,7 +491,9 @@ impl Manager {
             .network
             .activate_key(iroh::SecretKey::from_bytes(device.transport().as_bytes()))
             .await?;
-        self.ensure_ready(request)
+        self.ensure_ready(request)?;
+        self.auto_refresh().await;
+        Ok(())
     }
     fn persist(&mut self, state: &AccountState, request: Request) -> Result<(), CoreError> {
         self.ensure_ready(request)?;
@@ -470,6 +509,149 @@ impl Manager {
         }
         Ok(())
     }
+    fn local(&self) -> Result<&super::storage::schema::LocalAccount, CoreError> {
+        match &self.state {
+            Some(AccountState::Active(local)) => Ok(local),
+            _ => Err(unavailable(ErrorCode::AccountRestricted)),
+        }
+    }
+    async fn auto_refresh(&mut self) {
+        if self.ready().is_ok() && self.local().is_ok() {
+            let _ = self.publication(Action::Refresh).await;
+        }
+    }
+    async fn service<T>(
+        &self,
+        request: Request,
+        future: super::RecordFuture<'_, T>,
+    ) -> Result<T, CoreError> {
+        let mut lifecycle = self.shared.requests.subscribe();
+        self.ensure_ready(request)?;
+        tokio::select! { biased;
+            _ = lifecycle.changed() => Err(unavailable(ErrorCode::StorageLocked)),
+            result = tokio::time::timeout(Duration::from_secs(10), future) => {
+                self.ensure_ready(request)?;
+                result.map_err(|_| unavailable(ErrorCode::RecordUnavailable))?
+            }
+        }
+    }
+    fn commit_records(&mut self, records: RecordState, request: Request) -> Result<(), CoreError> {
+        self.ensure_ready(request)?;
+        if self.local()?.records.encode() == records.encode() {
+            return Ok(());
+        }
+        let revision = self
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| unavailable(ErrorCode::StorageFull))?;
+        let mut state = self.state.take().unwrap();
+        let AccountState::Active(local) = &mut state else {
+            unreachable!()
+        };
+        local.records = records;
+        local.revision = revision;
+        let result = self.persist(&state, request);
+        self.state = Some(state);
+        if result.is_ok() {
+            self.revision = revision;
+        }
+        result
+    }
+    fn ensure_packet_time(
+        &mut self,
+        signed: &super::publication::SignedRecord,
+        request: Request,
+    ) -> Result<(), CoreError> {
+        self.ensure_ready(request)?;
+        let now = self.services.clock.unix_seconds();
+        if !signed.current(now) || signed.record.is_expired(now) {
+            let mut records = self.local()?.records.clone();
+            records.state = PublicationState::LocalBlocked;
+            self.commit_records(records, request)?;
+            return Err(unavailable(ErrorCode::AccountRestricted));
+        }
+        Ok(())
+    }
+    async fn publication(&mut self, action: Action) -> Result<(), CoreError> {
+        let request = self.ready()?;
+        let local = self.local()?;
+        if matches!(action, Action::Revoke(target) if target == local.device.installation_id()) {
+            return Err(unavailable(ErrorCode::AccountRestricted));
+        }
+        if matches!(action, Action::Confirm(hash) if local.records.conflict.as_ref().map(|r| r.hash) != Some(hash))
+        {
+            return Err(unavailable(ErrorCode::RecordConflict));
+        }
+        let peer = local.keys.peer_id();
+        let backend = self.services.backend()?;
+        let lookup = self.service(request, backend.lookup(peer)).await;
+        self.ensure_ready(request)?;
+        let mut records = self.local()?.records.clone();
+        let result = match lookup {
+            Ok(lookup) => records.reconcile(
+                lookup,
+                self.local()?,
+                self.services.clock.unix_seconds(),
+                action,
+            ),
+            Err(error) => {
+                if records.conflict.is_none() {
+                    records.state = PublicationState::LocalBlocked;
+                }
+                Err(error)
+            }
+        };
+        // Includes observed floors and conflicting signed evidence on Err.
+        self.commit_records(records, request)?;
+        result?;
+        let pending = self.local()?.records.pending.clone();
+        for intent in pending {
+            if intent.status == PacketStatus::Held {
+                continue;
+            }
+            if intent.status == PacketStatus::AwaitingNotification {
+                let Some(notifier) = self.services.notifier.clone() else {
+                    continue;
+                };
+                self.ensure_packet_time(&intent.signed, request)?;
+                let revoke = self
+                    .local()?
+                    .records
+                    .tombstones
+                    .iter()
+                    .find(|t| Some(t.nonce) == intent.revoke_nonce)
+                    .cloned()
+                    .ok_or_else(|| unavailable(ErrorCode::StorageCorrupt))?;
+                self.service(request, notifier.notify(&revoke)).await?;
+                let mut records = self.local()?.records.clone();
+                records
+                    .pending
+                    .iter_mut()
+                    .find(|p| p.signed.hash == intent.signed.hash)
+                    .unwrap()
+                    .status = PacketStatus::Ready;
+                self.commit_records(records, request)?;
+            }
+            // Only the exact committed packet can be retried at its sequence.
+            self.ensure_packet_time(&intent.signed, request)?;
+            if let Err(error) = self
+                .service(request, backend.publish(&intent.signed.packet))
+                .await
+            {
+                if error.code == ErrorCode::RecordConflict {
+                    let mut records = self.local()?.records.clone();
+                    for pending in &mut records.pending {
+                        pending.status = PacketStatus::Held;
+                    }
+                    records.state = PublicationState::Conflict;
+                    self.commit_records(records, request)?;
+                }
+                return Err(error);
+            }
+        }
+        // A publish ACK is deliberately not an observation or completion.
+        Ok(())
+    }
     fn view(&self) -> AccountView {
         let mut view = AccountView {
             revision: self.revision,
@@ -480,6 +662,7 @@ impl Manager {
             contacts: vec![],
             pair: None,
             publish_intents: vec![],
+            publication: PublicationView::default(),
         };
         if self.ready().is_err() {
             view.phase = AccountPhase::Locked;
@@ -500,6 +683,13 @@ impl Manager {
                 view.installation = Some(local.device.installation_id());
                 view.devices.push(local.cert.clone());
                 view.publish_intents.push(local.intent);
+                view.publication = local.records.view();
+                match local.records.state {
+                    PublicationState::Observed => view.phase = AccountPhase::Active,
+                    PublicationState::Conflict => view.phase = AccountPhase::Conflict,
+                    PublicationState::Pending => view.phase = AccountPhase::PublishPending,
+                    PublicationState::LocalBlocked => {}
+                }
             }
             None if self.creation.is_some() => view.phase = AccountPhase::Candidate,
             None => {}
@@ -526,6 +716,132 @@ mod tests {
         fn delete(&self, _: StoreId) -> Result<(), CoreError> {
             Ok(())
         }
+    }
+
+    fn offline_services() -> AccountServices {
+        struct Offline;
+        impl crate::account::RecordBackend for Offline {
+            fn lookup(
+                &self,
+                _: PeerId,
+            ) -> crate::account::RecordFuture<'_, crate::account::Lookup> {
+                Box::pin(async { Err(unavailable(ErrorCode::RecordUnavailable)) })
+            }
+            fn publish<'a>(
+                &'a self,
+                _: &'a pkarr::SignedPacket,
+            ) -> crate::account::RecordFuture<'a, ()> {
+                Box::pin(async { panic!("offline lookup must not publish") })
+            }
+        }
+        AccountServices::new(
+            Arc::new(Offline),
+            Arc::new(crate::account::clock::SystemClock::default()),
+        )
+    }
+
+    #[tokio::test]
+    async fn completed_packet_replace_error_never_sends_and_reload_retries_exact_packet() {
+        use crate::account::{Lookup, PeerId, RecordBackend, RecordFuture, clock::FakeClock};
+        use std::sync::atomic::AtomicBool;
+        struct Backend {
+            absent: AtomicBool,
+            sent: std::sync::Mutex<Vec<pkarr::SignedPacket>>,
+        }
+        impl RecordBackend for Backend {
+            fn lookup(&self, _: PeerId) -> RecordFuture<'_, Lookup> {
+                Box::pin(async {
+                    if self.absent.load(Ordering::SeqCst) {
+                        Ok(Lookup::CompletedAbsent)
+                    } else {
+                        Err(unavailable(ErrorCode::RecordUnavailable))
+                    }
+                })
+            }
+            fn publish<'a>(&'a self, packet: &'a pkarr::SignedPacket) -> RecordFuture<'a, ()> {
+                Box::pin(async {
+                    self.sent.lock().unwrap().push(packet.clone());
+                    Ok(())
+                })
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let slot = CoreSlot::new();
+        slot.start(
+            CoreConfig {
+                data_dir: dir.path().into(),
+            },
+            &EventBus::new(),
+        )
+        .unwrap();
+        let network = slot.network().unwrap();
+        network.configure_local(None).await.unwrap();
+        let ticket = network.begin_account();
+        let request = Request {
+            ticket,
+            suspend: false,
+        };
+        let (requests, _) = watch::channel(request);
+        let shared = Arc::new(Shared {
+            network: network.clone(),
+            requests,
+            status: AtomicU64::new(ticket << 2),
+        });
+        let backend = Arc::new(Backend {
+            absent: AtomicBool::new(false),
+            sent: std::sync::Mutex::new(vec![]),
+        });
+        let mut manager = Manager {
+            store: Store::open(dir.path(), Arc::new(Protector)).unwrap(),
+            state: None,
+            creation: None,
+            revision: 0,
+            shared,
+            services: AccountServices::new(backend.clone(), Arc::new(FakeClock::new(1000, 0))),
+        };
+        let restored = manager.lifecycle(request).await;
+        manager.complete(request, restored);
+        manager
+            .recover(
+                &super::super::encode_recovery(&Secret32::from([0; 32])).unwrap(),
+                true,
+            )
+            .await
+            .unwrap();
+        backend.absent.store(true, Ordering::SeqCst);
+        use futures_util::FutureExt;
+        let result = super::super::storage::with_after_replace_failure(|| {
+            manager.publication(Action::Refresh).now_or_never().unwrap()
+        });
+        assert_eq!(result.unwrap_err().code, ErrorCode::StorageFull);
+        assert_eq!(manager.view().phase, AccountPhase::Locked);
+        assert!(backend.sent.lock().unwrap().is_empty());
+        let AccountState::Active(saved) =
+            AccountState::decode(&manager.store.load().unwrap().unwrap()).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(saved.records.allocated_seq, 1_000_000_000);
+        assert_eq!(saved.records.pending.len(), 1);
+        let packet = saved.records.pending[0].signed.packet.clone();
+        assert_eq!(
+            manager.publication(Action::Refresh).await.unwrap_err().code,
+            ErrorCode::StorageLocked
+        );
+        for suspend in [true, false] {
+            let ticket = network.block();
+            let request = Request { ticket, suspend };
+            manager.shared.requests.send_replace(request);
+            manager.shared.status.store(ticket << 2, Ordering::Release);
+            let result = manager.lifecycle(request).await;
+            manager.complete(request, result);
+        }
+        manager.publication(Action::Refresh).await.unwrap();
+        assert_eq!(
+            backend.sent.lock().unwrap()[0].as_bytes(),
+            packet.as_bytes()
+        );
+        network.execute(NetworkOp::Stop).await.unwrap();
     }
 
     #[tokio::test]
@@ -558,6 +874,7 @@ mod tests {
             creation: None,
             revision: 0,
             shared,
+            services: offline_services(),
         };
         let restored = manager.lifecycle(request).await;
         manager.complete(request, restored);
@@ -643,6 +960,7 @@ mod tests {
             creation: None,
             revision: 0,
             shared,
+            services: offline_services(),
         };
         let restored = manager.lifecycle(request).await;
         manager.complete(request, restored);

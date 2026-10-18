@@ -33,5 +33,6 @@ pub(super) fn local_account(
         cert,
         revision,
         intent,
+        records: super::publication::RecordState::new()?,
     })
 }
