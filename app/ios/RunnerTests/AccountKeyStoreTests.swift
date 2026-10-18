@@ -80,10 +80,34 @@ final class AccountKeyStoreTests: XCTestCase {
     XCTAssertEqual(cpKeyDelete(nil), 3)
   }
 
+  func testOwnedKeyBufferErasesRetainedAliasOnSuccessAndFailure() throws {
+    for status in [Int32(0), 1, 2, 3, 4] {
+      var retainedQuery: [String: Any] = [:]
+      let returned = withAccountKeyBuffer { value in
+        value.mutableBytes.initializeMemory(as: UInt8.self, repeating: 0x5a, count: value.length)
+        // Retain the same reference through the container used by SecItemAdd.
+        retainedQuery[kSecValueData as String] = value
+        XCTAssertTrue((retainedQuery[kSecValueData as String] as? NSMutableData) === value)
+        return status
+      }
+      XCTAssertEqual(returned, status)
+      let alias = try XCTUnwrap(retainedQuery[kSecValueData as String] as? NSMutableData)
+      XCTAssertEqual(alias.length, 49)
+      let bytes = UnsafeBufferPointer(start: alias.bytes.assumingMemoryBound(to: UInt8.self), count: alias.length)
+      XCTAssertTrue(bytes.allSatisfy { $0 == 0 }, "Retained application buffer must be cleared on every return")
+    }
+  }
+
   // Run in two separate xcodebuild invocations with ACCOUNT_KEY_TEST_PHASE=write/read.
   // The fixture contains only a random StoreId and opaque marker, never the key.
   func testRestartPersistence() throws {
-    guard let phase = ProcessInfo.processInfo.environment["ACCOUNT_KEY_TEST_PHASE"] else { return }
+    guard let phase = ProcessInfo.processInfo.environment["ACCOUNT_KEY_TEST_PHASE"] else {
+      throw XCTSkip("Restart persistence requires separate write/read test processes")
+    }
+    guard phase == "write" || phase == "read" else {
+      XCTFail("ACCOUNT_KEY_TEST_PHASE must be write or read")
+      return
+    }
     let file = FileManager.default.temporaryDirectory.appendingPathComponent("account-key-test-restart")
     let key = [UInt8](repeating: 0x45, count: 32)
     if phase == "write" {

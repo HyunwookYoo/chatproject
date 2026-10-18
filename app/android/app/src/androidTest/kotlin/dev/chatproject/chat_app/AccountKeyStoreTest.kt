@@ -3,6 +3,7 @@ package dev.chatproject.chat_app
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import org.junit.Assert.*
+import org.junit.Assume.assumeTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import java.security.SecureRandom
@@ -91,7 +92,9 @@ class AccountKeyStoreTest {
 
     // Separate instrumentation runs prove persistence across process death. Only synthetic keys.
     @Test fun restartPersistence() {
-        val phase = InstrumentationRegistry.getArguments().getString("accountPhase") ?: return
+        val phase = InstrumentationRegistry.getArguments().getString("accountPhase")
+        assumeTrue("Restart persistence requires separate write/read test processes", phase != null)
+        assertTrue("accountPhase must be write or read", phase == "write" || phase == "read")
         val file = java.io.File(context.noBackupFilesDir, "account-test-restart")
         val store = AccountKeyStore(context)
         if (phase == "write") {

@@ -5,6 +5,29 @@ import Security
 private let accountKeyLock = NSLock()
 private let markerLength = 17
 
+// Reference semantics keep the query and this scope on the same mutable allocation.
+// Unlike Swift Data, erasure cannot detach into a copy while the query retains plaintext.
+func withAccountKeyBuffer(_ body: (NSMutableData) -> Int32) -> Int32 {
+  guard let value = NSMutableData(length: markerLength + 32) else { return 4 }
+  defer { value.resetBytes(in: NSRange(location: 0, length: value.length)) }
+  return body(value)
+}
+
+private func copyKeychainValue(_ query: [String: Any], into buffer: NSMutableData) -> Int32 {
+  // Security returns immutable framework-owned data. Copy into our erasable buffer,
+  // then release our result/NSData references and drain autoreleases before using it.
+  // Security may retain internal copies; this code cannot promise to erase those.
+  return autoreleasepool {
+    var result: CFTypeRef?
+    defer { result = nil }
+    let status = SecItemCopyMatching(query as CFDictionary, &result)
+    guard status == errSecSuccess else { return keyStatus(status) }
+    guard let source = result as? NSData, source.length == buffer.length else { return 3 }
+    source.getBytes(buffer.mutableBytes, length: buffer.length)
+    return 0
+  }
+}
+
 private func keyStatus(_ status: OSStatus) -> Int32 {
   switch status {
   case errSecSuccess: return 0
@@ -36,22 +59,21 @@ func cpKeyProtect(_ id: UnsafePointer<UInt8>?, _ input: UnsafePointer<UInt8>?, _
   guard var query = keyQuery(id) else { return 4 }
   accountKeyLock.lock()
   defer { accountKeyLock.unlock() }
-  var value = Data(count: markerLength + 32)
-  defer { value.resetBytes(in: 0..<value.count) }
-  let randomStatus = value.withUnsafeMutableBytes { (bytes: UnsafeMutableRawBufferPointer) -> OSStatus in
+  return withAccountKeyBuffer { value in
+    let bytes = value.mutableBytes.assumingMemoryBound(to: UInt8.self)
     bytes[0] = 1
-    return SecRandomCopyBytes(kSecRandomDefault, 16, bytes.baseAddress!.advanced(by: 1))
+    let randomStatus = SecRandomCopyBytes(kSecRandomDefault, 16, bytes.advanced(by: 1))
+    guard randomStatus == errSecSuccess else { return 4 }
+    bytes.advanced(by: markerLength).update(from: input, count: 32)
+    query[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+    query[kSecValueData as String] = value
+    let status = SecItemAdd(query as CFDictionary, nil)
+    // Never overwrite an existing account key, including after interrupted initialization.
+    guard status == errSecSuccess else { return status == errSecDuplicateItem ? 1 : keyStatus(status) }
+    out.update(from: bytes, count: markerLength)
+    outLength.pointee = markerLength
+    return 0
   }
-  guard randomStatus == errSecSuccess else { return 4 }
-  value.replaceSubrange(markerLength..<value.count, with: UnsafeBufferPointer(start: input, count: 32))
-  query[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-  query[kSecValueData as String] = value
-  let status = SecItemAdd(query as CFDictionary, nil)
-  // Never overwrite an existing account key, including after interrupted initialization.
-  guard status == errSecSuccess else { return status == errSecDuplicateItem ? 1 : keyStatus(status) }
-  value.copyBytes(to: out, count: markerLength)
-  outLength.pointee = markerLength
-  return 0
 }
 
 @_cdecl("cp_key_unprotect")
@@ -65,17 +87,17 @@ func cpKeyUnprotect(_ id: UnsafePointer<UInt8>?, _ input: UnsafePointer<UInt8>?,
   defer { accountKeyLock.unlock() }
   query[kSecReturnData as String] = true
   query[kSecMatchLimit as String] = kSecMatchLimitOne
-  var result: CFTypeRef?
-  let status = SecItemCopyMatching(query as CFDictionary, &result)
-  guard status == errSecSuccess else { return keyStatus(status) }
-  guard var value = result as? Data, value.count == markerLength + 32 else { return 3 }
-  defer { value.resetBytes(in: 0..<value.count) }
-  var difference: UInt8 = 0
-  for index in 0..<markerLength { difference |= value[index] ^ input[index] }
-  guard difference == 0 else { return 3 }
-  value.copyBytes(to: out, from: markerLength..<value.count)
-  outLength.pointee = 32
-  return 0
+  return withAccountKeyBuffer { value in
+    let status = copyKeychainValue(query, into: value)
+    guard status == 0 else { return status }
+    let bytes = value.bytes.assumingMemoryBound(to: UInt8.self)
+    var difference: UInt8 = 0
+    for index in 0..<markerLength { difference |= bytes[index] ^ input[index] }
+    guard difference == 0 else { return 3 }
+    out.update(from: bytes.advanced(by: markerLength), count: 32)
+    outLength.pointee = 32
+    return 0
+  }
 }
 
 @_cdecl("cp_key_delete")
