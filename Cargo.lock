@@ -636,6 +636,8 @@ dependencies = [
  "tempfile",
  "tokio",
  "uniffi",
+ "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]

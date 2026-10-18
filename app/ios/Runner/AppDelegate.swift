@@ -21,6 +21,23 @@ import UserNotifications
   func didInitializeImplicitFlutterEngine(_ engineBridge: FlutterImplicitEngineBridge) {
     GeneratedPluginRegistrant.register(with: engineBridge.pluginRegistry)
     guard let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "ChatProbe") else { return }
+    let accountChannel = FlutterMethodChannel(name: "chat_app/account_storage", binaryMessenger: registrar.messenger())
+    accountChannel.setMethodCallHandler { call, result in
+      switch call.method {
+      case "storageRoot":
+        do {
+          let args = call.arguments as? [String: Any]
+          result(try AccountStorage.root(existing: args?["existing"] as? String))
+        } catch { result(FlutterError(code: "storage_unavailable", message: "계정 저장 공간을 열 수 없어요.", details: nil)) }
+      case "setSensitiveScreen":
+        guard let sensitive = call.arguments as? Bool else {
+          result(FlutterError(code: "invalid_argument", message: nil, details: nil)); return
+        }
+        SceneDelegate.setSensitiveScreen(sensitive)
+        result(nil)
+      default: result(FlutterMethodNotImplemented)
+      }
+    }
     let channel = FlutterMethodChannel(name: "chat_app/ios_probe", binaryMessenger: registrar.messenger())
     channel.setMethodCallHandler { [weak self] call, result in
       switch call.method {

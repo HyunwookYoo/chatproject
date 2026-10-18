@@ -90,7 +90,27 @@ class NetworkModel extends ChangeNotifier {
   void _failure(Object failure, StackTrace stack) {
     if (_closed) return;
     error = failure is rust.CoreError
-        ? '${failure.code.name} · ${networkErrorMessage(failure.code)}'
+        ? switch (failure.code) {
+            rust.ErrorCode.invalidRecovery ||
+            rust.ErrorCode.storageLocked ||
+            rust.ErrorCode.storageMissing ||
+            rust.ErrorCode.storageCorrupt ||
+            rust.ErrorCode.storageFull ||
+            rust.ErrorCode.accountExists ||
+            rust.ErrorCode.writerBusy ||
+            rust.ErrorCode.invalidInvite ||
+            rust.ErrorCode.inviteExpired ||
+            rust.ErrorCode.deviceLimit ||
+            rust.ErrorCode.pairMismatch ||
+            rust.ErrorCode.pairExpired ||
+            rust.ErrorCode.recordConflict ||
+            rust.ErrorCode.recordUnavailable ||
+            rust.ErrorCode.authFailed ||
+            rust.ErrorCode.accountRestricted => networkErrorMessage(
+              failure.code,
+            ),
+            _ => '${failure.code.name} · ${networkErrorMessage(failure.code)}',
+          }
         : '$failure';
     // The fixed diagnostic context avoids logging targets, tickets or probe bodies.
     debugPrint(
@@ -173,4 +193,20 @@ String networkErrorMessage(rust.ErrorCode code) => switch (code) {
   rust.ErrorCode.networkTimeout => '네트워크를 확인하고 다시 연결해 주세요.',
   rust.ErrorCode.transportFailed => '네트워크와 접속 권한을 확인하고 다시 시도해 주세요.',
   rust.ErrorCode.notAvailable => '이 기기의 네트워크와 접속 권한을 확인해 주세요.',
+  rust.ErrorCode.invalidRecovery ||
+  rust.ErrorCode.storageLocked ||
+  rust.ErrorCode.storageMissing ||
+  rust.ErrorCode.storageCorrupt ||
+  rust.ErrorCode.storageFull ||
+  rust.ErrorCode.accountExists ||
+  rust.ErrorCode.writerBusy ||
+  rust.ErrorCode.invalidInvite ||
+  rust.ErrorCode.inviteExpired ||
+  rust.ErrorCode.deviceLimit ||
+  rust.ErrorCode.pairMismatch ||
+  rust.ErrorCode.pairExpired ||
+  rust.ErrorCode.recordConflict ||
+  rust.ErrorCode.recordUnavailable ||
+  rust.ErrorCode.authFailed ||
+  rust.ErrorCode.accountRestricted => '계정 작업을 완료할 수 없어요. 다시 시도해 주세요.',
 };

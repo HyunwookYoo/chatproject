@@ -5,5 +5,6 @@ mod convert;
 mod frb_generated;
 mod global;
 mod native;
+pub mod platform_keys;
 
 uniffi::setup_scaffolding!();

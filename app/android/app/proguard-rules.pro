@@ -2,6 +2,7 @@
 -keep class com.sun.jna.** { *; }
 -keep class * extends com.sun.jna.** { *; }
 -keep class uniffi.** { *; }
+-keep class dev.chatproject.chat_app.AccountKeyStore { *; }
 -dontwarn java.awt.**
 -keepclasseswithmembernames class dev.chatproject.chat_app.MainActivity {
     native <methods>;

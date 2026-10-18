@@ -1,0 +1,9 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Flutter's integration_test pins AndroidX Test 1.3.0. These helper activities
+         predate the explicit exported flag required by the current target SDK. -->
+    <application>
+        <activity android:name="androidx.test.core.app.InstrumentationActivityInvoker$BootstrapActivity" android:exported="false" />
+        <activity android:name="androidx.test.core.app.InstrumentationActivityInvoker$EmptyActivity" android:exported="false" />
+        <activity android:name="androidx.test.core.app.InstrumentationActivityInvoker$EmptyFloatingActivity" android:exported="false" />
+    </application>
+</manifest>

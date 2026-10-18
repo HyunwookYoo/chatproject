@@ -1,9 +1,50 @@
 import 'dart:io';
 
+import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 
 import 'src/rust/api/chat.dart' as rust;
 import 'network/network_client.dart';
+
+const _accountStorage = MethodChannel('chat_app/account_storage');
+
+/// Paths and display capabilities may cross this channel; key material never does.
+Future<String> accountStorageRoot(String existing) async {
+  if (Platform.isAndroid || Platform.isIOS) {
+    final root = await _accountStorage.invokeMethod<String>('storageRoot', {
+      'existing': existing,
+    });
+    if (root == null || root.isEmpty) throw StateError('계정 저장 공간을 열 수 없어요.');
+    return root;
+  }
+  if (Platform.isWindows) {
+    for (final name in [
+      'store.id',
+      'key.wrap',
+      'account.bin',
+      '.store.id.tmp',
+      '.key.wrap.tmp',
+      '.account.bin.tmp',
+    ]) {
+      if (await FileSystemEntity.type(
+            '$existing${Platform.pathSeparator}$name',
+          ) !=
+          FileSystemEntityType.notFound) {
+        return existing;
+      }
+    }
+    final local = Platform.environment['LOCALAPPDATA'];
+    if (local == null || local.isEmpty) throw StateError('계정 저장 공간을 열 수 없어요.');
+    return '$local\\ChatProject\\account';
+  }
+  throw UnsupportedError('계정 보호 저장을 지원하지 않는 플랫폼이에요.');
+}
+
+Future<void> setSensitiveScreen(bool sensitive) async {
+  if (Platform.isAndroid || Platform.isIOS) {
+    await _accountStorage.invokeMethod<void>('setSensitiveScreen', sensitive);
+  }
+}
 
 /// The UI reaches the Rust core only through this interface, so widget tests can use
 /// a fake core.
@@ -26,12 +67,16 @@ class FrbCoreClient implements CoreClient, NetworkClient {
   Future<rust.CoreInfo> start() async {
     if (dataDir != null) return rust.coreStart(dataDir: dataDir!);
     final support = await getApplicationSupportDirectory();
-    return rust.coreStart(dataDir: '${support.path}${Platform.pathSeparator}core');
+    final root = await accountStorageRoot(
+      '${support.path}${Platform.pathSeparator}core',
+    );
+    return rust.coreStart(dataDir: root);
   }
 
   @override
   // Keep one Rust subscription across page listeners, without replaying messages.
-  Stream<rust.ChatEvent> events() => _events ??= rust.events().asBroadcastStream();
+  Stream<rust.ChatEvent> events() =>
+      _events ??= rust.events().asBroadcastStream();
 
   @override
   Future<rust.NetworkInfo> startNetwork() => rust.networkStart();

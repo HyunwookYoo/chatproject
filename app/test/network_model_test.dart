@@ -28,6 +28,43 @@ void main() {
     debugPrint = (message, {wrapWidth}) => diagnostics.add(message);
   });
   tearDown(() => debugPrint = previousPrint);
+  test('account failure hides raw detail and releases busy state', () async {
+    final client = FakeNetworkClient();
+    final model = NetworkModel(client);
+    await model.open();
+    for (final code in [
+      rust.ErrorCode.invalidRecovery,
+      rust.ErrorCode.storageLocked,
+      rust.ErrorCode.storageMissing,
+      rust.ErrorCode.storageCorrupt,
+      rust.ErrorCode.storageFull,
+      rust.ErrorCode.accountExists,
+      rust.ErrorCode.writerBusy,
+      rust.ErrorCode.invalidInvite,
+      rust.ErrorCode.inviteExpired,
+      rust.ErrorCode.deviceLimit,
+      rust.ErrorCode.pairMismatch,
+      rust.ErrorCode.pairExpired,
+      rust.ErrorCode.recordConflict,
+      rust.ErrorCode.recordUnavailable,
+      rust.ErrorCode.authFailed,
+      rust.ErrorCode.accountRestricted,
+    ]) {
+      client.commandError = rust.CoreError(
+        code: code,
+        detail: 'secret storage diagnostics',
+      );
+      expect(await model.startNetwork(), isFalse);
+      expect(model.busy, isFalse);
+      expect(model.error, '계정 작업을 완료할 수 없어요. 다시 시도해 주세요.');
+      expect(model.error, isNot(contains('secret storage diagnostics')));
+      expect(model.error, isNot(contains(code.name)));
+    }
+    expect(diagnostics.join(), isNot(contains('secret storage diagnostics')));
+    expect(model.recentLines, isEmpty);
+    await model.close();
+    await client.controller.close();
+  });
   test('subscribes before delayed snapshot and rejects older state', () async {
     final client = FakeNetworkClient();
     final delayed = Completer<rust.NetworkInfo>();

@@ -19,6 +19,34 @@ struct ContextState {
 static JVM_PTR: OnceLock<usize> = OnceLock::new();
 static CONTEXT: OnceLock<ContextState> = OnceLock::new();
 static INIT: Mutex<()> = Mutex::new(());
+static ACCOUNT_KEYS: OnceLock<GlobalRef> = OnceLock::new();
+
+pub(crate) fn account_context() -> Option<(&'static JavaVM, &'static GlobalRef)> {
+    Some((&CONTEXT.get()?.vm, ACCOUNT_KEYS.get()?))
+}
+
+// Called from managed initialization after the existing network VM/context setup.
+// Cache the application object here: native worker threads cannot FindClass it reliably.
+#[no_mangle]
+pub extern "system" fn Java_dev_chatproject_chat_1app_MainActivity_initializeAccountKeyStore(
+    env: JNIEnv,
+    _this: JObject,
+    store: JObject,
+) -> jboolean {
+    if CONTEXT.get().is_none() || store.is_null() {
+        return JNI_FALSE;
+    }
+    if ACCOUNT_KEYS.get().is_some() {
+        return JNI_TRUE;
+    }
+    match env.new_global_ref(store) {
+        Ok(reference) => {
+            let _ = ACCOUNT_KEYS.set(reference);
+            JNI_TRUE
+        }
+        Err(_) => JNI_FALSE,
+    }
+}
 
 #[no_mangle]
 pub extern "system" fn JNI_OnLoad(vm: *mut jni::sys::JavaVM, _reserved: *mut c_void) -> jint {
