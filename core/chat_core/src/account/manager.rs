@@ -585,16 +585,16 @@ impl Manager {
             self.revision = revision;
         }
         self.restrict_grants();
-        if result.is_ok() && self.local()?.records.conflict.is_none() {
-            if let Some(record) = &self.local()?.records.accepted {
-                if Some(record.hash) != old_accepted {
-                    self.auth.registry.sync_record(
-                        self.local()?.keys.peer_id(),
-                        record,
-                        self.auth.cancel.child_token(),
-                    );
-                }
-            }
+        if result.is_ok()
+            && self.local()?.records.conflict.is_none()
+            && let Some(record) = &self.local()?.records.accepted
+            && Some(record.hash) != old_accepted
+        {
+            self.auth.registry.sync_record(
+                self.local()?.keys.peer_id(),
+                record,
+                self.auth.cancel.child_token(),
+            );
         }
         result
     }
@@ -645,25 +645,24 @@ impl Manager {
         // Capture once, in the same durable transaction as the new tombstone.
         // Existing/uncaptured intents never resample the live registry on retry.
         for intent in &mut records.pending {
-            if let Some(nonce) = intent.revoke_nonce {
-                if !self
+            if let Some(nonce) = intent.revoke_nonce
+                && !self
                     .local()?
                     .records
                     .tombstones
                     .iter()
                     .any(|t| t.nonce == nonce)
-                {
-                    let revoke = records
-                        .tombstones
-                        .iter()
-                        .find(|t| t.nonce == nonce)
-                        .unwrap();
-                    intent.recipients = Some(
-                        self.auth
-                            .registry
-                            .capture(revoke, self.services.clock.unix_seconds())?,
-                    );
-                }
+            {
+                let revoke = records
+                    .tombstones
+                    .iter()
+                    .find(|t| t.nonce == nonce)
+                    .unwrap();
+                intent.recipients = Some(
+                    self.auth
+                        .registry
+                        .capture(revoke, self.services.clock.unix_seconds())?,
+                );
             }
         }
         // Includes observed floors and conflicting signed evidence on Err.

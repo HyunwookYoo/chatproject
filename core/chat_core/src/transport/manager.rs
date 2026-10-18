@@ -968,9 +968,8 @@ impl Manager {
                 let preparation=self.incoming.remove(&tag.generation);self.release_cutoffs();
                 if self.gate.blocked() || preparation.is_none_or(|p|p.cancel.is_cancelled()) {connection.close(0u32.into(),b"account blocked");return;}
                 match &self.account_input {
-                    Some(input)=>if let Err(error)=input.try_send(crate::account::connection::Input::Incoming(connection)) {
-                        if let crate::account::connection::Input::Incoming(conn)=error.into_inner(){conn.close(0u32.into(),b"account busy");}
-                    },
+                    Some(input)=>if let Err(error)=input.try_send(crate::account::connection::Input::Incoming(connection))
+                        && let crate::account::connection::Input::Incoming(conn)=error.into_inner(){conn.close(0u32.into(),b"account busy");},
                     None=>connection.close(0u32.into(),b"account unavailable"),
                 }
             }
