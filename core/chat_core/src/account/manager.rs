@@ -1121,7 +1121,7 @@ impl Manager {
                         Command::Confirm(flow, answers, reply) => { let result = self.confirm(flow, &answers).await; let _ = reply.send(result); }
                         Command::Cancel(flow, reply) => { let result = self.cancel(flow); let _ = reply.send(result); }
                         Command::Recover(words, confirmed, reply) => { let result = self.recover(&words, confirmed).await; let _ = reply.send(result); }
-                        Command::Snapshot(reply) => { self.expire_pair(); self.publish_view(); let _ = reply.send(Ok(self.view())); }
+                        Command::Snapshot(reply) => { let _ = reply.send(Ok(self.snapshot_view())); }
                         Command::Refresh(peer, reply) => {
                             let result = if matches!(&self.state,Some(AccountState::PendingImport(p)) if p.pin.peer==peer) {
                                 self.refresh_import().await
@@ -1567,6 +1567,13 @@ impl Manager {
         });
         if accepted { Ok(()) } else { Err(unavailable(ErrorCode::StorageLocked)) }
     }
+    fn snapshot_view(&mut self) -> AccountView {
+        self.expire_pair();
+        self.publish_view();
+        // Native readiness, clocks, and connection grants may change after publication.
+        // A revision always returns the exact projection cached for its event.
+        self.last_public_view.as_ref().expect("published account projection").clone()
+    }
     fn publish_view(&mut self) {
         let mut view = self.view();
         if self.last_public_view.as_ref() == Some(&view) { return; }
@@ -1723,6 +1730,79 @@ mod tests {
         account.request_suspend(); account.snapshot().await.unwrap();
         assert_eq!(account.retry_open().await.unwrap_err().code, ErrorCode::StorageLocked);
         assert_eq!(account.snapshot().await.unwrap().phase, AccountPhase::Locked);
+    }
+
+    #[tokio::test]
+    async fn snapshot_reuses_published_projection_when_native_readiness_changes() {
+        use std::sync::atomic::AtomicBool;
+        struct BoundarySink {
+            network: NetworkHandle,
+            armed: AtomicBool,
+            views: std::sync::Mutex<Vec<AccountView>>,
+        }
+        impl crate::EventSink for BoundarySink {
+            fn send(&self, event: crate::CoreEvent) -> bool {
+                if let crate::CoreEvent::AccountChanged { revision, view } = event {
+                    assert_eq!(revision, view.revision);
+                    self.views.lock().unwrap().push(*view);
+                    if self.armed.swap(false, Ordering::SeqCst) {
+                        // One nonblocking native change at publication/reply boundary.
+                        // No actor timer, lifecycle mailbox, or event-bus/core-slot reentry.
+                        self.network.lifecycle_gate(true);
+                    }
+                }
+                true
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let bus = EventBus::new();
+        let slot = CoreSlot::new();
+        slot.start(CoreConfig { data_dir: dir.path().into() }, &bus).unwrap();
+        let network = slot.network().unwrap();
+        network.configure_local(None).await.unwrap();
+        let ticket = network.begin_account();
+        let (requests, _) = watch::channel(Request { ticket, suspend: false });
+        let shared = Arc::new(Shared {
+            network: network.clone(),
+            requests,
+            status: AtomicU64::new((ticket << 2) | 1),
+        });
+        let sink = Arc::new(BoundarySink {
+            network,
+            armed: AtomicBool::new(true),
+            views: std::sync::Mutex::new(vec![]),
+        });
+        bus.subscribe(sink.clone());
+        let mut manager = Manager {
+            pair: super::super::pair::session::Runtime::default(),
+            auth: super::super::connection::Runtime::default(),
+            bus,
+            store: Store::open(dir.path(), Arc::new(Protector)).unwrap(),
+            state: None,
+            creation: None,
+            cleanup_pending: false,
+            revision: 0,
+            public_revision: 0,
+            last_public_view: None,
+            lock_error: None,
+            shared,
+            services: offline_services(),
+        };
+        // Exercise exactly the private path used by Command::Snapshot.
+        let snapshots = [manager.snapshot_view(), manager.snapshot_view(), manager.snapshot_view()];
+        assert!(!sink.armed.load(Ordering::SeqCst));
+        assert!(manager.shared.network.desired_suspend());
+        let views = sink.views.lock().unwrap();
+        assert_eq!(views.len(), 2);
+        assert_eq!(views[0].phase, AccountPhase::Unconfigured);
+        assert_eq!(views[1].phase, AccountPhase::Locked);
+        for snapshot in snapshots {
+            let equal_revision: Vec<_> = views.iter().filter(|v| v.revision == snapshot.revision).collect();
+            assert!(!equal_revision.is_empty());
+            for published in equal_revision {
+                assert_eq!(&snapshot, published, "one revision must identify exactly one public projection");
+            }
+        }
     }
 
     #[tokio::test]

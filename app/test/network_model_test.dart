@@ -6,6 +6,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter/foundation.dart';
 
 import 'support/fake_network_client.dart';
+import 'account_model_test.dart' as account_fixture show view;
 
 rust.NetworkInfo info(
   int revision, {
@@ -28,23 +29,42 @@ void main() {
     debugPrint = (message, {wrapWidth}) => diagnostics.add(message);
   });
   tearDown(() => debugPrint = previousPrint);
-  test('account events remain on shared stream and preserve M2 diagnostics', () async {
+  test('account events preserve M2 connection state timings and diagnostics', () async {
     final client = FakeNetworkClient();
     final model = NetworkModel(client);
     final accountEvents = <rust.ChatEvent>[];
     final accountSubscription = client.events().listen(accountEvents.add);
     await model.open();
+    model.applySnapshot(info(7, peers: [rust.PeerInfo(
+      peerId: 'transport-peer',
+      phase: rust.PeerPhase.connected,
+      path: rust.PeerPath.direct,
+      connectMs: BigInt.from(123),
+      directMs: BigInt.from(456),
+    )]));
+    model.appendLine('existing M2 diagnostic');
     final before = model.snapshot;
+    final beforeLines = List<String>.of(model.recentLines);
+    final beforeDiagnostics = List<String?>.of(diagnostics);
+    final changed = rust.ChatEvent.accountChanged(
+      revision: BigInt.from(99),
+      view: account_fixture.view(BigInt.from(99)),
+    );
     const cached = rust.ChatEvent.accountCacheUsed(peerId: 'account-peer');
     const ready = rust.ChatEvent.accountAuthChanged(
       peerId: 'account-peer', installationId: 'installation', ready: true,
     );
     client.controller.add(cached);
     client.controller.add(ready);
+    client.controller.add(changed);
     await Future<void>.delayed(Duration.zero);
-    expect(accountEvents, [cached, ready]);
+    expect(accountEvents, [cached, ready, changed]);
     expect(model.snapshot, same(before));
-    expect(model.recentLines, isEmpty);
+    expect(model.snapshot!.state, rust.NetworkState.online);
+    expect(model.snapshot!.peers.single.connectMs, BigInt.from(123));
+    expect(model.snapshot!.peers.single.directMs, BigInt.from(456));
+    expect(model.recentLines, beforeLines);
+    expect(diagnostics, beforeDiagnostics);
     expect(model.error, isNull);
     await accountSubscription.cancel();
     await model.close();
