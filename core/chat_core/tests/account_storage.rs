@@ -4,7 +4,9 @@ mod support;
 use chat_core::account::storage::{KeyProtector, Store, StoredPlaintext};
 use chat_core::account::{Secret32, StoreId};
 use chat_core::{CoreError, ErrorCode};
-use std::{fs, process::Command, sync::Arc};
+#[cfg(not(target_os = "ios"))]
+use std::process::Command;
+use std::{fs, sync::Arc};
 use support::{protector, state};
 
 const LIMIT: usize = 4 * 1024 * 1024;
@@ -257,12 +259,21 @@ fn unavailable_os_key_never_regenerates_or_overwrites_snapshot() {
     );
     locked.suspend().unwrap();
     assert_eq!(locked.resume().unwrap_err().code, ErrorCode::StorageLocked);
-    // Failed resume releases ownership as well as refusing new secret access.
-    let other = Store::open(dir.path(), protector()).unwrap();
+    // Failed validation must not hand persistent ownership to another Store.
+    #[cfg(not(target_os = "ios"))]
+    assert!(matches!(
+        Store::open(dir.path(), protector()),
+        Err(CoreError {
+            code: ErrorCode::WriterBusy,
+            ..
+        })
+    ));
     assert_eq!(locked.load().err().unwrap().code, ErrorCode::StorageLocked);
-    drop(other);
     assert_eq!(fs::read(dir.path().join("account.bin")).unwrap(), original);
     assert_eq!(fs::read(dir.path().join("key.wrap")).unwrap(), wrapped);
+    drop(locked);
+    let mut other = Store::open(dir.path(), protector()).unwrap();
+    assert_eq!(&*other.load().unwrap().unwrap().payload, b"existing");
 }
 
 #[test]
@@ -284,7 +295,8 @@ fn all_storage_files_are_bounded_before_secret_access() {
 }
 
 #[test]
-fn suspend_blocks_access_and_resume_reacquires_ownership() {
+#[cfg(not(target_os = "ios"))]
+fn suspend_blocks_access_and_retains_writer_until_drop() {
     let dir = tempfile::tempdir().unwrap();
     let mut store = Store::open(dir.path(), protector()).unwrap();
     store.commit(&state(b"saved")).unwrap();
@@ -294,11 +306,25 @@ fn suspend_blocks_access_and_resume_reacquires_ownership() {
         store.commit(&state(b"blocked")).unwrap_err().code,
         ErrorCode::StorageLocked
     );
-    let other = Store::open(dir.path(), protector()).unwrap();
-    assert_eq!(store.resume().unwrap_err().code, ErrorCode::WriterBusy);
-    drop(other);
+    assert!(matches!(
+        Store::open(dir.path(), protector()),
+        Err(CoreError {
+            code: ErrorCode::WriterBusy,
+            ..
+        })
+    ));
     store.resume().unwrap();
     assert_eq!(&*store.load().unwrap().unwrap().payload, b"saved");
+    assert!(matches!(
+        Store::open(dir.path(), protector()),
+        Err(CoreError {
+            code: ErrorCode::WriterBusy,
+            ..
+        })
+    ));
+    drop(store);
+    let mut other = Store::open(dir.path(), protector()).unwrap();
+    assert_eq!(&*other.load().unwrap().unwrap().payload, b"saved");
 }
 
 struct NoSecrets;
@@ -326,19 +352,32 @@ fn ownership_child() {
 }
 
 #[test]
+#[cfg(not(target_os = "ios"))]
 fn two_processes_canonical_folder_one_writer() {
     let dir = tempfile::tempdir().unwrap();
     let mut store = Store::open(dir.path(), protector()).unwrap();
     store.commit(&state(b"secret")).unwrap();
-    let output = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "ownership_child", "--nocapture"])
-        .env("CHAT_A2_OWNERSHIP_CHILD", dir.path().join("."))
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let competing_process = || {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "ownership_child", "--nocapture"])
+            .env("CHAT_A2_OWNERSHIP_CHILD", dir.path().join("."))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    competing_process();
+    store.suspend().unwrap();
+    competing_process();
+    store.resume().unwrap();
+    fs::write(dir.path().join("account.bin"), b"corrupt").unwrap();
+    store.suspend().unwrap();
+    assert_eq!(store.resume().unwrap_err().code, ErrorCode::StorageCorrupt);
+    competing_process();
+    drop(store);
+    assert!(Store::open(dir.path(), protector()).is_ok());
 }

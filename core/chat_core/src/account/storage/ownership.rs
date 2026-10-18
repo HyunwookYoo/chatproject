@@ -68,16 +68,19 @@ impl Ownership {
 
     pub(super) fn suspend(&mut self) {
         self.suspended = true;
-        self.held.take();
+        if self.short_lived {
+            self.held.take();
+        }
     }
 
     pub(super) fn resume(&mut self) -> Result<(), CoreError> {
         if !self.suspended {
             return Ok(());
         }
-        let lock = acquire(&self.root)?;
-        if !self.short_lived {
-            self.held = Some(lock);
+        if self.short_lived {
+            // Persistent owners keep their original lock through suspension and
+            // failed validation; only the iOS policy needs to reacquire here.
+            let _lock = acquire(&self.root)?;
         }
         self.suspended = false;
         Ok(())
@@ -110,11 +113,20 @@ mod tests {
         assert_eq!(store.load().err().unwrap().code, ErrorCode::StorageLocked);
         assert_eq!(store.resume().unwrap_err().code, ErrorCode::WriterBusy);
         drop(other);
+        let lock_while_suspended = acquire(dir.path()).unwrap();
+        assert_eq!(store.resume().unwrap_err().code, ErrorCode::WriterBusy);
+        drop(lock_while_suspended);
         store.resume().unwrap();
         let lock_after_resume = acquire(dir.path()).unwrap();
         drop(lock_after_resume);
         assert_eq!(&*store.load().unwrap().unwrap().payload, b"old");
         let lock_after_read = acquire(dir.path()).unwrap();
         drop(lock_after_read);
+        fs::write(dir.path().join("account.bin"), b"corrupt").unwrap();
+        store.suspend().unwrap();
+        assert_eq!(store.resume().unwrap_err().code, ErrorCode::StorageCorrupt);
+        assert_eq!(store.load().err().unwrap().code, ErrorCode::StorageLocked);
+        let lock_after_failed_validation = acquire(dir.path()).unwrap();
+        drop(lock_after_failed_validation);
     }
 }
