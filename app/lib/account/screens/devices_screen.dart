@@ -123,8 +123,10 @@ class DevicesScreen extends StatelessWidget {
                               context: context,
                               builder: (context) => AlertDialog(
                                 title: const Text('중단된 연결 버리기'),
-                                content: const DeviceWarningScreen(
-                                  disclosurePossible: true,
+                                content: const SingleChildScrollView(
+                                  child: DeviceWarningScreen(
+                                    disclosurePossible: true,
+                                  ),
                                 ),
                                 actions: [
                                   TextButton(

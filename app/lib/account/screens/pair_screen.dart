@@ -19,10 +19,13 @@ class PairScreen extends StatefulWidget {
 class _PairScreenState extends State<PairScreen> with WidgetsBindingObserver {
   a.PairDisplay? _display;
   List<int>? _flow;
+  List<int>? _cancelFlow;
+  Future<bool>? _cancellation;
   Future<Object?>? _pending;
   int _ticket = 0, _input = 0;
   bool _scan = false, _confirmed = false, _leaving = false;
   bool _hidden = false;
+  bool _consentMayDisclose = false, _closing = false;
   int _protectionTicket = 0;
   String? _error;
   Timer? _expiry;
@@ -35,6 +38,7 @@ class _PairScreenState extends State<PairScreen> with WidgetsBindingObserver {
   }
 
   bool get _disclosed =>
+      _consentMayDisclose ||
       model.snapshot?.disclosurePossible == true ||
       model.snapshot?.pendingImportRequiresRemoteRevoke == true ||
       _pair?.disclosurePossible == true;
@@ -75,26 +79,43 @@ class _PairScreenState extends State<PairScreen> with WidgetsBindingObserver {
     }
   }
 
-  Future<void> _abandon({bool notify = true}) async {
+  Future<bool> _abandon({bool notify = true}) async {
+    if (_cancellation case final Future<bool> cancellation) return cancellation;
     final ticket = ++_ticket;
-    final flow = _flow, pending = _pending;
+    final flow = _cancelFlow ?? _flow, pending = _pending;
+    final ownsOperation = _flow != null || pending != null;
+    _cancelFlow = flow == null ? null : List.of(flow);
     _flow = null;
     _display = null;
     _pending = null;
     _confirmed = false;
     _scan = false;
-    model.clearSecrets();
+    _error = null;
+    // A retry owns only its public flow, not a newer route's pending secrets.
+    if (ownsOperation) model.clearSecrets();
     if (mounted && notify) setState(() {});
     if (flow != null) {
-      final ok = await model.cancelAbandonedPair(flow, afterOperation: pending);
-      if (mounted && ticket == _ticket && !ok) {
-        setState(() => _error = '연결 취소를 확인하지 못했어요. 현재 상태를 확인해 주세요.');
+      final cancellation = model.cancelAbandonedPair(
+        flow,
+        afterOperation: pending,
+      );
+      _cancellation = cancellation;
+      final ok = await cancellation;
+      if (ticket != _ticket) return false;
+      _cancellation = null;
+      if (ok) {
+        _cancelFlow = null;
+      } else {
+        _error = '연결 취소를 확인하지 못했어요. 취소를 다시 시도해 주세요.';
       }
+      if (mounted && notify) setState(() {});
+      return ok;
     }
+    return true;
   }
 
   Future<void> _begin() async {
-    if (model.busy || _pending != null) return;
+    if (model.busy || _pending != null || _cancelFlow != null) return;
     final ticket = ++_ticket;
     final direction = _role == a.PairRole.existing
         ? a.PairDirection.existingDisplays
@@ -107,6 +128,8 @@ class _PairScreenState extends State<PairScreen> with WidgetsBindingObserver {
     final reply = await future;
     if (!mounted || ticket != _ticket) return;
     setState(() {
+      _error = null;
+      _consentMayDisclose = false;
       _pending = null;
       _display = reply;
       _flow = reply == null ? null : List.of(reply.flow);
@@ -115,6 +138,7 @@ class _PairScreenState extends State<PairScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _receive(String payload) async {
+    if (_cancelFlow != null) return;
     final ticket = ++_ticket;
     final future = model.pairScan(
       payload,
@@ -124,6 +148,8 @@ class _PairScreenState extends State<PairScreen> with WidgetsBindingObserver {
     final flow = await future;
     if (!mounted || ticket != _ticket) return;
     setState(() {
+      _error = null;
+      _consentMayDisclose = false;
       _pending = null;
       _scan = false;
       _flow = flow;
@@ -137,6 +163,10 @@ class _PairScreenState extends State<PairScreen> with WidgetsBindingObserver {
     final flow = _flow;
     if (flow == null || model.busy) return;
     final ticket = _ticket;
+    // Consent can let the other side disclose before our public view catches up.
+    if (approve || (_role == a.PairRole.new_ && matches)) {
+      _consentMayDisclose = true;
+    }
     final future = approve
         ? model.pairApprove(flow)
         : model.pairConfirmCode(flow, matches);
@@ -154,12 +184,19 @@ class _PairScreenState extends State<PairScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _close() async {
-    if (_leaving) return;
+    if (_leaving || _closing) return;
+    _closing = true;
     final yes = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
         title: const Text('연결 화면을 닫을까요?'),
-        content: DeviceWarningScreen(disclosurePossible: _disclosed),
+        content: SingleChildScrollView(
+          child: AnimatedBuilder(
+            animation: model,
+            builder: (_, _) =>
+                DeviceWarningScreen(disclosurePossible: _disclosed),
+          ),
+        ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(context, false),
@@ -172,9 +209,13 @@ class _PairScreenState extends State<PairScreen> with WidgetsBindingObserver {
         ],
       ),
     );
-    if (yes != true || !mounted) return;
-    await _abandon();
-    if (mounted) {
+    if (yes != true || !mounted) {
+      _closing = false;
+      return;
+    }
+    final canceled = await _abandon();
+    _closing = false;
+    if (mounted && canceled) {
       setState(() => _leaving = true);
       Navigator.pop(context);
     }
@@ -192,7 +233,7 @@ class _PairScreenState extends State<PairScreen> with WidgetsBindingObserver {
   @override
   Widget build(BuildContext context) {
     final pair = _pair;
-    final busy = model.busy || _pending != null;
+    final busy = model.busy || _pending != null || _cancellation != null;
     final content = SingleChildScrollView(
       padding: const EdgeInsets.all(24),
       child: Center(
@@ -212,7 +253,7 @@ class _PairScreenState extends State<PairScreen> with WidgetsBindingObserver {
                 const Text('새 QR, 새 확인 코드와 양쪽 확인, 기존 기기의 새 승인이 필요해요.'),
               if (_disclosed)
                 const DeviceWarningScreen(disclosurePossible: true),
-              if (_flow == null && !busy) ...[
+              if (_flow == null && _cancelFlow == null && !busy) ...[
                 if (defaultTargetPlatform == TargetPlatform.windows)
                   const Text(
                     'Windows에서는 기존 기기에 QR을 표시하고 새 기기로 스캔하는 반대 방향을 권해요.',
@@ -284,6 +325,11 @@ class _PairScreenState extends State<PairScreen> with WidgetsBindingObserver {
                 TextButton(
                   onPressed: busy ? null : _abandon,
                   child: const Text('새 QR로 다시 시작'),
+                ),
+              if (_cancelFlow != null)
+                TextButton(
+                  onPressed: busy ? null : _abandon,
+                  child: const Text('연결 취소 다시 시도'),
                 ),
               if (_error ?? model.error case final String error)
                 Semantics(liveRegion: true, child: Text(error)),

@@ -11,6 +11,7 @@ import 'package:flutter/scheduler.dart';
 import 'package:chat_app/src/rust/api/chat.dart' as r;
 import 'package:chat_app/src/rust/api/account.dart' as a;
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'account_onboarding_test.dart' show ScreenClient;
@@ -119,6 +120,7 @@ class UiPairClient extends ScreenClient {
   List<a.DeviceView> devices = [];
   List<a.PairResumeView> resumes = [];
   Completer<void>? commandWait;
+  Completer<a.PairDisplay>? beginWait;
   final canceled = <List<int>>[];
   @override
   a.AccountView view() {
@@ -161,6 +163,7 @@ class UiPairClient extends ScreenClient {
     a.PairDirection direction,
     Uint8List? resume,
   ) async {
+    if (beginWait case final Completer<a.PairDisplay> wait) return wait.future;
     beganDirection = direction;
     beganResume = resume;
     paired(a.PairPhase.comparing, direction);
@@ -196,7 +199,9 @@ class UiPairClient extends ScreenClient {
   @override
   Future<void> pairCancel(List<int> flow) async {
     canceled.add(List.of(flow));
-    pairing = null;
+    await cancelWait?.future;
+    check();
+    if (listEquals(pairing?.flow, flow)) pairing = null;
     emit();
   }
 
@@ -228,6 +233,8 @@ Future<AccountModel> mountPair(
   a.PairResumeView? resume,
   bool devices = false,
   bool locked = false,
+  bool pushed = false,
+  double scale = 1,
 }) async {
   final model = AccountModel(c);
   await model.open();
@@ -238,12 +245,33 @@ Future<AccountModel> mountPair(
             child: const MaterialApp(home: Text('UNLOCKED')),
           )
         : MaterialApp(
+            builder: (context, child) => MediaQuery(
+              data: MediaQuery.of(
+                context,
+              ).copyWith(textScaler: TextScaler.linear(scale)),
+              child: child!,
+            ),
             home: devices
                 ? DevicesScreen(model: model, onPair: (_) {})
+                : pushed
+                ? Builder(
+                    builder: (context) => Scaffold(
+                      body: TextButton(
+                        onPressed: () => Navigator.of(context).push(
+                          MaterialPageRoute<void>(
+                            builder: (_) =>
+                                PairScreen(model: model, resume: resume),
+                          ),
+                        ),
+                        child: const Text('OPEN PAIR'),
+                      ),
+                    ),
+                  )
                 : PairScreen(model: model, resume: resume),
           ),
   );
   await t.pumpAndSettle();
+  if (pushed) await hit(t, 'OPEN PAIR');
   addTearDown(() async {
     await t.pumpWidget(const SizedBox());
     await t.pumpAndSettle();
@@ -259,7 +287,247 @@ Future<void> hit(WidgetTester t, String text) async {
   await t.pumpAndSettle();
 }
 
+Future<void> keyboardActivate(
+  WidgetTester t,
+  String label, {
+  bool last = false,
+}) async {
+  final target = last ? find.text(label).last : find.text(label);
+  await t.ensureVisible(target);
+  for (var i = 0; i < 40 && !Focus.of(t.element(target)).hasFocus; i++) {
+    await t.sendKeyEvent(LogicalKeyboardKey.tab);
+    await t.pumpAndSettle();
+  }
+  expect(
+    Focus.of(t.element(target)).hasFocus,
+    isTrue,
+    reason: '$label reachable by Tab',
+  );
+  await t.sendKeyEvent(LogicalKeyboardKey.enter);
+  await t.pumpAndSettle();
+}
+
 void expandedTests() {
+  for (final role in a.PairRole.values) {
+    testWidgets(
+      'close warning covers delayed ${role.name} consent and disclosure',
+      (t) async {
+        final c = UiPairClient()
+          ..phase = a.AccountPhase.active
+          ..role = role;
+        await mountPair(t, c, pushed: true);
+        await hit(t, 'QR 표시');
+        if (role == a.PairRole.existing) {
+          c.paired(a.PairPhase.awaitingApproval, c.beganDirection!);
+          await t.pumpAndSettle();
+        }
+        c.commandWait = Completer<void>();
+        await hit(t, role == a.PairRole.existing ? '이 기기 연결 승인' : '양쪽 코드가 같아요');
+        await t.tap(find.byTooltip('취소'));
+        await t.pumpAndSettle();
+        final warning = find.descendant(
+          of: find.byType(AlertDialog),
+          matching: find.textContaining('원격 사본이 지워졌다고'),
+        );
+        expect(warning, findsOneWidget);
+        expect(find.textContaining('키 전달 전 연결을 취소'), findsNothing);
+        c.commandWait!.complete();
+        await t.pumpAndSettle();
+        expect(warning, findsOneWidget);
+        expect(c.canceled, isEmpty);
+        await hit(t, '연결 취소');
+        expect(c.canceled, [c.flow]);
+        expect(find.text('OPEN PAIR'), findsOneWidget);
+      },
+    );
+  }
+  testWidgets('open close warning follows newly projected disclosure', (
+    t,
+  ) async {
+    final c = UiPairClient()..phase = a.AccountPhase.active;
+    await mountPair(t, c);
+    await t.tap(find.byTooltip('취소'));
+    await t.pumpAndSettle();
+    c.disclosed = true;
+    c.emit();
+    await t.pumpAndSettle();
+    expect(
+      find.descendant(
+        of: find.byType(AlertDialog),
+        matching: find.textContaining('원격 사본이 지워졌다고'),
+      ),
+      findsOneWidget,
+    );
+  });
+  testWidgets(
+    'failed close stays visible and retries exact old flow without replacement',
+    (t) async {
+      final c = UiPairClient()..phase = a.AccountPhase.active;
+      final model = await mountPair(t, c, pushed: true);
+      await hit(t, 'QR 표시');
+      c.failure = r.ErrorCode.notAvailable;
+      c.cancelWait = Completer<void>();
+      await t.tap(find.byTooltip('취소'));
+      await t.pumpAndSettle();
+      await hit(t, '연결 취소');
+      expect(find.byType(PairScreen), findsOneWidget);
+      expect(find.text('PUBLIC_INVALID_PAIR_FIXTURE'), findsNothing);
+      // Another owner publishes a new flow while the old cancellation is pending.
+      final replacement = a.PairView(
+        flow: Uint8List.fromList(List.filled(16, 99)),
+        direction: a.PairDirection.newDisplays,
+        localRole: a.PairRole.new_,
+        phase: a.PairPhase.comparing,
+        sas: 'OTHER-FLOW',
+        expiresAt: BigInt.from(9999999999),
+        disclosurePossible: false,
+      );
+      c.pairing = replacement;
+      c.emit();
+      c.cancelWait!.complete();
+      await t.pumpAndSettle();
+      expect(find.byType(PairScreen), findsOneWidget);
+      expect(find.textContaining('연결 취소를 확인하지 못했어요'), findsOneWidget);
+      expect(find.text('QR 표시'), findsNothing);
+      expect(find.text('OTHER-FLOW'), findsNothing);
+      expect(model.error, isNull);
+      c.failure = null;
+      c.beginWait = Completer<a.PairDisplay>();
+      final replacementBegin = model.pairBegin(a.PairDirection.newDisplays);
+      await t.tap(find.byTooltip('취소'));
+      await t.pumpAndSettle();
+      await hit(t, '연결 취소');
+      expect(c.canceled, [c.flow, c.flow]);
+      expect(c.pairing, same(replacement));
+      expect(model.snapshot!.pair!.flow, replacement.flow);
+      expect(find.text('OPEN PAIR'), findsOneWidget);
+      expect(model.error, isNull);
+      c.beginWait!.complete(
+        a.PairDisplay(
+          flow: replacement.flow,
+          qr: 'PUBLIC_INVALID_REPLACEMENT_FIXTURE',
+          expiresAt: BigInt.from(9999999999),
+        ),
+      );
+      expect(await replacementBegin, isNotNull);
+      expect(c.canceled, [c.flow, c.flow]);
+    },
+  );
+  testWidgets(
+    'confirmed close waits for pending approval then reports cancel failure and retries',
+    (t) async {
+      final c = UiPairClient()..phase = a.AccountPhase.active;
+      await mountPair(t, c, pushed: true);
+      await hit(t, 'QR 표시');
+      c.paired(a.PairPhase.awaitingApproval, c.beganDirection!);
+      await t.pumpAndSettle();
+      c.commandWait = Completer<void>();
+      c.failure = r.ErrorCode.notAvailable;
+      await hit(t, '이 기기 연결 승인');
+      await t.tap(find.byTooltip('취소'));
+      await t.pumpAndSettle();
+      await hit(t, '연결 취소');
+      expect(c.canceled, isEmpty);
+      expect(find.byType(PairScreen), findsOneWidget);
+      expect(find.text('QR 표시'), findsNothing);
+      expect(find.text('PUBLIC_INVALID_PAIR_FIXTURE'), findsNothing);
+      await t.tap(find.byTooltip('취소'));
+      await t.pumpAndSettle();
+      expect(find.byType(AlertDialog), findsNothing);
+      c.commandWait!.complete();
+      await t.pumpAndSettle();
+      expect(c.approvals, 1);
+      expect(c.disclosed, isTrue);
+      expect(c.canceled, [c.flow]);
+      expect(find.textContaining('연결 취소를 확인하지 못했어요'), findsOneWidget);
+      expect(find.textContaining('원격 사본이 지워졌다고'), findsOneWidget);
+      c.failure = null;
+      c.cancelWait = Completer<void>();
+      await hit(t, '연결 취소 다시 시도');
+      expect(find.text('QR 표시'), findsNothing);
+      await t.tap(find.byTooltip('취소'));
+      await t.pumpAndSettle();
+      await hit(t, '연결 취소');
+      expect(c.canceled, [c.flow, c.flow]); // Close shares the in-flight retry.
+      expect(find.byType(PairScreen), findsOneWidget);
+      c.cancelWait!.complete();
+      await t.pumpAndSettle();
+      expect(c.canceled, [c.flow, c.flow]);
+      expect(find.text('OPEN PAIR'), findsOneWidget);
+    },
+  );
+  testWidgets(
+    'pair and close dialog at 200 percent remain keyboard actionable',
+    (t) async {
+      t.view.physicalSize = const Size(360, 640);
+      t.view.devicePixelRatio = 1;
+      addTearDown(t.view.resetPhysicalSize);
+      addTearDown(t.view.resetDevicePixelRatio);
+      final c = UiPairClient()..phase = a.AccountPhase.active;
+      await mountPair(t, c, scale: 2, pushed: true);
+      await keyboardActivate(t, 'QR 표시');
+      expect(find.text('ABCD-EFGH'), findsOneWidget);
+      await keyboardActivate(t, '양쪽 코드가 같아요');
+      expect(c.matches, 1);
+      c.disclosed = true;
+      c.emit();
+      await t.pumpAndSettle();
+      await t.tap(find.byTooltip('취소'));
+      await t.pumpAndSettle();
+      expect(t.takeException(), isNull);
+      await keyboardActivate(t, '계속');
+      expect(find.byType(AlertDialog), findsNothing);
+      expect(c.canceled, isEmpty);
+    },
+  );
+  for (final pending in [false, true]) {
+    testWidgets(
+      'devices and warning at 200 percent keyboard pending=$pending',
+      (t) async {
+        t.view.physicalSize = const Size(360, 640);
+        t.view.devicePixelRatio = 1;
+        addTearDown(t.view.resetPhysicalSize);
+        addTearDown(t.view.resetDevicePixelRatio);
+        final c = UiPairClient()
+          ..phase = pending
+              ? a.AccountPhase.pendingImport
+              : a.AccountPhase.active;
+        c.devices = List.generate(
+          2,
+          (i) => a.DeviceView(
+            installationId: Uint8List.fromList(List.filled(32, i)),
+            transportPublicKey: Uint8List(32),
+            kind: a.DeviceKind.desktop,
+          ),
+        );
+        await mountPair(t, c, devices: true, scale: 2);
+        expect(t.takeException(), isNull);
+        for (final device in c.devices) {
+          final id = find.textContaining(publicId(device.installationId));
+          await t.ensureVisible(id);
+          await t.pumpAndSettle();
+          expect(t.getSize(id).width, lessThanOrEqualTo(312));
+          final tile = find.ancestor(of: id, matching: find.byType(ListTile));
+          final title = find.descendant(
+            of: tile,
+            matching: find.textContaining('데스크톱'),
+          );
+          expect(t.getRect(title).bottom, lessThanOrEqualTo(t.getRect(id).top));
+          expect(
+            t.getRect(id).bottom,
+            lessThanOrEqualTo(t.getRect(tile).bottom),
+          );
+        }
+        await keyboardActivate(t, pending ? '중단된 연결 버리기' : '해제', last: true);
+        expect(t.takeException(), isNull);
+        expect(find.byType(AlertDialog), findsOneWidget);
+        await keyboardActivate(t, pending ? '로컬 연결 버리기' : '기기 해제');
+        expect(pending ? c.discards : c.revokes, 1);
+        expect(find.byType(AlertDialog), findsNothing);
+        expect(t.takeException(), isNull);
+      },
+    );
+  }
   testWidgets(
     'foreground release waits for later raster and ignores stale timing',
     (t) async {
@@ -557,7 +825,7 @@ void expandedTests() {
       await t.tap(find.byTooltip('취소'));
       await t.pumpAndSettle();
       expect(
-        find.textContaining(disclosed ? '원격 사본이 지워졌다고' : '키 전달 전 연결을 취소'),
+        find.textContaining(disclosed ? '원격 사본이 지워졌다고' : '연결 취소를 요청해요'),
         findsWidgets,
       );
       expect(c.canceled, isEmpty);

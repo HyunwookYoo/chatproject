@@ -16,7 +16,7 @@ class DeviceWarningScreen extends StatelessWidget {
       Text(
         disclosurePossible
             ? '이 기기가 계정 키 사본을 받았을 수 있어요. 연결을 취소하거나 목록에서 해제해도 원격 사본이 지워졌다고 보장할 수 없어요.'
-            : '키 전달 전 연결을 취소해요. 새로 연결할 때는 새 QR과 확인 코드가 필요해요.',
+            : '연결 취소를 요청해요. 취소는 이미 전달된 키 사본을 지우지 않아요. 새로 연결할 때는 새 QR과 확인 코드가 필요해요.',
       ),
       if (disclosurePossible)
         const Text(
