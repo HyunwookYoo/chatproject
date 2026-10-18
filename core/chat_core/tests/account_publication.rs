@@ -159,7 +159,7 @@ async fn unavailable_is_not_absent() {
 }
 
 #[tokio::test]
-async fn future_signed_observation_preserves_floor_without_authorization() {
+async fn future_initial_recovery_waits_for_fresh_current_base_across_restart() {
     let f = Fixture::new().await;
     let keys = derive_account(&Secret32::from([0; 32])).unwrap();
     let record = IdentityRecord {
@@ -168,13 +168,13 @@ async fn future_signed_observation_preserves_floor_without_authorization() {
         expires_at: 1_800_600_000,
         devices: vec![],
     };
-    f.backend.answer(Answer::Found(
-        record_packet(&keys, &record, 1_800_000_600_000_000).unwrap(),
-    ));
+    let future = record_packet(&keys, &record, 1_800_000_600_000_000).unwrap();
+    f.backend.answer(Answer::Found(future.clone()));
     f.recover().await;
     let view = f.view().await;
     assert_eq!(view.publication.observed_seq, 1_800_000_600_000_000);
     assert_eq!(view.publication.state, PublicationState::LocalBlocked);
+    assert_eq!(view.publication.conflict_hash, Some(record_hash(&future)));
     assert!(f.backend.sent.lock().unwrap().is_empty());
     f.backend.answer(Answer::Absent);
     assert_eq!(
@@ -182,6 +182,252 @@ async fn future_signed_observation_preserves_floor_without_authorization() {
         ErrorCode::AccountRestricted
     );
     assert_eq!(f.view().await.publication.allocated_seq, 0);
+    f.clock.set_unix_seconds(1_800_000_600);
+    assert_eq!(
+        f.refresh().await.unwrap_err().code,
+        ErrorCode::AccountRestricted
+    );
+    f.account.request_suspend();
+    while f.account.lifecycle_status() == 1 {
+        tokio::task::yield_now().await;
+    }
+    let Fixture {
+        _dir: dir,
+        slot,
+        account,
+        backend,
+        clock,
+    } = f;
+    drop(account);
+    drop(slot);
+    let (_slot, account) = open(dir.path(), backend.clone(), clock).await;
+    let restored = account.snapshot().await.unwrap();
+    assert_eq!(restored.publication.state, PublicationState::LocalBlocked);
+    assert_eq!(
+        restored.publication.conflict_hash,
+        Some(record_hash(&future))
+    );
+    assert_eq!(restored.publication.allocated_seq, 0);
+    assert!(backend.sent.lock().unwrap().is_empty());
+    let older = IdentityRecord {
+        issued_at: 1_800_000_000,
+        ..record.clone()
+    };
+    backend.answer(Answer::Found(
+        record_packet(&keys, &older, 1_800_000_599_000_000).unwrap(),
+    ));
+    assert_eq!(
+        account
+            .refresh_record(keys.peer_id())
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::AccountRestricted
+    );
+    assert_eq!(
+        account.snapshot().await.unwrap().publication.conflict_hash,
+        Some(record_hash(&future))
+    );
+    backend.answer(Answer::Found(future.clone()));
+    assert_eq!(
+        account
+            .confirm_record_conflict(record_hash(&future))
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::AccountRestricted
+    );
+    assert_eq!(
+        account.snapshot().await.unwrap().publication.conflict_hash,
+        Some(record_hash(&future))
+    );
+    backend.answer(Answer::Found(future));
+    account.refresh_record(keys.peer_id()).await.unwrap();
+    let replacement = parse_record(&backend.last(), keys.peer_id(), 1_800_000_600).unwrap();
+    assert_ne!(replacement.generation, record.generation);
+    assert_eq!(replacement.devices.len(), 1);
+    assert_eq!(
+        Some(replacement.devices[0].installation_id),
+        restored.installation
+    );
+    let published = account.snapshot().await.unwrap();
+    assert_eq!(published.publication.conflict_hash, None);
+    assert!(published.publication.allocated_seq > 1_800_000_600_000_000);
+    assert_eq!(published.publication.state, PublicationState::Pending);
+}
+
+#[tokio::test]
+async fn future_competitor_holds_ready_pending_across_absence() {
+    let f = Fixture::new().await;
+    f.recover().await;
+    let accepted = f.published().await;
+    f.backend.answer(Answer::Absent);
+    f.refresh().await.unwrap();
+    let before = f.view().await;
+    let sent = f.backend.sent.lock().unwrap().len();
+    let keys = derive_account(&Secret32::from([0; 32])).unwrap();
+    let mut competing = parse_record(&accepted, keys.peer_id(), 1_800_000_000).unwrap();
+    competing.generation = Generation([8; 16]);
+    competing.issued_at = 1_800_000_600;
+    competing.expires_at = 1_800_605_400;
+    let future = record_packet(&keys, &competing, 1_800_000_600_000_000).unwrap();
+    f.backend.answer(Answer::Found(future.clone()));
+    assert_eq!(
+        f.refresh().await.unwrap_err().code,
+        ErrorCode::AccountRestricted
+    );
+    f.backend.answer(Answer::Absent);
+    assert_eq!(
+        f.refresh().await.unwrap_err().code,
+        ErrorCode::RecordConflict
+    );
+    let held = f.view().await;
+    assert_eq!(held.publication.state, PublicationState::Conflict);
+    assert_eq!(held.publication.conflict_hash, Some(record_hash(&future)));
+    assert_eq!(held.publication.conflict, Some(competing));
+    assert_eq!(
+        held.publication.accepted_hash,
+        before.publication.accepted_hash
+    );
+    assert_eq!(
+        held.publication.allocated_seq,
+        before.publication.allocated_seq
+    );
+    assert_eq!(held.publication.pending_count, 1);
+    assert_eq!(f.backend.sent.lock().unwrap().len(), sent);
+}
+
+#[tokio::test]
+async fn future_excluded_writer_stays_held_after_clock_catches_up() {
+    let f = Fixture::new().await;
+    f.recover().await;
+    let accepted = f.published().await;
+    let before = f.view().await;
+    let sent = f.backend.sent.lock().unwrap().len();
+    let keys = derive_account(&Secret32::from([0; 32])).unwrap();
+    let mut competing = parse_record(&accepted, keys.peer_id(), 1_800_000_000).unwrap();
+    competing.devices.clear();
+    competing.issued_at = 1_800_000_600;
+    competing.expires_at = 1_800_605_400;
+    let future = record_packet(&keys, &competing, 1_800_000_600_000_000).unwrap();
+    f.backend.answer(Answer::Found(future.clone()));
+    assert_eq!(
+        f.refresh().await.unwrap_err().code,
+        ErrorCode::AccountRestricted
+    );
+    f.clock.set_unix_seconds(1_800_000_600);
+    f.backend.answer(Answer::Absent);
+    assert_eq!(
+        f.refresh().await.unwrap_err().code,
+        ErrorCode::RecordConflict
+    );
+    assert_eq!(
+        f.view().await.publication.allocated_seq,
+        before.publication.allocated_seq
+    );
+    assert_eq!(f.backend.sent.lock().unwrap().len(), sent);
+    f.backend.answer(Answer::Found(future.clone()));
+    assert_eq!(
+        f.account
+            .confirm_record_conflict(record_hash(&future))
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::AccountRestricted
+    );
+    assert_eq!(f.view().await.publication.conflict, Some(competing));
+}
+
+#[tokio::test]
+async fn future_same_sequence_conflict_and_pending_hold_survive_restart() {
+    let f = Fixture::new().await;
+    f.recover().await;
+    let accepted = f.published().await;
+    f.backend.answer(Answer::Absent);
+    f.refresh().await.unwrap();
+    let before = f.view().await;
+    let sent = f.backend.sent.lock().unwrap().len();
+    let keys = derive_account(&Secret32::from([0; 32])).unwrap();
+    let mut competing = parse_record(&accepted, keys.peer_id(), 1_800_000_000).unwrap();
+    competing.issued_at = 1_800_000_600;
+    competing.expires_at = 1_800_605_400;
+    let future = record_packet(&keys, &competing, before.publication.observed_seq).unwrap();
+    f.backend.answer(Answer::Found(future.clone()));
+    assert_eq!(
+        f.refresh().await.unwrap_err().code,
+        ErrorCode::AccountRestricted
+    );
+    f.account.request_suspend();
+    while f.account.lifecycle_status() == 1 {
+        tokio::task::yield_now().await;
+    }
+    let Fixture {
+        _dir: dir,
+        slot,
+        account,
+        backend,
+        clock,
+    } = f;
+    drop(account);
+    drop(slot);
+    clock.set_unix_seconds(1_800_000_600);
+    backend.answer(Answer::Absent);
+    let (_slot, account) = open(dir.path(), backend.clone(), clock).await;
+    let restored = account.snapshot().await.unwrap();
+    assert_eq!(backend.sent.lock().unwrap().len(), sent);
+    assert_eq!(restored.publication.state, PublicationState::Conflict);
+    assert_eq!(
+        restored.publication.conflict_hash,
+        Some(record_hash(&future))
+    );
+    assert_eq!(restored.publication.conflict, Some(competing));
+    assert_eq!(
+        restored.publication.accepted_hash,
+        before.publication.accepted_hash
+    );
+    assert_eq!(
+        restored.publication.allocated_seq,
+        before.publication.allocated_seq
+    );
+    assert_eq!(restored.publication.pending_count, 1);
+}
+
+#[tokio::test]
+async fn exact_known_packet_under_rollback_does_not_invent_conflict() {
+    for pending in [false, true] {
+        let f = Fixture::new().await;
+        f.recover().await;
+        let accepted = f.published().await;
+        let known = if pending {
+            f.backend.answer(Answer::Absent);
+            f.refresh().await.unwrap();
+            f.backend.last()
+        } else {
+            accepted
+        };
+        f.clock.set_unix_seconds(1_700_000_000);
+        f.backend.answer(Answer::Found(known.clone()));
+        assert_eq!(
+            f.refresh().await.unwrap_err().code,
+            ErrorCode::AccountRestricted
+        );
+        assert_eq!(
+            f.view().await.publication.state,
+            PublicationState::LocalBlocked
+        );
+        assert_eq!(f.view().await.publication.conflict_hash, None);
+        f.clock.set_unix_seconds(1_800_000_000);
+        f.backend.answer(if pending {
+            Answer::Absent
+        } else {
+            Answer::Found(known.clone())
+        });
+        f.refresh().await.unwrap();
+        assert_eq!(f.view().await.publication.conflict_hash, None);
+        if pending {
+            assert_eq!(f.backend.last().as_bytes(), known.as_bytes());
+        }
+    }
 }
 
 #[tokio::test]

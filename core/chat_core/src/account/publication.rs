@@ -320,14 +320,42 @@ impl RecordState {
         if absent && matches!(action, Action::Revoke(_)) {
             return Err(blocked());
         }
+        // Before its first allocation, confirmed recovery has no local list
+        // authority to compete with. Future evidence still requires a fresh,
+        // currently usable lookup before consuming that initial consent.
+        let initial_replacement = local.intent == PublishIntent::Replacement
+            && self.accepted.is_none()
+            && self.pending.is_empty()
+            && self.allocated_seq == 0
+            && self.state == PublicationState::LocalBlocked;
         if let Some(found) = &found
             && !found.current(now)
         {
-            // Preserve signed evidence's floor even when wall-clock policy
-            // forbids using it as a publication/authentication base.
             self.observed_seq = self.observed_seq.max(found.seq);
-            self.state = PublicationState::LocalBlocked;
+            let known = self.accepted.as_ref().is_some_and(|a| a.hash == found.hash)
+                || self.pending.iter().any(|p| p.signed.hash == found.hash);
+            if !known {
+                // Time policy cannot erase a competing signed base or release
+                // its dependent work on a later absence/clock correction.
+                self.hold(found.clone());
+                if initial_replacement {
+                    self.state = PublicationState::LocalBlocked;
+                }
+            } else if self.conflict.is_none() {
+                // Local rollback alone must not invent a competing packet.
+                self.state = PublicationState::LocalBlocked;
+            }
             return Err(blocked());
+        }
+        if initial_replacement && self.conflict.is_some() {
+            if !matches!(action, Action::Refresh)
+                || found
+                    .as_ref()
+                    .is_none_or(|record| record.seq < self.observed_seq)
+            {
+                return Err(blocked());
+            }
+            self.conflict = None;
         }
         if let Action::Confirm(hash) = action {
             if self.conflict.as_ref().map(|r| r.hash) != Some(hash) {
@@ -700,6 +728,63 @@ mod tests {
             1,
         )
         .unwrap()
+    }
+    #[test]
+    fn future_competitor_preserves_tombstone_and_holds_notification_in_snapshot() {
+        let local = local();
+        let mut records = local.records.clone();
+        let mut base = records.first_record(&local);
+        let target = RecordDevice {
+            installation_id: InstallationId([4; 32]),
+            transport_public_key: [5; 32],
+            kind: local.cert.kind,
+        };
+        base.devices.push(target.clone());
+        base.devices.sort_by_key(|device| device.installation_id);
+        base.issued_at = 1000;
+        base.expires_at = 2000;
+        let packet = record_packet(&local.keys, &base, 1_000_000_000).unwrap();
+        records.accepted = Some(SignedRecord::new(packet.clone(), local.keys.peer_id()).unwrap());
+        records.observed_seq = 1_000_000_000;
+        records.state = PublicationState::Observed;
+        records
+            .reconcile(
+                Lookup::Found(packet),
+                &local,
+                1000,
+                Action::Revoke(target.installation_id),
+            )
+            .unwrap();
+        let tombstones = records.tombstones.clone();
+        let allocated = records.allocated_seq;
+        base.generation = Generation([9; 16]);
+        base.issued_at = 1600;
+        let future = record_packet(&local.keys, &base, 1_600_000_000).unwrap();
+        assert_eq!(
+            records
+                .reconcile(Lookup::Found(future), &local, 1000, Action::Refresh)
+                .unwrap_err()
+                .code,
+            ErrorCode::AccountRestricted
+        );
+        let mut restored = RecordState::decode(&records.encode(), local.keys.peer_id()).unwrap();
+        assert!(
+            restored
+                .pending
+                .iter()
+                .all(|intent| intent.status == PacketStatus::Held)
+        );
+        assert_eq!(restored.tombstones, tombstones);
+        assert_eq!(restored.view().pending_notifications, tombstones);
+        assert_eq!(
+            restored
+                .reconcile(Lookup::CompletedAbsent, &local, 1600, Action::Refresh)
+                .unwrap_err()
+                .code,
+            ErrorCode::RecordConflict
+        );
+        assert_eq!(restored.allocated_seq, allocated);
+        assert_eq!(restored.tombstones, tombstones);
     }
     #[test]
     fn tombstone_256_and_pending_32_preserve_old_state() {
