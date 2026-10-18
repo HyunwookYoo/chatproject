@@ -111,6 +111,8 @@ impl From<chat_core::NetworkInfo> for NetworkInfo {
 impl From<chat_core::CoreEvent> for ChatEvent {
     fn from(event: chat_core::CoreEvent) -> Self {
         match event {
+            chat_core::CoreEvent::AccountAuthChanged {peer_id,installation_id,ready} => Self::AccountAuthChanged {peer_id,installation_id,ready},
+            chat_core::CoreEvent::AccountCacheUsed {peer_id} => Self::AccountCacheUsed {peer_id},
             chat_core::CoreEvent::ConnectionState(s) => Self::ConnectionState {
                 direct_peers: s.direct_peers,
                 mailbox_ok: s.mailbox_ok,
@@ -141,6 +143,11 @@ impl chat_core::EventSink for FrbSink {
 mod tests {
     use super::*;
 
+    #[test]
+    fn account_status_and_cache_are_distinct_public_events() {
+        assert_eq!(ChatEvent::from(chat_core::CoreEvent::AccountAuthChanged{peer_id:"account".into(),installation_id:"installation".into(),ready:false}),ChatEvent::AccountAuthChanged{peer_id:"account".into(),installation_id:"installation".into(),ready:false});
+        assert_eq!(ChatEvent::from(chat_core::CoreEvent::AccountCacheUsed{peer_id:"account".into()}),ChatEvent::AccountCacheUsed{peer_id:"account".into()});
+    }
     #[test]
     fn connection_state_keeps_every_field() {
         let event = chat_core::CoreEvent::ConnectionState(chat_core::ConnectionSnapshot {

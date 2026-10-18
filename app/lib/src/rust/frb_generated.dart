@@ -481,26 +481,34 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     switch (raw[0]) {
       case 0:
+        return ChatEvent_AccountAuthChanged(
+          peerId: dco_decode_String(raw[1]),
+          installationId: dco_decode_String(raw[2]),
+          ready: dco_decode_bool(raw[3]),
+        );
+      case 1:
+        return ChatEvent_AccountCacheUsed(peerId: dco_decode_String(raw[1]));
+      case 2:
         return ChatEvent_ConnectionState(
           directPeers: dco_decode_u_32(raw[1]),
           mailboxOk: dco_decode_bool(raw[2]),
           queueOk: dco_decode_opt_box_autoadd_bool(raw[3]),
         );
-      case 1:
+      case 3:
         return ChatEvent_Error(
           code: dco_decode_error_code(raw[1]),
           detail: dco_decode_String(raw[2]),
         );
-      case 2:
+      case 4:
         return ChatEvent_NetworkChanged(
           info: dco_decode_box_autoadd_network_info(raw[1]),
         );
-      case 3:
+      case 5:
         return ChatEvent_PeerChanged(
           revision: dco_decode_u_64(raw[1]),
           peer: dco_decode_box_autoadd_peer_info(raw[2]),
         );
-      case 4:
+      case 6:
         return ChatEvent_ProbeTextReceived(
           peerId: dco_decode_String(raw[1]),
           text: dco_decode_String(raw[2]),
@@ -709,6 +717,18 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var tag_ = sse_decode_i_32(deserializer);
     switch (tag_) {
       case 0:
+        var var_peerId = sse_decode_String(deserializer);
+        var var_installationId = sse_decode_String(deserializer);
+        var var_ready = sse_decode_bool(deserializer);
+        return ChatEvent_AccountAuthChanged(
+          peerId: var_peerId,
+          installationId: var_installationId,
+          ready: var_ready,
+        );
+      case 1:
+        var var_peerId = sse_decode_String(deserializer);
+        return ChatEvent_AccountCacheUsed(peerId: var_peerId);
+      case 2:
         var var_directPeers = sse_decode_u_32(deserializer);
         var var_mailboxOk = sse_decode_bool(deserializer);
         var var_queueOk = sse_decode_opt_box_autoadd_bool(deserializer);
@@ -717,18 +737,18 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           mailboxOk: var_mailboxOk,
           queueOk: var_queueOk,
         );
-      case 1:
+      case 3:
         var var_code = sse_decode_error_code(deserializer);
         var var_detail = sse_decode_String(deserializer);
         return ChatEvent_Error(code: var_code, detail: var_detail);
-      case 2:
+      case 4:
         var var_info = sse_decode_box_autoadd_network_info(deserializer);
         return ChatEvent_NetworkChanged(info: var_info);
-      case 3:
+      case 5:
         var var_revision = sse_decode_u_64(deserializer);
         var var_peer = sse_decode_box_autoadd_peer_info(deserializer);
         return ChatEvent_PeerChanged(revision: var_revision, peer: var_peer);
-      case 4:
+      case 6:
         var var_peerId = sse_decode_String(deserializer);
         var var_text = sse_decode_String(deserializer);
         return ChatEvent_ProbeTextReceived(peerId: var_peerId, text: var_text);
@@ -968,28 +988,40 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   void sse_encode_chat_event(ChatEvent self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     switch (self) {
+      case ChatEvent_AccountAuthChanged(
+        peerId: final peerId,
+        installationId: final installationId,
+        ready: final ready,
+      ):
+        sse_encode_i_32(0, serializer);
+        sse_encode_String(peerId, serializer);
+        sse_encode_String(installationId, serializer);
+        sse_encode_bool(ready, serializer);
+      case ChatEvent_AccountCacheUsed(peerId: final peerId):
+        sse_encode_i_32(1, serializer);
+        sse_encode_String(peerId, serializer);
       case ChatEvent_ConnectionState(
         directPeers: final directPeers,
         mailboxOk: final mailboxOk,
         queueOk: final queueOk,
       ):
-        sse_encode_i_32(0, serializer);
+        sse_encode_i_32(2, serializer);
         sse_encode_u_32(directPeers, serializer);
         sse_encode_bool(mailboxOk, serializer);
         sse_encode_opt_box_autoadd_bool(queueOk, serializer);
       case ChatEvent_Error(code: final code, detail: final detail):
-        sse_encode_i_32(1, serializer);
+        sse_encode_i_32(3, serializer);
         sse_encode_error_code(code, serializer);
         sse_encode_String(detail, serializer);
       case ChatEvent_NetworkChanged(info: final info):
-        sse_encode_i_32(2, serializer);
+        sse_encode_i_32(4, serializer);
         sse_encode_box_autoadd_network_info(info, serializer);
       case ChatEvent_PeerChanged(revision: final revision, peer: final peer):
-        sse_encode_i_32(3, serializer);
+        sse_encode_i_32(5, serializer);
         sse_encode_u_64(revision, serializer);
         sse_encode_box_autoadd_peer_info(peer, serializer);
       case ChatEvent_ProbeTextReceived(peerId: final peerId, text: final text):
-        sse_encode_i_32(4, serializer);
+        sse_encode_i_32(6, serializer);
         sse_encode_String(peerId, serializer);
         sse_encode_String(text, serializer);
     }

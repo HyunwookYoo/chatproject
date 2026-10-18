@@ -49,6 +49,10 @@ struct Envelope {
     reply: Reply,
 }
 enum Control {
+    AccountRegister(mpsc::Sender<crate::account::connection::Input>),
+    AccountDial { target: EndpointAddr, reply: oneshot::Sender<Result<iroh::endpoint::Connection, CoreError>> },
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    AccountTarget { target: EndpointAddr, reply: oneshot::Sender<Result<(),CoreError>> },
     Activate { key: Box<SecretKey>, start: bool, ticket: u64, reply: oneshot::Sender<Result<(), CoreError>> },
     Quiesce { reply: oneshot::Sender<Result<(), CoreError>> },
 }
@@ -130,6 +134,20 @@ impl NetworkHandle {
         }
         received.await.map_err(|_| err(ErrorCode::TransportFailed))?
     }
+    pub(crate) fn register_account(&self, input: mpsc::Sender<crate::account::connection::Input>) -> Result<(),CoreError> {
+        self.controls.try_send(Control::AccountRegister(input)).map_err(|_|err(ErrorCode::Busy))
+    }
+    pub(crate) async fn dial_account(&self, target: EndpointAddr)->Result<iroh::endpoint::Connection,CoreError> {
+        if self.gate.blocked(){return Err(err(ErrorCode::Busy));}
+        let (reply,result)=oneshot::channel(); self.controls.try_send(Control::AccountDial{target,reply}).map_err(|_|err(ErrorCode::Busy))?;
+        result.await.map_err(|_|err(ErrorCode::TransportFailed))?
+    }
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    pub async fn account_target_for_test(&self, ticket:String)->Result<(),CoreError> {
+        let target=parse_target(&ticket)?; let(reply,result)=oneshot::channel();
+        self.controls.try_send(Control::AccountTarget{target,reply}).map_err(|_|err(ErrorCode::Busy))?;
+        result.await.map_err(|_|err(ErrorCode::TransportFailed))?
+    }
     pub(crate) async fn quiesce(&self) -> Result<(), CoreError> {
         let (reply, received) = oneshot::channel();
         self.controls.send(Control::Quiesce { reply }).await.map_err(|_| err(ErrorCode::TransportFailed))?;
@@ -187,6 +205,7 @@ fn err(code: ErrorCode) -> CoreError {
 }
 
 pub(crate) enum Note {
+    AccountConnection { tag: SessionTag, connection: iroh::endpoint::Connection },
     Bound {
         epoch: u64,
         result: Result<Endpoint, CoreError>,
@@ -234,6 +253,7 @@ impl Note {
                 ..
             } => prepared.connection.close(0u32.into(), b"obsolete session"),
             Note::Incoming { incoming, .. } => incoming.refuse(),
+            Note::AccountConnection { connection, .. } => connection.close(0u32.into(), b"obsolete account"),
             _ => {}
         }
     }
@@ -256,6 +276,9 @@ struct Peer {
     disconnected_before: Option<u64>,
 }
 struct Manager {
+    account_input: Option<mpsc::Sender<crate::account::connection::Input>>,
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    account_targets: BTreeMap<iroh::EndpointId, EndpointAddr>,
     controls: Option<mpsc::Receiver<Control>>,
     gate: Arc<Gate>,
     activation: Option<(u64, oneshot::Sender<Result<(), CoreError>>)>,
@@ -284,6 +307,9 @@ impl Manager {
         let (notes, received) = mpsc::channel(64);
         Self {
             controls: None,
+            account_input: None,
+            #[cfg(all(feature = "test-hooks", debug_assertions))]
+            account_targets: BTreeMap::new(),
             gate: Arc::default(),
             activation: None,
             profile,
@@ -327,6 +353,23 @@ impl Manager {
     }
     async fn control(&mut self, control: Control) {
         match control {
+            Control::AccountRegister(input) => { self.account_input=Some(input); }
+            #[cfg(all(feature = "test-hooks", debug_assertions))]
+            Control::AccountTarget{target,reply} => {
+                let result=if matches!(self.profile,NetworkProfile::Local{..}) {self.account_targets.insert(target.id,target);Ok(())}else{Err(err(ErrorCode::NotAvailable))};
+                let _=reply.send(result);
+            }
+            Control::AccountDial{target,reply} => {
+                if self.gate.blocked(){let _=reply.send(Err(err(ErrorCode::Busy)));return;}
+                let Some(endpoint)=self.endpoint.clone() else {let _=reply.send(Err(err(ErrorCode::NetworkNotStarted)));return;};
+                #[cfg(all(feature = "test-hooks", debug_assertions))]
+                let target=self.account_targets.get(&target.id).cloned().unwrap_or(target);
+                let cancel=self.cancel.clone();
+                self.tasks.spawn(async move {
+                    let result=tokio::select!{biased;_=cancel.cancelled()=>Err(err(ErrorCode::Busy)),result=tokio::time::timeout(Duration::from_secs(8),endpoint.connect(target,crate::account::auth::ALPN))=>result.map_err(|_|err(ErrorCode::NetworkTimeout)).and_then(|r|r.map_err(|_|err(ErrorCode::TransportFailed)))};
+                    if let Err(Ok(conn))=reply.send(result){conn.close(0u32.into(),b"account dial cancelled");}
+                });
+            }
             Control::Quiesce { reply } => {
                 self.stop().await;
                 let _ = reply.send(Ok(()));
@@ -900,8 +943,14 @@ impl Manager {
                 let root = self.cancel.clone();
                 let notes = self.notes.clone();
                 self.tasks.spawn(async move {
+                    let mut routed=false;
                     let work = async {
                         let connection = incoming.await.map_err(|_| err(ErrorCode::TransportFailed))?;
+                        if connection.alpn()==crate::account::auth::ALPN {
+                            session::notify(&notes,&cancel,Note::AccountConnection{tag:tag.clone(),connection}).await;
+                            routed=true;
+                            return Err(err(ErrorCode::AccountRestricted));
+                        }
                         tag.peer_id = connection.remote_id().to_string();
                         session::notify(&notes, &cancel, Note::Identified { tag: tag.clone() }).await;
                         match session::prepare_session(connection.clone()).await {
@@ -910,9 +959,20 @@ impl Manager {
                         }
                     };
                     let result = tokio::select! { biased; _ = cancel.cancelled() => Err(err(ErrorCode::PeerNotConnected)), result = tokio::time::timeout(Duration::from_secs(10), work) => result.unwrap_or_else(|_| Err(err(ErrorCode::NetworkTimeout))) };
+                    if routed { return; }
                     // A peer-canceled preparation must still release its bounded registry slot.
                     session::notify(&notes, &root, Note::Ready { tag, outgoing: false, started: None, result }).await;
                 });
+            }
+            Note::AccountConnection{tag,connection} if tag.epoch==self.epoch => {
+                let preparation=self.incoming.remove(&tag.generation);self.release_cutoffs();
+                if self.gate.blocked() || preparation.is_none_or(|p|p.cancel.is_cancelled()) {connection.close(0u32.into(),b"account blocked");return;}
+                match &self.account_input {
+                    Some(input)=>if let Err(error)=input.try_send(crate::account::connection::Input::Incoming(connection)) {
+                        if let crate::account::connection::Input::Incoming(conn)=error.into_inner(){conn.close(0u32.into(),b"account busy");}
+                    },
+                    None=>connection.close(0u32.into(),b"account unavailable"),
+                }
             }
             Note::Identified { tag } if tag.epoch == self.epoch => {
                 if let Some(preparation) = self.incoming.get_mut(&tag.generation) {

@@ -21,6 +21,8 @@ impl ConnectionSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CoreEvent {
+    AccountAuthChanged { peer_id: String, installation_id: String, ready: bool },
+    AccountCacheUsed { peer_id: String },
     ConnectionState(ConnectionSnapshot),
     Error { code: ErrorCode, detail: String },
     NetworkChanged(NetworkInfo),

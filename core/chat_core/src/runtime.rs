@@ -43,7 +43,6 @@ struct RunningCore {
     runtime: Option<Runtime>,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     hooks: Arc<crate::puppet::HookState>,
-    #[cfg(all(feature = "test-hooks", debug_assertions))]
     bus: EventBus,
 }
 
@@ -103,7 +102,6 @@ impl CoreSlot {
             runtime: Some(runtime),
             #[cfg(all(feature = "test-hooks", debug_assertions))]
             hooks: Arc::default(),
-            #[cfg(all(feature = "test-hooks", debug_assertions))]
             bus: bus.clone(),
         }));
         Ok(info)
@@ -123,7 +121,7 @@ impl CoreSlot {
             .ok_or_else(|| CoreError::new(ErrorCode::CoreNotStarted, "core not started"))?;
         let mut account = core.account.lock().expect("account slot lock poisoned");
         if let Some(account) = account.as_ref() { return Ok(account.clone()); }
-        let handle = AccountHandle::open(core.runtime.as_ref().unwrap().handle(), &core.info.data_dir, protector, core.network.clone(), services)?;
+        let handle = AccountHandle::open(core.runtime.as_ref().unwrap().handle(), &core.info.data_dir, protector, core.network.clone(), services, core.bus.clone())?;
         *account = Some(handle.clone());
         Ok(handle)
     }

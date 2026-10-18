@@ -1,3 +1,5 @@
+pub(crate) mod auth;
+pub(crate) mod connection;
 mod certificate;
 pub mod clock;
 mod creation;

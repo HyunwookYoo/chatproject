@@ -50,6 +50,13 @@ Future<void> testHooksStart({
 sealed class ChatEvent with _$ChatEvent {
   const ChatEvent._();
 
+  const factory ChatEvent.accountAuthChanged({
+    required String peerId,
+    required String installationId,
+    required bool ready,
+  }) = ChatEvent_AccountAuthChanged;
+  const factory ChatEvent.accountCacheUsed({required String peerId}) =
+      ChatEvent_AccountCacheUsed;
   const factory ChatEvent.connectionState({
     required int directPeers,
     required bool mailboxOk,

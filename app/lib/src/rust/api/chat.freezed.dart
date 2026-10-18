@@ -49,6 +49,8 @@ extension ChatEventPatterns on ChatEvent {
 
   @optionalTypeArgs
   TResult maybeMap<TResult extends Object?>({
+    TResult Function(ChatEvent_AccountAuthChanged value)? accountAuthChanged,
+    TResult Function(ChatEvent_AccountCacheUsed value)? accountCacheUsed,
     TResult Function(ChatEvent_ConnectionState value)? connectionState,
     TResult Function(ChatEvent_Error value)? error,
     TResult Function(ChatEvent_NetworkChanged value)? networkChanged,
@@ -58,6 +60,10 @@ extension ChatEventPatterns on ChatEvent {
   }) {
     final _that = this;
     switch (_that) {
+      case ChatEvent_AccountAuthChanged() when accountAuthChanged != null:
+        return accountAuthChanged(_that);
+      case ChatEvent_AccountCacheUsed() when accountCacheUsed != null:
+        return accountCacheUsed(_that);
       case ChatEvent_ConnectionState() when connectionState != null:
         return connectionState(_that);
       case ChatEvent_Error() when error != null:
@@ -88,6 +94,10 @@ extension ChatEventPatterns on ChatEvent {
 
   @optionalTypeArgs
   TResult map<TResult extends Object?>({
+    required TResult Function(ChatEvent_AccountAuthChanged value)
+    accountAuthChanged,
+    required TResult Function(ChatEvent_AccountCacheUsed value)
+    accountCacheUsed,
     required TResult Function(ChatEvent_ConnectionState value) connectionState,
     required TResult Function(ChatEvent_Error value) error,
     required TResult Function(ChatEvent_NetworkChanged value) networkChanged,
@@ -97,6 +107,10 @@ extension ChatEventPatterns on ChatEvent {
   }) {
     final _that = this;
     switch (_that) {
+      case ChatEvent_AccountAuthChanged():
+        return accountAuthChanged(_that);
+      case ChatEvent_AccountCacheUsed():
+        return accountCacheUsed(_that);
       case ChatEvent_ConnectionState():
         return connectionState(_that);
       case ChatEvent_Error():
@@ -124,6 +138,8 @@ extension ChatEventPatterns on ChatEvent {
 
   @optionalTypeArgs
   TResult? mapOrNull<TResult extends Object?>({
+    TResult? Function(ChatEvent_AccountAuthChanged value)? accountAuthChanged,
+    TResult? Function(ChatEvent_AccountCacheUsed value)? accountCacheUsed,
     TResult? Function(ChatEvent_ConnectionState value)? connectionState,
     TResult? Function(ChatEvent_Error value)? error,
     TResult? Function(ChatEvent_NetworkChanged value)? networkChanged,
@@ -132,6 +148,10 @@ extension ChatEventPatterns on ChatEvent {
   }) {
     final _that = this;
     switch (_that) {
+      case ChatEvent_AccountAuthChanged() when accountAuthChanged != null:
+        return accountAuthChanged(_that);
+      case ChatEvent_AccountCacheUsed() when accountCacheUsed != null:
+        return accountCacheUsed(_that);
       case ChatEvent_ConnectionState() when connectionState != null:
         return connectionState(_that);
       case ChatEvent_Error() when error != null:
@@ -161,6 +181,9 @@ extension ChatEventPatterns on ChatEvent {
 
   @optionalTypeArgs
   TResult maybeWhen<TResult extends Object?>({
+    TResult Function(String peerId, String installationId, bool ready)?
+    accountAuthChanged,
+    TResult Function(String peerId)? accountCacheUsed,
     TResult Function(int directPeers, bool mailboxOk, bool? queueOk)?
     connectionState,
     TResult Function(ErrorCode code, String detail)? error,
@@ -171,6 +194,14 @@ extension ChatEventPatterns on ChatEvent {
   }) {
     final _that = this;
     switch (_that) {
+      case ChatEvent_AccountAuthChanged() when accountAuthChanged != null:
+        return accountAuthChanged(
+          _that.peerId,
+          _that.installationId,
+          _that.ready,
+        );
+      case ChatEvent_AccountCacheUsed() when accountCacheUsed != null:
+        return accountCacheUsed(_that.peerId);
       case ChatEvent_ConnectionState() when connectionState != null:
         return connectionState(
           _that.directPeers,
@@ -205,6 +236,9 @@ extension ChatEventPatterns on ChatEvent {
 
   @optionalTypeArgs
   TResult when<TResult extends Object?>({
+    required TResult Function(String peerId, String installationId, bool ready)
+    accountAuthChanged,
+    required TResult Function(String peerId) accountCacheUsed,
     required TResult Function(int directPeers, bool mailboxOk, bool? queueOk)
     connectionState,
     required TResult Function(ErrorCode code, String detail) error,
@@ -214,6 +248,14 @@ extension ChatEventPatterns on ChatEvent {
   }) {
     final _that = this;
     switch (_that) {
+      case ChatEvent_AccountAuthChanged():
+        return accountAuthChanged(
+          _that.peerId,
+          _that.installationId,
+          _that.ready,
+        );
+      case ChatEvent_AccountCacheUsed():
+        return accountCacheUsed(_that.peerId);
       case ChatEvent_ConnectionState():
         return connectionState(
           _that.directPeers,
@@ -245,6 +287,9 @@ extension ChatEventPatterns on ChatEvent {
 
   @optionalTypeArgs
   TResult? whenOrNull<TResult extends Object?>({
+    TResult? Function(String peerId, String installationId, bool ready)?
+    accountAuthChanged,
+    TResult? Function(String peerId)? accountCacheUsed,
     TResult? Function(int directPeers, bool mailboxOk, bool? queueOk)?
     connectionState,
     TResult? Function(ErrorCode code, String detail)? error,
@@ -254,6 +299,14 @@ extension ChatEventPatterns on ChatEvent {
   }) {
     final _that = this;
     switch (_that) {
+      case ChatEvent_AccountAuthChanged() when accountAuthChanged != null:
+        return accountAuthChanged(
+          _that.peerId,
+          _that.installationId,
+          _that.ready,
+        );
+      case ChatEvent_AccountCacheUsed() when accountCacheUsed != null:
+        return accountCacheUsed(_that.peerId);
       case ChatEvent_ConnectionState() when connectionState != null:
         return connectionState(
           _that.directPeers,
@@ -271,6 +324,165 @@ extension ChatEventPatterns on ChatEvent {
       case _:
         return null;
     }
+  }
+}
+
+/// @nodoc
+
+class ChatEvent_AccountAuthChanged extends ChatEvent {
+  const ChatEvent_AccountAuthChanged({
+    required this.peerId,
+    required this.installationId,
+    required this.ready,
+  }) : super._();
+
+  final String peerId;
+  final String installationId;
+  final bool ready;
+
+  /// Create a copy of ChatEvent
+  /// with the given fields replaced by the non-null parameter values.
+  @JsonKey(includeFromJson: false, includeToJson: false)
+  @pragma('vm:prefer-inline')
+  $ChatEvent_AccountAuthChangedCopyWith<ChatEvent_AccountAuthChanged>
+  get copyWith =>
+      _$ChatEvent_AccountAuthChangedCopyWithImpl<ChatEvent_AccountAuthChanged>(
+        this,
+        _$identity,
+      );
+
+  @override
+  bool operator ==(Object other) {
+    return identical(this, other) ||
+        (other.runtimeType == runtimeType &&
+            other is ChatEvent_AccountAuthChanged &&
+            (identical(other.peerId, peerId) || other.peerId == peerId) &&
+            (identical(other.installationId, installationId) ||
+                other.installationId == installationId) &&
+            (identical(other.ready, ready) || other.ready == ready));
+  }
+
+  @override
+  int get hashCode => Object.hash(runtimeType, peerId, installationId, ready);
+
+  @override
+  String toString() {
+    return 'ChatEvent.accountAuthChanged(peerId: $peerId, installationId: $installationId, ready: $ready)';
+  }
+}
+
+/// @nodoc
+abstract mixin class $ChatEvent_AccountAuthChangedCopyWith<$Res>
+    implements $ChatEventCopyWith<$Res> {
+  factory $ChatEvent_AccountAuthChangedCopyWith(
+    ChatEvent_AccountAuthChanged value,
+    $Res Function(ChatEvent_AccountAuthChanged) _then,
+  ) = _$ChatEvent_AccountAuthChangedCopyWithImpl;
+  @useResult
+  $Res call({String peerId, String installationId, bool ready});
+}
+
+/// @nodoc
+class _$ChatEvent_AccountAuthChangedCopyWithImpl<$Res>
+    implements $ChatEvent_AccountAuthChangedCopyWith<$Res> {
+  _$ChatEvent_AccountAuthChangedCopyWithImpl(this._self, this._then);
+
+  final ChatEvent_AccountAuthChanged _self;
+  final $Res Function(ChatEvent_AccountAuthChanged) _then;
+
+  /// Create a copy of ChatEvent
+  /// with the given fields replaced by the non-null parameter values.
+  @pragma('vm:prefer-inline')
+  $Res call({
+    Object? peerId = null,
+    Object? installationId = null,
+    Object? ready = null,
+  }) {
+    return _then(
+      ChatEvent_AccountAuthChanged(
+        peerId: null == peerId
+            ? _self.peerId
+            : peerId // ignore: cast_nullable_to_non_nullable
+                  as String,
+        installationId: null == installationId
+            ? _self.installationId
+            : installationId // ignore: cast_nullable_to_non_nullable
+                  as String,
+        ready: null == ready
+            ? _self.ready
+            : ready // ignore: cast_nullable_to_non_nullable
+                  as bool,
+      ),
+    );
+  }
+}
+
+/// @nodoc
+
+class ChatEvent_AccountCacheUsed extends ChatEvent {
+  const ChatEvent_AccountCacheUsed({required this.peerId}) : super._();
+
+  final String peerId;
+
+  /// Create a copy of ChatEvent
+  /// with the given fields replaced by the non-null parameter values.
+  @JsonKey(includeFromJson: false, includeToJson: false)
+  @pragma('vm:prefer-inline')
+  $ChatEvent_AccountCacheUsedCopyWith<ChatEvent_AccountCacheUsed>
+  get copyWith =>
+      _$ChatEvent_AccountCacheUsedCopyWithImpl<ChatEvent_AccountCacheUsed>(
+        this,
+        _$identity,
+      );
+
+  @override
+  bool operator ==(Object other) {
+    return identical(this, other) ||
+        (other.runtimeType == runtimeType &&
+            other is ChatEvent_AccountCacheUsed &&
+            (identical(other.peerId, peerId) || other.peerId == peerId));
+  }
+
+  @override
+  int get hashCode => Object.hash(runtimeType, peerId);
+
+  @override
+  String toString() {
+    return 'ChatEvent.accountCacheUsed(peerId: $peerId)';
+  }
+}
+
+/// @nodoc
+abstract mixin class $ChatEvent_AccountCacheUsedCopyWith<$Res>
+    implements $ChatEventCopyWith<$Res> {
+  factory $ChatEvent_AccountCacheUsedCopyWith(
+    ChatEvent_AccountCacheUsed value,
+    $Res Function(ChatEvent_AccountCacheUsed) _then,
+  ) = _$ChatEvent_AccountCacheUsedCopyWithImpl;
+  @useResult
+  $Res call({String peerId});
+}
+
+/// @nodoc
+class _$ChatEvent_AccountCacheUsedCopyWithImpl<$Res>
+    implements $ChatEvent_AccountCacheUsedCopyWith<$Res> {
+  _$ChatEvent_AccountCacheUsedCopyWithImpl(this._self, this._then);
+
+  final ChatEvent_AccountCacheUsed _self;
+  final $Res Function(ChatEvent_AccountCacheUsed) _then;
+
+  /// Create a copy of ChatEvent
+  /// with the given fields replaced by the non-null parameter values.
+  @pragma('vm:prefer-inline')
+  $Res call({Object? peerId = null}) {
+    return _then(
+      ChatEvent_AccountCacheUsed(
+        peerId: null == peerId
+            ? _self.peerId
+            : peerId // ignore: cast_nullable_to_non_nullable
+                  as String,
+      ),
+    );
   }
 }
 

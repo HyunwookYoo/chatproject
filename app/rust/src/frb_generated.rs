@@ -472,6 +472,22 @@ impl SseDecode for crate::api::chat::ChatEvent {
         let mut tag_ = <i32>::sse_decode(deserializer);
         match tag_ {
             0 => {
+                let mut var_peerId = <String>::sse_decode(deserializer);
+                let mut var_installationId = <String>::sse_decode(deserializer);
+                let mut var_ready = <bool>::sse_decode(deserializer);
+                return crate::api::chat::ChatEvent::AccountAuthChanged {
+                    peer_id: var_peerId,
+                    installation_id: var_installationId,
+                    ready: var_ready,
+                };
+            }
+            1 => {
+                let mut var_peerId = <String>::sse_decode(deserializer);
+                return crate::api::chat::ChatEvent::AccountCacheUsed {
+                    peer_id: var_peerId,
+                };
+            }
+            2 => {
                 let mut var_directPeers = <u32>::sse_decode(deserializer);
                 let mut var_mailboxOk = <bool>::sse_decode(deserializer);
                 let mut var_queueOk = <Option<bool>>::sse_decode(deserializer);
@@ -481,7 +497,7 @@ impl SseDecode for crate::api::chat::ChatEvent {
                     queue_ok: var_queueOk,
                 };
             }
-            1 => {
+            3 => {
                 let mut var_code = <crate::api::chat::ErrorCode>::sse_decode(deserializer);
                 let mut var_detail = <String>::sse_decode(deserializer);
                 return crate::api::chat::ChatEvent::Error {
@@ -489,11 +505,11 @@ impl SseDecode for crate::api::chat::ChatEvent {
                     detail: var_detail,
                 };
             }
-            2 => {
+            4 => {
                 let mut var_info = <crate::api::chat::NetworkInfo>::sse_decode(deserializer);
                 return crate::api::chat::ChatEvent::NetworkChanged { info: var_info };
             }
-            3 => {
+            5 => {
                 let mut var_revision = <u64>::sse_decode(deserializer);
                 let mut var_peer = <crate::api::chat::PeerInfo>::sse_decode(deserializer);
                 return crate::api::chat::ChatEvent::PeerChanged {
@@ -501,7 +517,7 @@ impl SseDecode for crate::api::chat::ChatEvent {
                     peer: var_peer,
                 };
             }
-            4 => {
+            6 => {
                 let mut var_peerId = <String>::sse_decode(deserializer);
                 let mut var_text = <String>::sse_decode(deserializer);
                 return crate::api::chat::ChatEvent::ProbeTextReceived {
@@ -787,34 +803,48 @@ fn pde_ffi_dispatcher_sync_impl(
 impl flutter_rust_bridge::IntoDart for crate::api::chat::ChatEvent {
     fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
         match self {
+            crate::api::chat::ChatEvent::AccountAuthChanged {
+                peer_id,
+                installation_id,
+                ready,
+            } => [
+                0.into_dart(),
+                peer_id.into_into_dart().into_dart(),
+                installation_id.into_into_dart().into_dart(),
+                ready.into_into_dart().into_dart(),
+            ]
+            .into_dart(),
+            crate::api::chat::ChatEvent::AccountCacheUsed { peer_id } => {
+                [1.into_dart(), peer_id.into_into_dart().into_dart()].into_dart()
+            }
             crate::api::chat::ChatEvent::ConnectionState {
                 direct_peers,
                 mailbox_ok,
                 queue_ok,
             } => [
-                0.into_dart(),
+                2.into_dart(),
                 direct_peers.into_into_dart().into_dart(),
                 mailbox_ok.into_into_dart().into_dart(),
                 queue_ok.into_into_dart().into_dart(),
             ]
             .into_dart(),
             crate::api::chat::ChatEvent::Error { code, detail } => [
-                1.into_dart(),
+                3.into_dart(),
                 code.into_into_dart().into_dart(),
                 detail.into_into_dart().into_dart(),
             ]
             .into_dart(),
             crate::api::chat::ChatEvent::NetworkChanged { info } => {
-                [2.into_dart(), info.into_into_dart().into_dart()].into_dart()
+                [4.into_dart(), info.into_into_dart().into_dart()].into_dart()
             }
             crate::api::chat::ChatEvent::PeerChanged { revision, peer } => [
-                3.into_dart(),
+                5.into_dart(),
                 revision.into_into_dart().into_dart(),
                 peer.into_into_dart().into_dart(),
             ]
             .into_dart(),
             crate::api::chat::ChatEvent::ProbeTextReceived { peer_id, text } => [
-                4.into_dart(),
+                6.into_dart(),
                 peer_id.into_into_dart().into_dart(),
                 text.into_into_dart().into_dart(),
             ]
@@ -1046,32 +1076,46 @@ impl SseEncode for crate::api::chat::ChatEvent {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
         match self {
+            crate::api::chat::ChatEvent::AccountAuthChanged {
+                peer_id,
+                installation_id,
+                ready,
+            } => {
+                <i32>::sse_encode(0, serializer);
+                <String>::sse_encode(peer_id, serializer);
+                <String>::sse_encode(installation_id, serializer);
+                <bool>::sse_encode(ready, serializer);
+            }
+            crate::api::chat::ChatEvent::AccountCacheUsed { peer_id } => {
+                <i32>::sse_encode(1, serializer);
+                <String>::sse_encode(peer_id, serializer);
+            }
             crate::api::chat::ChatEvent::ConnectionState {
                 direct_peers,
                 mailbox_ok,
                 queue_ok,
             } => {
-                <i32>::sse_encode(0, serializer);
+                <i32>::sse_encode(2, serializer);
                 <u32>::sse_encode(direct_peers, serializer);
                 <bool>::sse_encode(mailbox_ok, serializer);
                 <Option<bool>>::sse_encode(queue_ok, serializer);
             }
             crate::api::chat::ChatEvent::Error { code, detail } => {
-                <i32>::sse_encode(1, serializer);
+                <i32>::sse_encode(3, serializer);
                 <crate::api::chat::ErrorCode>::sse_encode(code, serializer);
                 <String>::sse_encode(detail, serializer);
             }
             crate::api::chat::ChatEvent::NetworkChanged { info } => {
-                <i32>::sse_encode(2, serializer);
+                <i32>::sse_encode(4, serializer);
                 <crate::api::chat::NetworkInfo>::sse_encode(info, serializer);
             }
             crate::api::chat::ChatEvent::PeerChanged { revision, peer } => {
-                <i32>::sse_encode(3, serializer);
+                <i32>::sse_encode(5, serializer);
                 <u64>::sse_encode(revision, serializer);
                 <crate::api::chat::PeerInfo>::sse_encode(peer, serializer);
             }
             crate::api::chat::ChatEvent::ProbeTextReceived { peer_id, text } => {
-                <i32>::sse_encode(4, serializer);
+                <i32>::sse_encode(6, serializer);
                 <String>::sse_encode(peer_id, serializer);
                 <String>::sse_encode(text, serializer);
             }

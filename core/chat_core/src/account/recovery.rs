@@ -34,5 +34,6 @@ pub(super) fn local_account(
         revision,
         intent,
         records: super::publication::RecordState::new()?,
+        remote: vec![],
     })
 }

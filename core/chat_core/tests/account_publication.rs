@@ -604,11 +604,11 @@ async fn concurrent_add_revoke_recovery_no_silent_merge() {
         .unwrap();
     let revoked = f.view().await;
     assert_eq!(revoked.publication.tombstones.len(), 1);
-    assert_eq!(revoked.publication.pending_notifications.len(), 1);
+    assert_eq!(revoked.publication.pending_notifications.len(), 0);
     assert_eq!(
         f.backend.sent.lock().unwrap().len(),
-        sent,
-        "no notifier means no public mutation"
+        sent + 1,
+        "installed empty authenticated registry has no recipients"
     );
     let replacement = IdentityRecord {
         generation: Generation([6; 16]),
@@ -624,7 +624,7 @@ async fn concurrent_add_revoke_recovery_no_silent_merge() {
     );
     assert_eq!(f.view().await.publication.tombstones.len(), 1);
     assert_eq!(f.view().await.publication.pending_notifications.len(), 1);
-    assert_eq!(f.backend.sent.lock().unwrap().len(), sent);
+    assert_eq!(f.backend.sent.lock().unwrap().len(), sent + 1);
     assert_eq!(
         f.account
             .revoke_device(f.view().await.installation.unwrap())
@@ -773,7 +773,7 @@ async fn legacy_a5_snapshot_is_rejected_without_file_modification() {
         chat_core::account::storage::Store::open(dir.path(), support::protector()).unwrap();
     let mut stored = store.load().unwrap().unwrap();
     let mut decoder = minicbor::Decoder::new(&stored.payload);
-    assert_eq!(decoder.array().unwrap(), Some(8));
+    assert_eq!(decoder.array().unwrap(), Some(9));
     for _ in 0..7 {
         decoder.skip().unwrap();
     }

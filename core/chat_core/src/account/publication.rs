@@ -94,7 +94,7 @@ pub(crate) struct SignedRecord {
     pub(crate) seq: u64,
 }
 impl SignedRecord {
-    fn new(packet: SignedPacket, peer: PeerId) -> Result<Self, CoreError> {
+    pub(crate) fn new(packet: SignedPacket, peer: PeerId) -> Result<Self, CoreError> {
         let record = parse_stored_record(&packet, peer)?;
         let seq = u64::from_be_bytes(packet.as_bytes()[96..104].try_into().unwrap());
         Ok(Self {
@@ -104,7 +104,7 @@ impl SignedRecord {
             seq,
         })
     }
-    fn decode(bytes: &[u8], peer: PeerId) -> Result<Self, CoreError> {
+    pub(crate) fn decode(bytes: &[u8], peer: PeerId) -> Result<Self, CoreError> {
         if !(104..=1000).contains(&bytes.len()) {
             return Err(wire::invalid());
         }
@@ -137,6 +137,7 @@ pub(crate) enum PacketStatus {
     AwaitingNotification,
     Held,
 }
+pub(crate) type Recipient = (InstallationId, [u8; 32]);
 #[derive(Clone)]
 pub(crate) struct PacketIntent {
     pub(crate) signed: SignedRecord,
@@ -144,6 +145,7 @@ pub(crate) struct PacketIntent {
     pub(crate) operation: PacketOperation,
     pub(crate) status: PacketStatus,
     pub(crate) revoke_nonce: Option<[u8; 16]>,
+    pub(crate) recipients: Option<Vec<Recipient>>,
 }
 #[derive(Clone)]
 pub(crate) struct RecordState {
@@ -294,6 +296,7 @@ impl RecordState {
                 PacketStatus::Ready
             },
             revoke_nonce,
+            recipients: None,
         });
         self.allocated_seq = seq;
         self.state = PublicationState::Pending;
@@ -376,6 +379,11 @@ impl RecordState {
             // Confirmation explicitly supersedes held packets, never tombstones.
             // Revoke notification must still complete before the rebased packet.
             let notification = self.pending.iter().find_map(|p| p.revoke_nonce);
+            let recipients = self
+                .pending
+                .iter()
+                .find(|p| p.revoke_nonce == notification)
+                .and_then(|p| p.recipients.clone());
             let old = self.clone();
             self.accepted = Some(found.clone());
             self.conflict = None;
@@ -390,6 +398,7 @@ impl RecordState {
                 *self = old;
                 return Err(error);
             }
+            self.pending.last_mut().unwrap().recipients = recipients;
             return Ok(());
         }
         if let Some(found) = found {
@@ -487,6 +496,7 @@ impl RecordState {
                         *self = old;
                         return Err(error);
                     }
+                    self.pending.last_mut().unwrap().recipients = intent.recipients;
                 }
             }
             self.state = PublicationState::Pending;
@@ -567,7 +577,7 @@ impl RecordState {
         }
         e.array(self.pending.len() as u64).unwrap();
         for intent in &self.pending {
-            e.array(5)
+            e.array(6)
                 .unwrap()
                 .bytes(intent.signed.packet.as_bytes())
                 .unwrap();
@@ -582,6 +592,19 @@ impl RecordState {
                 .unwrap();
             if let Some(nonce) = intent.revoke_nonce {
                 e.bytes(&nonce).unwrap();
+            } else {
+                e.null().unwrap();
+            }
+            if let Some(recipients) = &intent.recipients {
+                e.array(recipients.len() as u64).unwrap();
+                for (installation, transport) in recipients {
+                    e.array(2)
+                        .unwrap()
+                        .bytes(&installation.0)
+                        .unwrap()
+                        .bytes(transport)
+                        .unwrap();
+                }
             } else {
                 e.null().unwrap();
             }
@@ -645,7 +668,7 @@ impl RecordState {
         let count = bounded_array(&mut d, 32)?;
         let mut pending = Vec::with_capacity(count);
         for _ in 0..count {
-            wire::array(&mut d, 5)?;
+            wire::array(&mut d, 6)?;
             let signed = SignedRecord::decode(d.bytes().map_err(|_| wire::invalid())?, peer)?;
             if signed.seq > allocated_seq
                 || signed.record.generation != generation
@@ -676,12 +699,39 @@ impl RecordState {
             {
                 return Err(wire::invalid());
             }
+            let recipients = if d.datatype().map_err(|_| wire::invalid())? == Type::Null {
+                d.null().map_err(|_| wire::invalid())?;
+                None
+            } else {
+                let count = bounded_array(&mut d, 4)?;
+                let target = tombstones
+                    .iter()
+                    .find(|t| Some(t.nonce) == revoke_nonce)
+                    .ok_or_else(wire::invalid)?;
+                let mut recipients: Vec<Recipient> = Vec::with_capacity(count);
+                for _ in 0..count {
+                    wire::array(&mut d, 2)?;
+                    let recipient = (InstallationId(wire::bytes(&mut d)?), wire::bytes(&mut d)?);
+                    if recipient.0 == target.target_installation
+                        || recipient.1 == target.target_transport
+                        || recipients.last().is_some_and(|last| *last >= recipient)
+                        || recipients
+                            .iter()
+                            .any(|r| r.0 == recipient.0 || r.1 == recipient.1)
+                    {
+                        return Err(wire::invalid());
+                    }
+                    recipients.push(recipient);
+                }
+                Some(recipients)
+            };
             pending.push(PacketIntent {
                 signed,
                 base_hash,
                 operation,
                 status,
                 revoke_nonce,
+                recipients,
             });
         }
         let result = Self {
@@ -728,6 +778,81 @@ mod tests {
             1,
         )
         .unwrap()
+    }
+    #[test]
+    fn durable_notification_recipients_are_bounded_canonical_and_survive_renew_rebase() {
+        let local = local();
+        let mut records = local.records.clone();
+        let mut base = records.first_record(&local);
+        let target = RecordDevice {
+            installation_id: InstallationId([4; 32]),
+            transport_public_key: [5; 32],
+            kind: local.cert.kind,
+        };
+        base.devices.push(target.clone());
+        base.devices.sort_by_key(|d| d.installation_id);
+        base.issued_at = 1000;
+        base.expires_at = 2000;
+        let packet = record_packet(&local.keys, &base, 1_000_000_000).unwrap();
+        records.accepted = Some(SignedRecord::new(packet.clone(), local.keys.peer_id()).unwrap());
+        records.observed_seq = 1_000_000_000;
+        records
+            .reconcile(
+                Lookup::Found(packet),
+                &local,
+                1000,
+                Action::Revoke(target.installation_id),
+            )
+            .unwrap();
+        let expected = vec![(InstallationId([8; 32]), [9; 32])];
+        for recipients in [None, Some(vec![]), Some(expected.clone())] {
+            records.pending[0].recipients = recipients.clone();
+            let restored = RecordState::decode(&records.encode(), local.keys.peer_id()).unwrap();
+            assert_eq!(restored.pending[0].recipients, recipients);
+        }
+        for invalid in [
+            vec![expected[0], expected[0]],
+            vec![(InstallationId([10; 32]), [11; 32]), expected[0]],
+            vec![(target.installation_id, target.transport_public_key)],
+            (10..15)
+                .map(|i| (InstallationId([i; 32]), [i; 32]))
+                .collect(),
+        ] {
+            let mut invalid_state = records.clone();
+            invalid_state.pending[0].recipients = Some(invalid);
+            assert!(RecordState::decode(&invalid_state.encode(), local.keys.peer_id()).is_err());
+        }
+        let expiry = records.pending[0].signed.record.expires_at;
+        records
+            .reconcile(Lookup::CompletedAbsent, &local, expiry, Action::Refresh)
+            .unwrap();
+        assert_eq!(records.pending[0].recipients, Some(expected.clone()));
+        // Explicit resolution retains the required receipts even though the
+        // changed authority can prevent them from being fulfilled automatically.
+        base.issued_at = expiry;
+        base.expires_at = expiry + 600;
+        let conflict = record_packet(&local.keys, &base, (expiry + 1) * 1_000_000).unwrap();
+        let hash = record_hash(&conflict);
+        assert!(
+            records
+                .reconcile(
+                    Lookup::Found(conflict.clone()),
+                    &local,
+                    expiry,
+                    Action::Refresh
+                )
+                .is_err()
+        );
+        records
+            .reconcile(
+                Lookup::Found(conflict),
+                &local,
+                expiry,
+                Action::Confirm(hash),
+            )
+            .unwrap();
+        assert_eq!(records.pending[0].recipients, Some(expected));
+        assert!(RecordState::decode(&records.encode(), local.keys.peer_id()).is_ok());
     }
     #[test]
     fn future_competitor_preserves_tombstone_and_holds_notification_in_snapshot() {

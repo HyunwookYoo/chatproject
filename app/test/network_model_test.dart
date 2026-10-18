@@ -28,6 +28,28 @@ void main() {
     debugPrint = (message, {wrapWidth}) => diagnostics.add(message);
   });
   tearDown(() => debugPrint = previousPrint);
+  test('account events remain on shared stream and preserve M2 diagnostics', () async {
+    final client = FakeNetworkClient();
+    final model = NetworkModel(client);
+    final accountEvents = <rust.ChatEvent>[];
+    final accountSubscription = client.events().listen(accountEvents.add);
+    await model.open();
+    final before = model.snapshot;
+    const cached = rust.ChatEvent.accountCacheUsed(peerId: 'account-peer');
+    const ready = rust.ChatEvent.accountAuthChanged(
+      peerId: 'account-peer', installationId: 'installation', ready: true,
+    );
+    client.controller.add(cached);
+    client.controller.add(ready);
+    await Future<void>.delayed(Duration.zero);
+    expect(accountEvents, [cached, ready]);
+    expect(model.snapshot, same(before));
+    expect(model.recentLines, isEmpty);
+    expect(model.error, isNull);
+    await accountSubscription.cancel();
+    await model.close();
+    await client.controller.close();
+  });
   test('account failure hides raw detail and releases busy state', () async {
     final client = FakeNetworkClient();
     final model = NetworkModel(client);

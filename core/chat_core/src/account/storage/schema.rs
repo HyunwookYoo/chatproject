@@ -122,10 +122,11 @@ pub(crate) struct LocalAccount {
     pub(crate) revision: u64,
     pub(crate) intent: crate::account::PublishIntent,
     pub(crate) records: crate::account::publication::RecordState,
+    pub(crate) remote: Vec<crate::account::connection::RemoteRecord>,
 }
 impl AccountState {
     pub(crate) fn decode(stored: &StoredPlaintext) -> Result<Self, CoreError> {
-        if stored.payload.first() == Some(&0x88) {
+        if stored.payload.first() == Some(&0x89) {
             use crate::account::{
                 AccountKeys, InstallationCert, PublishIntent, derive_device, verify_cert,
             };
@@ -170,6 +171,7 @@ impl AccountState {
                 keys.peer_id(),
             )
             .map_err(|_| corrupt())?;
+            let remote = crate::account::connection::decode_cache(d.bytes().map_err(|_| corrupt())?, keys.peer_id()).map_err(|_| corrupt())?;
             let state = Self::Active(Box::new(LocalAccount {
                 keys,
                 device,
@@ -177,6 +179,7 @@ impl AccountState {
                 revision,
                 intent,
                 records,
+                remote,
             }));
             if state.encode().payload != stored.payload
                 || state.device().installation_id().0 != stored.installation
@@ -202,7 +205,7 @@ impl AccountState {
         if let Self::Active(local) = self {
             let mut payload = Zeroizing::new(Vec::with_capacity(384));
             let mut e = minicbor::Encoder::new(&mut *payload);
-            e.array(8)
+            e.array(9)
                 .unwrap()
                 .u8(1)
                 .unwrap()
@@ -222,6 +225,7 @@ impl AccountState {
                 })
                 .unwrap();
             e.bytes(&local.records.encode()).unwrap();
+            e.bytes(&crate::account::connection::encode_cache(&local.remote)).unwrap();
             return StoredPlaintext {
                 installation: local.device.installation_id().0,
                 payload,
@@ -261,7 +265,7 @@ mod account_tests {
         ));
         let stored = state.encode();
         let mut d = minicbor::Decoder::new(&stored.payload);
-        assert_eq!(d.array().unwrap(), Some(8));
+        assert_eq!(d.array().unwrap(), Some(9));
         assert_eq!(d.u8().unwrap(), 1);
         assert_eq!(d.u8().unwrap(), 1);
         let AccountState::Active(local) = &state else {
