@@ -1,9 +1,124 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart' show Uint8List;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:chat_app/src/rust/api/account.dart' as a;
 import 'account_onboarding_test.dart' show ScreenClient, mountAccount, tapText;
 
 void main() {
+  testWidgets(
+    'displayed safety consent cannot survive a local identity change',
+    (t) async {
+      final peer = Uint8List.fromList(List.filled(32, 1));
+      final c = ScreenClient()
+        ..phase = a.AccountPhase.active
+        ..saved = [
+          a.ContactView(
+            peerId: peer,
+            alias: '친구',
+            verified: false,
+            newDevice: false,
+            deviceUnverified: false,
+          ),
+        ];
+      await mountAccount(t, c);
+      await tapText(t, '\u2068친구\u2069');
+      await tapText(t, '안전번호 확인');
+      await tapText(t, '상대와 별도 경로로 전체 번호를 비교했어요');
+      c.localPeer = Uint8List.fromList(List.filled(32, 3));
+      c.emit();
+      await t.pumpAndSettle();
+      expect(find.text('확인 완료'), findsNothing);
+      expect(c.verifications, 0);
+      expect(find.text('안전번호 확인'), findsOneWidget);
+    },
+  );
+
+  testWidgets('late safety for A cannot replace or verify selected contact B', (
+    t,
+  ) async {
+    await t.binding.setSurfaceSize(const Size(1200, 900));
+    addTearDown(() => t.binding.setSurfaceSize(null));
+    final peerA = Uint8List.fromList(List.filled(32, 1)),
+        peerB = Uint8List.fromList(List.filled(32, 2));
+    final c = ScreenClient()
+      ..phase = a.AccountPhase.active
+      ..saved = [
+        a.ContactView(
+          peerId: peerA,
+          alias: '친구 A',
+          verified: false,
+          newDevice: false,
+          deviceUnverified: false,
+        ),
+        a.ContactView(
+          peerId: peerB,
+          alias: '친구 B',
+          verified: false,
+          newDevice: false,
+          deviceUnverified: false,
+        ),
+      ]
+      ..safetyWait = Completer<a.SafetyDisplay>();
+    await mountAccount(t, c);
+    await tapText(t, '\u2068친구 A\u2069');
+    await tapText(t, '안전번호 확인');
+    expect(c.safetyRequests.single.$2, peerA);
+    await tapText(t, '\u2068친구 B\u2069');
+    c.safetyWait!.complete(
+      a.SafetyDisplay(
+        digest: Uint8List.fromList(List.filled(32, 9)),
+        groups: 'PUBLIC_A_SAFETY',
+        qr: 'PUBLIC_A_QR',
+      ),
+    );
+    await t.pumpAndSettle();
+    expect(find.text('PUBLIC_A_SAFETY'), findsNothing);
+    expect(find.text('\u2068친구 B\u2069'), findsNWidgets(2));
+    expect(find.text('확인 완료'), findsNothing);
+    expect(c.verifications, 0);
+    c.safetyWait = null;
+    await tapText(t, '안전번호 확인');
+    expect(c.safetyRequests.last.$2, peerB);
+    await tapText(t, '상대와 별도 경로로 전체 번호를 비교했어요');
+    await tapText(t, '확인 완료');
+    expect(c.verifiedPeer, peerB);
+    expect(c.verifiedDigest, List.generate(32, (i) => i));
+  });
+  testWidgets('changed local identity invalidates pending safety response', (
+    t,
+  ) async {
+    final peer = Uint8List.fromList(List.filled(32, 1));
+    final c = ScreenClient()
+      ..phase = a.AccountPhase.active
+      ..saved = [
+        a.ContactView(
+          peerId: peer,
+          alias: '친구',
+          verified: false,
+          newDevice: false,
+          deviceUnverified: false,
+        ),
+      ]
+      ..safetyWait = Completer<a.SafetyDisplay>();
+    await mountAccount(t, c);
+    await tapText(t, '\u2068친구\u2069');
+    await tapText(t, '안전번호 확인');
+    c.localPeer = Uint8List.fromList(List.filled(32, 3));
+    c.emit();
+    c.safetyWait!.complete(
+      a.SafetyDisplay(
+        digest: Uint8List(32),
+        groups: 'PUBLIC_OLD_LOCAL_SAFETY',
+        qr: 'PUBLIC_OLD_QR',
+      ),
+    );
+    await t.pumpAndSettle();
+    expect(find.text('PUBLIC_OLD_LOCAL_SAFETY'), findsNothing);
+    expect(find.text('확인 완료'), findsNothing);
+    expect(c.verifications, 0);
+  });
+
   testWidgets(
     'selected contact status follows the coherent account projection',
     (t) async {

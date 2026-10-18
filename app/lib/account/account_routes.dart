@@ -34,11 +34,12 @@ class _AccountRoutesState extends State<AccountRoutes>
   _Page _page = _Page.home;
   a.RecoveryDisplay? _words;
   List<int>? _flow;
+  Future<bool>? _confirmation;
   List<int> _positions = [];
   String? _invite;
   a.InvitePreview? _preview;
   a.ContactView? _contact;
-  a.SafetyDisplay? _safety;
+  ({a.SafetyDisplay display, List<int> local, List<int> peer})? _safety;
   int _ticket = 0;
   bool _working = false;
   String? _routeError;
@@ -61,6 +62,13 @@ class _AccountRoutesState extends State<AccountRoutes>
   void _changed() {
     if (!mounted) return;
     setState(() {
+      final safety = _safety;
+      if (safety != null &&
+          !listEquals(safety.local, model.snapshot?.publicPeerId)) {
+        ++_ticket;
+        _safety = null;
+        if (_page == _Page.safety) _page = _Page.contact;
+      }
       final selected = _contact;
       if (selected != null) {
         for (final contact in model.snapshot?.contacts ?? <a.ContactView>[]) {
@@ -81,9 +89,11 @@ class _AccountRoutesState extends State<AccountRoutes>
   }
 
   Future<void> _cancel() async {
-    ++_ticket;
+    final ticket = ++_ticket;
     final flow = _flow;
+    final confirmation = _confirmation;
     _flow = null;
+    _confirmation = null;
     _drop();
     if (mounted) {
       setState(() {
@@ -92,8 +102,8 @@ class _AccountRoutesState extends State<AccountRoutes>
       });
     }
     if (flow != null) {
-      final ok = await model.cancelCreate(flow);
-      if (mounted && !ok) {
+      final ok = await _cancelFlow(flow, confirmation);
+      if (_current(ticket) && !ok) {
         setState(
           () => _routeError = '계정 생성을 취소하지 못했어요. 현재 상태를 확인한 뒤 다시 시도해 주세요.',
         );
@@ -107,11 +117,18 @@ class _AccountRoutesState extends State<AccountRoutes>
     model.removeListener(_changed);
     ++_ticket;
     final flow = _flow;
+    final confirmation = _confirmation;
     _flow = null;
+    _confirmation = null;
     _drop();
-    if (flow != null) unawaited(model.cancelCreate(flow));
+    if (flow != null) unawaited(_cancelFlow(flow, confirmation));
     super.dispose();
   }
+
+  Future<bool> _cancelFlow(List<int> flow, Future<bool>? confirmation) =>
+      confirmation == null
+      ? model.cancelCreate(flow)
+      : model.cancelAbandonedCreate(flow, afterConfirmation: confirmation);
 
   Future<void> _begin() async {
     if (_working || model.busy) return;
@@ -146,7 +163,10 @@ class _AccountRoutesState extends State<AccountRoutes>
     if (flow == null || _working || model.busy) return;
     final ticket = _ticket;
     _working = true;
-    final ok = await model.confirmCreate(flow, answers);
+    final confirmation = model.confirmCreate(flow, answers);
+    _confirmation = confirmation;
+    final ok = await confirmation;
+    if (identical(_confirmation, confirmation)) _confirmation = null;
     if (!_current(ticket)) return;
     setState(() {
       _working = false;
@@ -205,21 +225,29 @@ class _AccountRoutesState extends State<AccountRoutes>
     final peer = _contact?.peerId;
     if (local == null || peer == null) return;
     final ticket = _ticket;
-    final display = await model.safetyDisplay(local, peer);
-    if (_current(ticket) && display != null) {
+    final requestLocal = List<int>.of(local);
+    final requestPeer = List<int>.of(peer);
+    final display = await model.safetyDisplay(requestLocal, requestPeer);
+    if (_current(ticket) &&
+        display != null &&
+        listEquals(requestLocal, model.snapshot?.publicPeerId) &&
+        listEquals(requestPeer, _contact?.peerId)) {
       setState(() {
-        _safety = display;
+        _safety = (display: display, local: requestLocal, peer: requestPeer);
         _page = _Page.safety;
       });
     }
   }
 
   Future<void> _verify() async {
-    final display = _safety;
-    final peer = _contact?.peerId;
-    if (display == null || peer == null) return;
+    final safety = _safety;
+    if (safety == null ||
+        !listEquals(safety.local, model.snapshot?.publicPeerId) ||
+        !listEquals(safety.peer, _contact?.peerId)) {
+      return;
+    }
     final ticket = _ticket;
-    final ok = await model.confirmSafety(peer, display.digest);
+    final ok = await model.confirmSafety(safety.peer, safety.display.digest);
     if (_current(ticket) && ok) {
       setState(() {
         _safety = null;
@@ -272,8 +300,10 @@ class _AccountRoutesState extends State<AccountRoutes>
           title: Text(isolatedName(contact.alias)),
           subtitle: Text(contact.verified ? '안전번호 확인됨' : '안전번호 미확인'),
           onTap: () {
+            ++_ticket;
             setState(() {
               _contact = contact;
+              _safety = null;
               _page = _Page.contact;
             });
           },
@@ -343,7 +373,7 @@ class _AccountRoutesState extends State<AccountRoutes>
       ),
       _Page.contact => _contactDetail(),
       _Page.safety => SafetyScreen(
-        display: _safety!,
+        display: _safety!.display,
         busy: busy,
         onConfirm: _verify,
       ),

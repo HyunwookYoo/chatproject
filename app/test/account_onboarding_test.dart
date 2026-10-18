@@ -25,12 +25,20 @@ class ScreenClient implements AccountClient {
   List<a.ContactView> saved = [];
   Completer<a.RecoveryDisplay>? pending;
   Completer<void>? cancelWait;
+  Completer<void>? confirmWait;
+  Completer<a.SafetyDisplay>? safetyWait;
+  final safetyRequests = <(List<int>, List<int>)>[];
+  final canceledFlows = <List<int>>[];
+  List<int>? verifiedPeer, verifiedDigest;
+  Uint8List? localPeer;
   Uint8List? nextFlow;
   final flow = Uint8List.fromList(List.filled(16, 7));
   a.AccountView view() => a.AccountView(
     revision: BigInt.from(revision),
     phase: phase,
-    publicPeerId: phase == a.AccountPhase.unconfigured ? null : Uint8List(32),
+    publicPeerId: phase == a.AccountPhase.unconfigured
+        ? null
+        : localPeer ?? Uint8List(32),
     devices: [],
     contacts: saved,
     publishIntents: [],
@@ -80,7 +88,7 @@ class ScreenClient implements AccountClient {
   );
   @override
   Future<void> cancelCreate(List<int> id) async {
-    expect(id, flow);
+    canceledFlows.add(List.of(id));
     cancels++;
     await cancelWait?.future;
   }
@@ -89,6 +97,7 @@ class ScreenClient implements AccountClient {
   Future<void> confirmCreate(List<int> id, List<String> input) async {
     confirms++;
     answers = List.of(input);
+    await confirmWait?.future;
     check();
     phase = a.AccountPhase.publishPending;
     emit();
@@ -144,20 +153,24 @@ class ScreenClient implements AccountClient {
   }
 
   @override
-  Future<a.SafetyDisplay> safetyDisplay(
-    List<int> local,
-    List<int> peer,
-  ) async => a.SafetyDisplay(
-    digest: Uint8List.fromList(List.generate(32, (i) => i)),
-    groups: List.generate(
-      32,
-      (i) => i.toRadixString(16).padLeft(2, '0'),
-    ).join(),
-    qr: 'PUBLIC_SAFETY',
-  );
+  Future<a.SafetyDisplay> safetyDisplay(List<int> local, List<int> peer) async {
+    safetyRequests.add((List.of(local), List.of(peer)));
+    if (safetyWait != null) return safetyWait!.future;
+    return a.SafetyDisplay(
+      digest: Uint8List.fromList(List.generate(32, (i) => i)),
+      groups: List.generate(
+        32,
+        (i) => i.toRadixString(16).padLeft(2, '0'),
+      ).join(),
+      qr: 'PUBLIC_SAFETY',
+    );
+  }
+
   @override
   Future<void> confirmSafety(List<int> peer, List<int> digest) async {
     verifications++;
+    verifiedPeer = List.of(peer);
+    verifiedDigest = List.of(digest);
     expect(digest, List.generate(32, (i) => i));
     check();
     saved = [
@@ -213,6 +226,102 @@ Future<void> tapText(WidgetTester t, String label) async {
 }
 
 void main() {
+  for (final dispose in [false, true]) {
+    testWidgets(
+      'deferred invalid confirmation ${dispose ? 'disposal' : 'back'} eventually cancels exact native flow',
+      (t) async {
+        final c = ScreenClient()..confirmWait = Completer<void>();
+        final m = await mountAccount(t, c);
+        await tapText(t, '새 계정 만들기');
+        await tapText(t, '적어 두었어요');
+        await tapText(t, '확인하고 계정 만들기');
+        expect(c.confirms, 1);
+        expect(m.busy, isTrue);
+        if (dispose) {
+          await t.pumpWidget(const SizedBox());
+          await t.pumpAndSettle();
+        } else {
+          await t.binding.handlePopRoute();
+          await t.pumpAndSettle();
+          expect(find.text('새 계정 만들기'), findsOneWidget);
+        }
+        expect(c.cancels, 0);
+        c.confirmWait!.completeError(
+          const r.CoreError(
+            code: r.ErrorCode.invalidRecovery,
+            detail: 'PUBLIC_INVALID_ANSWERS',
+          ),
+        );
+        await t.pumpAndSettle();
+        expect(c.cancels, 1);
+        expect(c.canceledFlows, [c.flow]);
+        expect(m.recoveryDisplay, isNull);
+        expect(m.snapshot!.phase, a.AccountPhase.unconfigured);
+        expect(c.controller.hasListener, isTrue);
+      },
+    );
+    testWidgets(
+      'abandoned successful confirmation ${dispose ? 'disposal' : 'back'} is never rolled back',
+      (t) async {
+        final c = ScreenClient()..confirmWait = Completer<void>();
+        final m = await mountAccount(t, c);
+        await tapText(t, '새 계정 만들기');
+        await tapText(t, '적어 두었어요');
+        await tapText(t, '확인하고 계정 만들기');
+        if (dispose) {
+          await t.pumpWidget(const SizedBox());
+          await t.pumpAndSettle();
+        } else {
+          await t.binding.handlePopRoute();
+          await t.pumpAndSettle();
+          expect(find.text('새 계정 만들기'), findsOneWidget);
+        }
+        c.confirmWait!.complete();
+        await t.pumpAndSettle();
+        expect(c.cancels, 0);
+        expect(m.snapshot!.phase, a.AccountPhase.publishPending);
+        expect(m.recoveryDisplay, isNull);
+      },
+    );
+  }
+  testWidgets(
+    'deferred failed confirmation cleanup cannot clear or error a replacement route',
+    (t) async {
+      final c = ScreenClient()
+        ..confirmWait = Completer<void>()
+        ..cancelWait = Completer<void>();
+      final m = await mountAccount(t, c);
+      await tapText(t, '새 계정 만들기');
+      await tapText(t, '적어 두었어요');
+      await tapText(t, '확인하고 계정 만들기');
+      await tapText(t, '취소');
+      c.confirmWait!.completeError(
+        const r.CoreError(
+          code: r.ErrorCode.invalidRecovery,
+          detail: 'PUBLIC_INVALID_ANSWERS',
+        ),
+      );
+      await t.pumpAndSettle();
+      expect(c.cancels, 1);
+      expect(c.canceledFlows, [c.flow]);
+      c.nextFlow = Uint8List.fromList(List.filled(16, 8));
+      await tapText(t, '새 계정 만들기');
+      final replacement = m.recoveryDisplay;
+      expect(replacement!.flow, c.nextFlow);
+      c.cancelWait!.completeError(
+        const r.CoreError(
+          code: r.ErrorCode.notAvailable,
+          detail: 'PUBLIC_CANCEL_FAILED',
+        ),
+      );
+      await t.pumpAndSettle();
+      expect(m.recoveryDisplay, same(replacement));
+      expect(m.errorCode, isNull);
+      expect(find.textContaining('취소하지 못했어요'), findsNothing);
+      expect(find.text('1. public-marker-1'), findsOneWidget);
+    },
+  );
+
   test(
     'abandoned cleanup cannot clear a replacement display or set its error',
     () async {

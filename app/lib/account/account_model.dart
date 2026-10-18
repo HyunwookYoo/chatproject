@@ -177,6 +177,24 @@ class AccountModel extends ChangeNotifier {
     return _command(() => client.cancelCreate(flow));
   }
 
+  /// Only abandoned confirmation cleanup may wait past the normal busy guard.
+  /// Never clears or reports errors into a replacement route's state.
+  Future<bool> cancelAbandonedCreate(
+    List<int> flow, {
+    required Future<bool> afterConfirmation,
+  }) async {
+    final generation = _generation;
+    final capturedFlow = List<int>.of(flow);
+    if (await afterConfirmation) return true; // Durable confirmation won.
+    if (!_current(generation)) return false;
+    try {
+      await client.cancelCreate(capturedFlow);
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
   Future<bool> recover(String words, bool confirmReplacement) {
     clearSecrets();
     return _command(() => client.recover(words, confirmReplacement));
