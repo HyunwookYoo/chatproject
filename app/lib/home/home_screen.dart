@@ -135,7 +135,7 @@ class _HomeScreenState extends State<HomeScreen> {
                       ),
                       SizedBox(height: 12),
                       Text(
-                        '만나서 서로 QR을 찍으면 첫 연락처가 생겨요.',
+                        '초대를 확인하고 연락처를 추가해 보세요.',
                         textAlign: TextAlign.center,
                         style: TextStyle(fontSize: 15, color: AppColors.textSecondary),
                       ),

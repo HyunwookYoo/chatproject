@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 
 import 'bootstrap.dart';
+import 'account/account_model.dart';
+import 'account/account_routes.dart';
 import 'core_client.dart';
 import 'home/home_screen.dart';
 import 'network/network_client.dart';
@@ -20,9 +22,16 @@ Future<void> main(List<String> arguments) async {
 }
 
 class ChatApp extends StatelessWidget {
-  const ChatApp({super.key, required this.core, this.probe, this.network});
+  const ChatApp({
+    super.key,
+    required this.core,
+    this.probe,
+    this.network,
+    this.account,
+  });
 
   final CoreClient core;
+  final AccountModel? account;
   final ProbeHost? probe;
   final NetworkClient? network;
 
@@ -31,7 +40,12 @@ class ChatApp extends StatelessWidget {
     return MaterialApp(
       title: 'ChatProject',
       theme: buildAppTheme(),
-      home: HomeScreen(core: core, probe: probe, network: network),
+      home: account == null
+          ? HomeScreen(core: core, probe: probe, network: network)
+          : AccountRoutes(
+              model: account!,
+              child: HomeScreen(core: core, probe: probe, network: network),
+            ),
     );
   }
 }

@@ -43,6 +43,7 @@ Future<Widget> bootstrap(
     await accountModel?.open();
     final app = ChatApp(
       core: core,
+      account: accountModel,
       network: core is NetworkClient ? core as NetworkClient : null,
       probe: Platform.isIOS ? IosProbeHost() : null,
     );

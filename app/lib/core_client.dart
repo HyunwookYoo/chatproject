@@ -44,7 +44,7 @@ Future<String> accountStorageRoot(String existing) async {
 }
 
 Future<void> setSensitiveScreen(bool sensitive) async {
-  if (Platform.isAndroid || Platform.isIOS) {
+  if (Platform.isAndroid || Platform.isIOS || Platform.isWindows) {
     await _accountStorage.invokeMethod<void>('setSensitiveScreen', sensitive);
   }
 }
