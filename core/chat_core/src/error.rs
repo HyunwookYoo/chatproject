@@ -17,6 +17,22 @@ pub enum ErrorCode {
     NetworkTimeout,
     TransportFailed,
     NotAvailable,
+    InvalidRecovery,
+    StorageLocked,
+    StorageMissing,
+    StorageCorrupt,
+    StorageFull,
+    AccountExists,
+    WriterBusy,
+    InvalidInvite,
+    InviteExpired,
+    DeviceLimit,
+    PairMismatch,
+    PairExpired,
+    RecordConflict,
+    RecordUnavailable,
+    AuthFailed,
+    AccountRestricted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

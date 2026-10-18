@@ -120,6 +120,22 @@ enum ErrorCode {
   networkTimeout,
   transportFailed,
   notAvailable,
+  invalidRecovery,
+  storageLocked,
+  storageMissing,
+  storageCorrupt,
+  storageFull,
+  accountExists,
+  writerBusy,
+  invalidInvite,
+  inviteExpired,
+  deviceLimit,
+  pairMismatch,
+  pairExpired,
+  recordConflict,
+  recordUnavailable,
+  authFailed,
+  accountRestricted,
 }
 
 class NetworkInfo {
