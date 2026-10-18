@@ -45,6 +45,7 @@ pub(crate) enum Stage {
     Observed,
 }
 pub(crate) struct PairTransaction {
+    pub tx: TxId,
     pub pin: ExistingPin,
     pub payload: Zeroizing<Vec<u8>>,
     pub approved_flow: FlowId,
@@ -139,6 +140,7 @@ impl PairTransaction {
             return Err(invalid());
         }
         let s = Self {
+            tx,
             pin,
             payload,
             approved_flow,

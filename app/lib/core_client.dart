@@ -5,6 +5,7 @@ import 'package:path_provider/path_provider.dart';
 
 import 'src/rust/api/chat.dart' as rust;
 import 'network/network_client.dart';
+import 'account/account_client.dart';
 
 const _accountStorage = MethodChannel('chat_app/account_storage');
 
@@ -37,7 +38,9 @@ Future<String> accountStorageRoot(String existing) async {
     if (local == null || local.isEmpty) throw StateError('계정 저장 공간을 열 수 없어요.');
     return '$local\\ChatProject\\account';
   }
-  throw UnsupportedError('계정 보호 저장을 지원하지 않는 플랫폼이에요.');
+  // The Rust provider returns NotAvailable on unsupported OSes; the account
+  // model keeps that failure on its locked route without a fake protector.
+  return existing;
 }
 
 Future<void> setSensitiveScreen(bool sensitive) async {
@@ -58,6 +61,7 @@ class FrbCoreClient implements CoreClient, NetworkClient {
   FrbCoreClient({this.dataDir});
 
   final String? dataDir;
+  late final AccountClient account = FrbAccountClient(this);
   Stream<rust.ChatEvent>? _events;
 
   @override

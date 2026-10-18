@@ -98,7 +98,9 @@ async fn three_positions_required_then_phrase_absent_on_disk() {
     assert_eq!(view.phase, AccountPhase::LocalReady);
     assert_eq!(view.public_peer_id, Some(peer));
     assert_eq!(view.publish_intents, vec![PublishIntent::LocalCreate]);
-    chat_core::account::verify_cert(&view.devices[0], peer).unwrap();
+    let cert = public_cert(&account).await;
+    chat_core::account::verify_cert(&cert, peer).unwrap();
+    assert_eq!(view.devices[0].installation_id, cert.installation_id);
     let debug = format!("{view:?}");
     let phrase = display.words.join(" ");
     assert!(!debug.contains(&phrase));
@@ -187,7 +189,7 @@ async fn recovery_same_peer_new_device_no_contacts() {
         view.devices[0].transport_public_key,
         original_view.devices[0].transport_public_key
     );
-    chat_core::account::verify_cert(&view.devices[0], original_view.public_peer_id.unwrap())
+    chat_core::account::verify_cert(&public_cert(&account).await, original_view.public_peer_id.unwrap())
         .unwrap();
     assert!(view.contacts.is_empty());
     assert_eq!(view.phase, AccountPhase::PublishPending);
@@ -276,7 +278,8 @@ async fn established_restart_reconstructs_signing_seed_and_endpoint() {
     drop(slot);
     let (slot, account) = open(dir.path()).await;
     let after = account.snapshot().await.unwrap();
-    assert_eq!(after, before);
+    assert_eq!(after.revision, 1); // A fresh actor starts a new public stream epoch.
+    assert_eq!(after, chat_core::account::AccountView { revision: after.revision, ..before });
     slot.network()
         .unwrap()
         .execute(NetworkOp::Start)
@@ -434,4 +437,10 @@ async fn commit_error_gates_mutations_until_disk_is_reconciled() {
         .execute(NetworkOp::Stop)
         .await
         .unwrap();
+}
+
+async fn public_cert(account: &AccountHandle) -> chat_core::account::InstallationCert {
+    use chat_core::account::clock::Clock;
+    let invite = account.create_invite(None).await.unwrap();
+    chat_core::account::parse_invite(&invite, chat_core::account::clock::SystemClock::default().unix_seconds()).unwrap().issuing_cert
 }

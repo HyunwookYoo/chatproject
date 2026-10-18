@@ -21,6 +21,7 @@ impl ConnectionSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CoreEvent {
+    AccountChanged { revision: u64, view: Box<crate::account::AccountView> },
     AccountAuthChanged { peer_id: String, installation_id: String, ready: bool },
     AccountCacheUsed { peer_id: String },
     ConnectionState(ConnectionSnapshot),
@@ -38,7 +39,7 @@ pub trait EventSink: Send + Sync + 'static {
 }
 
 /// Fans out core events to every subscriber in publish order. A subscriber that joins
-/// late first gets the latest connection state; other events are not replayed.
+/// late first gets the latest connection and public account state. Other events are not replayed.
 #[derive(Default, Clone)]
 pub struct EventBus {
     state: Arc<Mutex<BusState>>,
@@ -48,6 +49,7 @@ pub struct EventBus {
 struct BusState {
     sinks: Vec<Arc<dyn EventSink>>,
     last_connection: Option<ConnectionSnapshot>,
+    last_account: Option<CoreEvent>,
 }
 
 impl EventBus {
@@ -61,6 +63,8 @@ impl EventBus {
             && !sink.send(CoreEvent::ConnectionState(snapshot)) {
             return;
         }
+        if let Some(snapshot) = &state.last_account
+            && !sink.send(snapshot.clone()) { return; }
         state.sinks.push(sink);
     }
 
@@ -68,6 +72,9 @@ impl EventBus {
         let mut state = self.state.lock().expect("event bus lock poisoned");
         if let CoreEvent::ConnectionState(snapshot) = &event {
             state.last_connection = Some(*snapshot);
+        }
+        if matches!(&event, CoreEvent::AccountChanged { .. }) {
+            state.last_account = Some(event.clone());
         }
         state.sinks.retain(|sink| sink.send(event.clone()));
     }

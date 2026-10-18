@@ -19,6 +19,21 @@ pub struct AccountServices {
     pub(crate) notifier: Option<Arc<dyn RevocationNotifier>>,
 }
 impl AccountServices {
+    /// Local bridge/storage fixture only. It never constructs a production backend.
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    pub fn offline_for_test() -> Self {
+        struct Offline;
+        impl RecordBackend for Offline {
+            fn lookup(&self, _: PeerId) -> super::RecordFuture<'_, Lookup> {
+                Box::pin(async { Err(CoreError::new(crate::ErrorCode::RecordUnavailable, "Offline fixture")) })
+            }
+            fn publish<'a>(&'a self, _: &'a SignedPacket) -> super::RecordFuture<'a, ()> {
+                Box::pin(async { Err(CoreError::new(crate::ErrorCode::RecordUnavailable, "Offline fixture")) })
+            }
+        }
+        Self::new(Arc::new(Offline), Arc::new(super::clock::FakeClock::new(SystemClock::default().unix_seconds(), 0)))
+    }
+
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     pub fn new(backend: Arc<dyn RecordBackend>, clock: Arc<dyn Clock>) -> Self {
         Self {
@@ -47,14 +62,14 @@ impl AccountServices {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PublicationState {
     LocalBlocked,
     Pending,
     Observed,
     Conflict,
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PublicationView {
     pub state: PublicationState,
     pub generation: Option<Generation>,

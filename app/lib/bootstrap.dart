@@ -1,9 +1,12 @@
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
-import 'package:flutter/widgets.dart';
+import 'package:flutter/material.dart';
 
 import 'core_client.dart';
+import 'account/account_client.dart';
+import 'account/account_model.dart';
+import 'src/rust/api/account.dart' as account;
 import 'main.dart';
 import 'network/network_client.dart';
 import 'probe/probe_host.dart';
@@ -15,6 +18,7 @@ Future<Widget> bootstrap(
   required Future<void> Function() initializeRust,
   required CoreClient Function(String?) createClient,
   Future<void> Function(String, String)? startTestHooks,
+  AccountClient? Function(CoreClient)? createAccountClient,
 }) async {
   var startingHooks = false;
   try {
@@ -30,11 +34,21 @@ Future<Widget> bootstrap(
         startingHooks = false;
       }
     }
-    return ChatApp(
+    final accountClient =
+        createAccountClient?.call(core) ??
+        (core is FrbCoreClient ? core.account : null);
+    final accountModel = accountClient == null
+        ? null
+        : AccountModel(accountClient);
+    await accountModel?.open();
+    final app = ChatApp(
       core: core,
       network: core is NetworkClient ? core as NetworkClient : null,
       probe: Platform.isIOS ? IosProbeHost() : null,
     );
+    return accountModel == null
+        ? app
+        : AccountGate(model: accountModel, child: app);
   } catch (error, stack) {
     final reason = error is rust.CoreError
         ? error.code.name
@@ -114,4 +128,58 @@ Future<void> _startTestHooks(String url, String name) =>
     );
   }
   return (url, name);
+}
+
+/// Minimal safe startup boundary; account setup/recovery screens are added separately.
+class AccountGate extends StatefulWidget {
+  const AccountGate({super.key, required this.model, required this.child});
+  final AccountModel model;
+  final Widget child;
+  @override
+  State<AccountGate> createState() => _AccountGateState();
+}
+
+class _AccountGateState extends State<AccountGate> {
+  @override
+  void dispose() {
+    widget.model.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => ListenableBuilder(
+    listenable: widget.model,
+    builder: (context, _) =>
+        widget.model.snapshot?.phase != account.AccountPhase.locked
+        ? widget.child
+        : MaterialApp(
+            home: Scaffold(
+              body: SafeArea(
+                child: Center(
+                  child: Padding(
+                    padding: const EdgeInsets.all(24),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        const Text('계정 보호 저장을 열 수 없어요.'),
+                        const SizedBox(height: 16),
+                        Text(
+                          widget.model.error ??
+                              accountErrorMessage(rust.ErrorCode.storageLocked),
+                        ),
+                        const SizedBox(height: 16),
+                        FilledButton(
+                          onPressed: widget.model.busy
+                              ? null
+                              : widget.model.retry,
+                          child: const Text('다시 시도'),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+  );
 }

@@ -502,6 +502,7 @@ async fn discard_pending_then_phrase_recovery() {
     let old = n.a.snapshot().await.unwrap().installation.unwrap();
     n.protector.fail_delete.store(true, SeqCst);
     assert!(n.a.discard_pending_import().await.is_err());
+    assert_eq!(n.a.retry_open().await.unwrap_err().code, chat_core::ErrorCode::StorageLocked);
     assert_eq!(n.a.snapshot().await.unwrap().phase, AccountPhase::Locked);
     assert!(n.a.begin_create().await.is_err());
     n.protector.fail_delete.store(false, SeqCst);

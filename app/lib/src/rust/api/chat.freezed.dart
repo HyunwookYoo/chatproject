@@ -49,6 +49,7 @@ extension ChatEventPatterns on ChatEvent {
 
   @optionalTypeArgs
   TResult maybeMap<TResult extends Object?>({
+    TResult Function(ChatEvent_AccountChanged value)? accountChanged,
     TResult Function(ChatEvent_AccountAuthChanged value)? accountAuthChanged,
     TResult Function(ChatEvent_AccountCacheUsed value)? accountCacheUsed,
     TResult Function(ChatEvent_ConnectionState value)? connectionState,
@@ -60,6 +61,8 @@ extension ChatEventPatterns on ChatEvent {
   }) {
     final _that = this;
     switch (_that) {
+      case ChatEvent_AccountChanged() when accountChanged != null:
+        return accountChanged(_that);
       case ChatEvent_AccountAuthChanged() when accountAuthChanged != null:
         return accountAuthChanged(_that);
       case ChatEvent_AccountCacheUsed() when accountCacheUsed != null:
@@ -94,6 +97,7 @@ extension ChatEventPatterns on ChatEvent {
 
   @optionalTypeArgs
   TResult map<TResult extends Object?>({
+    required TResult Function(ChatEvent_AccountChanged value) accountChanged,
     required TResult Function(ChatEvent_AccountAuthChanged value)
     accountAuthChanged,
     required TResult Function(ChatEvent_AccountCacheUsed value)
@@ -107,6 +111,8 @@ extension ChatEventPatterns on ChatEvent {
   }) {
     final _that = this;
     switch (_that) {
+      case ChatEvent_AccountChanged():
+        return accountChanged(_that);
       case ChatEvent_AccountAuthChanged():
         return accountAuthChanged(_that);
       case ChatEvent_AccountCacheUsed():
@@ -138,6 +144,7 @@ extension ChatEventPatterns on ChatEvent {
 
   @optionalTypeArgs
   TResult? mapOrNull<TResult extends Object?>({
+    TResult? Function(ChatEvent_AccountChanged value)? accountChanged,
     TResult? Function(ChatEvent_AccountAuthChanged value)? accountAuthChanged,
     TResult? Function(ChatEvent_AccountCacheUsed value)? accountCacheUsed,
     TResult? Function(ChatEvent_ConnectionState value)? connectionState,
@@ -148,6 +155,8 @@ extension ChatEventPatterns on ChatEvent {
   }) {
     final _that = this;
     switch (_that) {
+      case ChatEvent_AccountChanged() when accountChanged != null:
+        return accountChanged(_that);
       case ChatEvent_AccountAuthChanged() when accountAuthChanged != null:
         return accountAuthChanged(_that);
       case ChatEvent_AccountCacheUsed() when accountCacheUsed != null:
@@ -181,6 +190,7 @@ extension ChatEventPatterns on ChatEvent {
 
   @optionalTypeArgs
   TResult maybeWhen<TResult extends Object?>({
+    TResult Function(BigInt revision, AccountView view)? accountChanged,
     TResult Function(String peerId, String installationId, bool ready)?
     accountAuthChanged,
     TResult Function(String peerId)? accountCacheUsed,
@@ -194,6 +204,8 @@ extension ChatEventPatterns on ChatEvent {
   }) {
     final _that = this;
     switch (_that) {
+      case ChatEvent_AccountChanged() when accountChanged != null:
+        return accountChanged(_that.revision, _that.view);
       case ChatEvent_AccountAuthChanged() when accountAuthChanged != null:
         return accountAuthChanged(
           _that.peerId,
@@ -236,6 +248,7 @@ extension ChatEventPatterns on ChatEvent {
 
   @optionalTypeArgs
   TResult when<TResult extends Object?>({
+    required TResult Function(BigInt revision, AccountView view) accountChanged,
     required TResult Function(String peerId, String installationId, bool ready)
     accountAuthChanged,
     required TResult Function(String peerId) accountCacheUsed,
@@ -248,6 +261,8 @@ extension ChatEventPatterns on ChatEvent {
   }) {
     final _that = this;
     switch (_that) {
+      case ChatEvent_AccountChanged():
+        return accountChanged(_that.revision, _that.view);
       case ChatEvent_AccountAuthChanged():
         return accountAuthChanged(
           _that.peerId,
@@ -287,6 +302,7 @@ extension ChatEventPatterns on ChatEvent {
 
   @optionalTypeArgs
   TResult? whenOrNull<TResult extends Object?>({
+    TResult? Function(BigInt revision, AccountView view)? accountChanged,
     TResult? Function(String peerId, String installationId, bool ready)?
     accountAuthChanged,
     TResult? Function(String peerId)? accountCacheUsed,
@@ -299,6 +315,8 @@ extension ChatEventPatterns on ChatEvent {
   }) {
     final _that = this;
     switch (_that) {
+      case ChatEvent_AccountChanged() when accountChanged != null:
+        return accountChanged(_that.revision, _that.view);
       case ChatEvent_AccountAuthChanged() when accountAuthChanged != null:
         return accountAuthChanged(
           _that.peerId,
@@ -324,6 +342,82 @@ extension ChatEventPatterns on ChatEvent {
       case _:
         return null;
     }
+  }
+}
+
+/// @nodoc
+
+class ChatEvent_AccountChanged extends ChatEvent {
+  const ChatEvent_AccountChanged({required this.revision, required this.view})
+    : super._();
+
+  final BigInt revision;
+  final AccountView view;
+
+  /// Create a copy of ChatEvent
+  /// with the given fields replaced by the non-null parameter values.
+  @JsonKey(includeFromJson: false, includeToJson: false)
+  @pragma('vm:prefer-inline')
+  $ChatEvent_AccountChangedCopyWith<ChatEvent_AccountChanged> get copyWith =>
+      _$ChatEvent_AccountChangedCopyWithImpl<ChatEvent_AccountChanged>(
+        this,
+        _$identity,
+      );
+
+  @override
+  bool operator ==(Object other) {
+    return identical(this, other) ||
+        (other.runtimeType == runtimeType &&
+            other is ChatEvent_AccountChanged &&
+            (identical(other.revision, revision) ||
+                other.revision == revision) &&
+            (identical(other.view, view) || other.view == view));
+  }
+
+  @override
+  int get hashCode => Object.hash(runtimeType, revision, view);
+
+  @override
+  String toString() {
+    return 'ChatEvent.accountChanged(revision: $revision, view: $view)';
+  }
+}
+
+/// @nodoc
+abstract mixin class $ChatEvent_AccountChangedCopyWith<$Res>
+    implements $ChatEventCopyWith<$Res> {
+  factory $ChatEvent_AccountChangedCopyWith(
+    ChatEvent_AccountChanged value,
+    $Res Function(ChatEvent_AccountChanged) _then,
+  ) = _$ChatEvent_AccountChangedCopyWithImpl;
+  @useResult
+  $Res call({BigInt revision, AccountView view});
+}
+
+/// @nodoc
+class _$ChatEvent_AccountChangedCopyWithImpl<$Res>
+    implements $ChatEvent_AccountChangedCopyWith<$Res> {
+  _$ChatEvent_AccountChangedCopyWithImpl(this._self, this._then);
+
+  final ChatEvent_AccountChanged _self;
+  final $Res Function(ChatEvent_AccountChanged) _then;
+
+  /// Create a copy of ChatEvent
+  /// with the given fields replaced by the non-null parameter values.
+  @pragma('vm:prefer-inline')
+  $Res call({Object? revision = null, Object? view = null}) {
+    return _then(
+      ChatEvent_AccountChanged(
+        revision: null == revision
+            ? _self.revision
+            : revision // ignore: cast_nullable_to_non_nullable
+                  as BigInt,
+        view: null == view
+            ? _self.view
+            : view // ignore: cast_nullable_to_non_nullable
+                  as AccountView,
+      ),
+    );
   }
 }
 

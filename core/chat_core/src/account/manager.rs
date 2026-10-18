@@ -1,6 +1,6 @@
 //! Single owner of protected account state. A5 extends commands and AccountState.
 use super::{
-    AccountServices, FlowId, InstallationCert, InstallationId, PeerId, PublicationState,
+    AccountServices, FlowId, InstallationId, PeerId, PublicationState,
     PublicationView, RecoveryDisplay,
     creation::Creation,
     derive_device,
@@ -20,7 +20,7 @@ use std::{
 use tokio::sync::{mpsc, oneshot, watch};
 use zeroize::Zeroizing;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AccountPhase {
     Unconfigured,
     Candidate,
@@ -31,24 +31,25 @@ pub enum AccountPhase {
     Conflict,
     Locked,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PublishIntent {
     LocalCreate,
     Replacement,
 }
 /// Public data only. No recovery display or private keys can enter this view.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AccountView {
     pub disclosure_possible: bool,
     pub pending_pair_transactions: Vec<super::TxId>,
     pub pending_import_requires_remote_revoke: bool,
     pub revision: u64,
     pub phase: AccountPhase,
+    pub lock_error: Option<ErrorCode>,
     pub public_peer_id: Option<PeerId>,
     pub installation: Option<InstallationId>,
-    pub devices: Vec<InstallationCert>,
-    pub contacts: Vec<PeerId>,
-    pub pair: Option<FlowId>,
+    pub devices: Vec<super::RecordDevice>,
+    pub contacts: Vec<super::ContactView>,
+    pub pair: Option<super::PairView>,
     pub publish_intents: Vec<PublishIntent>,
     pub publication: PublicationView,
 }
@@ -59,6 +60,7 @@ pub struct CandidateInfo {
     pub endpoint_id: String,
 }
 enum Command {
+    Retry(oneshot::Sender<Result<(), CoreError>>),
     #[cfg(all(feature="test-hooks",debug_assertions))]
     PairTestStop(super::PairTestStop,oneshot::Sender<Result<(),CoreError>>),
     #[cfg(all(feature="test-hooks",debug_assertions))]
@@ -110,6 +112,7 @@ struct Queued {
 impl Command {
     fn reject(self, error: CoreError) {
         match self {
+            Self::Retry(reply) => { let _ = reply.send(Err(error)); }
             #[cfg(all(feature="test-hooks",debug_assertions))]
             Self::PairTestStop(_,reply)=>{let _=reply.send(Err(error));}
             #[cfg(all(feature="test-hooks",debug_assertions))]
@@ -236,6 +239,9 @@ impl AccountHandle {
                 creation: None,
                 cleanup_pending: false,
                 revision,
+                public_revision: 0,
+                last_public_view: None,
+                lock_error: None,
                 shared: shared.clone(),
                 services,
             }
@@ -289,6 +295,7 @@ impl AccountHandle {
         self.send(|reply| Command::Recover(words, confirm_replacement, reply))
             .await
     }
+    pub async fn retry_open(&self) -> Result<(), CoreError> { self.send(Command::Retry).await }
     pub async fn snapshot(&self) -> Result<AccountView, CoreError> {
         self.send(Command::Snapshot).await
     }
@@ -365,6 +372,9 @@ struct Manager {
     creation: Option<Creation>,
     cleanup_pending: bool,
     revision: u64,
+    public_revision: u64,
+    last_public_view: Option<AccountView>,
+    lock_error: Option<ErrorCode>,
     shared: Arc<Shared>,
     services: AccountServices,
 }
@@ -389,7 +399,7 @@ impl Manager {
                 .existing
                 .iter()
                 .filter(|t| t.stage != Stage::Observed)
-                .filter_map(|t| t.envelope().ok().map(|e| e.tx))
+                .map(|t| t.tx)
                 .collect(),
             _ => vec![],
         }
@@ -555,6 +565,7 @@ impl Manager {
             t.approved_hash = handshake;
         } else {
             local.pairs.existing.push(PairTransaction {
+                tx,
                 pin: ExistingPin {
                     peer: local.keys.peer_id(),
                     installation: local.device.installation_id(),
@@ -1055,6 +1066,7 @@ impl Manager {
         let result = self.lifecycle(initial).await;
         self.complete(initial, result);
         self.auto_refresh().await;
+        self.publish_view();
         let mut expiry = tokio::time::interval(Duration::from_millis(100));
         let mut import_poll = tokio::time::interval(Duration::from_secs(1));
         let mut refresh = tokio::time::interval(Duration::from_secs(60));
@@ -1080,6 +1092,7 @@ impl Manager {
                         continue;
                     }
                     match queued.command {
+                        Command::Retry(reply) => { let result = self.retry_open(); let _ = reply.send(result); }
                         #[cfg(all(feature="test-hooks",debug_assertions))]
                         Command::PairTestStop(stop,reply)=>{self.pair.stop=Some(stop);self.pair.reached=None;let _=reply.send(Ok(()));}
                         #[cfg(all(feature="test-hooks",debug_assertions))]
@@ -1108,7 +1121,7 @@ impl Manager {
                         Command::Confirm(flow, answers, reply) => { let result = self.confirm(flow, &answers).await; let _ = reply.send(result); }
                         Command::Cancel(flow, reply) => { let result = self.cancel(flow); let _ = reply.send(result); }
                         Command::Recover(words, confirmed, reply) => { let result = self.recover(&words, confirmed).await; let _ = reply.send(result); }
-                        Command::Snapshot(reply) => { self.expire_pair(); let _ = reply.send(Ok(self.view())); }
+                        Command::Snapshot(reply) => { self.expire_pair(); self.publish_view(); let _ = reply.send(Ok(self.view())); }
                         Command::Refresh(peer, reply) => {
                             let result = if matches!(&self.state,Some(AccountState::PendingImport(p)) if p.pin.peer==peer) {
                                 self.refresh_import().await
@@ -1122,6 +1135,7 @@ impl Manager {
                     }
                 }
             }
+            self.publish_view();
         }
         self.pair.current=None;
         self.auth.cancel.cancel();
@@ -1131,7 +1145,10 @@ impl Manager {
     fn current(&self, request: Request) -> bool {
         self.shared.requests.borrow().ticket == request.ticket
     }
-    fn complete(&self, request: Request, result: Result<(), CoreError>) {
+    fn complete(&mut self, request: Request, result: Result<(), CoreError>) {
+        if self.current(request) {
+            self.lock_error = result.as_ref().err().map(|error| error.code);
+        }
         let status = if result.is_ok() { 1 } else { 2 };
         self.shared
             .status
@@ -1535,23 +1552,50 @@ impl Manager {
         // A publish ACK is deliberately not an observation or completion.
         Ok(())
     }
+    fn retry_open(&mut self) -> Result<(), CoreError> {
+        let previous = *self.shared.requests.borrow();
+        if self.cleanup_pending || previous.suspend || self.shared.network.desired_suspend() {
+            return Err(unavailable(ErrorCode::StorageLocked));
+        }
+        if self.ready().is_ok() { return Ok(()); }
+        let ticket = self.shared.network.block();
+        let accepted = self.shared.requests.send_if_modified(|request| {
+            if request.ticket != previous.ticket || request.suspend || self.shared.network.desired_suspend() { return false; }
+            *request = Request { ticket, suspend: false };
+            self.shared.status.fetch_max(ticket << 2, Ordering::AcqRel);
+            true
+        });
+        if accepted { Ok(()) } else { Err(unavailable(ErrorCode::StorageLocked)) }
+    }
+    fn publish_view(&mut self) {
+        let mut view = self.view();
+        if self.last_public_view.as_ref() == Some(&view) { return; }
+        // A process owns this ordering independently of durable transaction counters.
+        self.public_revision = self.public_revision.checked_add(1).expect("public revision exhausted");
+        view.revision = self.public_revision;
+        self.last_public_view = Some(view.clone());
+        self.bus.publish(crate::CoreEvent::AccountChanged { revision: view.revision, view: Box::new(view) });
+    }
     fn view(&self) -> AccountView {
         let mut view = AccountView {
             disclosure_possible: self.state.as_ref().is_some_and(|s|matches!(s,AccountState::Active(l) if !l.pairs.existing.is_empty())),
             pending_pair_transactions: self.pending_pairs(),
             pending_import_requires_remote_revoke: matches!(self.state,Some(AccountState::CandidatePinned(_) | AccountState::PendingImport(_))),
-            revision: self.revision,
+            revision: self.public_revision,
+            lock_error: None,
             phase: AccountPhase::Unconfigured,
             public_peer_id: None,
             installation: None,
             devices: vec![],
             contacts: vec![],
-            pair: self.pair.current.as_ref().map(|s|s.qr.flow),
+            pair: self.pair_view(),
             publish_intents: vec![],
             publication: PublicationView::default(),
         };
         if self.ready().is_err() {
             view.phase = AccountPhase::Locked;
+            view.lock_error = Some(self.lock_error.unwrap_or(ErrorCode::StorageLocked));
+            view.pair = None;
             return view;
         }
         match &self.state {
@@ -1566,15 +1610,18 @@ impl Manager {
                 view.installation = Some(device.installation_id());
             }
             Some(AccountState::Active(local)) => {
-                view.revision = local.revision;
                 view.phase = match local.intent {
                     PublishIntent::LocalCreate => AccountPhase::LocalReady,
                     PublishIntent::Replacement => AccountPhase::PublishPending,
                 };
                 view.public_peer_id = Some(local.keys.peer_id());
                 view.installation = Some(local.device.installation_id());
-                view.devices.push(local.cert.clone());
-                view.contacts = local.contacts.iter().map(|c| c.peer).collect();
+                view.devices = local.records.accepted.as_ref().map(|r| r.record.devices.clone()).unwrap_or_else(|| vec![super::RecordDevice {
+                    installation_id: local.cert.installation_id,
+                    transport_public_key: local.cert.transport_public_key,
+                    kind: local.cert.kind,
+                }]);
+                view.contacts = local.contacts.iter().map(|c| self.contact_view(c)).collect();
                 view.publish_intents.push(local.intent);
                 view.publication = local.records.view();
                 match local.records.state {
@@ -1632,6 +1679,92 @@ mod tests {
             Arc::new(Offline),
             Arc::new(crate::account::clock::SystemClock::default()),
         )
+    }
+
+    #[tokio::test]
+    async fn explicit_retry_reloads_failed_foreground_without_overriding_suspend() {
+        use std::sync::atomic::AtomicU8;
+        struct Flaky(AtomicU8);
+        impl KeyProtector for Flaky {
+            fn protect(&self, id: StoreId, key: &Secret32) -> Result<Vec<u8>, CoreError> { Protector.protect(id, key) }
+            fn unprotect(&self, id: StoreId, blob: &[u8]) -> Result<Secret32, CoreError> {
+                match self.0.load(Ordering::SeqCst) {
+                    1 => Err(unavailable(ErrorCode::StorageMissing)),
+                    2 => Err(unavailable(ErrorCode::StorageCorrupt)),
+                    _ => Protector.unprotect(id, blob),
+                }
+            }
+            fn delete(&self, _: StoreId) -> Result<(), CoreError> { Ok(()) }
+        }
+        let dir = tempfile::tempdir().unwrap(); let slot = CoreSlot::new();
+        slot.start(CoreConfig { data_dir: dir.path().into() }, &EventBus::new()).unwrap();
+        slot.network().unwrap().configure_local(None).await.unwrap();
+        let protector = Arc::new(Flaky(AtomicU8::new(0)));
+        let account = slot.open_account_with_services(protector.clone(), offline_services()).unwrap();
+        account.prepare_candidate().await.unwrap();
+        account.request_suspend(); account.snapshot().await.unwrap();
+        protector.0.store(1, Ordering::SeqCst);
+        account.request_resume();
+        let locked = account.snapshot().await.unwrap();
+        assert_eq!(locked.lock_error, Some(ErrorCode::StorageMissing));
+        protector.0.store(2, Ordering::SeqCst);
+        let stale_ticket = account.shared.requests.borrow().ticket;
+        account.retry_open().await.unwrap();
+        let (reply, rejected) = oneshot::channel();
+        account.commands.try_send(Queued { ticket: stale_ticket, command: Command::Begin(reply) }).ok().unwrap();
+        assert!(matches!(rejected.await.unwrap(), Err(CoreError { code: ErrorCode::StorageLocked, .. })));
+        assert_eq!(account.snapshot().await.unwrap().lock_error, Some(ErrorCode::StorageCorrupt));
+        protector.0.store(0, Ordering::SeqCst);
+        account.retry_open().await.unwrap();
+        assert_eq!(account.snapshot().await.unwrap().phase, AccountPhase::Candidate);
+        // Native intent can change before its lifecycle mailbox notification arrives.
+        account.shared.network.lifecycle_gate(true);
+        assert_eq!(account.retry_open().await.unwrap_err().code, ErrorCode::StorageLocked);
+        account.request_suspend(); account.snapshot().await.unwrap();
+        assert_eq!(account.retry_open().await.unwrap_err().code, ErrorCode::StorageLocked);
+        assert_eq!(account.snapshot().await.unwrap().phase, AccountPhase::Locked);
+    }
+
+    #[tokio::test]
+    async fn public_projection_emits_ordered_changes_without_secret_replies() {
+        struct Sink(std::sync::Mutex<Vec<String>>);
+        impl crate::EventSink for Sink {
+            fn send(&self, event: crate::CoreEvent) -> bool {
+                self.0.lock().unwrap().push(serde_json::to_string(&event).unwrap()); true
+            }
+        }
+        let dir = tempfile::tempdir().unwrap(); let bus = EventBus::new();
+        let sink = Arc::new(Sink(std::sync::Mutex::new(vec![]))); bus.subscribe(sink.clone());
+        let slot = CoreSlot::new(); slot.start(CoreConfig { data_dir: dir.path().into() }, &bus).unwrap();
+        slot.network().unwrap().configure_local(None).await.unwrap();
+        let account = slot.open_account_with_services(Arc::new(Protector), offline_services()).unwrap();
+        let before = account.snapshot().await.unwrap();
+        let display = account.begin_create().await.unwrap();
+        let during = account.snapshot().await.unwrap();
+        account.cancel_create(display.flow).await.unwrap();
+        let after = account.snapshot().await.unwrap();
+        account.prepare_candidate().await.unwrap();
+        let qr = account.pair_begin(super::super::PairDirection::NewDisplays, None).await.unwrap();
+        let paired = account.snapshot().await.unwrap();
+        assert_eq!(paired.pair.as_ref().unwrap().flow, qr.flow);
+        assert!(paired.revision > after.revision);
+        assert!(during.revision > before.revision && after.revision > during.revision);
+        let late = Arc::new(Sink(std::sync::Mutex::new(vec![])));
+        bus.subscribe(late.clone());
+        assert!(late.0.lock().unwrap().iter().any(|e| e.contains("account_changed")), "late registration must replay latest public projection");
+        let events = sink.0.lock().unwrap();
+        assert!(events.iter().any(|e| e.contains("account_changed")), "actor must publish public changes");
+        let text = events.join("");
+        assert!(!text.contains(&display.words.join(" ")));
+        assert!(!text.contains(&qr.qr));
+        let revisions: Vec<u64> = events.iter().filter_map(|e| {
+            let value: serde_json::Value = serde_json::from_str(e).unwrap();
+            if value["kind"] != "account_changed" { return None; }
+            assert_eq!(value["revision"], value["view"]["revision"]);
+            value["revision"].as_u64()
+        }).collect();
+        assert!(revisions.windows(2).all(|r| r[0] < r[1]));
+        assert!(!text.contains("\"words\"") && !text.contains("\"qr\"") && !text.contains("psk"));
     }
 
     #[tokio::test]
@@ -1694,6 +1827,9 @@ mod tests {
             creation: None,
                 cleanup_pending: false,
             revision: 0,
+            public_revision: 0,
+            last_public_view: None,
+            lock_error: None,
             shared,
             services: AccountServices::new(backend.clone(), Arc::new(FakeClock::new(1000, 0))),
         };
@@ -1775,6 +1911,9 @@ mod tests {
                 creation: None,
                 cleanup_pending: false,
                 revision: 0,
+            public_revision: 0,
+            last_public_view: None,
+            lock_error: None,
                 shared: Arc::new(Shared {
                     network: network.clone(),
                     requests,
@@ -1817,6 +1956,7 @@ mod tests {
             let receipt = Receipt::sign(tx, hash(&payload), &device, flow, [6; 32]);
             let state = if existing {
                 local.pairs.existing.push(PairTransaction {
+                    tx,
                     pin,
                     payload,
                     approved_flow: flow,
@@ -1917,6 +2057,9 @@ mod tests {
             creation: None,
                 cleanup_pending: false,
             revision: 0,
+            public_revision: 0,
+            last_public_view: None,
+            lock_error: None,
             shared,
             services: offline_services(),
         };
@@ -2007,6 +2150,9 @@ mod tests {
             creation: None,
                 cleanup_pending: false,
             revision: 0,
+            public_revision: 0,
+            last_public_view: None,
+            lock_error: None,
             shared,
             services: offline_services(),
         };

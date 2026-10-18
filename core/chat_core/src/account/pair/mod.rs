@@ -8,7 +8,7 @@ pub(crate) mod wire;
 use super::FlowId;
 use zeroize::Zeroize;
 pub(crate) const ALPN: &[u8] = b"chatproject/pair/1";
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PairDirection {
     NewDisplays,
     ExistingDisplays,
@@ -46,7 +46,7 @@ impl Drop for PairDisplay {
         self.qr.zeroize();
     }
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PairPhase {
     WaitingQr,
     Comparing,
@@ -59,7 +59,7 @@ pub enum PairPhase {
     Active,
     Observed,
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PairView {
     pub flow: FlowId,
     pub direction: PairDirection,

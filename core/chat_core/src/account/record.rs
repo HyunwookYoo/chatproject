@@ -17,14 +17,14 @@ pub const RECORD_TTL_SECONDS: u32 = 86400;
 pub const RECORD_LIFETIME_SECONDS: u64 = 604800;
 pub const MAX_ACCOUNT_PACKET_BYTES: usize = 1000;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RecordDevice {
     pub installation_id: InstallationId,
     pub transport_public_key: [u8; 32],
     pub kind: DeviceKind,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct IdentityRecord {
     pub generation: Generation,
     pub issued_at: u64,

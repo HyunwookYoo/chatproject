@@ -777,7 +777,7 @@ async fn qr_requires_durable_candidate_and_successful_endpoint_bind() {
             .await
             .unwrap();
     assert_eq!(n.a.snapshot().await.unwrap().installation, before);
-    assert_eq!(n.a.snapshot().await.unwrap().pair, Some(display.flow));
+    assert_eq!(n.a.snapshot().await.unwrap().pair.map(|p| p.flow), Some(display.flow));
 }
 #[tokio::test]
 async fn restart_keeps_candidate_but_discards_flow_psk_and_approval() {
@@ -909,7 +909,8 @@ async fn authority_time_boundary(
     assert_eq!(snapshot.public_peer_id, Some(keys.peer_id()));
     // Account creation signs its certificate using SystemClock. Anchor only the
     // fixture epoch to that public timestamp; all tested changes use FakeClock.
-    let now = snapshot.devices[0].created_at;
+    let invite = e.a.create_invite(None).await.unwrap();
+    let now = chat_core::account::parse_invite(&invite, setup_time).unwrap().issuing_cert.created_at;
     e.clock.set_unix_seconds(now);
     e.a.refresh_record(keys.peer_id()).await.unwrap();
     let base = e.a.snapshot().await.unwrap().publication.accepted.unwrap();

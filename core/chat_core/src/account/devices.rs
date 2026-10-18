@@ -3,7 +3,7 @@ use crate::CoreError;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use minicbor::{Decoder, Encoder};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RevokeIntent {
     pub peer_id: PeerId,
     pub generation: Generation,
@@ -12,6 +12,7 @@ pub struct RevokeIntent {
     pub target_transport: [u8; 32],
     pub nonce: [u8; 16],
     pub issued_at: u64,
+    #[serde(with = "signature_serde")]
     pub sig: [u8; 64],
 }
 
@@ -215,5 +216,16 @@ mod tests {
             assert!(RevokeIntent::from_frame(&frame).is_err());
         }
         assert!(RevokeIntent::from_frame(&vec![0; 65541]).is_err());
+    }
+}
+
+// Serde supports arrays through 32 bytes; this public signature stays exactly 64.
+mod signature_serde {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    pub fn serialize<S: Serializer>(value: &[u8; 64], serializer: S) -> Result<S::Ok, S::Error> {
+        value.as_slice().serialize(serializer)
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<[u8; 64], D::Error> {
+        Vec::<u8>::deserialize(deserializer)?.try_into().map_err(|_| serde::de::Error::custom("invalid public signature length"))
     }
 }

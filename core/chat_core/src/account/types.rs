@@ -4,7 +4,7 @@ use zeroize::Zeroizing;
 
 macro_rules! public_id {
     ($name:ident, $size:expr) => {
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
         pub struct $name(pub [u8; $size]);
 
         impl fmt::Display for $name {
@@ -26,7 +26,7 @@ public_id!(FlowId, 16);
 public_id!(TxId, 16);
 public_id!(StoreId, 16);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DeviceKind {
     Desktop,
     Mobile,
@@ -84,7 +84,7 @@ pub struct InvitePreview {
     pub issued_at: u64,
     pub expires_at: u64,
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ContactView {
     pub peer_id: PeerId,
     pub alias: String,

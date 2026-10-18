@@ -328,7 +328,7 @@ mod actor {
             .unwrap();
         assert_eq!(duplicate.alias, "local alias");
         assert!(duplicate.verified);
-        assert_eq!(a.snapshot().await.unwrap().contacts, vec![contact.peer_id]);
+        assert_eq!(a.snapshot().await.unwrap().contacts, vec![chat_core::account::ContactView { verified: true, ..contact.clone() }]);
         assert_eq!(a.contacts().await.unwrap(), vec![duplicate.clone()]);
         for alias in ["x".repeat(65), "a\nb".into(), "a\u{0085}b".into()] {
             assert!(a.accept_invite(input.clone(), alias).await.is_err());

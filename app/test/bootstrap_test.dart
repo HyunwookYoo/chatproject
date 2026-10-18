@@ -10,9 +10,46 @@ import 'package:flutter/widgets.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'support/fake_network_client.dart';
+import 'account_model_test.dart' show FakeAccountClient;
+import 'package:chat_app/account/account_model.dart';
 
 void main() {
   late DebugPrintCallback previousPrint;
+  testWidgets(
+    'protected storage failure stays on locked retry route without raw detail',
+    (tester) async {
+      debugPrint = previousPrint;
+      for (final code in [
+        rust.ErrorCode.storageLocked,
+        rust.ErrorCode.storageMissing,
+        rust.ErrorCode.storageCorrupt,
+        rust.ErrorCode.notAvailable,
+      ]) {
+        final core = FakeNetworkClient();
+        final account = FakeAccountClient()
+          ..openError = rust.CoreError(
+            code: code,
+            detail: 'private native detail',
+          );
+        final app = await bootstrap(
+          [],
+          initializeRust: () async {},
+          createClient: (_) => core,
+          createAccountClient: (_) => account,
+        );
+        expect(app, isA<AccountGate>());
+        await tester.pumpWidget(app);
+        expect(find.text(accountErrorMessage(code)), findsOneWidget);
+        expect(find.text('다시 시도'), findsOneWidget);
+        expect(find.textContaining('private native detail'), findsNothing);
+        expect(find.byTooltip('네트워크 측정'), findsNothing);
+        await tester.pumpWidget(const SizedBox());
+        await account.controller.close();
+        await core.controller.close();
+      }
+    },
+  );
+
   setUp(() {
     previousPrint = debugPrint;
     debugPrint = (message, {wrapWidth}) {};

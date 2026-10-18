@@ -99,6 +99,7 @@ pub struct CoreError {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChatEvent {
+    AccountChanged { revision: u64, view: Box<super::account::AccountView> },
     AccountAuthChanged { peer_id: String, installation_id: String, ready: bool },
     AccountCacheUsed { peer_id: String },
     ConnectionState {

@@ -77,6 +77,7 @@ class NetworkModel extends ChangeNotifier {
         );
       // Account identity/authentication is consumed by the account model. These
       // shared-stream events must not alter M2 endpoint diagnostics or timings.
+      case rust.ChatEvent_AccountChanged():
       case rust.ChatEvent_AccountAuthChanged():
       case rust.ChatEvent_AccountCacheUsed():
       case rust.ChatEvent_ConnectionState():
