@@ -49,7 +49,7 @@ struct Envelope {
     reply: Reply,
 }
 enum Control {
-    Activate { key: SecretKey, start: bool, ticket: u64, reply: oneshot::Sender<Result<(), CoreError>> },
+    Activate { key: Box<SecretKey>, start: bool, ticket: u64, reply: oneshot::Sender<Result<(), CoreError>> },
     Quiesce { reply: oneshot::Sender<Result<(), CoreError>> },
 }
 #[derive(Default)]
@@ -124,7 +124,7 @@ impl NetworkHandle {
     }
     pub(crate) async fn install_key(&self, key: SecretKey, start: bool, ticket: u64) -> Result<(), CoreError> {
         let (reply, received) = oneshot::channel();
-        if self.controls.try_send(Control::Activate { key, start, ticket, reply }).is_err() {
+        if self.controls.try_send(Control::Activate { key: Box::new(key), start, ticket, reply }).is_err() {
             // No transition was queued: remain blocked, with the persisted key untouched.
             return Err(err(ErrorCode::Busy));
         }
@@ -337,7 +337,7 @@ impl Manager {
                     return;
                 }
                 self.stop().await;
-                self.key = key;
+                self.key = *key;
                 self.peers.clear();
                 self.info.peers.clear();
                 self.info.endpoint_id = Some(self.key.public().to_string());
@@ -405,11 +405,10 @@ impl Manager {
             }
             #[cfg(all(feature = "test-hooks", debug_assertions))]
             NetworkOp::ConfigureLocal { relay } => {
-                if let Some(url) = &relay {
-                    if let Err(error) = crate::puppet::protocol::validate_relay(url.as_str()) {
-                        let _ = reply.send(Err(error));
-                        return;
-                    }
+                if let Some(url) = &relay
+                    && let Err(error) = crate::puppet::protocol::validate_relay(url.as_str()) {
+                    let _ = reply.send(Err(error));
+                    return;
                 }
                 let same = matches!(&self.profile, NetworkProfile::Local { relay: current } if current == &relay);
                 if same {
@@ -1198,7 +1197,7 @@ mod tests {
         let ticket = manager.gate.block();
         let (reply, received) = oneshot::channel();
         let key = SecretKey::generate();
-        manager.control(Control::Activate { key: key.clone(), start: false, ticket, reply }).await;
+        manager.control(Control::Activate { key: Box::new(key.clone()), start: false, ticket, reply }).await;
         received.await.unwrap().unwrap();
         let before = manager.info.clone();
         manager.cancel = CancellationToken::new();

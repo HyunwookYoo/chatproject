@@ -1,8 +1,10 @@
 mod certificate;
 pub mod clock;
+mod creation;
 mod keys;
 mod pkarr_backend;
 mod record;
+mod recovery;
 pub mod storage;
 mod types;
 mod wire;
@@ -21,4 +23,5 @@ pub use keys::{
 pub use types::{DeviceKind, FlowId, Generation, InstallationId, PeerId, Secret32, StoreId, TxId};
 
 mod manager;
-pub use manager::{AccountHandle, CandidateInfo};
+pub use creation::RecoveryDisplay;
+pub use manager::{AccountHandle, AccountPhase, AccountView, CandidateInfo, PublishIntent};

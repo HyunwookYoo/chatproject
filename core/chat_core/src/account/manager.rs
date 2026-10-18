@@ -1,6 +1,8 @@
 //! Single owner of protected account state. A5 extends commands and AccountState.
 use super::{
-    InstallationId, derive_device, random_secret,
+    FlowId, InstallationCert, InstallationId, PeerId, RecoveryDisplay,
+    creation::Creation,
+    derive_device, random_secret, recovery,
     storage::{KeyProtector, Store, schema::AccountState},
 };
 use crate::{CoreError, ErrorCode, NetworkHandle};
@@ -13,13 +15,80 @@ use std::{
     time::Duration,
 };
 use tokio::sync::{mpsc, oneshot, watch};
+use zeroize::Zeroizing;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountPhase {
+    Unconfigured,
+    Candidate,
+    PendingImport,
+    LocalReady,
+    PublishPending,
+    Active,
+    Conflict,
+    Locked,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishIntent {
+    LocalCreate,
+    Replacement,
+}
+/// Public data only. No recovery display or private keys can enter this view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountView {
+    pub revision: u64,
+    pub phase: AccountPhase,
+    pub public_peer_id: Option<PeerId>,
+    pub installation: Option<InstallationId>,
+    pub devices: Vec<InstallationCert>,
+    pub contacts: Vec<PeerId>,
+    pub pair: Option<FlowId>,
+    pub publish_intents: Vec<PublishIntent>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CandidateInfo {
     pub installation_id: InstallationId,
     pub endpoint_id: String,
 }
-struct Prepare(oneshot::Sender<Result<CandidateInfo, CoreError>>);
+enum Command {
+    Prepare(oneshot::Sender<Result<CandidateInfo, CoreError>>),
+    Begin(oneshot::Sender<Result<RecoveryDisplay, CoreError>>),
+    Confirm(
+        FlowId,
+        Zeroizing<[String; 3]>,
+        oneshot::Sender<Result<(), CoreError>>,
+    ),
+    Cancel(FlowId, oneshot::Sender<Result<(), CoreError>>),
+    Recover(
+        Zeroizing<String>,
+        bool,
+        oneshot::Sender<Result<(), CoreError>>,
+    ),
+    Snapshot(oneshot::Sender<Result<AccountView, CoreError>>),
+}
+struct Queued {
+    ticket: u64,
+    command: Command,
+}
+impl Command {
+    fn reject(self, error: CoreError) {
+        match self {
+            Self::Prepare(reply) => {
+                let _ = reply.send(Err(error));
+            }
+            Self::Begin(reply) => {
+                let _ = reply.send(Err(error));
+            }
+            Self::Confirm(_, _, reply) | Self::Cancel(_, reply) | Self::Recover(_, _, reply) => {
+                let _ = reply.send(Err(error));
+            }
+            Self::Snapshot(reply) => {
+                let _ = reply.send(Err(error));
+            }
+        }
+    }
+}
 #[derive(Clone, Copy)]
 struct Request {
     ticket: u64,
@@ -34,7 +103,7 @@ struct Shared {
 }
 #[derive(Clone)]
 pub struct AccountHandle {
-    commands: mpsc::Sender<Prepare>,
+    commands: mpsc::Sender<Queued>,
     shared: Arc<Shared>,
 }
 fn unavailable(code: ErrorCode) -> CoreError {
@@ -55,6 +124,11 @@ impl AccountHandle {
             .as_ref()
             .map(AccountState::decode)
             .transpose()?;
+        let revision = match &state {
+            Some(AccountState::Active(local)) => local.revision,
+            Some(AccountState::Candidate(_)) => 1,
+            None => 0,
+        };
         let ticket = network.block();
         let (requests, received) = watch::channel(Request {
             ticket,
@@ -70,6 +144,8 @@ impl AccountHandle {
             Manager {
                 store,
                 state,
+                creation: None,
+                revision,
                 shared: shared.clone(),
             }
             .run(input, received),
@@ -79,16 +155,46 @@ impl AccountHandle {
     /// Persists the inactive installation before binding its Endpoint. No account
     /// membership, identity, certificate, or QR authorization is implied.
     pub async fn prepare_candidate(&self) -> Result<CandidateInfo, CoreError> {
-        if self.shared.requests.borrow().suspend || self.lifecycle_status() == 2 {
-            return Err(unavailable(ErrorCode::StorageLocked));
-        }
+        self.send(Command::Prepare).await
+    }
+    async fn send<T>(
+        &self,
+        command: impl FnOnce(oneshot::Sender<Result<T, CoreError>>) -> Command,
+    ) -> Result<T, CoreError> {
         let (reply, result) = oneshot::channel();
+        let ticket = self.shared.requests.borrow().ticket;
         self.commands
-            .try_send(Prepare(reply))
+            .try_send(Queued {
+                ticket,
+                command: command(reply),
+            })
             .map_err(|_| unavailable(ErrorCode::Busy))?;
         result
             .await
             .map_err(|_| unavailable(ErrorCode::NotAvailable))?
+    }
+    pub async fn begin_create(&self) -> Result<RecoveryDisplay, CoreError> {
+        self.send(Command::Begin).await
+    }
+    pub async fn confirm_create(
+        &self,
+        flow: FlowId,
+        answers: [String; 3],
+    ) -> Result<(), CoreError> {
+        let answers = Zeroizing::new(answers);
+        self.send(|reply| Command::Confirm(flow, answers, reply))
+            .await
+    }
+    pub async fn cancel_create(&self, flow: FlowId) -> Result<(), CoreError> {
+        self.send(|reply| Command::Cancel(flow, reply)).await
+    }
+    pub async fn recover(&self, words: String, confirm_replacement: bool) -> Result<(), CoreError> {
+        let words = Zeroizing::new(words);
+        self.send(|reply| Command::Recover(words, confirm_replacement, reply))
+            .await
+    }
+    pub async fn snapshot(&self) -> Result<AccountView, CoreError> {
+        self.send(Command::Snapshot).await
     }
     /// ABI status: 0 completed, 1 pending, 2 failed. Never waits for file IO.
     pub fn lifecycle_status(&self) -> i32 {
@@ -127,12 +233,14 @@ impl AccountHandle {
 struct Manager {
     store: Store,
     state: Option<AccountState>,
+    creation: Option<Creation>,
+    revision: u64,
     shared: Arc<Shared>,
 }
 impl Manager {
     async fn run(
         mut self,
-        mut commands: mpsc::Receiver<Prepare>,
+        mut commands: mpsc::Receiver<Queued>,
         mut requests: watch::Receiver<Request>,
     ) {
         let initial = *requests.borrow_and_update();
@@ -146,9 +254,20 @@ impl Manager {
                     let result = self.lifecycle(request).await;
                     self.complete(request, result);
                 }
-                command = commands.recv() => match command {
-                    Some(Prepare(reply)) => { let result = self.prepare().await; let _ = reply.send(result); }
-                    None => break,
+                command = commands.recv() => {
+                    let Some(queued) = command else { break; };
+                    if !matches!(queued.command, Command::Snapshot(_)) && queued.ticket != self.shared.requests.borrow().ticket {
+                        queued.command.reject(unavailable(ErrorCode::StorageLocked));
+                        continue;
+                    }
+                    match queued.command {
+                        Command::Prepare(reply) => { let result = self.prepare().await; let _ = reply.send(result); }
+                        Command::Begin(reply) => { let result = self.begin(); let _ = reply.send(result); }
+                        Command::Confirm(flow, answers, reply) => { let result = self.confirm(flow, &answers).await; let _ = reply.send(result); }
+                        Command::Cancel(flow, reply) => { let result = self.cancel(flow); let _ = reply.send(result); }
+                        Command::Recover(words, confirmed, reply) => { let result = self.recover(&words, confirmed).await; let _ = reply.send(result); }
+                        Command::Snapshot(reply) => { let _ = reply.send(Ok(self.view())); }
+                    }
                 }
             }
         }
@@ -183,6 +302,9 @@ impl Manager {
         Ok(())
     }
     async fn lifecycle(&mut self, request: Request) -> Result<(), CoreError> {
+        if self.creation.take().is_some() {
+            self.revision += 1;
+        }
         // The caller already gated all new operations. Drain only for a bounded
         // time; pending/failure stays closed. Store locks never cross an await.
         let stopped =
@@ -201,7 +323,12 @@ impl Manager {
             .load()
             .and_then(|state| state.as_ref().map(AccountState::decode).transpose());
         match loaded {
-            Ok(state) => self.state = state,
+            Ok(state) => {
+                if let Some(AccountState::Active(local)) = &state {
+                    self.revision = self.revision.max(local.revision);
+                }
+                self.state = state;
+            }
             Err(error) => {
                 self.store.suspend()?;
                 return Err(error);
@@ -214,21 +341,19 @@ impl Manager {
         result
     }
     async fn prepare(&mut self) -> Result<CandidateInfo, CoreError> {
-        let request = *self.shared.requests.borrow();
-        if request.suspend
-            || self.shared.network.desired_suspend()
-            || self.shared.status.load(Ordering::Acquire) != (request.ticket << 2) | 1
-        {
-            return Err(unavailable(ErrorCode::StorageLocked));
+        let request = self.ready()?;
+        self.allow_setup()?;
+        if self.creation.is_some() {
+            return Err(unavailable(ErrorCode::Busy));
         }
         if self.state.is_none() {
             let state = AccountState::Candidate(derive_device(random_secret()?)?);
-            self.store.commit(&state.encode())?;
+            self.ensure_ready(request)?;
+            self.persist(&state, request)?;
             self.state = Some(state);
+            self.revision += 1;
         }
-        if !self.current(request) {
-            return Err(unavailable(ErrorCode::StorageLocked));
-        }
+        self.ensure_ready(request)?;
         let device = self.state.as_ref().unwrap().device();
         let candidate = CandidateInfo {
             installation_id: device.installation_id(),
@@ -238,10 +363,148 @@ impl Manager {
         };
         let key = iroh::SecretKey::from_bytes(device.transport().as_bytes());
         self.shared.network.activate_key(key).await?;
-        if !self.current(request) {
+        self.ensure_ready(request)?;
+        Ok(candidate)
+    }
+    fn ready(&self) -> Result<Request, CoreError> {
+        let request = *self.shared.requests.borrow();
+        if request.suspend
+            || self.shared.network.desired_suspend()
+            || self.shared.status.load(Ordering::Acquire) != (request.ticket << 2) | 1
+        {
             return Err(unavailable(ErrorCode::StorageLocked));
         }
-        Ok(candidate)
+        Ok(request)
+    }
+    fn ensure_ready(&self, request: Request) -> Result<(), CoreError> {
+        if self.ready()?.ticket != request.ticket {
+            return Err(unavailable(ErrorCode::StorageLocked));
+        }
+        Ok(())
+    }
+    fn allow_setup(&self) -> Result<(), CoreError> {
+        if matches!(self.state, Some(AccountState::Active(_))) {
+            return Err(CoreError::new(
+                ErrorCode::AccountExists,
+                "Account already exists; use a separate empty storage folder for recovery",
+            ));
+        }
+        Ok(())
+    }
+    fn begin(&mut self) -> Result<RecoveryDisplay, CoreError> {
+        let request = self.ready()?;
+        self.allow_setup()?;
+        let (creation, display) = Creation::begin()?;
+        self.ensure_ready(request)?;
+        self.creation = Some(creation);
+        self.revision += 1;
+        Ok(display)
+    }
+    fn cancel(&mut self, flow: FlowId) -> Result<(), CoreError> {
+        self.ready()?;
+        self.allow_setup()?;
+        if self.creation.as_ref().map(|c| c.flow) != Some(flow) {
+            return Err(unavailable(ErrorCode::InvalidRecovery));
+        }
+        self.creation = None;
+        self.revision += 1;
+        Ok(())
+    }
+    async fn confirm(&mut self, flow: FlowId, answers: &[String; 3]) -> Result<(), CoreError> {
+        let request = self.ready()?;
+        self.allow_setup()?;
+        if !self
+            .creation
+            .as_ref()
+            .is_some_and(|c| c.matches(flow, answers))
+        {
+            return Err(unavailable(ErrorCode::InvalidRecovery));
+        }
+        let creation = self.creation.take().unwrap();
+        let local =
+            recovery::local_account(creation.keys, PublishIntent::LocalCreate, self.revision + 1)?;
+        self.establish(local, request).await
+    }
+    async fn recover(&mut self, words: &str, confirmed: bool) -> Result<(), CoreError> {
+        let request = self.ready()?;
+        self.allow_setup()?;
+        if !confirmed {
+            return Err(unavailable(ErrorCode::AccountRestricted));
+        }
+        let local = recovery::recover(words, self.revision + 1)?;
+        self.establish(local, request).await
+    }
+    async fn establish(
+        &mut self,
+        local: super::storage::schema::LocalAccount,
+        request: Request,
+    ) -> Result<(), CoreError> {
+        self.ensure_ready(request)?;
+        let state = AccountState::Active(Box::new(local));
+        self.persist(&state, request)?;
+        let AccountState::Active(local) = &state else {
+            unreachable!()
+        };
+        self.revision = local.revision;
+        self.state = Some(state);
+        self.creation = None;
+        self.ensure_ready(request)?;
+        let device = self.state.as_ref().unwrap().device();
+        self.shared
+            .network
+            .activate_key(iroh::SecretKey::from_bytes(device.transport().as_bytes()))
+            .await?;
+        self.ensure_ready(request)
+    }
+    fn persist(&mut self, state: &AccountState, request: Request) -> Result<(), CoreError> {
+        self.ensure_ready(request)?;
+        if let Err(error) = self.store.commit(&state.encode()) {
+            // An error can follow atomic replacement. Do not trust the old
+            // in-memory state or permit another setup to overwrite the new one.
+            // A new suspend/resume cycle must reload and validate the actual disk.
+            self.shared.network.block();
+            self.shared
+                .status
+                .fetch_max((request.ticket << 2) | 2, Ordering::AcqRel);
+            return Err(error);
+        }
+        Ok(())
+    }
+    fn view(&self) -> AccountView {
+        let mut view = AccountView {
+            revision: self.revision,
+            phase: AccountPhase::Unconfigured,
+            public_peer_id: None,
+            installation: None,
+            devices: vec![],
+            contacts: vec![],
+            pair: None,
+            publish_intents: vec![],
+        };
+        if self.ready().is_err() {
+            view.phase = AccountPhase::Locked;
+            return view;
+        }
+        match &self.state {
+            Some(AccountState::Candidate(device)) => {
+                view.phase = AccountPhase::Candidate;
+                view.installation = Some(device.installation_id());
+            }
+            Some(AccountState::Active(local)) => {
+                view.revision = local.revision;
+                view.phase = match local.intent {
+                    PublishIntent::LocalCreate => AccountPhase::LocalReady,
+                    PublishIntent::Replacement => AccountPhase::PublishPending,
+                };
+                view.public_peer_id = Some(local.keys.peer_id());
+                view.installation = Some(local.device.installation_id());
+                view.devices.push(local.cert.clone());
+                view.publish_intents.push(local.intent);
+            }
+            None if self.creation.is_some() => view.phase = AccountPhase::Candidate,
+            None => {}
+        }
+        view
     }
 }
 
@@ -263,6 +526,91 @@ mod tests {
         fn delete(&self, _: StoreId) -> Result<(), CoreError> {
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn completed_replace_error_cannot_overwrite_established_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let slot = CoreSlot::new();
+        slot.start(
+            CoreConfig {
+                data_dir: dir.path().into(),
+            },
+            &EventBus::new(),
+        )
+        .unwrap();
+        let network = slot.network().unwrap();
+        network.configure_local(None).await.unwrap();
+        let ticket = network.begin_account();
+        let request = Request {
+            ticket,
+            suspend: false,
+        };
+        let (requests, _) = watch::channel(request);
+        let shared = Arc::new(Shared {
+            network: network.clone(),
+            requests,
+            status: AtomicU64::new(ticket << 2),
+        });
+        let mut manager = Manager {
+            store: Store::open(dir.path(), Arc::new(Protector)).unwrap(),
+            state: None,
+            creation: None,
+            revision: 0,
+            shared,
+        };
+        let restored = manager.lifecycle(request).await;
+        manager.complete(request, restored);
+        manager.prepare().await.unwrap();
+        let local = recovery::recover(
+            &super::super::encode_recovery(&Secret32::from([0; 32])).unwrap(),
+            2,
+        )
+        .unwrap();
+        let peer = local.keys.peer_id();
+        let state = AccountState::Active(Box::new(local));
+        let result =
+            super::super::storage::with_after_replace_failure(|| manager.persist(&state, request));
+        assert_eq!(result.unwrap_err().code, ErrorCode::StorageFull);
+        assert_eq!(manager.view().phase, AccountPhase::Locked);
+        assert_eq!(
+            manager.begin().err().unwrap().code,
+            ErrorCode::StorageLocked
+        );
+        assert_eq!(
+            manager.recover("invalid", true).await.unwrap_err().code,
+            ErrorCode::StorageLocked
+        );
+        let bytes = std::fs::read(dir.path().join("account.bin")).unwrap();
+        // The call returned Err, but atomic replacement really committed Active.
+        let AccountState::Active(saved) =
+            AccountState::decode(&manager.store.load().unwrap().unwrap()).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(saved.keys.peer_id(), peer);
+        for suspend in [true, false] {
+            let ticket = network.block();
+            let request = Request { ticket, suspend };
+            manager.shared.requests.send_replace(request);
+            manager.shared.status.store(ticket << 2, Ordering::Release);
+            let result = manager.lifecycle(request).await;
+            manager.complete(request, result);
+        }
+        assert_eq!(
+            manager.begin().err().unwrap().code,
+            ErrorCode::AccountExists
+        );
+        assert_eq!(
+            manager.recover("invalid", true).await.unwrap_err().code,
+            ErrorCode::AccountExists
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("account.bin")).unwrap(),
+            bytes
+        );
+        assert_eq!(manager.view().public_peer_id, Some(peer));
+        network.execute(NetworkOp::Stop).await.unwrap();
     }
 
     #[tokio::test]
@@ -292,6 +640,8 @@ mod tests {
         let mut manager = Manager {
             store: Store::open(dir.path(), Arc::new(Protector)).unwrap(),
             state: None,
+            creation: None,
+            revision: 0,
             shared,
         };
         let restored = manager.lifecycle(request).await;

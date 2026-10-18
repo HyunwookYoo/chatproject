@@ -118,10 +118,25 @@ pub(super) fn replace(root: &Path, name: &str, bytes: &[u8]) -> Result<(), CoreE
     replace_file(&temporary, &destination).map_err(|_| write_error())?;
     #[cfg(test)]
     tests::boundary(name, "after_replace");
+    #[cfg(test)]
+    tests::io_failure("after_replace").map_err(|_| write_error())?;
     sync_directory(root)?;
     #[cfg(test)]
     tests::boundary(name, "after_directory_sync");
     Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn with_after_replace_failure<T>(operation: impl FnOnce() -> T) -> T {
+    struct Restore(Option<&'static str>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            tests::FAIL_AT.with(|failure| failure.set(self.0));
+        }
+    }
+    let previous = tests::FAIL_AT.with(|failure| failure.replace(Some("after_replace")));
+    let _restore = Restore(previous);
+    operation()
 }
 
 #[cfg(test)]
@@ -131,6 +146,27 @@ mod tests {
         test_support::{protector, state},
     };
     use std::{fs, process::Command};
+
+    #[test]
+    fn after_replace_scope_restores_previous_failure_on_return_error_and_panic() {
+        for panic in [false, true] {
+            FAIL_AT.with(|failure| failure.set(Some("sync")));
+            let result = std::panic::catch_unwind(|| {
+                super::with_after_replace_failure(|| {
+                    assert!(io_failure("after_replace").is_err());
+                    assert!(io_failure("sync").is_ok());
+                    if panic {
+                        panic!("test-only unwind");
+                    }
+                    Err::<(), ()>(())
+                })
+            });
+            assert_eq!(result.is_err(), panic);
+            assert!(io_failure("after_replace").is_ok());
+            assert!(io_failure("sync").is_err());
+            FAIL_AT.with(|failure| failure.set(None));
+        }
+    }
 
     pub(super) fn boundary(name: &str, boundary: &str) {
         let target = std::env::var("CHAT_A2_CRASH_FILE").unwrap_or_else(|_| "account.bin".into());

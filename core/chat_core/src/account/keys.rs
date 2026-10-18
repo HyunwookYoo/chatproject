@@ -19,6 +19,11 @@ pub struct AccountKeys {
 }
 
 impl AccountKeys {
+    /// Reconstitute a stored signing seed, without applying the recovery KDF again.
+    pub(crate) fn from_identity(identity: Secret32) -> Self {
+        let peer = PeerId(public_key(&identity));
+        Self { identity, peer }
+    }
     pub fn peer_id(&self) -> PeerId {
         self.peer
     }
