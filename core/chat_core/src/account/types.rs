@@ -67,3 +67,37 @@ impl Secret32 {
         &mut self.0
     }
 }
+
+/// A public endpoint suggestion, never device authorization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EndpointHint {
+    pub transport_public_key: [u8; 32],
+    pub relay_url: Option<String>,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvitePreview {
+    pub peer_id: PeerId,
+    pub issuing_cert: super::InstallationCert,
+    pub endpoint_hint: EndpointHint,
+    /// Signed display suggestion, never a verified real-world name.
+    pub display_name: Option<String>,
+    pub issued_at: u64,
+    pub expires_at: u64,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContactView {
+    pub peer_id: PeerId,
+    pub alias: String,
+    /// Local independent-channel confirmation of the full account safety digest.
+    pub verified: bool,
+    /// Sticky notice after a fresh proof uses a different installation.
+    pub new_device: bool,
+    /// True unless an authorized live B3 grant currently proves this peer.
+    pub device_unverified: bool,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SafetyDisplay {
+    pub digest: [u8; 32],
+    pub groups: String,
+    pub qr: String,
+}

@@ -56,6 +56,14 @@ pub struct CandidateInfo {
     pub endpoint_id: String,
 }
 enum Command {
+    CreateInvite(Option<String>, oneshot::Sender<Result<String, CoreError>>),
+    AcceptInvite(
+        String,
+        String,
+        oneshot::Sender<Result<super::ContactView, CoreError>>,
+    ),
+    Contacts(oneshot::Sender<Result<Vec<super::ContactView>, CoreError>>),
+    ConfirmSafety(PeerId, [u8; 32], oneshot::Sender<Result<(), CoreError>>),
     Connect(PeerId, oneshot::Sender<Result<(), CoreError>>),
     Prepare(oneshot::Sender<Result<CandidateInfo, CoreError>>),
     Begin(oneshot::Sender<Result<RecoveryDisplay, CoreError>>),
@@ -82,6 +90,15 @@ struct Queued {
 impl Command {
     fn reject(self, error: CoreError) {
         match self {
+            Self::CreateInvite(_, reply) => {
+                let _ = reply.send(Err(error));
+            }
+            Self::AcceptInvite(_, _, reply) => {
+                let _ = reply.send(Err(error));
+            }
+            Self::Contacts(reply) => {
+                let _ = reply.send(Err(error));
+            }
             Self::Prepare(reply) => {
                 let _ = reply.send(Err(error));
             }
@@ -94,7 +111,8 @@ impl Command {
             | Self::Connect(_, reply)
             | Self::Refresh(_, reply)
             | Self::Revoke(_, reply)
-            | Self::Resolve(_, reply) => {
+            | Self::Resolve(_, reply)
+            | Self::ConfirmSafety(_, _, reply) => {
                 let _ = reply.send(Err(error));
             }
             Self::Snapshot(reply) => {
@@ -223,6 +241,24 @@ impl AccountHandle {
     pub async fn snapshot(&self) -> Result<AccountView, CoreError> {
         self.send(Command::Snapshot).await
     }
+    pub async fn create_invite(&self, name: Option<String>) -> Result<String, CoreError> {
+        self.send(|reply| Command::CreateInvite(name, reply)).await
+    }
+    pub async fn accept_invite(
+        &self,
+        input: String,
+        alias: String,
+    ) -> Result<super::ContactView, CoreError> {
+        self.send(|reply| Command::AcceptInvite(input, alias, reply))
+            .await
+    }
+    pub async fn contacts(&self) -> Result<Vec<super::ContactView>, CoreError> {
+        self.send(Command::Contacts).await
+    }
+    pub async fn confirm_safety(&self, peer: PeerId, digest: [u8; 32]) -> Result<(), CoreError> {
+        self.send(|reply| Command::ConfirmSafety(peer, digest, reply))
+            .await
+    }
     pub async fn connect_account(&self, peer: PeerId) -> Result<(), CoreError> {
         self.send(|reply| Command::Connect(peer, reply)).await
     }
@@ -311,6 +347,10 @@ impl Manager {
                         continue;
                     }
                     match queued.command {
+                        Command::CreateInvite(name,reply) => {let result=self.create_invite(name);let _=reply.send(result);}
+                        Command::AcceptInvite(input,alias,reply) => {let result=self.accept_invite(&input,alias);let _=reply.send(result);}
+                        Command::Contacts(reply) => {let result=self.contact_views();let _=reply.send(result);}
+                        Command::ConfirmSafety(peer,digest,reply) => {let result=self.confirm_safety(peer,digest);let _=reply.send(result);}
                         Command::Connect(peer,reply) => {let result=self.connect(peer).await;let _=reply.send(result);}
                         Command::Prepare(reply) => { let result = self.prepare().await; let _ = reply.send(result); }
                         Command::Begin(reply) => { let result = self.begin(); let _ = reply.send(result); }
@@ -763,6 +803,7 @@ impl Manager {
                 view.public_peer_id = Some(local.keys.peer_id());
                 view.installation = Some(local.device.installation_id());
                 view.devices.push(local.cert.clone());
+                view.contacts = local.contacts.iter().map(|c| c.peer).collect();
                 view.publish_intents.push(local.intent);
                 view.publication = local.records.view();
                 match local.records.state {
@@ -1434,6 +1475,10 @@ impl Manager {
             conn.close(0u32.into(), b"account restricted");
             return Err(unavailable(ErrorCode::AccountRestricted));
         }
+        if let Err(error) = self.observe_contact_device(grant.peer, grant.installation) {
+            conn.close(0u32.into(), b"contact persistence failed");
+            return Err(error);
+        }
         let mut sessions = self.auth.registry.0.lock().unwrap();
         sessions.retain(|s| {
             if s.grant.peer == grant.peer && s.grant.installation == grant.installation {
@@ -1680,5 +1725,126 @@ impl Manager {
             return Err(unavailable(ErrorCode::AccountRestricted));
         }
         Ok(body.to_vec())
+    }
+}
+
+impl Manager {
+    fn create_invite(&self, name: Option<String>) -> Result<String, CoreError> {
+        self.ready()?;
+        let local = self.local()?;
+        super::invite::create(
+            &local.keys,
+            &local.cert,
+            name,
+            self.services.clock.unix_seconds(),
+        )
+    }
+    fn contact_view(&self, c: &super::contacts::Contact) -> super::ContactView {
+        let verified = self.auth.registry.0.lock().unwrap().iter().any(|s| {
+            s.ready
+                && s.conn.close_reason().is_none()
+                && s.grant.peer == c.peer
+                && self.grant_authorized(&s.grant)
+        });
+        c.view(verified)
+    }
+    fn contact_views(&self) -> Result<Vec<super::ContactView>, CoreError> {
+        self.ready()?;
+        Ok(self
+            .local()?
+            .contacts
+            .iter()
+            .map(|c| self.contact_view(c))
+            .collect())
+    }
+    fn commit_contacts(
+        &mut self,
+        contacts: Vec<super::contacts::Contact>,
+        request: Request,
+    ) -> Result<(), CoreError> {
+        self.ensure_ready(request)?;
+        let revision = self
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| unavailable(ErrorCode::StorageFull))?;
+        let mut state = self.state.take().unwrap();
+        let AccountState::Active(local) = &mut state else {
+            unreachable!()
+        };
+        local.contacts = contacts;
+        local.revision = revision;
+        let result = self.persist(&state, request);
+        self.state = Some(state);
+        if result.is_ok() {
+            self.revision = revision;
+        }
+        result
+    }
+    fn accept_invite(
+        &mut self,
+        input: &str,
+        alias: String,
+    ) -> Result<super::ContactView, CoreError> {
+        let request = self.ready()?;
+        let preview = super::parse_invite(input, self.services.clock.unix_seconds())?;
+        super::invite::validate_name(&alias)?;
+        let local = self.local()?;
+        if local.keys.peer_id() == preview.peer_id {
+            return Err(unavailable(ErrorCode::AccountRestricted));
+        }
+        if let Some(c) = local.contacts.iter().find(|c| c.peer == preview.peer_id) {
+            return Ok(self.contact_view(c));
+        }
+        if local.contacts.len() >= 1000 {
+            return Err(unavailable(ErrorCode::StorageFull));
+        }
+        let mut contacts = local.contacts.clone();
+        let contact = super::contacts::Contact {
+            peer: preview.peer_id,
+            alias,
+            verified_digest: None,
+            known_installation: Some(preview.issuing_cert.installation_id),
+            new_device: false,
+        };
+        contacts.push(contact.clone());
+        contacts.sort_by_key(|c| c.peer);
+        self.commit_contacts(contacts, request)?;
+        Ok(self.contact_view(&contact))
+    }
+    fn confirm_safety(&mut self, peer: PeerId, digest: [u8; 32]) -> Result<(), CoreError> {
+        let request = self.ready()?;
+        let local = self.local()?;
+        if super::safety_digest(local.keys.peer_id(), peer) != digest {
+            return Err(super::wire::invalid());
+        }
+        let mut contacts = local.contacts.clone();
+        let contact = contacts
+            .iter_mut()
+            .find(|c| c.peer == peer)
+            .ok_or_else(|| unavailable(ErrorCode::AccountRestricted))?;
+        if contact.verified_digest == Some(digest) {
+            return Ok(());
+        }
+        contact.verified_digest = Some(digest);
+        self.commit_contacts(contacts, request)
+    }
+    fn observe_contact_device(
+        &mut self,
+        peer: PeerId,
+        installation: InstallationId,
+    ) -> Result<(), CoreError> {
+        let request = self.ready()?;
+        let mut contacts = self.local()?.contacts.clone();
+        let Some(c) = contacts.iter_mut().find(|c| c.peer == peer) else {
+            return Ok(());
+        };
+        if c.known_installation == Some(installation) {
+            return Ok(());
+        }
+        // Invite baseline is only a comparison hint. This path requires a fresh
+        // authorized B3 proof, and the notice remains sticky across later proofs.
+        c.new_device |= c.known_installation.is_some();
+        c.known_installation = Some(installation);
+        self.commit_contacts(contacts, request)
     }
 }

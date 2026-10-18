@@ -35,5 +35,6 @@ pub(super) fn local_account(
         intent,
         records: super::publication::RecordState::new()?,
         remote: vec![],
+        contacts: vec![],
     })
 }

@@ -171,7 +171,7 @@ impl Fixture {
             .unwrap();
         let mut payload = minicbor::Encoder::new(Vec::new());
         payload
-            .array(9)
+            .array(10)
             .unwrap()
             .u8(1)
             .unwrap()
@@ -188,6 +188,8 @@ impl Fixture {
             .u8(0)
             .unwrap()
             .bytes(&records.into_writer())
+            .unwrap()
+            .bytes(&[0x80])
             .unwrap()
             .bytes(&[0x80])
             .unwrap();
@@ -405,7 +407,7 @@ fn durable_snapshot(root: &std::path::Path) -> StoredPlaintext {
 fn durable_tombstones(root: &std::path::Path) -> Vec<chat_core::account::RevokeIntent> {
     let state = durable_snapshot(root);
     let mut d = minicbor::Decoder::new(&state.payload);
-    assert_eq!(d.array().unwrap(), Some(9));
+    assert_eq!(d.array().unwrap(), Some(10));
     for _ in 0..7 {
         d.skip().unwrap();
     }
@@ -731,56 +733,58 @@ async fn remote_high_water_conflict_survives_store_reload() {
     assert!(a.account.connect_account(b.peer).await.is_err());
 }
 #[tokio::test]
-async fn previous_array8_snapshot_is_rejected_without_file_mutation() {
-    let (a, _b, _backend) = pair().await;
-    a.account.request_suspend();
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while a.account.lifecycle_status() == 1 {
-            tokio::task::yield_now().await;
+async fn previous_array8_and9_snapshots_are_rejected_without_file_mutation() {
+    for field_count in [8, 9] {
+        let (a, _b, _backend) = pair().await;
+        a.account.request_suspend();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while a.account.lifecycle_status() == 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let path = a._dir.path().to_path_buf();
+        drop(a.account);
+        drop(a.slot);
+        let mut store = Store::open(&path, support::protector()).unwrap();
+        let mut state = store.load().unwrap().unwrap();
+        let mut d = minicbor::Decoder::new(&state.payload);
+        d.array().unwrap();
+        for _ in 0..field_count {
+            d.skip().unwrap();
         }
-    })
-    .await
-    .unwrap();
-    let path = a._dir.path().to_path_buf();
-    drop(a.account);
-    drop(a.slot);
-    let mut store = Store::open(&path, support::protector()).unwrap();
-    let mut state = store.load().unwrap().unwrap();
-    let mut d = minicbor::Decoder::new(&state.payload);
-    d.array().unwrap();
-    for _ in 0..8 {
-        d.skip().unwrap();
-    }
-    let end = d.position();
-    state.payload.truncate(end);
-    state.payload[0] = 0x88;
-    store.commit(&state).unwrap();
-    drop(store);
-    let before = std::fs::read(path.join("account.bin")).unwrap();
-    let slot = CoreSlot::new();
-    slot.start(
-        CoreConfig {
-            data_dir: path.clone(),
-        },
-        &EventBus::new(),
-    )
-    .unwrap();
-    slot.network().unwrap().configure_local(None).await.unwrap();
-    let backend = Arc::new(Backend {
-        packets: Mutex::new(BTreeMap::new()),
-        offline: AtomicBool::new(true),
-        capture: Mutex::new(None),
-        observed: Mutex::new(vec![]),
-        ..Default::default()
-    });
-    assert!(
-        slot.open_account_with_services(
-            support::protector(),
-            AccountServices::new(backend, Arc::new(FakeClock::new(NOW, 0)))
+        let end = d.position();
+        state.payload.truncate(end);
+        state.payload[0] = 0x80 + field_count;
+        store.commit(&state).unwrap();
+        drop(store);
+        let before = std::fs::read(path.join("account.bin")).unwrap();
+        let slot = CoreSlot::new();
+        slot.start(
+            CoreConfig {
+                data_dir: path.clone(),
+            },
+            &EventBus::new(),
         )
-        .is_err()
-    );
-    assert_eq!(std::fs::read(path.join("account.bin")).unwrap(), before);
+        .unwrap();
+        slot.network().unwrap().configure_local(None).await.unwrap();
+        let backend = Arc::new(Backend {
+            packets: Mutex::new(BTreeMap::new()),
+            offline: AtomicBool::new(true),
+            capture: Mutex::new(None),
+            observed: Mutex::new(vec![]),
+            ..Default::default()
+        });
+        assert!(
+            slot.open_account_with_services(
+                support::protector(),
+                AccountServices::new(backend, Arc::new(FakeClock::new(NOW, 0)))
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(path.join("account.bin")).unwrap(), before);
+    }
 }
 #[tokio::test]
 async fn lifecycle_suspend_invalidates_ready_event_and_cancels_account_work() {
@@ -1259,7 +1263,7 @@ async fn publish_conflict_without_signed_evidence_closes_and_denies_account_gran
 fn durable_remote(root: &std::path::Path, peer: PeerId) -> Option<(Vec<u8>, u64)> {
     let state = durable_snapshot(root);
     let mut d = minicbor::Decoder::new(&state.payload);
-    assert_eq!(d.array().unwrap(), Some(9));
+    assert_eq!(d.array().unwrap(), Some(10));
     for _ in 0..8 {
         d.skip().unwrap();
     }
@@ -1397,4 +1401,83 @@ async fn cross_account_public_controls_bind_peer_and_preserve_observation_floor(
         assert!(durable_remote(a._dir.path(), a_peer).is_none());
         raw.close().await;
     }
+}
+#[tokio::test]
+async fn contact_device_status_requires_live_fresh_proof_and_preserves_safety() {
+    let (a, b, backend) = pair().await;
+    let old_packet = packet(2, &[13], 2, NOW, NOW + 600, NOW * 1_000_000);
+    let isolated = Arc::new(Backend::default());
+    isolated
+        .packets
+        .lock()
+        .unwrap()
+        .insert(b.peer, old_packet.clone());
+    let old = Fixture::new(2, 13, &old_packet, isolated).await;
+    let invite = old
+        .account
+        .create_invite(Some("untrusted claim".into()))
+        .await
+        .unwrap();
+    let contact = a
+        .account
+        .accept_invite(invite.clone(), "local".into())
+        .await
+        .unwrap();
+    assert!(contact.device_unverified);
+    assert!(!contact.verified);
+    assert!(!contact.new_device);
+    let digest = chat_core::account::safety_digest(a.peer, b.peer);
+    a.account.confirm_safety(b.peer, digest).await.unwrap();
+    // Fresh proof must resolve current public record, not trust the stale invite endpoint.
+    a.account.connect_account(b.peer).await.unwrap();
+    let contact = a.account.contacts().await.unwrap().remove(0);
+    assert!(!contact.device_unverified);
+    assert!(contact.new_device);
+    assert!(contact.verified);
+    assert_eq!(contact.alias, "local");
+    let duplicate = a
+        .account
+        .accept_invite(invite, "overwrite".into())
+        .await
+        .unwrap();
+    assert_eq!(duplicate, contact);
+    reload(&a).await;
+    let offline = a.account.contacts().await.unwrap().remove(0);
+    assert!(offline.device_unverified);
+    assert!(offline.new_device);
+    assert!(offline.verified);
+
+    let c_packet = packet(3, &[14], 3, NOW, NOW + 600, NOW * 1_000_000);
+    let c_peer = derive_account(&Secret32::from([3; 32])).unwrap().peer_id();
+    backend
+        .packets
+        .lock()
+        .unwrap()
+        .insert(c_peer, c_packet.clone());
+    let c = Fixture::new(3, 14, &c_packet, backend).await;
+    let different = a
+        .account
+        .accept_invite(c.account.create_invite(None).await.unwrap(), "other".into())
+        .await
+        .unwrap();
+    assert!(!different.verified);
+    assert!(different.device_unverified);
+    assert!(!different.new_device);
+    assert_ne!(chat_core::account::safety_digest(a.peer, c.peer), digest);
+}
+#[tokio::test]
+async fn invited_current_installation_proof_does_not_report_new_device() {
+    let (a, b, _) = pair().await;
+    a.account
+        .accept_invite(b.account.create_invite(None).await.unwrap(), "b".into())
+        .await
+        .unwrap();
+    a.account.connect_account(b.peer).await.unwrap();
+    let contact = a.account.contacts().await.unwrap().remove(0);
+    assert!(!contact.device_unverified);
+    assert!(!contact.new_device);
+    assert!(!contact.verified);
+    b.clock.set_unix_seconds(NOW + 601);
+    a.clock.set_unix_seconds(NOW + 601);
+    assert!(a.account.contacts().await.unwrap()[0].device_unverified);
 }
