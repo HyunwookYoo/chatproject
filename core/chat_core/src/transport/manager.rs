@@ -49,8 +49,9 @@ struct Envelope {
     reply: Reply,
 }
 enum Control {
+    PairRegister(mpsc::Sender<crate::account::pair::session::Input>),
     AccountRegister(mpsc::Sender<crate::account::connection::Input>),
-    AccountDial { target: EndpointAddr, reply: oneshot::Sender<Result<iroh::endpoint::Connection, CoreError>> },
+    AccountDial { target: EndpointAddr, alpn: &'static [u8], reply: oneshot::Sender<Result<iroh::endpoint::Connection, CoreError>> },
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     AccountTarget { target: EndpointAddr, reply: oneshot::Sender<Result<(),CoreError>> },
     Activate { key: Box<SecretKey>, start: bool, ticket: u64, reply: oneshot::Sender<Result<(), CoreError>> },
@@ -139,8 +140,13 @@ impl NetworkHandle {
     }
     pub(crate) async fn dial_account(&self, target: EndpointAddr)->Result<iroh::endpoint::Connection,CoreError> {
         if self.gate.blocked(){return Err(err(ErrorCode::Busy));}
-        let (reply,result)=oneshot::channel(); self.controls.try_send(Control::AccountDial{target,reply}).map_err(|_|err(ErrorCode::Busy))?;
+        let (reply,result)=oneshot::channel(); self.controls.try_send(Control::AccountDial{target,alpn:crate::account::auth::ALPN,reply}).map_err(|_|err(ErrorCode::Busy))?;
         result.await.map_err(|_|err(ErrorCode::TransportFailed))?
+    }
+    pub(crate) fn register_pair(&self,input:mpsc::Sender<crate::account::pair::session::Input>)->Result<(),CoreError>{self.controls.try_send(Control::PairRegister(input)).map_err(|_|err(ErrorCode::Busy))}
+    pub(crate) async fn dial_pair(&self,target:EndpointAddr)->Result<iroh::endpoint::Connection,CoreError>{
+        if self.gate.blocked(){return Err(err(ErrorCode::Busy));}
+        let(reply,result)=oneshot::channel();self.controls.try_send(Control::AccountDial{target,alpn:crate::account::pair::ALPN,reply}).map_err(|_|err(ErrorCode::Busy))?;result.await.map_err(|_|err(ErrorCode::TransportFailed))?
     }
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     pub async fn account_target_for_test(&self, ticket:String)->Result<(),CoreError> {
@@ -277,6 +283,7 @@ struct Peer {
 }
 struct Manager {
     account_input: Option<mpsc::Sender<crate::account::connection::Input>>,
+    pair_input: Option<mpsc::Sender<crate::account::pair::session::Input>>,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     account_targets: BTreeMap<iroh::EndpointId, EndpointAddr>,
     controls: Option<mpsc::Receiver<Control>>,
@@ -308,6 +315,7 @@ impl Manager {
         Self {
             controls: None,
             account_input: None,
+            pair_input: None,
             #[cfg(all(feature = "test-hooks", debug_assertions))]
             account_targets: BTreeMap::new(),
             gate: Arc::default(),
@@ -353,20 +361,21 @@ impl Manager {
     }
     async fn control(&mut self, control: Control) {
         match control {
+            Control::PairRegister(input) => { self.pair_input=Some(input); }
             Control::AccountRegister(input) => { self.account_input=Some(input); }
             #[cfg(all(feature = "test-hooks", debug_assertions))]
             Control::AccountTarget{target,reply} => {
                 let result=if matches!(self.profile,NetworkProfile::Local{..}) {self.account_targets.insert(target.id,target);Ok(())}else{Err(err(ErrorCode::NotAvailable))};
                 let _=reply.send(result);
             }
-            Control::AccountDial{target,reply} => {
+            Control::AccountDial{target,alpn,reply} => {
                 if self.gate.blocked(){let _=reply.send(Err(err(ErrorCode::Busy)));return;}
                 let Some(endpoint)=self.endpoint.clone() else {let _=reply.send(Err(err(ErrorCode::NetworkNotStarted)));return;};
                 #[cfg(all(feature = "test-hooks", debug_assertions))]
                 let target=self.account_targets.get(&target.id).cloned().unwrap_or(target);
                 let cancel=self.cancel.clone();
                 self.tasks.spawn(async move {
-                    let result=tokio::select!{biased;_=cancel.cancelled()=>Err(err(ErrorCode::Busy)),result=tokio::time::timeout(Duration::from_secs(8),endpoint.connect(target,crate::account::auth::ALPN))=>result.map_err(|_|err(ErrorCode::NetworkTimeout)).and_then(|r|r.map_err(|_|err(ErrorCode::TransportFailed)))};
+                    let result=tokio::select!{biased;_=cancel.cancelled()=>Err(err(ErrorCode::Busy)),result=tokio::time::timeout(Duration::from_secs(8),endpoint.connect(target,alpn))=>result.map_err(|_|err(ErrorCode::NetworkTimeout)).and_then(|r|r.map_err(|_|err(ErrorCode::TransportFailed)))};
                     if let Err(Ok(conn))=reply.send(result){conn.close(0u32.into(),b"account dial cancelled");}
                 });
             }
@@ -946,7 +955,7 @@ impl Manager {
                     let mut routed=false;
                     let work = async {
                         let connection = incoming.await.map_err(|_| err(ErrorCode::TransportFailed))?;
-                        if connection.alpn()==crate::account::auth::ALPN {
+                        if connection.alpn()==crate::account::auth::ALPN || connection.alpn()==crate::account::pair::ALPN {
                             session::notify(&notes,&cancel,Note::AccountConnection{tag:tag.clone(),connection}).await;
                             routed=true;
                             return Err(err(ErrorCode::AccountRestricted));
@@ -967,6 +976,14 @@ impl Manager {
             Note::AccountConnection{tag,connection} if tag.epoch==self.epoch => {
                 let preparation=self.incoming.remove(&tag.generation);self.release_cutoffs();
                 if self.gate.blocked() || preparation.is_none_or(|p|p.cancel.is_cancelled()) {connection.close(0u32.into(),b"account blocked");return;}
+                if connection.alpn()==crate::account::pair::ALPN {
+                    match &self.pair_input {
+                        Some(input)=>if let Err(error)=input.try_send(crate::account::pair::session::Input::Incoming(connection))
+                            && let crate::account::pair::session::Input::Incoming(conn)=error.into_inner(){conn.close(0u32.into(),b"pair busy");},
+                        None=>connection.close(0u32.into(),b"pair unavailable"),
+                    }
+                    return;
+                }
                 match &self.account_input {
                     Some(input)=>if let Err(error)=input.try_send(crate::account::connection::Input::Incoming(connection))
                         && let crate::account::connection::Input::Incoming(conn)=error.into_inner(){conn.close(0u32.into(),b"account busy");},

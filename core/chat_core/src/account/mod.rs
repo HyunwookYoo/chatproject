@@ -38,3 +38,6 @@ mod safety;
 pub use invite::parse_invite;
 pub use types::{EndpointHint, InvitePreview, ContactView, SafetyDisplay};
 pub use safety::{safety_digest, safety_display};
+
+pub(crate) mod pair;
+pub use pair::{PairDirection, PairDisplay, PairPhase, PairView};

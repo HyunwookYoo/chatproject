@@ -56,6 +56,16 @@ pub struct CandidateInfo {
     pub endpoint_id: String,
 }
 enum Command {
+    PairBegin(super::PairDirection,Option<super::TxId>,oneshot::Sender<Result<super::PairDisplay,CoreError>>),
+    PairScan(Zeroizing<String>,oneshot::Sender<Result<(),CoreError>>),
+    PairConfirm(FlowId,bool,oneshot::Sender<Result<(),CoreError>>),
+    PairApprove(FlowId,oneshot::Sender<Result<(),CoreError>>),
+    PairCancel(FlowId,oneshot::Sender<Result<(),CoreError>>),
+    PairView(oneshot::Sender<Result<Option<super::PairView>,CoreError>>),
+    #[cfg(all(feature="test-hooks",debug_assertions))]
+    PairFixtureSend(FlowId,Zeroizing<Vec<u8>>,oneshot::Sender<Result<usize,CoreError>>),
+    #[cfg(all(feature="test-hooks",debug_assertions))]
+    PairFixtureReceived(FlowId,oneshot::Sender<Result<Vec<u8>,CoreError>>),
     CreateInvite(Option<String>, oneshot::Sender<Result<String, CoreError>>),
     AcceptInvite(
         String,
@@ -90,6 +100,13 @@ struct Queued {
 impl Command {
     fn reject(self, error: CoreError) {
         match self {
+            Self::PairBegin(_,_,reply)=>{let _=reply.send(Err(error));}
+            Self::PairView(reply)=>{let _=reply.send(Err(error));}
+            #[cfg(all(feature="test-hooks",debug_assertions))]
+            Self::PairFixtureSend(_,_,reply)=>{let _=reply.send(Err(error));}
+            #[cfg(all(feature="test-hooks",debug_assertions))]
+            Self::PairFixtureReceived(_,reply)=>{let _=reply.send(Err(error));}
+            Self::PairScan(_,reply)|Self::PairConfirm(_,_,reply)|Self::PairApprove(_,reply)|Self::PairCancel(_,reply)=>{let _=reply.send(Err(error));}
             Self::CreateInvite(_, reply) => {
                 let _ = reply.send(Err(error));
             }
@@ -175,6 +192,8 @@ impl AccountHandle {
         });
         let (commands, input) = mpsc::channel(8);
         let auth = super::connection::Runtime::default();
+        let pair=super::pair::session::Runtime::default();
+        shared.network.register_pair(pair.send.clone())?;
         shared.network.register_account(auth.send.clone())?;
         if services.notifier.is_none() {
             services.notifier = Some(Arc::new(super::connection::Notifier {
@@ -184,6 +203,7 @@ impl AccountHandle {
         }
         runtime.spawn(
             Manager {
+                pair,
                 auth,
                 bus,
                 store,
@@ -306,6 +326,7 @@ impl AccountHandle {
     }
 }
 struct Manager {
+    pair:super::pair::session::Runtime,
     auth: super::connection::Runtime,
     bus: crate::EventBus,
     store: Store,
@@ -337,7 +358,8 @@ impl Manager {
                     self.complete(request, result);
                     self.auto_refresh().await;
                 }
-                _ = expiry.tick() => { self.restrict_grants(); }
+                _ = expiry.tick() => { self.restrict_grants(); self.expire_pair(); }
+                Some(input)=self.pair.input.recv()=>{self.pair_input(input).await;}
                 Some(input) = self.auth.input.recv() => { self.auth_input(input).await; }
                 _ = refresh.tick() => { self.auto_refresh().await; }
                 command = commands.recv() => {
@@ -347,6 +369,17 @@ impl Manager {
                         continue;
                     }
                     match queued.command {
+                        Command::PairBegin(direction,resume,reply)=>{let result=self.pair_begin(direction,resume).await;let _=reply.send(result);}
+                        Command::PairScan(qr,reply)=>{let result=self.pair_scan(&qr).await;let _=reply.send(result);}
+                        Command::PairConfirm(flow,matches,reply)=>{let result=self.pair_confirm(flow,matches).await;let _=reply.send(result);}
+                        Command::PairApprove(flow,reply)=>{let result=self.pair_approve(flow).await;let _=reply.send(result);}
+                        Command::PairCancel(flow,reply)=>{let result=self.pair_cancel(flow);let _=reply.send(result);}
+                        Command::PairView(reply)=>{self.expire_pair();let result=self.ready().map(|_|self.pair.current.as_ref().map(|s|s.view()));let _=reply.send(result);}
+                        #[cfg(all(feature="test-hooks",debug_assertions))]
+                        Command::PairFixtureSend(flow,bytes,reply)=>{let result=self.pair_fixture_send(flow,bytes).await;let _=reply.send(result);}
+                        #[cfg(all(feature="test-hooks",debug_assertions))]
+                        Command::PairFixtureReceived(flow,reply)=>{let result=self.pair_session(flow).map(|s|s.received.to_vec());let _=reply.send(result);}
+
                         Command::CreateInvite(name,reply) => {let result=self.create_invite(name);let _=reply.send(result);}
                         Command::AcceptInvite(input,alias,reply) => {let result=self.accept_invite(&input,alias);let _=reply.send(result);}
                         Command::Contacts(reply) => {let result=self.contact_views();let _=reply.send(result);}
@@ -357,7 +390,7 @@ impl Manager {
                         Command::Confirm(flow, answers, reply) => { let result = self.confirm(flow, &answers).await; let _ = reply.send(result); }
                         Command::Cancel(flow, reply) => { let result = self.cancel(flow); let _ = reply.send(result); }
                         Command::Recover(words, confirmed, reply) => { let result = self.recover(&words, confirmed).await; let _ = reply.send(result); }
-                        Command::Snapshot(reply) => { let _ = reply.send(Ok(self.view())); }
+                        Command::Snapshot(reply) => { self.expire_pair(); let _ = reply.send(Ok(self.view())); }
                         Command::Refresh(peer, reply) => {
                             let result = if self.local().is_ok_and(|local| local.keys.peer_id() == peer) {
                                 self.publication(Action::Refresh).await
@@ -370,6 +403,7 @@ impl Manager {
                 }
             }
         }
+        self.pair.current=None;
         self.auth.cancel.cancel();
         self.close_auth();
         let _ = self.store.suspend();
@@ -403,6 +437,7 @@ impl Manager {
         Ok(())
     }
     async fn lifecycle(&mut self, request: Request) -> Result<(), CoreError> {
+        self.pair.current=None;
         self.auth.cancel.cancel();
         self.close_auth();
         self.auth.cancel = tokio_util::sync::CancellationToken::new();
@@ -781,7 +816,7 @@ impl Manager {
             installation: None,
             devices: vec![],
             contacts: vec![],
-            pair: None,
+            pair: self.pair.current.as_ref().map(|s|s.qr.flow),
             publish_intents: vec![],
             publication: PublicationView::default(),
         };
@@ -914,6 +949,7 @@ mod tests {
             sent: std::sync::Mutex::new(vec![]),
         });
         let mut manager = Manager {
+            pair: super::super::pair::session::Runtime::default(),
             auth: super::super::connection::Runtime::default(),
             bus: EventBus::new(),
             store: Store::open(dir.path(), Arc::new(Protector)).unwrap(),
@@ -993,6 +1029,7 @@ mod tests {
             status: AtomicU64::new(ticket << 2),
         });
         let mut manager = Manager {
+            pair: super::super::pair::session::Runtime::default(),
             auth: super::super::connection::Runtime::default(),
             bus: EventBus::new(),
             store: Store::open(dir.path(), Arc::new(Protector)).unwrap(),
@@ -1081,6 +1118,7 @@ mod tests {
             status: AtomicU64::new(ticket << 2),
         });
         let mut manager = Manager {
+            pair: super::super::pair::session::Runtime::default(),
             auth: super::super::connection::Runtime::default(),
             bus: EventBus::new(),
             store: Store::open(dir.path(), Arc::new(Protector)).unwrap(),
@@ -1846,5 +1884,423 @@ impl Manager {
         c.new_device |= c.known_installation.is_some();
         c.known_installation = Some(installation);
         self.commit_contacts(contacts, request)
+    }
+}
+
+impl AccountHandle {
+    pub async fn pair_begin(
+        &self,
+        direction: super::PairDirection,
+        resume: Option<super::TxId>,
+    ) -> Result<super::PairDisplay, CoreError> {
+        self.send(|reply| Command::PairBegin(direction, resume, reply))
+            .await
+    }
+    pub async fn pair_scan(&self, qr: String) -> Result<(), CoreError> {
+        self.send(|reply| Command::PairScan(Zeroizing::new(qr), reply))
+            .await
+    }
+    pub async fn pair_confirm_code(&self, flow: FlowId, matches: bool) -> Result<(), CoreError> {
+        self.send(|reply| Command::PairConfirm(flow, matches, reply))
+            .await
+    }
+    pub async fn pair_approve(&self, flow: FlowId) -> Result<(), CoreError> {
+        self.send(|reply| Command::PairApprove(flow, reply)).await
+    }
+    pub async fn pair_cancel(&self, flow: FlowId) -> Result<(), CoreError> {
+        self.send(|reply| Command::PairCancel(flow, reply)).await
+    }
+    pub async fn pair_view(&self) -> Result<Option<super::PairView>, CoreError> {
+        self.send(Command::PairView).await
+    }
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    pub async fn pair_fixture_send(
+        &self,
+        flow: FlowId,
+        bytes: Vec<u8>,
+    ) -> Result<usize, CoreError> {
+        if bytes.len() > super::pair::channel::MAX_PLAIN {
+            return Err(super::wire::invalid());
+        }
+        self.send(|reply| Command::PairFixtureSend(flow, Zeroizing::new(bytes), reply))
+            .await
+    }
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    pub async fn pair_fixture_received(&self, flow: FlowId) -> Result<Vec<u8>, CoreError> {
+        self.send(|reply| Command::PairFixtureReceived(flow, reply))
+            .await
+    }
+}
+impl Manager {
+    fn expire_pair(&mut self) {
+        if self
+            .pair
+            .current
+            .as_ref()
+            .is_some_and(|s| !s.live(&*self.services.clock))
+        {
+            self.pair.current = None;
+            self.revision += 1;
+        }
+    }
+    fn pair_session(
+        &mut self,
+        flow: FlowId,
+    ) -> Result<&mut super::pair::session::Session, CoreError> {
+        self.ready()?;
+        self.expire_pair();
+        self.pair
+            .current
+            .as_mut()
+            .filter(|s| s.qr.flow == flow)
+            .ok_or_else(super::wire::invalid)
+    }
+    async fn pair_prepare(&mut self, role: super::pair::wire::Role) -> Result<(), CoreError> {
+        use super::pair::wire::Role;
+        self.ready()?;
+        if role == Role::New {
+            self.prepare().await?;
+        } else {
+            self.publication(Action::Refresh).await?;
+            if !self.local_authorized() {
+                return Err(unavailable(ErrorCode::AccountRestricted));
+            }
+            let request = self.ready()?;
+            self.shared.network.execute(crate::NetworkOp::Start).await?;
+            self.service(
+                request,
+                Box::pin(async {
+                    loop {
+                        let crate::NetworkReply::Info(info) =
+                            self.shared.network.execute(crate::NetworkOp::Info).await?
+                        else {
+                            return Err(unavailable(ErrorCode::TransportFailed));
+                        };
+                        match info.state {
+                            crate::NetworkState::Online => return Ok(()),
+                            crate::NetworkState::Starting => {
+                                tokio::time::sleep(Duration::from_millis(10)).await
+                            }
+                            _ => return Err(unavailable(ErrorCode::TransportFailed)),
+                        }
+                    }
+                }),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+    async fn pair_begin(
+        &mut self,
+        direction: super::PairDirection,
+        resume: Option<super::TxId>,
+    ) -> Result<super::PairDisplay, CoreError> {
+        use super::pair::{
+            session::Session,
+            wire::{Qr, Role},
+        };
+        self.expire_pair();
+        if self.pair.current.is_some() || resume.is_some() {
+            return Err(unavailable(ErrorCode::Busy));
+        }
+        let role = if direction == super::PairDirection::NewDisplays {
+            Role::New
+        } else {
+            Role::Existing
+        };
+        self.pair_prepare(role).await?;
+        let device = self
+            .state
+            .as_ref()
+            .ok_or_else(super::wire::invalid)?
+            .device();
+        let mut flow = FlowId([0; 16]);
+        getrandom::fill(&mut flow.0).map_err(|_| unavailable(ErrorCode::NotAvailable))?;
+        let qr = Qr {
+            direction,
+            flow,
+            transport: device.transport_public_key(),
+            installation: device.installation_id(),
+            existing: if role == Role::Existing {
+                Some(self.local()?.keys.peer_id())
+            } else {
+                None
+            },
+            resume,
+            relay: None,
+            expires: self.services.clock.unix_seconds().saturating_add(300),
+            psk: super::random_secret()?,
+        };
+        let display = super::PairDisplay {
+            flow,
+            qr: qr.display(),
+            expires_at: qr.expires,
+        };
+        self.pair.current = Some(Session::new(qr, role, false, &*self.services.clock));
+        self.revision += 1;
+        Ok(display)
+    }
+    async fn pair_scan(&mut self, text: &str) -> Result<(), CoreError> {
+        use super::pair::{
+            session::Session,
+            wire::{Qr, Role},
+        };
+        self.ready()?;
+        self.expire_pair();
+        if self.pair.current.is_some() {
+            return Err(unavailable(ErrorCode::Busy));
+        }
+        let qr = Qr::parse(text, self.services.clock.unix_seconds())?;
+        if qr.resume.is_some() {
+            return Err(unavailable(ErrorCode::AccountRestricted));
+        }
+        let role = if qr.owner() == Role::Existing {
+            Role::New
+        } else {
+            Role::Existing
+        };
+        self.pair_prepare(role).await?;
+        let mut target = iroh::EndpointAddr::from(
+            iroh::EndpointId::from_bytes(&qr.transport).map_err(|_| super::wire::invalid())?,
+        );
+        if let Some(relay) = &qr.relay {
+            target = target.with_relay_url(relay.parse().map_err(|_| super::wire::invalid())?);
+        }
+        self.pair.current = Some(Session::new(qr, role, true, &*self.services.clock));
+        let request = self.ready()?;
+        let connection = self
+            .service(request, Box::pin(self.shared.network.dial_pair(target)))
+            .await;
+        match connection {
+            Ok(conn) => self.pair_handshake(conn).await,
+            Err(e) => {
+                self.pair.current = None;
+                Err(e)
+            }
+        }
+    }
+    async fn pair_handshake(&mut self, conn: iroh::endpoint::Connection) -> Result<(), CoreError> {
+        use super::pair::{
+            channel,
+            wire::{Preface, Role},
+        };
+        self.expire_pair();
+        let result = async {
+            let request = self.ready()?;
+            let session = self
+                .pair
+                .current
+                .as_mut()
+                .ok_or_else(super::wire::invalid)?;
+            session.bind(*conn.remote_id().as_bytes())?;
+            let local_role = session.role;
+            if local_role == Role::Existing {
+                self.publication(Action::Refresh).await?;
+                if !self.local_authorized() {
+                    return Err(unavailable(ErrorCode::AccountRestricted));
+                }
+            }
+            let backend = self.services.backend()?;
+            let session = self
+                .pair
+                .current
+                .as_ref()
+                .ok_or_else(super::wire::invalid)?;
+            let device = self
+                .state
+                .as_ref()
+                .ok_or_else(super::wire::invalid)?
+                .device();
+            let cert = if local_role == Role::Existing {
+                Some(&self.local()?.cert)
+            } else {
+                None
+            };
+            let local = Preface {
+                flow: session.qr.flow,
+                role: local_role,
+                transport: device.transport_public_key(),
+                installation: device.installation_id(),
+                existing: cert.map(|c| c.peer_id),
+                resume: session.qr.resume,
+            };
+            let prepared = self
+                .service(
+                    request,
+                    Box::pin(channel::prepare(
+                        &conn,
+                        &session.qr,
+                        local,
+                        session.initiator,
+                    )),
+                )
+                .await?;
+            let session = self
+                .pair
+                .current
+                .as_mut()
+                .ok_or_else(super::wire::invalid)?;
+            if session
+                .candidate_installation
+                .is_some_and(|id| id != prepared.remote.installation)
+            {
+                return Err(super::wire::invalid());
+            }
+            session.candidate_installation = Some(prepared.remote.installation);
+            let session = self
+                .pair
+                .current
+                .as_ref()
+                .ok_or_else(super::wire::invalid)?;
+            let device = self
+                .state
+                .as_ref()
+                .ok_or_else(super::wire::invalid)?
+                .device();
+            let cert = if local_role == Role::Existing {
+                Some(&self.local()?.cert)
+            } else {
+                None
+            };
+            let (channel, recv) = self
+                .service(
+                    request,
+                    Box::pin(channel::establish(channel::Establish {
+                        conn: conn.clone(),
+                        qr: &session.qr,
+                        prepared,
+                        device,
+                        cert,
+                        backend,
+                        now: self.services.clock.unix_seconds(),
+                    })),
+                )
+                .await?;
+            self.ensure_ready(request)?;
+            if local_role == Role::Existing && !self.local_authorized() {
+                return Err(unavailable(ErrorCode::AccountRestricted));
+            }
+            let session = self
+                .pair
+                .current
+                .as_mut()
+                .ok_or_else(super::wire::invalid)?;
+            if !session.live(&*self.services.clock) {
+                return Err(super::wire::invalid());
+            }
+            channel::reader(
+                recv,
+                conn.clone(),
+                session.qr.flow,
+                self.pair.send.clone(),
+                session.cancel.clone(),
+            );
+            session.channel = Some(channel);
+            Ok(())
+        }
+        .await;
+        if result.is_err() {
+            conn.close(0u32.into(), b"pair handshake failed");
+            if let Some(s) = &mut self.pair.current {
+                s.failures += 1;
+            }
+            self.expire_pair();
+        }
+        result
+    }
+    async fn pair_input(&mut self, input: super::pair::session::Input) {
+        use super::pair::session::Input;
+        self.expire_pair();
+        match input {
+            Input::Incoming(conn) => {
+                if self
+                    .pair
+                    .current
+                    .as_ref()
+                    .is_none_or(|s| s.initiator || s.channel.is_some())
+                {
+                    conn.close(0u32.into(), b"pair not accepting");
+                    return;
+                }
+                let _ = self.pair_handshake(conn).await;
+            }
+            Input::Frame {
+                flow,
+                connection,
+                body,
+            } => {
+                if self.pair.current.as_ref().is_some_and(|s| {
+                    s.qr.flow == flow
+                        && s.channel
+                            .as_ref()
+                            .is_some_and(|c| c.conn.stable_id() == connection)
+                }) {
+                    let result =
+                        body.and_then(|b| self.pair_session(flow)?.receive(connection, &b));
+                    if result.is_err() {
+                        self.pair.current = None;
+                    }
+                }
+            }
+        }
+    }
+    async fn pair_confirm(&mut self, flow: FlowId, matches: bool) -> Result<(), CoreError> {
+        self.pair_session(flow)?;
+        if !matches {
+            self.pair.current = None;
+            return Ok(());
+        }
+        let request = self.ready()?;
+        let mut session = self.pair.current.take().ok_or_else(super::wire::invalid)?;
+        let result = self.service(request, Box::pin(session.confirm())).await;
+        if result.is_ok() && session.live(&*self.services.clock) {
+            self.pair.current = Some(session);
+        }
+        result
+    }
+    async fn pair_approve(&mut self, flow: FlowId) -> Result<(), CoreError> {
+        // Only a local command enters this method. Remote confirmation never calls it.
+        self.pair_session(flow)?;
+        self.publication(Action::Refresh).await?;
+        if !self.local_authorized() {
+            return Err(unavailable(ErrorCode::AccountRestricted));
+        }
+        let clock = self.services.clock.clone();
+        self.pair_session(flow)?.approve(&*clock)
+    }
+    fn pair_cancel(&mut self, flow: FlowId) -> Result<(), CoreError> {
+        self.pair_session(flow)?;
+        self.pair.current = None;
+        self.revision += 1;
+        Ok(())
+    }
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    async fn pair_fixture_send(
+        &mut self,
+        flow: FlowId,
+        bytes: Zeroizing<Vec<u8>>,
+    ) -> Result<usize, CoreError> {
+        if !self.local_authorized() {
+            return Err(unavailable(ErrorCode::AccountRestricted));
+        }
+        let clock = self.services.clock.clone();
+        let request = self.ready()?;
+        let session = self.pair_session(flow)?;
+        let permit = session.fixture_permit()?;
+        // Reject denied sends without discarding a still-valid comparison session.
+        if !session.approved || !session.local_confirmed || !session.remote_confirmed {
+            return Err(super::wire::invalid());
+        }
+        let mut session = self.pair.current.take().ok_or_else(super::wire::invalid)?;
+        let result = self
+            .service(
+                request,
+                Box::pin(session.send_gated(&*clock, permit, || bytes)),
+            )
+            .await;
+        if result.is_ok() && session.live(&*clock) {
+            self.pair.current = Some(session);
+        }
+        result
     }
 }

@@ -18,7 +18,11 @@ pub(crate) async fn bind_endpoint(
 ) -> Result<Endpoint, CoreError> {
     let builder = Endpoint::builder(iroh::endpoint::presets::Minimal)
         .secret_key(key)
-        .alpns(vec![ALPN.to_vec(), crate::account::auth::ALPN.to_vec()]);
+        .alpns(vec![
+            ALPN.to_vec(),
+            crate::account::auth::ALPN.to_vec(),
+            crate::account::pair::ALPN.to_vec(),
+        ]);
     let builder = match profile {
         NetworkProfile::Public => builder.relay_mode(RelayMode::Default).address_lookup(
             iroh_mainline_address_lookup::DhtAddressLookup::builder()
