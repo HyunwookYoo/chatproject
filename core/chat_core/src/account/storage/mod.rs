@@ -5,7 +5,7 @@ use std::{fs, path::Path, sync::Arc};
 use zeroize::Zeroizing;
 mod atomic;
 mod ownership;
-mod schema;
+pub(crate) mod schema;
 
 pub trait KeyProtector: Send + Sync {
     fn protect(&self, id: StoreId, secret: &Secret32) -> Result<Vec<u8>, CoreError>;

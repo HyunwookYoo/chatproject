@@ -1,4 +1,4 @@
-//! Only the encrypted envelope lives here. A5 owns the typed payload codec.
+//! Encrypted envelope and minimal Candidate payload. A5 extends AccountState.
 use aes_gcm::{
     Aes256Gcm, KeyInit, Nonce,
     aead::{AeadInPlace, Key},
@@ -107,4 +107,39 @@ pub(super) fn unseal(
         installation,
         payload,
     })
+}
+
+/// Private seed state never implements Debug, Clone, or serde.
+pub(crate) enum AccountState {
+    Candidate(crate::account::DeviceKeys),
+}
+impl AccountState {
+    pub(crate) fn decode(stored: &StoredPlaintext) -> Result<Self, CoreError> {
+        // Canonical definite CBOR [1, 0, bytes32]. Reject nonminimal integers,
+        // indefinite arrays, extra fields, and trailing data.
+        if stored.payload.len() != 37 || stored.payload[..5] != [0x83, 1, 0, 0x58, 32] {
+            return Err(corrupt());
+        }
+        let mut seed = Secret32::from([0; 32]);
+        seed.as_mut_bytes().copy_from_slice(&stored.payload[5..]);
+        let keys = crate::account::derive_device(seed)?;
+        if keys.installation_id().0 != stored.installation {
+            return Err(corrupt());
+        }
+        Ok(Self::Candidate(keys))
+    }
+    pub(crate) fn encode(&self) -> StoredPlaintext {
+        let Self::Candidate(keys) = self;
+        let mut payload = Zeroizing::new(Vec::with_capacity(37));
+        payload.extend_from_slice(&[0x83, 1, 0, 0x58, 32]);
+        payload.extend_from_slice(keys.seed().as_bytes());
+        StoredPlaintext {
+            installation: keys.installation_id().0,
+            payload,
+        }
+    }
+    pub(crate) fn device(&self) -> &crate::account::DeviceKeys {
+        let Self::Candidate(keys) = self;
+        keys
+    }
 }

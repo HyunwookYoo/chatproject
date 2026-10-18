@@ -7,6 +7,7 @@ use tokio::runtime::Runtime;
 use crate::error::{CoreError, ErrorCode};
 use crate::event::{ConnectionSnapshot, CoreEvent, EventBus};
 use crate::transport::{NetworkHandle, NetworkProfile};
+use crate::account::{AccountHandle, storage::KeyProtector};
 
 /// Version of this core build. The UI shows it; Kotlin and Swift read it too.
 pub const CORE_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -31,12 +32,14 @@ pub struct CoreInfo {
 /// share a process (design 12.3), and either one may start the core first.
 #[derive(Default)]
 pub struct CoreSlot {
+    gate: Arc<crate::transport::Gate>,
     running: Mutex<Option<Arc<RunningCore>>>,
 }
 
 struct RunningCore {
     info: CoreInfo,
     network: NetworkHandle,
+    account: Mutex<Option<AccountHandle>>,
     runtime: Option<Runtime>,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     hooks: Arc<crate::puppet::HookState>,
@@ -86,7 +89,7 @@ impl CoreSlot {
             .enable_all()
             .build()
             .map_err(|_| CoreError::new(ErrorCode::TransportFailed, "cannot create core runtime"))?;
-        let network = NetworkHandle::spawn(runtime.handle(), profile, bus.clone());
+        let network = NetworkHandle::spawn_with_gate(runtime.handle(), profile, bus.clone(), self.gate.clone());
         let info = CoreInfo {
             version: CORE_VERSION.to_string(),
             instance_id: new_instance_id(),
@@ -96,6 +99,7 @@ impl CoreSlot {
         *running = Some(Arc::new(RunningCore {
             info: info.clone(),
             network,
+            account: Mutex::new(None),
             runtime: Some(runtime),
             #[cfg(all(feature = "test-hooks", debug_assertions))]
             hooks: Arc::default(),
@@ -103,6 +107,37 @@ impl CoreSlot {
             bus: bus.clone(),
         }));
         Ok(info)
+    }
+
+    /// Opens the protected account once, without starting network IO.
+    pub fn open_account(&self, protector: Arc<dyn KeyProtector>) -> Result<AccountHandle, CoreError> {
+        let core = self.running.lock().expect("core slot lock poisoned").clone()
+            .ok_or_else(|| CoreError::new(ErrorCode::CoreNotStarted, "core not started"))?;
+        let mut account = core.account.lock().expect("account slot lock poisoned");
+        if let Some(account) = account.as_ref() { return Ok(account.clone()); }
+        let handle = AccountHandle::open(core.runtime.as_ref().unwrap().handle(), &core.info.data_dir, protector, core.network.clone())?;
+        *account = Some(handle.clone());
+        Ok(handle)
+    }
+    pub fn account(&self) -> Result<AccountHandle, CoreError> {
+        let core = self.running.lock().expect("core slot lock poisoned").clone()
+            .ok_or_else(|| CoreError::new(ErrorCode::CoreNotStarted, "core not started"))?;
+        let account = core.account.lock().expect("account slot lock poisoned").clone();
+        account.ok_or_else(|| CoreError::new(ErrorCode::NotAvailable, "account not opened"))
+    }
+    /// Native lifecycle callers do not wait for initialization or another slot caller.
+    pub fn account_suspend(&self) -> i32 { self.account_lifecycle(true) }
+    pub fn account_resume(&self) -> i32 { self.account_lifecycle(false) }
+    fn account_lifecycle(&self, suspend: bool) -> i32 {
+        self.gate.lifecycle(suspend);
+        let Ok(running) = self.running.try_lock() else { return 1; };
+        let Some(core) = running.as_ref() else { return 0; };
+        let Ok(account) = core.account.try_lock() else { return 1; };
+        match account.as_ref() {
+            Some(account) if suspend => account.request_suspend(),
+            Some(account) => account.request_resume(),
+            None => 0,
+        }
     }
 
     #[cfg(not(all(feature = "test-hooks", debug_assertions)))]

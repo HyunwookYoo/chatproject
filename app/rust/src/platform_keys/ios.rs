@@ -70,3 +70,61 @@ impl KeyProtector for IosProtector {
         status(unsafe { cp_key_delete(id.0.as_ptr()) })
     }
 }
+
+/// Lifecycle ABI status is distinct from the KeyProtector ABI above:
+/// 0 completed, 1 pending (keep gated), 2 failed (keep gated).
+#[no_mangle]
+pub extern "C" fn cp_account_suspend() -> i32 {
+    std::panic::catch_unwind(|| crate::global::CORE.account_suspend()).unwrap_or(2)
+}
+
+#[no_mangle]
+pub extern "C" fn cp_account_resume() -> i32 {
+    std::panic::catch_unwind(|| crate::global::CORE.account_resume()).unwrap_or(2)
+}
+
+// Apple-target source coverage. Windows execution of core lifecycle tests is
+// deliberately not presented as execution of this ABI or UIKit callbacks.
+#[cfg(all(test, feature = "test-hooks", debug_assertions))]
+mod lifecycle_tests {
+    use super::*;
+    use crate::global::{BUS, CORE};
+    use chat_core::{CoreConfig, NetworkOp};
+    use std::{sync::Arc, time::Duration};
+    struct Protector;
+    impl KeyProtector for Protector {
+        fn protect(&self, _: StoreId, key: &Secret32) -> Result<Vec<u8>, CoreError> {
+            Ok(key.as_bytes().iter().map(|b| b ^ 0x96).collect())
+        }
+        fn unprotect(&self, _: StoreId, blob: &[u8]) -> Result<Secret32, CoreError> {
+            if blob.len() != 32 { return Err(super::super::error(ErrorCode::StorageCorrupt)); }
+            Ok(Secret32::from(std::array::from_fn(|i| blob[i] ^ 0x96)))
+        }
+        fn delete(&self, _: StoreId) -> Result<(), CoreError> { Ok(()) }
+    }
+    #[tokio::test]
+    async fn lifecycle_abi_controls_the_same_core_actor() {
+        let dir = tempfile::tempdir().unwrap();
+        CORE.start(CoreConfig { data_dir: dir.path().into() }, &BUS).unwrap();
+        let network = CORE.network().unwrap();
+        network.configure_local(None).await.unwrap();
+        let account = CORE.open_account(Arc::new(Protector)).unwrap();
+        account.prepare_candidate().await.unwrap();
+        assert_eq!(cp_account_suspend(), 1);
+        assert_eq!(network.execute(NetworkOp::Start).await.unwrap_err().code, ErrorCode::Busy);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while cp_account_suspend() == 1 {
+            assert!(std::time::Instant::now() < deadline);
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(cp_account_suspend(), 0);
+        assert_eq!(cp_account_resume(), 1);
+        while cp_account_resume() == 1 {
+            assert!(std::time::Instant::now() < deadline);
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(cp_account_resume(), 0);
+        network.execute(NetworkOp::Start).await.unwrap();
+        network.execute(NetworkOp::Stop).await.unwrap();
+    }
+}

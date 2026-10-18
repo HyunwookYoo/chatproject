@@ -10,8 +10,8 @@ use iroh::{Endpoint, EndpointAddr, SecretKey, Watcher, endpoint::Incoming};
 use std::{
     collections::BTreeMap,
     sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -48,15 +48,99 @@ struct Envelope {
     op: NetworkOp,
     reply: Reply,
 }
+enum Control {
+    Activate { key: SecretKey, start: bool, ticket: u64, reply: oneshot::Sender<Result<(), CoreError>> },
+    Quiesce { reply: oneshot::Sender<Result<(), CoreError>> },
+}
+#[derive(Default)]
+pub(crate) struct Gate {
+    desired_suspend: AtomicBool,
+    account_opened: AtomicBool,
+    revision: AtomicU64,
+    cancel: Mutex<CancellationToken>,
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    fail_bind: std::sync::atomic::AtomicBool,
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    hold_bind: Mutex<Option<Arc<tokio::sync::Notify>>>,
+}
+impl Gate {
+    pub(crate) fn desired_suspend(&self) -> bool { self.desired_suspend.load(Ordering::Acquire) }
+    pub(crate) fn lifecycle(&self, suspend: bool) {
+        if self.desired_suspend.swap(suspend, Ordering::AcqRel) != suspend && self.account_opened.load(Ordering::Acquire) { self.block(); }
+    }
+    pub(crate) fn block(&self) -> u64 {
+        let mut current = self.revision.load(Ordering::Acquire);
+        loop {
+            let next = (current + 2) | 1;
+            match self.revision.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => { self.cancel(); return next; }
+                Err(value) => current = value,
+            }
+        }
+    }
+    fn blocked(&self) -> bool { self.desired_suspend() || self.revision.load(Ordering::Acquire) & 1 != 0 }
+    fn cancel(&self) {
+        // Lifecycle callers never wait for the actor, file IO, or a held mutex.
+        if let Ok(cancel) = self.cancel.try_lock() { cancel.cancel(); }
+    }
+}
 #[derive(Clone)]
 pub struct NetworkHandle {
     commands: mpsc::Sender<Envelope>,
+    controls: mpsc::Sender<Control>,
+    gate: Arc<Gate>,
 }
 impl NetworkHandle {
     pub fn spawn(handle: &tokio::runtime::Handle, profile: NetworkProfile, bus: EventBus) -> Self {
+        Self::spawn_with_gate(handle, profile, bus, Arc::default())
+    }
+    pub(crate) fn spawn_with_gate(handle: &tokio::runtime::Handle, profile: NetworkProfile, bus: EventBus, gate: Arc<Gate>) -> Self {
         let (commands, receiver) = mpsc::channel(64);
-        handle.spawn(Manager::new(profile, bus).run(receiver));
-        Self { commands }
+        let (controls, control_rx) = mpsc::channel(8);
+        let mut manager = Manager::new(profile, bus);
+        manager.gate = gate.clone();
+        manager.controls = Some(control_rx);
+        handle.spawn(manager.run(receiver));
+        Self { commands, controls, gate }
+    }
+    /// Serial diagnostic-to-installation transition. A different installation cannot replace it.
+    pub async fn activate_key(&self, key: SecretKey) -> Result<(), CoreError> {
+        let current = self.gate.revision.load(Ordering::Acquire);
+        if self.gate.desired_suspend() || current & 1 != 0 || self.gate.revision.compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            return Err(err(ErrorCode::Busy));
+        }
+        self.gate.cancel();
+        self.install_key(key, true, current + 1).await
+    }
+    pub(crate) fn block(&self) -> u64 { self.gate.block() }
+    pub(crate) fn begin_account(&self) -> u64 { self.gate.account_opened.store(true, Ordering::Release); self.block() }
+    pub(crate) fn desired_suspend(&self) -> bool { self.gate.desired_suspend() }
+    pub(crate) fn lifecycle_gate(&self, suspend: bool) { self.gate.lifecycle(suspend); }
+    pub(crate) fn release(&self, ticket: u64) {
+        let _ = self.gate.revision.compare_exchange(ticket, ticket + 1, Ordering::AcqRel, Ordering::Acquire);
+    }
+    pub(crate) async fn install_key(&self, key: SecretKey, start: bool, ticket: u64) -> Result<(), CoreError> {
+        let (reply, received) = oneshot::channel();
+        if self.controls.try_send(Control::Activate { key, start, ticket, reply }).is_err() {
+            // No transition was queued: remain blocked, with the persisted key untouched.
+            return Err(err(ErrorCode::Busy));
+        }
+        received.await.map_err(|_| err(ErrorCode::TransportFailed))?
+    }
+    pub(crate) async fn quiesce(&self) -> Result<(), CoreError> {
+        let (reply, received) = oneshot::channel();
+        self.controls.send(Control::Quiesce { reply }).await.map_err(|_| err(ErrorCode::TransportFailed))?;
+        received.await.map_err(|_| err(ErrorCode::TransportFailed))?
+    }
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    pub fn hold_next_bind_for_test(&self) -> Arc<tokio::sync::Notify> {
+        let release = Arc::new(tokio::sync::Notify::new());
+        *self.gate.hold_bind.lock().unwrap() = Some(release.clone());
+        release
+    }
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    pub fn fail_next_bind_for_test(&self) {
+        self.gate.fail_bind.store(true, Ordering::Release);
     }
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     pub async fn configure_local(&self, relay: Option<iroh::RelayUrl>) -> Result<(), CoreError> {
@@ -73,6 +157,7 @@ impl NetworkHandle {
         }
     }
     pub async fn execute(&self, op: NetworkOp) -> Result<NetworkReply, CoreError> {
+        if self.gate.blocked() && !matches!(op, NetworkOp::Info) { return Err(err(ErrorCode::Busy)); }
         let (reply, received) = oneshot::channel();
         self.commands
             .try_send(Envelope { op, reply })
@@ -161,6 +246,10 @@ struct Peer {
     disconnected_before: Option<u64>,
 }
 struct Manager {
+    controls: Option<mpsc::Receiver<Control>>,
+    gate: Arc<Gate>,
+    installed: bool,
+    activation: Option<(u64, oneshot::Sender<Result<(), CoreError>>)>,
     profile: NetworkProfile,
     bus: EventBus,
     key: SecretKey,
@@ -185,6 +274,10 @@ impl Manager {
     fn new(profile: NetworkProfile, bus: EventBus) -> Self {
         let (notes, received) = mpsc::channel(64);
         Self {
+            controls: None,
+            gate: Arc::default(),
+            installed: false,
+            activation: None,
             profile,
             bus,
             key: SecretKey::generate(),
@@ -213,12 +306,54 @@ impl Manager {
         }
     }
     async fn run(mut self, mut commands: mpsc::Receiver<Envelope>) {
+        let mut controls = self.controls.take().unwrap();
         loop {
             tokio::select! {
+                _ = self.cancel.cancelled(), if self.activation.is_some() => self.stop().await,
+                Some(control) = controls.recv() => self.control(control).await,
                 command = commands.recv() => match command { Some(command) => self.command(command).await, None => { if self.info.state != NetworkState::Stopped { self.stop().await; } break; } },
                 Some(note) = self.received.recv() => self.note(note).await,
                 Some(_) = self.tasks.join_next(), if !self.tasks.is_empty() => {},
             }
+        }
+    }
+    async fn control(&mut self, control: Control) {
+        match control {
+            Control::Quiesce { reply } => {
+                self.stop().await;
+                let _ = reply.send(Ok(()));
+            }
+            Control::Activate { key, start, ticket, reply } => {
+                if self.gate.revision.load(Ordering::Acquire) != ticket {
+                    let _ = reply.send(Err(err(ErrorCode::Busy)));
+                    return;
+                }
+                if self.installed && self.key.public() != key.public() {
+                    self.stop().await;
+                    let _ = self.gate.revision.compare_exchange(ticket, ticket + 1, Ordering::AcqRel, Ordering::Acquire);
+                    let _ = reply.send(Err(err(ErrorCode::AccountRestricted)));
+                    return;
+                }
+                self.stop().await;
+                self.key = key;
+                self.installed = true;
+                self.peers.clear();
+                self.info.peers.clear();
+                self.info.endpoint_id = Some(self.key.public().to_string());
+                if start && self.gate.revision.load(Ordering::Acquire) == ticket {
+                    self.activation = Some((ticket, reply));
+                    self.start();
+                } else {
+                    // Restoring a key does not implicitly start the network.
+                    let _ = reply.send(Ok(()));
+                }
+            }
+        }
+    }
+    fn finish_activation(&mut self, result: Result<(), CoreError>) {
+        if let Some((ticket, reply)) = self.activation.take() {
+            let _ = self.gate.revision.compare_exchange(ticket, ticket + 1, Ordering::AcqRel, Ordering::Acquire);
+            let _ = reply.send(result);
         }
     }
     fn publish(&mut self, changed: Option<&str>) {
@@ -257,6 +392,10 @@ impl Manager {
     }
     async fn command(&mut self, envelope: Envelope) {
         let Envelope { op, reply } = envelope;
+        if self.gate.blocked() && !matches!(op, NetworkOp::Info) {
+            let _ = reply.send(Err(err(ErrorCode::Busy)));
+            return;
+        }
         let result = match op {
             NetworkOp::Info => Ok(NetworkReply::Info(self.info.clone())),
             NetworkOp::Start => {
@@ -405,15 +544,35 @@ impl Manager {
             NetworkState::Stopped | NetworkState::Failed
         ) {
             self.cancel = CancellationToken::new();
+            {
+                let mut shared = self.gate.cancel.lock().unwrap();
+                *shared = self.cancel.clone();
+                let expected = self.activation.as_ref().map(|(ticket, _)| *ticket);
+                let revision = self.gate.revision.load(Ordering::Acquire);
+                if revision & 1 != 0 && expected != Some(revision) { self.cancel.cancel(); }
+            }
             self.epoch += 1;
             self.info.state = NetworkState::Starting;
             self.publish(None);
+            #[cfg(all(feature = "test-hooks", debug_assertions))]
+            if self.gate.fail_bind.swap(false, Ordering::AcqRel) {
+                self.info.state = NetworkState::Failed;
+                self.publish(None);
+                self.finish_activation(Err(err(ErrorCode::TransportFailed)));
+                return;
+            }
             let profile = self.profile.clone();
             let key = self.key.clone();
             let epoch = self.epoch;
             let cancel = self.cancel.clone();
             let notes = self.notes.clone();
+            #[cfg(all(feature = "test-hooks", debug_assertions))]
+            let hold = self.gate.hold_bind.lock().unwrap().take();
             self.tasks.spawn(async move {
+                        #[cfg(all(feature = "test-hooks", debug_assertions))]
+                        if let Some(hold) = hold {
+                            tokio::select! { biased; _ = cancel.cancelled() => return, _ = hold.notified() => {} }
+                        }
                         let result = tokio::select! { biased; _ = cancel.cancelled() => return, result = bind_endpoint(&profile, key) => result };
                         #[cfg(any(test, all(feature = "test-hooks", debug_assertions)))]
                         if let Ok(endpoint) = &result
@@ -638,8 +797,10 @@ impl Manager {
         });
     }
     async fn note(&mut self, note: Note) {
+        if self.cancel.is_cancelled() { note.discard().await; return; }
         match note {
             Note::Bound { epoch, result } if epoch == self.epoch => {
+                let completion = result.as_ref().map(|_| ()).map_err(Clone::clone);
                 match result {
                     Ok(endpoint) => {
                         self.info.endpoint_id = Some(endpoint.id().to_string());
@@ -688,6 +849,7 @@ impl Manager {
                     }
                 }
                 self.publish(None);
+                self.finish_activation(completion);
             }
             Note::OwnAddress { epoch }
                 if epoch == self.epoch && self.info.state == NetworkState::Online =>
@@ -960,6 +1122,7 @@ impl Manager {
         }
     }
     async fn stop(&mut self) {
+        self.finish_activation(Err(err(ErrorCode::Busy)));
         self.cancel.cancel();
         self.epoch += 1;
         for peer in self.peers.values_mut() {
@@ -1013,6 +1176,32 @@ pub(crate) async fn within_retry_budget<F: std::future::Future>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn key_transition_rejects_old_epoch_notes_and_full_control_queue_stays_gated() {
+        let mut manager = Manager::new(NetworkProfile::Local { relay: None }, EventBus::new());
+        manager.endpoint = Some(bind_endpoint(&manager.profile, manager.key.clone()).await.unwrap());
+        let old_epoch = manager.epoch;
+        let ticket = manager.gate.block();
+        let (reply, received) = oneshot::channel();
+        let key = SecretKey::generate();
+        manager.control(Control::Activate { key: key.clone(), start: false, ticket, reply }).await;
+        received.await.unwrap().unwrap();
+        let before = manager.info.clone();
+        manager.cancel = CancellationToken::new();
+        let obsolete = bind_endpoint(&manager.profile, SecretKey::generate()).await.unwrap();
+        manager.note(Note::Bound { epoch: old_epoch, result: Ok(obsolete) }).await;
+        manager.note(Note::Text { tag: SessionTag { epoch: old_epoch, generation: 0, peer_id: "old".into() }, text: "obsolete".into() }).await;
+        assert_eq!(manager.info, before);
+        assert_eq!(manager.key.public(), key.public());
+        let (commands, _) = mpsc::channel(1);
+        let (controls, _receiver) = mpsc::channel(1);
+        let (reply, _) = oneshot::channel();
+        controls.try_send(Control::Quiesce { reply }).ok().unwrap();
+        let net = NetworkHandle { commands, controls, gate: Arc::default() };
+        assert_eq!(net.activate_key(key).await.unwrap_err().code, ErrorCode::Busy);
+        assert!(net.gate.blocked());
+        assert_eq!(net.execute(NetworkOp::Start).await.unwrap_err().code, ErrorCode::Busy);
+    }
     struct Sink(mpsc::Sender<CoreEvent>);
     impl crate::EventSink for Sink {
         fn send(&self, event: CoreEvent) -> bool {
@@ -1046,7 +1235,9 @@ mod tests {
         let added = "127.0.0.1:42001".parse().unwrap();
         assert!(!parse_target(manager.info.ticket.as_ref().unwrap()).unwrap().ip_addrs().any(|addr| *addr == added));
         let (commands, receiver) = mpsc::channel(64);
-        let handle = NetworkHandle { commands };
+        let (controls, received_controls) = mpsc::channel(8);
+        let handle = NetworkHandle { commands, controls, gate: manager.gate.clone() };
+        manager.controls = Some(received_controls);
         let actor = tokio::spawn(manager.run(receiver));
         advertise(&endpoint, added).await;
         let fresh = tokio::time::timeout(Duration::from_millis(300), async {
@@ -1611,7 +1802,8 @@ mod tests {
             ErrorCode::Busy
         );
         let (commands, receiver) = mpsc::channel(64);
-        let net = NetworkHandle { commands };
+        let (controls, _) = mpsc::channel(8);
+        let net = NetworkHandle { commands, controls, gate: Arc::default() };
         drop(receiver);
         assert_eq!(
             net.execute(NetworkOp::Info).await.unwrap_err().code,

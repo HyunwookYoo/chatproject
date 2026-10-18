@@ -19,3 +19,6 @@ pub use keys::{
     random_secret,
 };
 pub use types::{DeviceKind, FlowId, Generation, InstallationId, PeerId, Secret32, StoreId, TxId};
+
+mod manager;
+pub use manager::{AccountHandle, CandidateInfo};

@@ -16,3 +16,5 @@ pub use transport::{
 
 #[cfg(all(feature = "test-hooks", debug_assertions))]
 pub mod puppet;
+
+pub use account::{AccountHandle, CandidateInfo};
