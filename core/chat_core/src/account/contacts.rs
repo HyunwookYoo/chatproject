@@ -2,6 +2,7 @@
 use super::{ContactView, InstallationId, PeerId, invite::validate_name, safety_digest, wire};
 use crate::CoreError;
 use minicbor::{Decoder, Encoder, data::Type};
+use zeroize::{Zeroize, Zeroizing};
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct Contact {
     pub peer: PeerId,
@@ -9,6 +10,22 @@ pub(crate) struct Contact {
     pub verified_digest: Option<[u8; 32]>,
     pub known_installation: Option<InstallationId>,
     pub new_device: bool,
+}
+impl Zeroize for Contact {
+    fn zeroize(&mut self) {
+        self.peer.0.zeroize();
+        self.alias.zeroize();
+        self.verified_digest.zeroize();
+        if let Some(id) = &mut self.known_installation {
+            id.0.zeroize();
+        }
+        self.new_device.zeroize();
+    }
+}
+impl Drop for Contact {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
 }
 impl Contact {
     pub(crate) fn view(&self, device_verified: bool) -> ContactView {
@@ -21,8 +38,17 @@ impl Contact {
         }
     }
 }
-pub(crate) fn encode(contacts: &[Contact]) -> Vec<u8> {
-    let mut e = Encoder::new(Vec::new());
+fn encoded_capacity(contacts: &[Contact]) -> usize {
+    // Nine bytes covers any definite array/text length prefix. All other
+    // fields have fixed maximum widths; reserve before copying private data.
+    9 + contacts
+        .iter()
+        .map(|c| 1 + 34 + 9 + c.alias.len() + 1 + 34 + 34 + 1)
+        .sum::<usize>()
+}
+pub(crate) fn encode(contacts: &[Contact]) -> Zeroizing<Vec<u8>> {
+    let mut bytes = Zeroizing::new(Vec::with_capacity(encoded_capacity(contacts)));
+    let mut e = Encoder::new(&mut *bytes);
     e.array(contacts.len() as u64).unwrap();
     for c in contacts {
         e.array(6)
@@ -45,7 +71,7 @@ pub(crate) fn encode(contacts: &[Contact]) -> Vec<u8> {
         }
         e.u8(u8::from(c.new_device)).unwrap();
     }
-    e.into_writer()
+    bytes
 }
 pub(crate) fn decode(input: &[u8], own: PeerId) -> Result<Vec<Contact>, CoreError> {
     let mut d = Decoder::new(input);
@@ -59,42 +85,47 @@ pub(crate) fn decode(input: &[u8], own: PeerId) -> Result<Vec<Contact>, CoreErro
     let mut contacts = Vec::with_capacity(n as usize);
     for _ in 0..n {
         wire::array(&mut d, 6)?;
-        let peer = PeerId(wire::bytes(&mut d)?);
-        let alias = d.str().map_err(|_| wire::invalid())?.to_string();
-        validate_name(&alias)?;
+        let mut contact = Contact {
+            peer: PeerId(wire::bytes(&mut d)?),
+            alias: String::new(),
+            verified_digest: None,
+            known_installation: None,
+            new_device: false,
+        };
+        let alias = d.str().map_err(|_| wire::invalid())?;
+        validate_name(alias)?;
+        contact.alias = alias.into();
         let verified = wire::uint(&mut d)?;
-        let digest = if d.datatype().map_err(|_| wire::invalid())? == Type::Null {
+        contact.verified_digest = if d.datatype().map_err(|_| wire::invalid())? == Type::Null {
             d.null().map_err(|_| wire::invalid())?;
             None
         } else {
             Some(wire::bytes(&mut d)?)
         };
-        let known_installation = if d.datatype().map_err(|_| wire::invalid())? == Type::Null {
+        contact.known_installation = if d.datatype().map_err(|_| wire::invalid())? == Type::Null {
             d.null().map_err(|_| wire::invalid())?;
             None
         } else {
             Some(InstallationId(wire::bytes(&mut d)?))
         };
-        let new_device = match wire::uint(&mut d)? {
+        contact.new_device = match wire::uint(&mut d)? {
             0 => false,
             1 => true,
             _ => return Err(wire::invalid()),
         };
-        if peer == own
-            || contacts.last().is_some_and(|c: &Contact| c.peer >= peer)
-            || verified != u64::from(digest.is_some())
-            || digest.is_some_and(|v| v != safety_digest(own, peer))
-            || (new_device && known_installation.is_none())
+        if contact.peer == own
+            || contacts
+                .last()
+                .is_some_and(|c: &Contact| c.peer >= contact.peer)
+            || verified != u64::from(contact.verified_digest.is_some())
+            || contact
+                .verified_digest
+                .is_some_and(|v| v != safety_digest(own, contact.peer))
+            || (contact.new_device && contact.known_installation.is_none())
         {
             return Err(wire::invalid());
         }
-        contacts.push(Contact {
-            peer,
-            alias,
-            verified_digest: digest,
-            known_installation,
-            new_device,
-        });
+        contacts.push(contact);
     }
     wire::canonical(input, &encode(&contacts))?;
     Ok(contacts)
@@ -112,6 +143,33 @@ mod tests {
             known_installation: None,
             new_device: false,
         }
+    }
+    #[test]
+    fn private_contact_owner_and_complete_encoding_reserve() {
+        assert!(std::mem::needs_drop::<Contact>());
+        let mut contacts: Vec<_> = (0..1000).map(contact).collect();
+        for c in &mut contacts {
+            c.alias = "x".repeat(64);
+            c.verified_digest = Some([7; 32]);
+            c.known_installation = Some(InstallationId([8; 32]));
+        }
+        let encoded: Zeroizing<Vec<u8>> = encode(&contacts);
+        assert_eq!(encoded.capacity(), encoded_capacity(&contacts));
+        assert!(encoded.len() <= encoded_capacity(&contacts));
+        contacts[0].zeroize();
+        assert!(contacts[0].alias.is_empty());
+        assert_eq!(contacts[0].peer.0, [0; 32]);
+        assert!(contacts[0].verified_digest.is_none_or(|d| d == [0; 32]));
+        assert!(
+            contacts[0]
+                .known_installation
+                .is_none_or(|d| d.0 == [0; 32])
+        );
+        // A valid first entry followed by a malformed entry exercises partial
+        // decode: every constructed Contact owns its own zeroizing Drop.
+        let mut partial = encode(&[contact(1), contact(2)]);
+        partial.pop();
+        assert!(decode(&partial, PeerId([255; 32])).is_err());
     }
     #[test]
     fn canonical_contact_bounds_order_and_verification() {

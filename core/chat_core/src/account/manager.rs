@@ -63,6 +63,8 @@ enum Command {
     PairTestStop(super::PairTestStop,oneshot::Sender<Result<(),CoreError>>),
     #[cfg(all(feature="test-hooks",debug_assertions))]
     PairTestBytes(oneshot::Sender<Result<(usize,usize),CoreError>>),
+    #[cfg(all(feature="test-hooks",debug_assertions))]
+    PairTestReached(oneshot::Sender<Result<Option<super::PairTestStop>,CoreError>>),
     DiscardPending(oneshot::Sender<Result<(),CoreError>>),
     PairBegin(super::PairDirection,Option<super::TxId>,oneshot::Sender<Result<super::PairDisplay,CoreError>>),
     PairScan(Zeroizing<String>,oneshot::Sender<Result<(),CoreError>>),
@@ -112,6 +114,8 @@ impl Command {
             Self::PairTestStop(_,reply)=>{let _=reply.send(Err(error));}
             #[cfg(all(feature="test-hooks",debug_assertions))]
             Self::PairTestBytes(reply)=>{let _=reply.send(Err(error));}
+            #[cfg(all(feature="test-hooks",debug_assertions))]
+            Self::PairTestReached(reply)=>{let _=reply.send(Err(error));}
             Self::DiscardPending(reply)=>{let _=reply.send(Err(error));}
             Self::PairBegin(_,_,reply)=>{let _=reply.send(Err(error));}
             Self::PairView(reply)=>{let _=reply.send(Err(error));}
@@ -177,6 +181,8 @@ impl AccountHandle {
     pub async fn pair_test_stop(&self,stop:super::PairTestStop)->Result<(),CoreError>{self.send(|reply|Command::PairTestStop(stop,reply)).await}
     #[cfg(all(feature="test-hooks",debug_assertions))]
     pub async fn pair_test_bytes(&self)->Result<(usize,usize),CoreError>{self.send(Command::PairTestBytes).await}
+    #[cfg(all(feature="test-hooks",debug_assertions))]
+    pub async fn pair_test_reached(&self)->Result<Option<super::PairTestStop>,CoreError>{self.send(Command::PairTestReached).await}
     pub(crate) fn open(
         runtime: &tokio::runtime::Handle,
         root: &Path,
@@ -367,6 +373,7 @@ impl Manager {
     fn pair_checkpoint(&mut self, at: super::PairTestStop) -> Result<(), CoreError> {
         if self.pair.stop == Some(at) {
             self.pair.stop = None;
+            self.pair.reached = Some(at);
             self.pair.current = None;
             return Err(unavailable(ErrorCode::NotAvailable));
         }
@@ -602,6 +609,8 @@ impl Manager {
             self.pair.stop = None;
         }
         let mut sent = 0;
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        let mut reached_first = false;
         let result = self
             .service(
                 request,
@@ -617,6 +626,7 @@ impl Manager {
                             .await?;
                         #[cfg(all(feature = "test-hooks", debug_assertions))]
                         if stop_first {
+                            reached_first = true;
                             return Err(unavailable(ErrorCode::NotAvailable));
                         }
                     }
@@ -627,6 +637,9 @@ impl Manager {
         #[cfg(all(feature = "test-hooks", debug_assertions))]
         {
             self.pair.bytes.0 += sent;
+            if reached_first {
+                self.pair.reached = Some(super::PairTestStop::EAfterFirstChunk);
+            }
         }
         let _ = sent;
         if result.is_ok() && session.live(&*clock) {
@@ -1018,6 +1031,16 @@ impl Manager {
             },
         };
         self.commit_pair_state(AccountState::Active(Box::new(local)), request)?;
+        // Store callbacks can change time while persistence is synchronous.
+        // The committed Active snapshot is established/non-discardable, but
+        // cannot be exposed as successful activation on stale authority.
+        if !self.local_authorized() {
+            self.pair.current = None;
+            self.close_auth();
+            self.shared.network.block();
+            self.shared.status.fetch_max((request.ticket << 2) | 2, Ordering::AcqRel);
+            return Err(unavailable(ErrorCode::AccountRestricted));
+        }
         if let Some(s) = &mut self.pair.current {
             s.phase = Some(super::PairPhase::Active);
         }
@@ -1058,9 +1081,11 @@ impl Manager {
                     }
                     match queued.command {
                         #[cfg(all(feature="test-hooks",debug_assertions))]
-                        Command::PairTestStop(stop,reply)=>{self.pair.stop=Some(stop);let _=reply.send(Ok(()));}
+                        Command::PairTestStop(stop,reply)=>{self.pair.stop=Some(stop);self.pair.reached=None;let _=reply.send(Ok(()));}
                         #[cfg(all(feature="test-hooks",debug_assertions))]
                         Command::PairTestBytes(reply)=>{let _=reply.send(Ok(self.pair.bytes));}
+                        #[cfg(all(feature="test-hooks",debug_assertions))]
+                        Command::PairTestReached(reply)=>{let _=reply.send(Ok(self.pair.reached));}
                         Command::DiscardPending(reply)=>{let result=self.discard_pending().await;let _=reply.send(result);}
                         Command::PairBegin(direction,resume,reply)=>{let result=self.pair_begin(direction,resume).await;let _=reply.send(result);}
                         Command::PairScan(qr,reply)=>{let result=self.pair_scan(&qr).await;let _=reply.send(result);}
@@ -1316,7 +1341,6 @@ impl Manager {
         }
     }
     async fn auto_refresh(&mut self) {
-        if self.ready().is_ok() && matches!(self.state,Some(AccountState::PendingImport(_))) {let _=self.refresh_import().await;}
         if self.ready().is_ok() && self.local().is_ok() {
             let _ = self.publication(Action::Refresh).await;
         }
@@ -1554,7 +1578,8 @@ impl Manager {
                 view.publish_intents.push(local.intent);
                 view.publication = local.records.view();
                 match local.records.state {
-                    PublicationState::Observed => view.phase = AccountPhase::Active,
+                    PublicationState::Observed if self.local_authorized() => view.phase = AccountPhase::Active,
+                    PublicationState::Observed => view.publication.state = PublicationState::LocalBlocked,
                     PublicationState::Conflict => view.phase = AccountPhase::Conflict,
                     PublicationState::Pending => view.phase = AccountPhase::PublishPending,
                     PublicationState::LocalBlocked => {}
@@ -2814,11 +2839,14 @@ impl Manager {
     }
     async fn pair_prepare(&mut self, role: super::pair::wire::Role) -> Result<(), CoreError> {
         use super::pair::wire::Role;
-        self.ready()?;
+        let request = self.ready()?;
         if role == Role::New {
             if matches!(self.state,Some(AccountState::CandidatePinned(_) | AccountState::PendingImport(_) | AccountState::Active(_))) {
                 let device=self.state.as_ref().unwrap().device();
-                self.shared.network.install_key(iroh::SecretKey::from_bytes(device.transport().as_bytes()), true, self.shared.network.block()).await?;
+                let key=iroh::SecretKey::from_bytes(device.transport().as_bytes());
+                let ticket=self.shared.network.block();
+                self.service(request,Box::pin(self.shared.network.install_key(key,true,ticket))).await?;
+                self.ensure_ready(request)?;
             }else{self.prepare().await?;}
         } else {
             self.publication(Action::Refresh).await?;
@@ -2868,8 +2896,10 @@ impl Manager {
         } else {
             Role::Existing
         };
+        let request=self.ready()?;
         self.validate_pair_role(role,resume)?;
         self.pair_prepare(role).await?;
+        self.ensure_ready(request)?;
         let device = self
             .state
             .as_ref()
@@ -2923,8 +2953,10 @@ impl Manager {
             && qr.direction == super::PairDirection::ExistingDisplays
             && qr.resume.is_some()
             && matches!(self.state, Some(AccountState::Candidate(_)));
+        let request=self.ready()?;
         if !first_offer { self.validate_pair_role(role,qr.resume)?; }
         self.pair_prepare(role).await?;
+        self.ensure_ready(request)?;
         let mut target = iroh::EndpointAddr::from(
             iroh::EndpointId::from_bytes(&qr.transport).map_err(|_| super::wire::invalid())?,
         );

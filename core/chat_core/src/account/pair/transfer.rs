@@ -26,16 +26,6 @@ pub(crate) struct Payload {
     pub base: [u8; 32],
     pub contacts: Vec<Contact>,
 }
-impl Drop for Payload {
-    fn drop(&mut self) {
-        use zeroize::Zeroize;
-        for c in &mut self.contacts {
-            c.alias.zeroize();
-            c.peer.0.zeroize();
-            c.verified_digest.zeroize();
-        }
-    }
-}
 impl Payload {
     pub(crate) fn encode_parts(
         tx: TxId,

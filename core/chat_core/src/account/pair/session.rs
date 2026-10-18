@@ -23,6 +23,8 @@ pub(crate) struct Runtime {
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     pub stop: Option<super::PairTestStop>,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
+    pub reached: Option<super::PairTestStop>,
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
     pub bytes: (usize, usize),
     pub send: mpsc::Sender<Input>,
     pub input: mpsc::Receiver<Input>,
@@ -34,6 +36,8 @@ impl Default for Runtime {
         Self {
             #[cfg(all(feature = "test-hooks", debug_assertions))]
             stop: None,
+            #[cfg(all(feature = "test-hooks", debug_assertions))]
+            reached: None,
             #[cfg(all(feature = "test-hooks", debug_assertions))]
             bytes: (0, 0),
             send,

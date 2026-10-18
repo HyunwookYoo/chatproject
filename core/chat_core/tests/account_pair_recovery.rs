@@ -56,10 +56,14 @@ struct Backend {
     offline: std::sync::atomic::AtomicBool,
     hold_publish: std::sync::atomic::AtomicBool,
     published: std::sync::atomic::AtomicUsize,
+    lookups: std::sync::atomic::AtomicUsize,
+    publication_packets: Mutex<Vec<Vec<u8>>>,
 }
 impl RecordBackend for Backend {
     fn lookup(&self, p: PeerId) -> RecordFuture<'_, Lookup> {
         Box::pin(async move {
+            self.lookups
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if self.offline.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(CoreError::new(
                     chat_core::ErrorCode::RecordUnavailable,
@@ -86,6 +90,10 @@ impl RecordBackend for Backend {
             }
             self.published
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.publication_packets
+                .lock()
+                .unwrap()
+                .push(p.as_bytes().to_vec());
             self.packets
                 .lock()
                 .unwrap()
@@ -556,6 +564,134 @@ async fn already_published_no_duplicate_add() {
     assert!(n.a.discard_pending_import().await.is_err());
 }
 
+fn field(input: &[u8], index: usize) -> &[u8] {
+    let mut d = minicbor::Decoder::new(input);
+    assert!(d.array().unwrap().unwrap() > index as u64);
+    for _ in 0..index {
+        d.skip().unwrap();
+    }
+    let start = d.position();
+    d.skip().unwrap();
+    &input[start..d.position()]
+}
+fn byte_field(input: &[u8], index: usize) -> &[u8] {
+    minicbor::Decoder::new(field(input, index)).bytes().unwrap()
+}
+fn number_field(input: &[u8], index: usize) -> u64 {
+    minicbor::Decoder::new(field(input, index)).u64().unwrap()
+}
+#[derive(Default)]
+struct DiskBoundary {
+    tag: u64,
+    tx: Option<TxId>,
+    stage: Option<u64>,
+    receipt: bool,
+    add: bool,
+    payload_hash: Option<[u8; 32]>,
+    pin: Option<[[u8; 32]; 3]>,
+    publication: Option<[u8; 32]>,
+}
+impl DiskBoundary {
+    fn read(store: &mut chat_core::account::storage::Store) -> Self {
+        use sha2::{Digest, Sha256};
+        let stored = store.load().unwrap().unwrap();
+        let raw = &stored.payload;
+        let mut out = Self {
+            tag: number_field(raw, 1),
+            ..Default::default()
+        };
+        match out.tag {
+            0 => {}
+            2 => {
+                out.pin = Some(std::array::from_fn(|i| {
+                    byte_field(field(raw, 4), i).try_into().unwrap()
+                }));
+                out.tx = Some(TxId(byte_field(raw, 5).try_into().unwrap()));
+                out.payload_hash = Some(byte_field(raw, 6).try_into().unwrap());
+            }
+            3 => {
+                out.pin = Some(std::array::from_fn(|i| {
+                    byte_field(field(raw, 4), i).try_into().unwrap()
+                }));
+                let payload = byte_field(raw, 5);
+                out.tx = Some(TxId(byte_field(payload, 1).try_into().unwrap()));
+                out.payload_hash = Some(Sha256::digest(payload).into());
+                out.receipt = !byte_field(raw, 6).is_empty();
+            }
+            1 => {
+                let pairs = byte_field(raw, 10);
+                let list = field(pairs, 1);
+                if minicbor::Decoder::new(list).array().unwrap().unwrap() > 0 {
+                    let t = byte_field(list, 0);
+                    out.tx = Some(TxId(byte_field(t, 1).try_into().unwrap()));
+                    out.pin = Some(std::array::from_fn(|i| {
+                        byte_field(t, i + 2).try_into().unwrap()
+                    }));
+                    out.stage = Some(number_field(t, 8));
+                    out.receipt = field(t, 9) != [0xf6];
+                    out.payload_hash = Some(Sha256::digest(byte_field(t, 5)).into());
+                    if field(t, 10) != [0xf6] {
+                        out.publication = Some(byte_field(t, 10).try_into().unwrap());
+                    }
+                }
+                if field(pairs, 2) != [0xf6] {
+                    let origin = byte_field(pairs, 2);
+                    out.tx = Some(TxId(byte_field(origin, 1).try_into().unwrap()));
+                    out.payload_hash = Some(byte_field(origin, 6).try_into().unwrap());
+                    out.receipt = true;
+                    out.pin = Some(std::array::from_fn(|i| {
+                        byte_field(field(origin, 2), i).try_into().unwrap()
+                    }));
+                }
+                let records = byte_field(raw, 7);
+                let pending = field(records, 8);
+                let count = minicbor::Decoder::new(pending).array().unwrap().unwrap();
+                for i in 0..count {
+                    let intent = field(pending, i as usize);
+                    if number_field(intent, 2) == 5 {
+                        out.add = true;
+                        assert_eq!(number_field(intent, 3), 0);
+                        let hash: [u8; 32] = Sha256::digest(byte_field(intent, 0)).into();
+                        assert_eq!(out.publication, Some(hash));
+                    }
+                }
+            }
+            _ => panic!("unexpected stored state"),
+        }
+        out
+    }
+}
+async fn reached(a: &AccountHandle, stop: PairTestStop) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while a.pair_test_reached().await.unwrap() != Some(stop) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the exact configured production boundary must be reached");
+}
+async fn existing_offer(e: &Fixture, n: &Fixture, tx: TxId) -> FlowId {
+    let display =
+        e.a.pair_begin(PairDirection::ExistingDisplays, Some(tx))
+            .await
+            .unwrap();
+    n.route_to(e).await;
+    n.a.pair_scan(display.qr.clone()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while e
+            .a
+            .pair_view()
+            .await
+            .unwrap()
+            .is_none_or(|v| v.sas.is_none())
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    display.flow
+}
 #[tokio::test]
 async fn crash_boundaries_reload_durable_history() {
     for stop in [
@@ -570,36 +706,86 @@ async fn crash_boundaries_reload_durable_history() {
         PairTestStop::EBeforePublish,
         PairTestStop::EAfterPublish,
     ] {
-        let (e, n, f, _) = connected(PairDirection::NewDisplays).await;
+        let backend = Arc::new(Backend::default());
+        let e = Fixture::new(true, backend.clone()).await;
+        let n = Fixture::new(false, backend.clone()).await;
+        let existing = e.a.snapshot().await.unwrap();
+        let peer = existing.public_peer_id.unwrap();
+        let epin = [
+            peer.0,
+            existing.installation.unwrap().0,
+            existing.devices[0].transport_public_key,
+        ];
+        let installation = n.a.prepare_candidate().await.unwrap().installation_id;
+        let f = fresh(&e, &n, None).await;
         confirm_wait(&e, &n, f).await;
         let new = matches!(
             stop,
             PairTestStop::NBeforeImport | PairTestStop::NAfterImport | PairTestStop::NAfterAck
         );
-        if new {
-            n.a.pair_test_stop(stop).await.unwrap();
+        let stopping = if new { &n.a } else { &e.a };
+        stopping.pair_test_stop(stop).await.unwrap();
+        let approval = e.a.pair_approve(f).await;
+        if matches!(
+            stop,
+            PairTestStop::EBeforeDisclosure
+                | PairTestStop::EAfterDisclosure
+                | PairTestStop::EAfterFirstChunk
+        ) {
+            assert!(approval.is_err());
         } else {
-            e.a.pair_test_stop(stop).await.unwrap();
+            assert!(approval.is_ok());
         }
-        let _ = e.a.pair_approve(f).await;
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let bytes = e.a.pair_test_bytes().await.unwrap().0;
+        reached(stopping, stop).await;
+        let sent = e.a.pair_test_bytes().await.unwrap().0;
+        let ack = n.a.pair_test_bytes().await.unwrap().1;
         if matches!(
             stop,
             PairTestStop::EBeforeDisclosure | PairTestStop::EAfterDisclosure
         ) {
-            assert_eq!(bytes, 0, "{stop:?}");
+            assert_eq!(sent, 0, "{stop:?}");
+        } else {
+            assert!(sent > 0, "{stop:?}");
         }
         if matches!(
             stop,
-            PairTestStop::NBeforeImport | PairTestStop::NAfterImport
+            PairTestStop::EBeforeDisclosure
+                | PairTestStop::EAfterDisclosure
+                | PairTestStop::NBeforeImport
+                | PairTestStop::NAfterImport
         ) {
-            assert_eq!(n.a.pair_test_bytes().await.unwrap().1, 0, "{stop:?}");
+            assert_eq!(ack, 0, "{stop:?}");
         }
-        let e = e.restart().await;
-        let n = n.restart().await;
+        if matches!(
+            stop,
+            PairTestStop::NAfterAck
+                | PairTestStop::EBeforeReceipt
+                | PairTestStop::EAfterReceipt
+                | PairTestStop::EBeforePublish
+                | PairTestStop::EAfterPublish
+        ) {
+            assert!(ack > 0, "{stop:?}");
+        }
+        let published = backend.published.load(std::sync::atomic::Ordering::SeqCst);
+        if stop == PairTestStop::EAfterPublish {
+            assert_eq!(published, 2);
+        } else if stop != PairTestStop::NAfterAck {
+            assert_eq!(published, 1, "{stop:?}");
+        }
+        // Freeze possible existing Add retries while reading the actual files.
+        backend
+            .hold_publish
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut ed = DiskBoundary::default();
+        let e = e.restart_edit(|store| ed = DiskBoundary::read(store)).await;
+        let mut nd = DiskBoundary::default();
+        let n = n.restart_edit(|store| nd = DiskBoundary::read(store)).await;
+        assert_eq!(ed.tag, 1);
+        if ed.tx.is_some() {
+            assert_eq!(ed.pin, Some(epin));
+        }
         assert_eq!(
-            e.a.snapshot().await.unwrap().disclosure_possible,
+            ed.tx.is_some(),
             stop != PairTestStop::EBeforeDisclosure,
             "{stop:?}"
         );
@@ -607,25 +793,114 @@ async fn crash_boundaries_reload_durable_history() {
             stop,
             PairTestStop::EBeforeDisclosure | PairTestStop::EAfterDisclosure
         ) {
-            assert_eq!(
-                n.a.snapshot().await.unwrap().phase,
-                AccountPhase::Candidate,
-                "{stop:?}"
-            );
+            assert_eq!(nd.tag, 0);
+        }
+        // A successful local first-chunk write is not proof that N received
+        // even the envelope before E closed. N's durable pin is required at
+        // NBeforeImport and checked for exact equality whenever it exists.
+        if stop == PairTestStop::EAfterPublish {
+            assert!(matches!(nd.tag, 1 | 3));
+            assert!(nd.receipt);
+        }
+        if stop == PairTestStop::NBeforeImport {
+            assert_eq!(nd.tag, 2);
+            assert!(!nd.receipt);
         }
         if matches!(
             stop,
-            PairTestStop::NBeforeImport
-                | PairTestStop::NAfterImport
+            PairTestStop::NAfterImport
+                | PairTestStop::NAfterAck
                 | PairTestStop::EBeforeReceipt
                 | PairTestStop::EAfterReceipt
+                | PairTestStop::EBeforePublish
         ) {
+            assert_eq!(nd.tag, 3, "{stop:?}");
+            assert!(nd.receipt);
+        }
+        if matches!(
+            stop,
+            PairTestStop::EAfterDisclosure
+                | PairTestStop::EAfterFirstChunk
+                | PairTestStop::NBeforeImport
+                | PairTestStop::NAfterImport
+                | PairTestStop::EBeforeReceipt
+        ) {
+            assert_eq!(ed.stage, Some(0));
+            assert!(!ed.receipt);
+            assert!(!ed.add);
+            assert!(ed.publication.is_none());
+        }
+        if stop == PairTestStop::EAfterReceipt {
+            assert_eq!(ed.stage, Some(1));
+            assert!(ed.receipt);
+            assert!(!ed.add);
+            assert!(ed.publication.is_none());
+        }
+        if stop == PairTestStop::EBeforePublish {
+            assert_eq!(ed.stage, Some(2));
+            assert!(ed.receipt);
+            assert!(ed.add);
+            assert!(ed.publication.is_some());
+        }
+        if stop == PairTestStop::EAfterPublish {
+            assert_eq!(ed.stage, Some(3));
+            assert!(ed.receipt);
+            assert!(!ed.add);
+            assert!(ed.publication.is_some());
+        }
+        if nd.tag != 0 {
+            assert_eq!(nd.tx, ed.tx);
+            assert_eq!(nd.payload_hash, ed.payload_hash);
+            assert_eq!(nd.pin, Some(epin));
+        }
+        assert!(e.a.pair_view().await.unwrap().is_none());
+        assert!(n.a.pair_view().await.unwrap().is_none());
+        // The table now also proves reconciliation for every reached boundary.
+        backend
+            .hold_publish
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let fresh_flow = if let Some(tx) = ed.tx {
+            existing_offer(&e, &n, tx).await
+        } else {
+            fresh(&e, &n, None).await
+        };
+        assert_ne!(fresh_flow, f);
+        assert!(e.a.pair_approve(f).await.is_err());
+        assert!(e.a.pair_approve(fresh_flow).await.is_err());
+        assert_eq!(e.a.pair_test_bytes().await.unwrap().0, 0);
+        confirm_wait(&e, &n, fresh_flow).await;
+        assert_eq!(e.a.pair_test_bytes().await.unwrap().0, 0);
+        e.a.pair_approve(fresh_flow).await.unwrap();
+        active(&n).await;
+        let view = n.a.snapshot().await.unwrap();
+        assert_eq!(view.installation, Some(installation));
+        assert_eq!(view.publication.accepted.unwrap().devices.len(), 2);
+        if let Some(tx) = ed.tx {
             assert_eq!(
-                n.a.snapshot().await.unwrap().phase,
-                AccountPhase::PendingImport,
-                "{stop:?}"
+                n.a.pair_view().await.unwrap().unwrap().transaction,
+                Some(tx)
             );
         }
+        {
+            let packets = backend.publication_packets.lock().unwrap();
+            let unique: std::collections::BTreeSet<_> = packets.iter().collect();
+            assert_eq!(
+                unique.len(),
+                2,
+                "no new Add packet on {stop:?} reconciliation"
+            );
+        }
+        let n = n
+            .restart_edit(|store| {
+                let final_disk = DiskBoundary::read(store);
+                assert_eq!(final_disk.tag, 1);
+                assert!(final_disk.receipt);
+                if ed.tx.is_some() {
+                    assert_eq!(final_disk.tx, ed.tx);
+                    assert_eq!(final_disk.payload_hash, ed.payload_hash);
+                }
+            })
+            .await;
         assert!(n.a.pair_view().await.unwrap().is_none());
     }
 }
@@ -929,4 +1204,146 @@ async fn cancel_and_timeout_preserve_durable_disclosure_warning() {
             1
         );
     }
+}
+
+async fn unpublished_pair() -> (Fixture, Fixture, Arc<Backend>, FlowId) {
+    let backend = Arc::new(Backend::default());
+    let e = Fixture::new(true, backend.clone()).await;
+    let n = Fixture::new(false, backend.clone()).await;
+    let f = fresh(&e, &n, None).await;
+    confirm_wait(&e, &n, f).await;
+    backend
+        .hold_publish
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    e.a.pair_approve(f).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while e.a.snapshot().await.unwrap().publication.pending_count != 1
+            || n.a.pair_test_bytes().await.unwrap().1 == 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    n.a.pair_cancel(f).await.unwrap();
+    (e, n, backend, f)
+}
+#[tokio::test]
+async fn activation_commit_clock_change_is_error_and_reload_never_claims_active() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (e, n, b, _) = unpublished_pair().await;
+    let peer = e.a.snapshot().await.unwrap().public_peer_id.unwrap();
+    b.hold_publish.store(false, SeqCst);
+    e.a.refresh_record(peer).await.unwrap();
+    e.a.refresh_record(peer).await.unwrap();
+    let next = n.protector.reads.load(SeqCst) + 1;
+    *n.protector.shift_clock.lock().unwrap() = Some((next, n.clock.clone(), NOW - 301));
+    assert!(
+        n.a.refresh_record(peer).await.is_err(),
+        "time-invalid activation commit must not report success"
+    );
+    assert_eq!(n.a.snapshot().await.unwrap().phase, AccountPhase::Locked);
+    assert!(n.a.pair_view().await.is_err());
+    assert!(n.a.create_invite(None).await.is_err());
+    let n = n
+        .restart_edit(|store| {
+            let stored = store.load().unwrap().unwrap();
+            let mut d = minicbor::Decoder::new(&stored.payload);
+            assert_eq!(d.array().unwrap(), Some(11));
+            assert_eq!(d.u8().unwrap(), 1);
+            assert_eq!(d.u8().unwrap(), 1);
+        })
+        .await;
+    let view = n.a.snapshot().await.unwrap();
+    assert_ne!(view.phase, AccountPhase::Active);
+    assert_eq!(
+        view.publication.state,
+        chat_core::account::PublicationState::LocalBlocked
+    );
+    assert!(n.a.pair_view().await.unwrap().is_none());
+    assert!(n.a.connect_account(peer).await.is_err());
+    assert!(
+        n.a.revoke_device(e.a.snapshot().await.unwrap().installation.unwrap())
+            .await
+            .is_err()
+    );
+    assert!(n.a.discard_pending_import().await.is_err());
+    n.clock.set_unix_seconds(NOW);
+    n.a.refresh_record(peer).await.unwrap();
+    n.a.refresh_record(peer).await.unwrap();
+    assert_eq!(n.a.snapshot().await.unwrap().phase, AccountPhase::Active);
+}
+#[tokio::test]
+async fn cancelled_and_restarted_import_has_no_automatic_lookup() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (e, n, b, _) = unpublished_pair().await;
+    let peer = e.a.snapshot().await.unwrap().public_peer_id.unwrap();
+    b.hold_publish.store(false, SeqCst);
+    e.a.refresh_record(peer).await.unwrap();
+    e.a.refresh_record(peer).await.unwrap();
+    e.a.request_suspend();
+    settled(&e.a).await;
+    let before = b.lookups.load(SeqCst);
+    tokio::time::pause();
+    for _ in 0..3 {
+        tokio::time::advance(Duration::from_secs(61)).await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let _ = n.a.snapshot().await.unwrap();
+    }
+    assert_eq!(
+        b.lookups.load(SeqCst),
+        before,
+        "cancelled import must not poll"
+    );
+    tokio::time::resume();
+    let n = n.restart().await;
+    assert_eq!(
+        b.lookups.load(SeqCst),
+        before,
+        "restart must await explicit refresh"
+    );
+    assert_eq!(
+        n.a.snapshot().await.unwrap().phase,
+        AccountPhase::PendingImport
+    );
+    tokio::time::pause();
+    for _ in 0..3 {
+        tokio::time::advance(Duration::from_secs(61)).await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let _ = n.a.snapshot().await.unwrap();
+    }
+    assert_eq!(b.lookups.load(SeqCst), before);
+    tokio::time::resume();
+    n.a.refresh_record(peer).await.unwrap();
+    assert_eq!(b.lookups.load(SeqCst), before + 1);
+    assert_eq!(n.a.snapshot().await.unwrap().phase, AccountPhase::Active);
+}
+#[tokio::test]
+async fn resume_key_transition_cancellation_returns_no_display_or_session() {
+    let (_e, n, _b, _) = unpublished_pair().await;
+    let tx = n.a.snapshot().await.unwrap().pending_pair_transactions[0];
+    let (entered, release) = n
+        .slot
+        .network()
+        .unwrap()
+        .hold_next_key_transition_for_test();
+    let a = n.a.clone();
+    let begin =
+        tokio::spawn(async move { a.pair_begin(PairDirection::NewDisplays, Some(tx)).await });
+    tokio::time::timeout(Duration::from_secs(5), entered)
+        .await
+        .unwrap()
+        .unwrap();
+    n.a.request_suspend();
+    let _ = release.send(());
+    assert!(
+        begin.await.unwrap().is_err(),
+        "cancelled resume must not return a QR"
+    );
+    settled(&n.a).await;
+    assert!(n.a.snapshot().await.unwrap().pair.is_none());
+    assert_eq!(n.a.snapshot().await.unwrap().phase, AccountPhase::Locked);
+    n.a.request_resume();
+    settled(&n.a).await;
+    assert!(n.a.pair_view().await.unwrap().is_none());
 }

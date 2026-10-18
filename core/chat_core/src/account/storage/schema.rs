@@ -128,15 +128,6 @@ pub(crate) struct LocalAccount {
     pub(crate) contacts: Vec<crate::account::contacts::Contact>,
     pub(crate) pairs: crate::account::pair::transaction::PairState,
 }
-impl Drop for LocalAccount {
-    fn drop(&mut self) {
-        use zeroize::Zeroize;
-        for c in &mut self.contacts {
-            c.alias.zeroize();c.peer.0.zeroize();c.verified_digest.zeroize();
-            if let Some(id)=&mut c.known_installation{id.0.zeroize();}
-        }
-    }
-}
 impl AccountState {
     fn decode_pending(stored: &StoredPlaintext) -> Result<Self, CoreError> {
         use crate::account::{
@@ -358,7 +349,7 @@ impl AccountState {
         if let Self::Active(local) = self {
             let records = local.records.encode();
             let remote = crate::account::connection::encode_cache(&local.remote);
-            let contacts = Zeroizing::new(crate::account::contacts::encode(&local.contacts));
+            let contacts = crate::account::contacts::encode(&local.contacts);
             let pairs = local.pairs.encode();
             let capacity = records.len() + remote.len() + contacts.len() + pairs.len() + 512;
             let mut payload = Zeroizing::new(Vec::with_capacity(capacity));
@@ -449,6 +440,32 @@ mod account_tests {
         assert_eq!(restored.keys.peer_id(), peer);
         assert_eq!(restored.revision, 7);
         assert_eq!(restored.intent, PublishIntent::Replacement);
+    }
+
+    #[test]
+    fn valid_contacts_then_invalid_pair_state_rejects_with_owned_contact_drop() {
+        let mut local = local_account(
+            derive_account(&Secret32::from([0; 32])).unwrap(),
+            PublishIntent::LocalCreate,
+            1,
+        )
+        .unwrap();
+        local.contacts.push(crate::account::contacts::Contact {
+            peer: crate::account::PeerId([5; 32]),
+            alias: "private alias".into(),
+            verified_digest: None,
+            known_installation: None,
+            new_device: false,
+        });
+        let state = AccountState::Active(Box::new(local));
+        let mut stored = state.encode();
+        assert!(AccountState::decode(&stored).is_ok());
+        assert!(std::mem::needs_drop::<crate::account::contacts::Contact>());
+        // Valid contacts are decoded before this last pair-state version fails.
+        let len = stored.payload.len();
+        assert_eq!(&stored.payload[len - 4..], &[0x83, 1, 0x80, 0xf6]);
+        stored.payload[len - 3] = 2;
+        assert!(AccountState::decode(&stored).is_err());
     }
 
     #[test]

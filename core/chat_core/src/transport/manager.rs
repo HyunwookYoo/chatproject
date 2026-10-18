@@ -70,6 +70,8 @@ pub(crate) struct Gate {
     hold_bind: Mutex<Option<Arc<tokio::sync::Notify>>>,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     token_window: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    key_transition: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
 }
 impl Gate {
     pub(crate) fn desired_suspend(&self) -> bool { self.desired_suspend.load(Ordering::Acquire) }
@@ -173,6 +175,13 @@ impl NetworkHandle {
         let (entered, received) = std::sync::mpsc::channel();
         let (release, resumed) = std::sync::mpsc::channel();
         *self.gate.token_window.lock().unwrap() = Some((entered, resumed));
+        (received, release)
+    }
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    pub fn hold_next_key_transition_for_test(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (entered, received) = oneshot::channel();
+        let (release, resumed) = oneshot::channel();
+        *self.gate.key_transition.lock().unwrap() = Some((entered, resumed));
         (received, release)
     }
     #[cfg(all(feature = "test-hooks", debug_assertions))]
@@ -407,6 +416,14 @@ impl Manager {
                     return;
                 }
                 self.stop().await;
+                #[cfg(all(feature = "test-hooks", debug_assertions))]
+                {
+                    let hold = self.gate.key_transition.lock().unwrap().take();
+                    if let Some((entered, released)) = hold {
+                        let _ = entered.send(());
+                        let _ = tokio::time::timeout(Duration::from_secs(5), released).await;
+                    }
+                }
                 self.key = *key;
                 self.peers.clear();
                 self.info.peers.clear();
