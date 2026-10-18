@@ -63,7 +63,14 @@ struct Fixture {
     clock: Arc<FakeClock>,
 }
 impl Fixture {
-    async fn new(existing: bool, backend: Arc<Backend>) -> Self {
+    async fn new(existing: bool, backend: Arc<dyn RecordBackend>) -> Self {
+        Self::with_clock(existing, backend, Arc::new(FakeClock::new(NOW, 0))).await
+    }
+    async fn with_clock(
+        existing: bool,
+        backend: Arc<dyn RecordBackend>,
+        clock: Arc<FakeClock>,
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let slot = CoreSlot::new();
         slot.start(
@@ -74,7 +81,6 @@ impl Fixture {
         )
         .unwrap();
         slot.network().unwrap().configure_local(None).await.unwrap();
-        let clock = Arc::new(FakeClock::new(NOW, 0));
         let a = slot
             .open_account_with_services(
                 Arc::new(Protector),
@@ -854,4 +860,142 @@ async fn existing_display_waits_for_rebound_endpoint_before_returning_qr() {
     };
     assert_eq!(info.state, chat_core::NetworkState::Online);
     assert!(info.ticket.is_some());
+}
+
+/// Real lookup await boundary with a deterministic wall-clock change. The packet
+/// remains an independently signed public record; no ready/grant state is faked.
+struct ClockJumpBackend {
+    peer: PeerId,
+    packet: pkarr::SignedPacket,
+    clock: Arc<FakeClock>,
+    after_lookup: u64,
+}
+impl RecordBackend for ClockJumpBackend {
+    fn lookup(&self, peer: PeerId) -> RecordFuture<'_, Lookup> {
+        Box::pin(async move {
+            assert_eq!(peer, self.peer);
+            tokio::task::yield_now().await;
+            self.clock.set_unix_seconds(self.after_lookup);
+            Ok(Lookup::Found(self.packet.clone()))
+        })
+    }
+    fn publish<'a>(&'a self, _: &'a pkarr::SignedPacket) -> RecordFuture<'a, ()> {
+        Box::pin(async { panic!("candidate pairing must not publish") })
+    }
+}
+async fn authority_time_boundary(
+    issued_offset: i64,
+    expiry_offset: i64,
+    sequence_offset: i64,
+    after_lookup_offset: i64,
+    should_accept: bool,
+) {
+    use chat_core::account::{
+        IdentityRecord, clock::Clock, derive_account, encode_recovery, record_packet,
+    };
+    let setup_time = chat_core::account::clock::SystemClock::default().unix_seconds();
+    let e = Fixture::with_clock(
+        false,
+        Arc::new(Backend::default()),
+        Arc::new(FakeClock::new(setup_time, 0)),
+    )
+    .await;
+    // Test-owned fixed entropy lets this fixture sign a bounded public record
+    // with selected timestamps without reading an account's private state.
+    let entropy = Secret32::from([42; 32]);
+    let keys = derive_account(&entropy).unwrap();
+    e.a.recover(encode_recovery(&entropy).unwrap(), true)
+        .await
+        .unwrap();
+    let snapshot = e.a.snapshot().await.unwrap();
+    assert_eq!(snapshot.public_peer_id, Some(keys.peer_id()));
+    // Account creation signs its certificate using SystemClock. Anchor only the
+    // fixture epoch to that public timestamp; all tested changes use FakeClock.
+    let now = snapshot.devices[0].created_at;
+    e.clock.set_unix_seconds(now);
+    e.a.refresh_record(keys.peer_id()).await.unwrap();
+    let base = e.a.snapshot().await.unwrap().publication.accepted.unwrap();
+    let issued = now.checked_add_signed(issued_offset).unwrap();
+    let expires = now.checked_add_signed(expiry_offset).unwrap();
+    let sequence_seconds = now.checked_add_signed(sequence_offset).unwrap();
+    let after_lookup = now.checked_add_signed(after_lookup_offset).unwrap();
+    let packet = record_packet(
+        &keys,
+        &IdentityRecord {
+            issued_at: issued,
+            expires_at: expires,
+            ..base
+        },
+        sequence_seconds * 1_000_000,
+    )
+    .unwrap();
+    let clock = Arc::new(FakeClock::new(now, 0));
+    let n = Fixture::with_clock(
+        false,
+        Arc::new(ClockJumpBackend {
+            peer: keys.peer_id(),
+            packet,
+            clock: clock.clone(),
+            after_lookup,
+        }),
+        clock.clone(),
+    )
+    .await;
+    let display =
+        e.a.pair_begin(PairDirection::ExistingDisplays, None)
+            .await
+            .unwrap();
+    n.route_to(&e).await;
+    let result = n.a.pair_scan(display.qr.clone()).await;
+    assert_eq!(clock.unix_seconds(), after_lookup);
+    assert!(
+        clock.unix_seconds() < display.expires_at,
+        "QR must remain live"
+    );
+    assert_eq!(
+        clock.monotonic_ms(),
+        0,
+        "total pairing deadline must remain live"
+    );
+    if should_accept {
+        result.unwrap();
+        assert_eq!(
+            n.a.pair_view().await.unwrap().unwrap().phase,
+            PairPhase::Comparing
+        );
+    } else {
+        assert!(
+            result.is_err(),
+            "N accepted authority invalid at lookup completion"
+        );
+        assert!(
+            n.a.pair_view()
+                .await
+                .unwrap()
+                .is_none_or(|v| v.phase != PairPhase::Comparing)
+        );
+    }
+}
+#[tokio::test]
+async fn authority_time_expiry_during_lookup_rejects_while_qr_live() {
+    authority_time_boundary(0, 5, 0, 6, false).await;
+}
+#[tokio::test]
+async fn authority_time_rollback_rechecks_certificate_creation() {
+    // Record times remain acceptable; only E's certificate is now too far ahead.
+    authority_time_boundary(-500, 100, -500, -301, false).await;
+}
+#[tokio::test]
+async fn authority_time_rollback_rechecks_record_issue_time() {
+    // Certificate and sequence remain acceptable; record issuance exceeds +300s.
+    authority_time_boundary(100, 200, 0, -201, false).await;
+}
+#[tokio::test]
+async fn authority_time_rollback_rechecks_record_sequence() {
+    // Certificate and issuance remain acceptable; sequence exceeds +300s.
+    authority_time_boundary(0, 200, 100, -201, false).await;
+}
+#[tokio::test]
+async fn authority_time_fresh_after_lookup_still_compares() {
+    authority_time_boundary(0, 100, 0, 1, true).await;
 }

@@ -2,7 +2,8 @@
 use super::wire::{self, Preface, Qr, Role};
 use crate::CoreError;
 use crate::account::{
-    DeviceKeys, InstallationCert, Lookup, RecordBackend, parse_record, verify_cert, wire::invalid,
+    DeviceKeys, InstallationCert, Lookup, RecordBackend, clock::Clock, parse_record, verify_cert,
+    wire::invalid,
 };
 use hkdf::Hkdf;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
@@ -141,7 +142,7 @@ pub(crate) struct Establish<'a> {
     pub device: &'a DeviceKeys,
     pub cert: Option<&'a InstallationCert>,
     pub backend: Arc<dyn RecordBackend>,
-    pub now: u64,
+    pub clock: &'a dyn Clock,
 }
 pub(crate) async fn establish(args: Establish<'_>) -> Result<(Channel, RecvStream), CoreError> {
     let Establish {
@@ -151,7 +152,7 @@ pub(crate) async fn establish(args: Establish<'_>) -> Result<(Channel, RecvStrea
         device,
         cert,
         backend,
-        now,
+        clock,
     } = args;
     let Prepared {
         mut send,
@@ -240,13 +241,18 @@ pub(crate) async fn establish(args: Establish<'_>) -> Result<(Channel, RecvStrea
         verify_cert(&cert, peer)?;
         if cert.installation_id != channel.remote.installation
             || cert.transport_public_key != channel.remote.transport
-            || cert.created_at > now.saturating_add(300)
         {
             return Err(invalid());
         }
         let Lookup::Found(packet) = backend.lookup(peer).await? else {
             return Err(invalid());
         };
+        // Authority is evaluated at acceptance, after the final network await.
+        // The clock may have advanced or rolled back during lookup/handshake.
+        let now = clock.unix_seconds();
+        if cert.created_at > now.saturating_add(300) {
+            return Err(invalid());
+        }
         let record = parse_record(&packet, peer, now)?;
         if !crate::account::publication::SignedRecord::new(packet, peer)?.current(now) {
             return Err(invalid());

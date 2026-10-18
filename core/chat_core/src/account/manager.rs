@@ -2172,7 +2172,7 @@ impl Manager {
                         device,
                         cert,
                         backend,
-                        now: self.services.clock.unix_seconds(),
+                        clock: &*self.services.clock,
                     })),
                 )
                 .await?;

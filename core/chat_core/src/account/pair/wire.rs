@@ -83,11 +83,8 @@ impl Qr {
         Zeroizing::new(e.into_writer())
     }
     pub(crate) fn display(&self) -> String {
-        format!(
-            "{}{}",
-            PREFIX,
-            data_encoding::BASE64URL_NOPAD.encode(&self.encode())
-        )
+        let encoded = Zeroizing::new(data_encoding::BASE64URL_NOPAD.encode(&self.encode()));
+        format!("{PREFIX}{}", encoded.as_str())
     }
     pub(crate) fn parse(text: &str, now: u64) -> Result<Self, CoreError> {
         let encoded = text.strip_prefix(PREFIX).ok_or_else(invalid)?;
