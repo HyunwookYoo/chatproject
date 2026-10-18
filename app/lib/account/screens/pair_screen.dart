@@ -178,6 +178,8 @@ class _PairScreenState extends State<PairScreen> with WidgetsBindingObserver {
       if (ok && !approve) _confirmed = matches;
     });
     if (ok && !matches) {
+      // Clear this ceremony before forgetting its ownership.
+      model.clearSecrets();
       _flow = null;
       await _abandon();
     }

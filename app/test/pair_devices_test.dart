@@ -308,6 +308,30 @@ Future<void> keyboardActivate(
 }
 
 void expandedTests() {
+  testWidgets(
+    'successful SAS rejection clears owned cached and visible QR through disposal',
+    (t) async {
+      final c = UiPairClient()..phase = a.AccountPhase.active;
+      final model = await mountPair(t, c, pushed: true);
+      await hit(t, 'QR 표시');
+      expect(model.pairDisplay, isNotNull);
+      expect(find.text('PUBLIC_INVALID_PAIR_FIXTURE'), findsOneWidget);
+      await hit(t, '코드가 달라요');
+      expect(c.matches, 1);
+      expect(model.pairDisplay, isNull);
+      expect(find.text('PUBLIC_INVALID_PAIR_FIXTURE'), findsNothing);
+      expect(find.text('ABCD-EFGH'), findsNothing);
+      expect(c.canceled, isEmpty);
+      await t.tap(find.byTooltip('취소'));
+      await t.pumpAndSettle();
+      await hit(t, '연결 취소');
+      expect(find.byType(PairScreen), findsNothing);
+      expect(find.text('OPEN PAIR'), findsOneWidget);
+      expect(model.pairDisplay, isNull);
+      expect(find.text('PUBLIC_INVALID_PAIR_FIXTURE'), findsNothing);
+      expect(c.canceled, isEmpty);
+    },
+  );
   for (final role in a.PairRole.values) {
     testWidgets(
       'close warning covers delayed ${role.name} consent and disclosure',
