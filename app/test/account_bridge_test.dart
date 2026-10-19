@@ -17,6 +17,21 @@ class _SecretReplyApi implements RustLibApi {
   int begins = 0;
   int pairs = 0;
   int subscriptions = 0;
+  List<int>? connectedPeer;
+  (List<int>, List<int>)? confirmedRemote;
+  @override
+  Future<void> crateApiAccountConnectAccount({required List<int> peer}) async {
+    connectedPeer = List.of(peer);
+  }
+
+  @override
+  Future<void> crateApiAccountConfirmRemoteRecord({
+    required List<int> peer,
+    required List<int> hash,
+  }) async {
+    confirmedRemote = (List.of(peer), List.of(hash));
+  }
+
   @override
   Future<void> crateApiAccountOpenAccount() async {}
   @override
@@ -83,6 +98,13 @@ void main() {
     final events = <rust.ChatEvent>[];
     final sub = core.events().listen(events.add);
     await model.open();
+    final peer = List<int>.filled(32, 7);
+    final hash = List<int>.filled(32, 9);
+    expect(await model.connectAccount(peer), isTrue);
+    expect(api.connectedPeer, peer);
+    expect(await model.confirmRemoteRecord(peer, hash), isTrue);
+    expect(api.confirmedRemote!.$1, peer);
+    expect(api.confirmedRemote!.$2, hash);
     final recovery = await model.beginCreate();
     expect(api.begins, 1);
     expect(recovery!.words, [_wordsMarker]);

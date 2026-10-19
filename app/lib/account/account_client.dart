@@ -22,6 +22,7 @@ abstract interface class AccountClient {
   Future<void> refreshRecord(List<int> peer);
   Future<void> revokeDevice(List<int> target);
   Future<void> confirmRecordConflict(List<int> baseHash);
+  Future<void> confirmRemoteRecord(List<int> peer, List<int> hash);
   Future<account.PairDisplay> pairBegin(
     account.PairDirection direction,
     Uint8List? resume,
@@ -84,6 +85,9 @@ class FrbAccountClient implements AccountClient {
   @override
   Future<void> confirmRecordConflict(List<int> baseHash) =>
       account.confirmRecordConflict(baseHash: baseHash);
+  @override
+  Future<void> confirmRemoteRecord(List<int> peer, List<int> hash) =>
+      account.confirmRemoteRecord(peer: peer, hash: hash);
   @override
   Future<account.PairDisplay> pairBegin(
     account.PairDirection direction,

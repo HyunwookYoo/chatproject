@@ -8,7 +8,7 @@ import 'chat.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
 // These functions are ignored because they are not marked as `pub`: `handle`, `id`
-// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`
+// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`
 
 Future<void> openAccount() => RustLib.instance.api.crateApiAccountOpenAccount();
 
@@ -76,6 +76,14 @@ Future<void> refreshRecord({required List<int> peer}) =>
 
 Future<void> revokeDevice({required List<int> target}) =>
     RustLib.instance.api.crateApiAccountRevokeDevice(target: target);
+
+Future<void> confirmRemoteRecord({
+  required List<int> peer,
+  required List<int> hash,
+}) => RustLib.instance.api.crateApiAccountConfirmRemoteRecord(
+  peer: peer,
+  hash: hash,
+);
 
 Future<void> confirmRecordConflict({required List<int> baseHash}) => RustLib
     .instance
@@ -149,6 +157,7 @@ class AccountView {
   final Uint8List? installation;
   final List<DeviceView> devices;
   final List<ContactView> contacts;
+  final List<RemoteRecordView> remoteRecords;
   final PairView? pair;
   final List<PublishIntent> publishIntents;
   final PublicationView publication;
@@ -165,6 +174,7 @@ class AccountView {
     this.installation,
     required this.devices,
     required this.contacts,
+    required this.remoteRecords,
     this.pair,
     required this.publishIntents,
     required this.publication,
@@ -183,6 +193,7 @@ class AccountView {
       installation.hashCode ^
       devices.hashCode ^
       contacts.hashCode ^
+      remoteRecords.hashCode ^
       pair.hashCode ^
       publishIntents.hashCode ^
       publication.hashCode ^
@@ -203,6 +214,7 @@ class AccountView {
           installation == other.installation &&
           devices == other.devices &&
           contacts == other.contacts &&
+          remoteRecords == other.remoteRecords &&
           pair == other.pair &&
           publishIntents == other.publishIntents &&
           publication == other.publication &&
@@ -560,6 +572,41 @@ class RecoveryDisplay {
           flow == other.flow &&
           words == other.words &&
           positions == other.positions;
+}
+
+class RemoteRecordView {
+  final Uint8List peer;
+  final Uint8List acceptedGeneration;
+  final Uint8List? conflictHash;
+  final RecordView? conflict;
+  final bool cached;
+
+  const RemoteRecordView({
+    required this.peer,
+    required this.acceptedGeneration,
+    this.conflictHash,
+    this.conflict,
+    required this.cached,
+  });
+
+  @override
+  int get hashCode =>
+      peer.hashCode ^
+      acceptedGeneration.hashCode ^
+      conflictHash.hashCode ^
+      conflict.hashCode ^
+      cached.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is RemoteRecordView &&
+          runtimeType == other.runtimeType &&
+          peer == other.peer &&
+          acceptedGeneration == other.acceptedGeneration &&
+          conflictHash == other.conflictHash &&
+          conflict == other.conflict &&
+          cached == other.cached;
 }
 
 class RevocationView {

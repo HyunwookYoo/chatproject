@@ -50,6 +50,7 @@ pub struct AccountView {
     pub installation: Option<InstallationId>,
     pub devices: Vec<super::RecordDevice>,
     pub contacts: Vec<super::ContactView>,
+    pub remote_records: Vec<super::RemoteRecordView>,
     pub pair: Option<super::PairView>,
     pub publish_intents: Vec<PublishIntent>,
     pub publication: PublicationView,
@@ -105,6 +106,7 @@ enum Command {
     Refresh(PeerId, oneshot::Sender<Result<(), CoreError>>),
     Revoke(InstallationId, oneshot::Sender<Result<(), CoreError>>),
     Resolve([u8; 32], oneshot::Sender<Result<(), CoreError>>),
+    ResolveRemote(PeerId, [u8; 32], oneshot::Sender<Result<(), CoreError>>),
 }
 struct Queued {
     ticket: u64,
@@ -150,6 +152,7 @@ impl Command {
             | Self::Connect(_, reply)
             | Self::Refresh(_, reply)
             | Self::Revoke(_, reply)
+            | Self::ResolveRemote(_, _, reply)
             | Self::Resolve(_, reply)
             | Self::ConfirmSafety(_, _, reply) => {
                 let _ = reply.send(Err(error));
@@ -330,6 +333,9 @@ impl AccountHandle {
     }
     pub async fn confirm_record_conflict(&self, base_hash: [u8; 32]) -> Result<(), CoreError> {
         self.send(|reply| Command::Resolve(base_hash, reply)).await
+    }
+    pub async fn confirm_remote_record(&self, peer: PeerId, hash: [u8; 32]) -> Result<(), CoreError> {
+        self.send(|reply| Command::ResolveRemote(peer, hash, reply)).await
     }
     /// ABI status: 0 completed, 1 pending, 2 failed. Never waits for file IO.
     pub fn lifecycle_status(&self) -> i32 {
@@ -539,11 +545,7 @@ impl Manager {
             if base.record.devices.len() >= 5 {
                 return Err(unavailable(ErrorCode::DeviceLimit));
             }
-            if !local.records.pending.is_empty()
-                || local.pairs.existing.len() + local.records.pending.len() >= 31
-            {
-                return Err(unavailable(ErrorCode::StorageFull));
-            }
+            local.pairs.admit_new(local.records.pending.len())?;
             let mut tx = super::TxId([0; 16]);
             getrandom::fill(&mut tx.0).map_err(|_| super::wire::invalid())?;
             let cert = super::certificate::sign_cert_public(
@@ -1145,6 +1147,7 @@ impl Manager {
                             let _ = reply.send(result);
                         }
                         Command::Revoke(target, reply) => { let result = self.publication(Action::Revoke(target)).await; let _ = reply.send(result); }
+                        Command::ResolveRemote(peer, hash, reply) => { let result = self.confirm_remote(peer, hash).await; let _ = reply.send(result); }
                         Command::Resolve(hash, reply) => { let result = self.publication(Action::Confirm(hash)).await; let _ = reply.send(result); }
                     }
                 }
@@ -1610,6 +1613,7 @@ impl Manager {
             installation: None,
             devices: vec![],
             contacts: vec![],
+            remote_records: vec![],
             pair: self.pair_view(),
             publish_intents: vec![],
             publication: PublicationView::default(),
@@ -1644,6 +1648,13 @@ impl Manager {
                     kind: local.cert.kind,
                 }]);
                 view.contacts = local.contacts.iter().map(|c| self.contact_view(c)).collect();
+                view.remote_records = local.remote.iter().map(|r| super::RemoteRecordView {
+                    peer: r.peer,
+                    accepted_generation: r.accepted.record.generation,
+                    conflict_hash: r.conflict.as_ref().map(|c| c.hash),
+                    conflict: r.conflict.as_ref().map(|c| c.record.clone()),
+                    cached: self.auth.registry.0.lock().unwrap().iter().any(|s| s.grant.peer == r.peer && s.cached && s.ready && s.conn.close_reason().is_none() && self.grant_authorized(&s.grant)),
+                }).collect();
                 view.publish_intents.push(local.intent);
                 view.publication = local.records.view();
                 match local.records.state {
@@ -2503,6 +2514,45 @@ impl Manager {
         self.commit_remote(remote, request)?;
         result
     }
+    async fn confirm_remote(&mut self, peer: PeerId, hash: [u8; 32]) -> Result<(), CoreError> {
+        let request = self.ready()?;
+        if peer == self.local()?.keys.peer_id() {
+            return Err(unavailable(ErrorCode::AccountRestricted));
+        }
+        let reviewed = self.local()?.remote.iter().find(|r| r.peer == peer)
+            .and_then(|r| r.conflict.as_ref()).is_some_and(|r| r.hash == hash);
+        let backend = self.services.backend()?;
+        let lookup = self.service(request, backend.lookup(peer)).await?;
+        self.ensure_ready(request)?;
+        let super::Lookup::Found(packet) = lookup else {
+            return Err(unavailable(ErrorCode::RecordUnavailable));
+        };
+        let signed = super::publication::SignedRecord::new(packet, peer)?;
+        // Retain newly observed evidence even when consent is stale.
+        let observed = self.observe_remote(peer, signed.clone(), request);
+        if let Err(error) = observed && error.code != ErrorCode::RecordConflict {
+            return Err(error);
+        }
+        let mut remote = self.local()?.remote.clone();
+        let entry = remote.iter_mut().find(|r| r.peer == peer).unwrap();
+        let now = self.services.clock.unix_seconds();
+        if !reviewed || signed.hash != hash || signed.seq < entry.floor
+            || !signed.current(now) || signed.record.is_expired(now) {
+            return Err(unavailable(ErrorCode::RecordConflict));
+        }
+        super::parse_record(&signed.packet, peer, self.services.clock.unix_seconds())?;
+        entry.accepted = signed;
+        entry.conflict = None;
+        self.restrict_peer_grants(peer, true);
+        self.commit_remote(remote, request)
+    }
+    fn restrict_peer_grants(&self, peer: PeerId, close: bool) {
+        for grant in self.auth.registry.apply(|grant| (grant.peer != peer, close && grant.peer == peer)) {
+            self.bus.publish(crate::CoreEvent::AccountAuthChanged {
+                peer_id: grant.peer.to_string(), installation_id: grant.installation.to_string(), ready: false,
+            });
+        }
+    }
     async fn remote_record(
         &mut self,
         peer: PeerId,
@@ -2517,6 +2567,7 @@ impl Manager {
         let backend = self.services.backend()?;
         let lookup = self.service(request, backend.lookup(peer)).await;
         self.ensure_ready(request)?;
+        self.auth.cached_lookups.remove(&peer);
         let mut cached = false;
         match lookup {
             Ok(super::Lookup::Found(packet)) => {
@@ -2553,13 +2604,19 @@ impl Manager {
         )?;
         let record = accepted.accepted.clone();
         if cached {
+            self.auth.cached_lookups.insert(peer);
             self.bus.publish(crate::CoreEvent::AccountCacheUsed {
                 peer_id: peer.to_string(),
             });
+        } else {
+            for session in self.auth.registry.0.lock().unwrap().iter_mut().filter(|s| s.grant.peer == peer) {
+                session.cached = false;
+            }
         }
         Ok(record)
     }
     async fn connect(&mut self, peer: PeerId) -> Result<(), CoreError> {
+        self.restrict_peer_grants(peer, false);
         self.restrict_grants();
         if !self.local_authorized() {
             return Err(unavailable(ErrorCode::AccountRestricted));
@@ -2605,6 +2662,7 @@ impl Manager {
                     continue;
                 }
             };
+            let mut evidence = None;
             let result = self
                 .service(
                     request,
@@ -2614,9 +2672,15 @@ impl Manager {
                         self.local()?,
                         &record,
                         &*self.services.clock,
+                        &mut evidence,
                     )),
                 )
                 .await;
+            if let Some(signed) = evidence
+                && let Err(error) = self.observe_auth_record(peer, signed, request) {
+                conn.close(0u32.into(), b"account record changed");
+                return Err(error);
+            }
             match result {
                 Ok(grant) => return self.install_grant(conn, grant),
                 Err(error) => {
@@ -2657,6 +2721,7 @@ impl Manager {
             conn: conn.clone(),
             grant: grant.clone(),
             ready: true,
+            cached: self.auth.cached_lookups.contains(&grant.peer),
         });
         drop(sessions);
         self.bus.publish(crate::CoreEvent::AccountAuthChanged {
@@ -2680,8 +2745,10 @@ impl Manager {
                     let preface = self
                         .service(request, Box::pin(super::auth::receive_preface(&conn)))
                         .await?;
-                    let record = self.remote_record(preface.hello.peer).await?;
-                    let grant = self
+                    let peer = preface.hello.peer;
+                    let record = self.remote_record(peer).await?;
+                    let mut evidence = None;
+                    let result = self
                         .service(
                             request,
                             Box::pin(super::auth::authenticate_incoming(
@@ -2690,10 +2757,14 @@ impl Manager {
                                 &record,
                                 &*self.services.clock,
                                 preface,
+                                &mut evidence,
                             )),
                         )
-                        .await?;
-                    self.install_grant(conn.clone(), grant)
+                        .await;
+                    if let Some(signed) = evidence {
+                        self.observe_auth_record(peer, signed, request)?;
+                    }
+                    self.install_grant(conn.clone(), result?)
                 }
                 .await;
                 if result.is_err() {
@@ -2723,6 +2794,18 @@ impl Manager {
                     }
                 });
             }
+        }
+    }
+    fn observe_auth_record(
+        &mut self,
+        peer: PeerId,
+        signed: super::publication::SignedRecord,
+        request: Request,
+    ) -> Result<(), CoreError> {
+        if peer == self.local()?.keys.peer_id() {
+            self.apply_record_change(&signed, request)
+        } else {
+            self.observe_remote(peer, signed, request)
         }
     }
     fn apply_record_change(
@@ -3076,7 +3159,7 @@ impl Manager {
             .current
             .as_mut()
             .filter(|s| s.qr.flow == flow)
-            .ok_or_else(super::wire::invalid)
+            .ok_or_else(|| unavailable(ErrorCode::PairExpired))
     }
     async fn pair_prepare(&mut self, role: super::pair::wire::Role) -> Result<(), CoreError> {
         use super::pair::wire::Role;
@@ -3423,9 +3506,12 @@ impl Manager {
         self.start_transfer(flow).await
     }
     fn pair_cancel(&mut self, flow: FlowId) -> Result<(), CoreError> {
-        self.pair_session(flow)?;
-        self.pair.current = None;
-        self.revision += 1;
+        self.ready()?;
+        self.expire_pair();
+        if self.pair.current.as_ref().is_some_and(|s| s.qr.flow == flow) {
+            self.pair.current = None;
+            self.revision += 1;
+        }
         Ok(())
     }
     #[cfg(all(feature = "test-hooks", debug_assertions))]

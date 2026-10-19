@@ -1,3 +1,4 @@
+import 'record_review.dart';
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart' show listEquals;
@@ -313,22 +314,51 @@ class _AccountRoutesState extends State<AccountRoutes>
       builder: (_) => DevicesScreen(model: model, onPair: _pair),
     ),
   );
-  Widget _contactDetail() => Column(
-    crossAxisAlignment: CrossAxisAlignment.stretch,
-    children: [
-      Text(
-        isolatedName(_contact!.alias),
-        style: Theme.of(context).textTheme.headlineSmall,
-      ),
-      Text(_contact!.verified ? '안전번호 확인됨' : '안전번호 미확인'),
-      if (_contact!.newDevice) const Text('새 기기가 있어요'),
-      if (_contact!.deviceUnverified) const Text('기기 목록을 확인하지 못했어요'),
-      FilledButton(
-        onPressed: model.busy ? null : _showSafety,
-        child: const Text('안전번호 확인'),
-      ),
-    ],
-  );
+  Widget _contactDetail() {
+    final selectedPeer = List<int>.of(_contact!.peerId);
+    final remote = model.snapshot?.remoteRecords
+        .where((r) => listEquals(r.peer, selectedPeer))
+        .firstOrNull;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Text(
+          isolatedName(_contact!.alias),
+          style: Theme.of(context).textTheme.headlineSmall,
+        ),
+        Text(_contact!.verified ? '안전번호 확인됨' : '안전번호 미확인'),
+        if (_contact!.newDevice) const Text('새 기기가 있어요'),
+        if (remote?.cached == true)
+          const Text('저장된 기기 목록으로 인증했어요. 최신 공개 목록은 확인하지 못했어요.'),
+        if (remote?.conflict case final a.RecordView conflict)
+          if (remote?.conflictHash case final List<int> hash)
+            RecordReview(
+              record: conflict,
+              hash: hash,
+              enabled: !model.busy,
+              generationChanged: !listEquals(
+                conflict.generation,
+                remote?.acceptedGeneration,
+              ),
+              onConfirm: (displayedHash) =>
+                  model.confirmRemoteRecord(selectedPeer, displayedHash),
+            ),
+        if (_contact!.deviceUnverified) const Text('기기 목록을 확인하지 못했어요'),
+        if (!_contact!.deviceUnverified) const Text('현재 기기 인증됨'),
+        FilledButton(
+          onPressed: model.busy
+              ? null
+              : () => model.connectAccount(List<int>.of(_contact!.peerId)),
+          child: const Text('현재 기기 인증'),
+        ),
+        FilledButton(
+          onPressed: model.busy ? null : _showSafety,
+          child: const Text('안전번호 확인'),
+        ),
+      ],
+    );
+  }
+
   Widget _contacts(a.AccountView view) => Column(
     crossAxisAlignment: CrossAxisAlignment.stretch,
     children: [

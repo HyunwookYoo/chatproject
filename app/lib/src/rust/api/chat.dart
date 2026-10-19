@@ -148,6 +148,7 @@ enum ErrorCode {
   recordUnavailable,
   authFailed,
   accountRestricted,
+  pairHistoryFull,
 }
 
 class NetworkInfo {

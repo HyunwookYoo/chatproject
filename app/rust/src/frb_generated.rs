@@ -37,7 +37,7 @@ flutter_rust_bridge::frb_generated_boilerplate!(
     default_rust_auto_opaque = RustAutoOpaqueMoi,
 );
 pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_VERSION: &str = "2.11.1";
-pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = -2116775198;
+pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = -1286569699;
 
 // Section: executor
 
@@ -221,6 +221,44 @@ fn wire__crate__api__account__confirm_record_conflict_impl(
                     (move || async move {
                         let output_ok =
                             crate::api::account::confirm_record_conflict(api_base_hash).await?;
+                        Ok(output_ok)
+                    })()
+                    .await,
+                )
+            }
+        },
+    )
+}
+fn wire__crate__api__account__confirm_remote_record_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_async::<flutter_rust_bridge::for_generated::SseCodec, _, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "confirm_remote_record",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_peer = <Vec<u8>>::sse_decode(&mut deserializer);
+            let api_hash = <Vec<u8>>::sse_decode(&mut deserializer);
+            deserializer.end();
+            move |context| async move {
+                transform_result_sse::<_, crate::api::chat::CoreError>(
+                    (move || async move {
+                        let output_ok =
+                            crate::api::account::confirm_remote_record(api_peer, api_hash).await?;
                         Ok(output_ok)
                     })()
                     .await,
@@ -1428,6 +1466,8 @@ impl SseDecode for crate::api::account::AccountView {
         let mut var_installation = <Option<Vec<u8>>>::sse_decode(deserializer);
         let mut var_devices = <Vec<crate::api::account::DeviceView>>::sse_decode(deserializer);
         let mut var_contacts = <Vec<crate::api::account::ContactView>>::sse_decode(deserializer);
+        let mut var_remoteRecords =
+            <Vec<crate::api::account::RemoteRecordView>>::sse_decode(deserializer);
         let mut var_pair = <Option<crate::api::account::PairView>>::sse_decode(deserializer);
         let mut var_publishIntents =
             <Vec<crate::api::account::PublishIntent>>::sse_decode(deserializer);
@@ -1445,6 +1485,7 @@ impl SseDecode for crate::api::account::AccountView {
             installation: var_installation,
             devices: var_devices,
             contacts: var_contacts,
+            remote_records: var_remoteRecords,
             pair: var_pair,
             publish_intents: var_publishIntents,
             publication: var_publication,
@@ -1658,6 +1699,7 @@ impl SseDecode for crate::api::chat::ErrorCode {
             25 => crate::api::chat::ErrorCode::RecordUnavailable,
             26 => crate::api::chat::ErrorCode::AuthFailed,
             27 => crate::api::chat::ErrorCode::AccountRestricted,
+            28 => crate::api::chat::ErrorCode::PairHistoryFull,
             _ => unreachable!("Invalid variant for ErrorCode: {}", inner),
         };
     }
@@ -1781,6 +1823,20 @@ impl SseDecode for Vec<crate::api::account::PublishIntent> {
         let mut ans_ = vec![];
         for idx_ in 0..len_ {
             ans_.push(<crate::api::account::PublishIntent>::sse_decode(
+                deserializer,
+            ));
+        }
+        return ans_;
+    }
+}
+
+impl SseDecode for Vec<crate::api::account::RemoteRecordView> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut len_ = <i32>::sse_decode(deserializer);
+        let mut ans_ = vec![];
+        for idx_ in 0..len_ {
+            ans_.push(<crate::api::account::RemoteRecordView>::sse_decode(
                 deserializer,
             ));
         }
@@ -2154,6 +2210,24 @@ impl SseDecode for crate::api::account::RecoveryDisplay {
     }
 }
 
+impl SseDecode for crate::api::account::RemoteRecordView {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut var_peer = <Vec<u8>>::sse_decode(deserializer);
+        let mut var_acceptedGeneration = <Vec<u8>>::sse_decode(deserializer);
+        let mut var_conflictHash = <Option<Vec<u8>>>::sse_decode(deserializer);
+        let mut var_conflict = <Option<crate::api::account::RecordView>>::sse_decode(deserializer);
+        let mut var_cached = <bool>::sse_decode(deserializer);
+        return crate::api::account::RemoteRecordView {
+            peer: var_peer,
+            accepted_generation: var_acceptedGeneration,
+            conflict_hash: var_conflictHash,
+            conflict: var_conflict,
+            cached: var_cached,
+        };
+    }
+}
+
 impl SseDecode for crate::api::account::RevocationView {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
@@ -2235,42 +2309,45 @@ fn pde_ffi_dispatcher_primary_impl(
             rust_vec_len,
             data_len,
         ),
-        6 => wire__crate__api__account__confirm_safety_impl(port, ptr, rust_vec_len, data_len),
-        7 => wire__crate__api__account__connect_account_impl(port, ptr, rust_vec_len, data_len),
-        8 => wire__crate__api__chat__connect_peer_impl(port, ptr, rust_vec_len, data_len),
-        9 => wire__crate__api__account__contacts_impl(port, ptr, rust_vec_len, data_len),
-        10 => wire__crate__api__chat__core_start_impl(port, ptr, rust_vec_len, data_len),
-        12 => wire__crate__api__account__create_invite_impl(port, ptr, rust_vec_len, data_len),
-        13 => wire__crate__api__account__discard_pending_import_impl(
+        6 => {
+            wire__crate__api__account__confirm_remote_record_impl(port, ptr, rust_vec_len, data_len)
+        }
+        7 => wire__crate__api__account__confirm_safety_impl(port, ptr, rust_vec_len, data_len),
+        8 => wire__crate__api__account__connect_account_impl(port, ptr, rust_vec_len, data_len),
+        9 => wire__crate__api__chat__connect_peer_impl(port, ptr, rust_vec_len, data_len),
+        10 => wire__crate__api__account__contacts_impl(port, ptr, rust_vec_len, data_len),
+        11 => wire__crate__api__chat__core_start_impl(port, ptr, rust_vec_len, data_len),
+        13 => wire__crate__api__account__create_invite_impl(port, ptr, rust_vec_len, data_len),
+        14 => wire__crate__api__account__discard_pending_import_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        14 => wire__crate__api__chat__disconnect_peer_impl(port, ptr, rust_vec_len, data_len),
-        15 => wire__crate__api__chat__events_impl(port, ptr, rust_vec_len, data_len),
-        16 => wire__crate__api__chat__init_app_impl(port, ptr, rust_vec_len, data_len),
-        17 => wire__crate__api__chat__network_info_impl(port, ptr, rust_vec_len, data_len),
-        18 => wire__crate__api__chat__network_start_impl(port, ptr, rust_vec_len, data_len),
-        19 => wire__crate__api__chat__network_stop_impl(port, ptr, rust_vec_len, data_len),
-        20 => wire__crate__api__account__open_account_impl(port, ptr, rust_vec_len, data_len),
-        21 => wire__crate__api__account__pair_approve_impl(port, ptr, rust_vec_len, data_len),
-        22 => wire__crate__api__account__pair_begin_impl(port, ptr, rust_vec_len, data_len),
-        23 => wire__crate__api__account__pair_cancel_impl(port, ptr, rust_vec_len, data_len),
-        24 => wire__crate__api__account__pair_confirm_code_impl(port, ptr, rust_vec_len, data_len),
-        25 => wire__crate__api__account__pair_scan_impl(port, ptr, rust_vec_len, data_len),
-        26 => wire__crate__api__account__pair_view_impl(port, ptr, rust_vec_len, data_len),
-        27 => wire__crate__api__account__parse_invite_impl(port, ptr, rust_vec_len, data_len),
-        28 => wire__crate__api__account__prepare_candidate_impl(port, ptr, rust_vec_len, data_len),
-        29 => wire__crate__api__account__recover_impl(port, ptr, rust_vec_len, data_len),
-        30 => wire__crate__api__account__refresh_record_impl(port, ptr, rust_vec_len, data_len),
-        31 => wire__crate__api__account__retry_open_impl(port, ptr, rust_vec_len, data_len),
-        32 => wire__crate__api__account__revoke_device_impl(port, ptr, rust_vec_len, data_len),
-        33 => wire__crate__api__account__safety_display_impl(port, ptr, rust_vec_len, data_len),
-        34 => wire__crate__api__chat__send_probe_text_impl(port, ptr, rust_vec_len, data_len),
-        35 => wire__crate__api__account__snapshot_impl(port, ptr, rust_vec_len, data_len),
-        36 => wire__crate__api__chat__test_hooks_start_impl(port, ptr, rust_vec_len, data_len),
-        37 => wire__crate__api__account__test_storage_start_impl(port, ptr, rust_vec_len, data_len),
+        15 => wire__crate__api__chat__disconnect_peer_impl(port, ptr, rust_vec_len, data_len),
+        16 => wire__crate__api__chat__events_impl(port, ptr, rust_vec_len, data_len),
+        17 => wire__crate__api__chat__init_app_impl(port, ptr, rust_vec_len, data_len),
+        18 => wire__crate__api__chat__network_info_impl(port, ptr, rust_vec_len, data_len),
+        19 => wire__crate__api__chat__network_start_impl(port, ptr, rust_vec_len, data_len),
+        20 => wire__crate__api__chat__network_stop_impl(port, ptr, rust_vec_len, data_len),
+        21 => wire__crate__api__account__open_account_impl(port, ptr, rust_vec_len, data_len),
+        22 => wire__crate__api__account__pair_approve_impl(port, ptr, rust_vec_len, data_len),
+        23 => wire__crate__api__account__pair_begin_impl(port, ptr, rust_vec_len, data_len),
+        24 => wire__crate__api__account__pair_cancel_impl(port, ptr, rust_vec_len, data_len),
+        25 => wire__crate__api__account__pair_confirm_code_impl(port, ptr, rust_vec_len, data_len),
+        26 => wire__crate__api__account__pair_scan_impl(port, ptr, rust_vec_len, data_len),
+        27 => wire__crate__api__account__pair_view_impl(port, ptr, rust_vec_len, data_len),
+        28 => wire__crate__api__account__parse_invite_impl(port, ptr, rust_vec_len, data_len),
+        29 => wire__crate__api__account__prepare_candidate_impl(port, ptr, rust_vec_len, data_len),
+        30 => wire__crate__api__account__recover_impl(port, ptr, rust_vec_len, data_len),
+        31 => wire__crate__api__account__refresh_record_impl(port, ptr, rust_vec_len, data_len),
+        32 => wire__crate__api__account__retry_open_impl(port, ptr, rust_vec_len, data_len),
+        33 => wire__crate__api__account__revoke_device_impl(port, ptr, rust_vec_len, data_len),
+        34 => wire__crate__api__account__safety_display_impl(port, ptr, rust_vec_len, data_len),
+        35 => wire__crate__api__chat__send_probe_text_impl(port, ptr, rust_vec_len, data_len),
+        36 => wire__crate__api__account__snapshot_impl(port, ptr, rust_vec_len, data_len),
+        37 => wire__crate__api__chat__test_hooks_start_impl(port, ptr, rust_vec_len, data_len),
+        38 => wire__crate__api__account__test_storage_start_impl(port, ptr, rust_vec_len, data_len),
         _ => unreachable!(),
     }
 }
@@ -2283,7 +2360,7 @@ fn pde_ffi_dispatcher_sync_impl(
 ) -> flutter_rust_bridge::for_generated::WireSyncRust2DartSse {
     // Codec=Pde (Serialization + dispatch), see doc to use other codecs
     match func_id {
-        11 => wire__crate__api__chat__core_version_impl(ptr, rust_vec_len, data_len),
+        12 => wire__crate__api__chat__core_version_impl(ptr, rust_vec_len, data_len),
         _ => unreachable!(),
     }
 }
@@ -2328,6 +2405,7 @@ impl flutter_rust_bridge::IntoDart for crate::api::account::AccountView {
             self.installation.into_into_dart().into_dart(),
             self.devices.into_into_dart().into_dart(),
             self.contacts.into_into_dart().into_dart(),
+            self.remote_records.into_into_dart().into_dart(),
             self.pair.into_into_dart().into_dart(),
             self.publish_intents.into_into_dart().into_dart(),
             self.publication.into_into_dart().into_dart(),
@@ -2576,6 +2654,7 @@ impl flutter_rust_bridge::IntoDart for crate::api::chat::ErrorCode {
             Self::RecordUnavailable => 25.into_dart(),
             Self::AuthFailed => 26.into_dart(),
             Self::AccountRestricted => 27.into_dart(),
+            Self::PairHistoryFull => 28.into_dart(),
             _ => unreachable!(),
         }
     }
@@ -2969,6 +3048,30 @@ impl flutter_rust_bridge::IntoIntoDart<crate::api::account::RecoveryDisplay>
     }
 }
 // Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::api::account::RemoteRecordView {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        [
+            self.peer.into_into_dart().into_dart(),
+            self.accepted_generation.into_into_dart().into_dart(),
+            self.conflict_hash.into_into_dart().into_dart(),
+            self.conflict.into_into_dart().into_dart(),
+            self.cached.into_into_dart().into_dart(),
+        ]
+        .into_dart()
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive
+    for crate::api::account::RemoteRecordView
+{
+}
+impl flutter_rust_bridge::IntoIntoDart<crate::api::account::RemoteRecordView>
+    for crate::api::account::RemoteRecordView
+{
+    fn into_into_dart(self) -> crate::api::account::RemoteRecordView {
+        self
+    }
+}
+// Codec=Dco (DartCObject based), see doc to use other codecs
 impl flutter_rust_bridge::IntoDart for crate::api::account::RevocationView {
     fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
         [
@@ -3072,6 +3175,7 @@ impl SseEncode for crate::api::account::AccountView {
         <Option<Vec<u8>>>::sse_encode(self.installation, serializer);
         <Vec<crate::api::account::DeviceView>>::sse_encode(self.devices, serializer);
         <Vec<crate::api::account::ContactView>>::sse_encode(self.contacts, serializer);
+        <Vec<crate::api::account::RemoteRecordView>>::sse_encode(self.remote_records, serializer);
         <Option<crate::api::account::PairView>>::sse_encode(self.pair, serializer);
         <Vec<crate::api::account::PublishIntent>>::sse_encode(self.publish_intents, serializer);
         <crate::api::account::PublicationView>::sse_encode(self.publication, serializer);
@@ -3248,6 +3352,7 @@ impl SseEncode for crate::api::chat::ErrorCode {
                 crate::api::chat::ErrorCode::RecordUnavailable => 25,
                 crate::api::chat::ErrorCode::AuthFailed => 26,
                 crate::api::chat::ErrorCode::AccountRestricted => 27,
+                crate::api::chat::ErrorCode::PairHistoryFull => 28,
                 _ => {
                     unimplemented!("");
                 }
@@ -3351,6 +3456,16 @@ impl SseEncode for Vec<crate::api::account::PublishIntent> {
         <i32>::sse_encode(self.len() as _, serializer);
         for item in self {
             <crate::api::account::PublishIntent>::sse_encode(item, serializer);
+        }
+    }
+}
+
+impl SseEncode for Vec<crate::api::account::RemoteRecordView> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <i32>::sse_encode(self.len() as _, serializer);
+        for item in self {
+            <crate::api::account::RemoteRecordView>::sse_encode(item, serializer);
         }
     }
 }
@@ -3679,6 +3794,17 @@ impl SseEncode for crate::api::account::RecoveryDisplay {
         <Vec<u8>>::sse_encode(self.flow, serializer);
         <Vec<String>>::sse_encode(self.words, serializer);
         <Vec<u8>>::sse_encode(self.positions, serializer);
+    }
+}
+
+impl SseEncode for crate::api::account::RemoteRecordView {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <Vec<u8>>::sse_encode(self.peer, serializer);
+        <Vec<u8>>::sse_encode(self.accepted_generation, serializer);
+        <Option<Vec<u8>>>::sse_encode(self.conflict_hash, serializer);
+        <Option<crate::api::account::RecordView>>::sse_encode(self.conflict, serializer);
+        <bool>::sse_encode(self.cached, serializer);
     }
 }
 

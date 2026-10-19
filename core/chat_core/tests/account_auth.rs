@@ -313,6 +313,43 @@ async fn valid_cert_actual_endpoint_installation_proof_required() {
             .any(|e| matches!(e, CoreEvent::AccountAuthChanged { ready: true, .. }))
     );
 }
+
+#[tokio::test]
+async fn handshake_changed_signed_record_restricts_live_grant_durably() {
+    for fail_store in [false, true] {
+    let own = packet(1, &[11], 1, NOW, NOW + 600, NOW * 1_000_000);
+    let old = packet(2, &[12, 13], 2, NOW, NOW + 600, NOW * 1_000_000);
+    let changed = packet(2, &[13], 2, NOW + 1, NOW + 601, (NOW + 1) * 1_000_000);
+    let backend = Arc::new(Backend::default());
+    let newer = Arc::new(Backend::default());
+    let ap = derive_account(&Secret32::from([1; 32])).unwrap().peer_id();
+    let bp = derive_account(&Secret32::from([2; 32])).unwrap().peer_id();
+    for (target, remote) in [(&backend, &old), (&newer, &changed)] {
+        target.packets.lock().unwrap().insert(ap, own.clone());
+        target.packets.lock().unwrap().insert(bp, remote.clone());
+    }
+    let protector = Arc::new(FailingProtector(AtomicBool::new(false)));
+    let a = Fixture::with_protector(1, 11, &own, backend.clone(), protector.clone()).await;
+    let b = Fixture::new(2, 12, &old, backend.clone()).await;
+    let c = Fixture::new(2, 13, &changed, newer).await;
+    a.route(&b).await;
+    b.route(&a).await;
+    c.route(&a).await;
+    a.account.connect_account(bp).await.unwrap();
+    backend.offline.store(true, Ordering::SeqCst);
+    protector.0.store(fail_store, Ordering::SeqCst);
+    assert!(c.account.connect_account(ap).await.is_err());
+    a.account.snapshot().await.unwrap();
+    assert!(a.events.0.lock().unwrap().iter().any(|e| matches!(e, CoreEvent::AccountAuthChanged { ready: false, .. })), "signed handshake evidence did not restrict old grant");
+    if fail_store {
+        assert_eq!(a.view().await.phase, chat_core::account::AccountPhase::Locked);
+        assert!(a.account.connect_account(bp).await.is_err());
+    } else {
+        reload(&a).await;
+        assert!(a.account.connect_account(bp).await.is_err(), "removed device authorized via stale cache after restart");
+    }
+    }
+}
 #[tokio::test]
 async fn cached_unexpired_allows_new_proof_but_not_mutation() {
     let (a, b, backend) = pair().await;
@@ -327,6 +364,10 @@ async fn cached_unexpired_allows_new_proof_but_not_mutation() {
             .iter()
             .any(|e| matches!(e, CoreEvent::AccountCacheUsed { .. }))
     );
+    assert!(a.view().await.remote_records.iter().any(|r| r.peer == b.peer && r.cached), "cache provenance missing from coherent snapshot");
+    backend.offline.store(false, Ordering::SeqCst);
+    a.account.refresh_record(b.peer).await.unwrap();
+    assert!(a.view().await.remote_records.iter().all(|r| !r.cached), "fresh lookup retained stale cache warning");
     let local = (a.view().await).installation.unwrap();
     assert!(b.account.revoke_device(local).await.is_err());
 }
@@ -547,7 +588,7 @@ fn hello_parts(
 #[tokio::test]
 async fn replay_other_connection_role_nonce_rejected() {
     use ed25519_dalek::{Signer, SigningKey};
-    for mode in ["replay", "role", "nonce", "identity_key", "endpoint"] {
+    for mode in ["replay", "role", "nonce", "identity_key", "endpoint", "record_signature", "record_malformed"] {
         let a_packet = packet(1, &[11], 1, NOW, NOW + 600, NOW * 1_000_000);
         let b_packet = packet(2, &[12], 2, NOW, NOW + 600, NOW * 1_000_000);
         let a_peer = derive_account(&Secret32::from([1; 32])).unwrap().peer_id();
@@ -629,6 +670,13 @@ async fn replay_other_connection_role_nonce_rejected() {
                     break;
                 }
                 let _ = read_control(&mut recv).await;
+                if mode.starts_with("record_") {
+                    let mut invalid = b_packet.as_bytes().to_vec();
+                    if mode == "record_signature" { invalid[32] ^= 1; } else { invalid.truncate(20); }
+                    send_control(&mut send, &control(2, &invalid)).await;
+                    connections.push(conn);
+                    break;
+                }
                 send_control(&mut send, &control(2, b_packet.as_bytes())).await;
                 if mode == "nonce" {
                     remote.3[0] ^= 1;
@@ -694,6 +742,7 @@ async fn replay_other_connection_role_nonce_rejected() {
             "accepted {mode}"
         );
         task.await.unwrap();
+        assert!(a.view().await.remote_records.iter().all(|r| r.conflict.is_none()), "invalid evidence poisoned {mode}");
         raw.close().await;
     }
 }
@@ -733,6 +782,76 @@ async fn remote_high_water_conflict_survives_store_reload() {
     .unwrap();
     a.account.snapshot().await.unwrap();
     assert!(a.account.connect_account(b.peer).await.is_err());
+}
+
+#[tokio::test]
+async fn explicit_remote_review_recovers_membership_and_generation_without_old_device() {
+    for generation in [2, 9] {
+        let (a, b, backend) = pair().await;
+        let invite = b.account.create_invite(Some("peer".into())).await.unwrap();
+        a.account.accept_invite(invite, "peer".into()).await.unwrap();
+        a.account.confirm_safety(b.peer, chat_core::account::safety_digest(a.peer, b.peer)).await.unwrap();
+        a.account.connect_account(b.peer).await.unwrap();
+        let old = backend.packets.lock().unwrap().get(&b.peer).unwrap().clone();
+        let next = packet(2, &[13], generation, NOW + 1, NOW + 601, (NOW + 1) * 1_000_000);
+        backend.packets.lock().unwrap().insert(b.peer, next.clone());
+        assert!(a.account.refresh_record(b.peer).await.is_err());
+        reload(&a).await;
+        let hash = chat_core::account::record_hash(&next);
+        let view = a.view().await;
+        let conflict = view.remote_records.iter().find(|r| r.peer == b.peer).unwrap();
+        assert_eq!(conflict.conflict_hash, Some(hash));
+        assert_eq!(conflict.conflict.as_ref().unwrap().generation, Generation([generation; 16]));
+        a.account.confirm_remote_record(b.peer, hash).await.unwrap();
+        assert!(a.account.contacts().await.unwrap()[0].device_unverified);
+        a.slot.network().unwrap().execute(NetworkOp::Start).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let NetworkReply::Info(info) = a.slot.network().unwrap().execute(NetworkOp::Info).await.unwrap()
+                    && info.ticket.is_some() { break; }
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        let c = Fixture::new(2, 13, &next, backend.clone()).await;
+        a.route(&c).await;
+        c.route(&a).await;
+        a.account.connect_account(b.peer).await.unwrap();
+        let contact = a.account.contacts().await.unwrap().remove(0);
+        assert!(contact.verified && contact.new_device && !contact.device_unverified);
+        backend.packets.lock().unwrap().insert(b.peer, old.clone());
+        assert!(a.account.refresh_record(b.peer).await.is_err());
+        assert!(a.account.confirm_remote_record(b.peer, chat_core::account::record_hash(&old)).await.is_err());
+        backend.packets.lock().unwrap().insert(b.peer, next.clone());
+        assert!(a.account.refresh_record(b.peer).await.is_err());
+        a.account.confirm_remote_record(b.peer, hash).await.unwrap();
+        let newest = packet(2, &[14], generation, NOW + 2, NOW + 602, (NOW + 2) * 1_000_000);
+        backend.packets.lock().unwrap().insert(b.peer, newest);
+        assert!(a.account.confirm_remote_record(b.peer, hash).await.is_err());
+        backend.offline.store(true, Ordering::SeqCst);
+        assert!(a.account.connect_account(b.peer).await.is_err());
+        assert!(b.account.connect_account(a.peer).await.is_err());
+    }
+}
+
+#[tokio::test]
+async fn remote_review_rejects_absent_expired_future_and_preserves_floor() {
+    for mode in ["absent", "expired", "future"] {
+        let (a, b, backend) = pair().await;
+        a.account.connect_account(b.peer).await.unwrap();
+        let next = packet(2, &[13], 9, NOW + 1, NOW + 601, (NOW + 1) * 1_000_000);
+        backend.packets.lock().unwrap().insert(b.peer, next.clone());
+        assert!(a.account.refresh_record(b.peer).await.is_err());
+        let hash = chat_core::account::record_hash(&next);
+        match mode {
+            "absent" => { backend.packets.lock().unwrap().remove(&b.peer); }
+            "expired" => a.clock.set_unix_seconds(NOW + 602),
+            _ => { backend.packets.lock().unwrap().insert(b.peer, packet(2, &[13], 9, NOW + 600, NOW + 1200, (NOW + 600) * 1_000_000)); }
+        }
+        assert!(a.account.confirm_remote_record(b.peer, hash).await.is_err(), "accepted {mode}");
+        backend.offline.store(true, Ordering::SeqCst);
+        assert!(a.account.connect_account(b.peer).await.is_err());
+        assert!(a.view().await.remote_records.iter().any(|r| r.peer == b.peer && r.conflict.is_some()));
+    }
 }
 #[tokio::test]
 async fn previous_array8_9_and10_snapshots_are_rejected_without_file_mutation() {

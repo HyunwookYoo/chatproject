@@ -19,7 +19,7 @@ Future<void> main(List<String> arguments) async {
       defaultsTo: Platform.isWindows ? 'mixed' : 'android',
       allowed: ['mixed', 'android', 'windows'],
     )
-    ..addOption('scenario', defaultsTo: 'm2', allowed: ['m2', 'm3'])
+    ..addOption('scenario', defaultsTo: 'm2', allowed: ['m2', 'm3', 'm3-auth'])
     ..addOption('repo-root', mandatory: true);
   late ArgResults options;
   try {
@@ -33,14 +33,15 @@ Future<void> main(List<String> arguments) async {
     }
   } on FormatException {
     stderr.writeln(
-      'Usage: dart run bin/run.dart --profile mixed|android|windows --scenario m2|m3 --repo-root <absolute>',
+      'Usage: dart run bin/run.dart --profile mixed|android|windows --scenario m2|m3|m3-auth --repo-root <absolute>',
     );
     exitCode = 64;
     return;
   }
   final root = p.normalize(options['repo-root'] as String);
   final profile = options['profile'] as String;
-  final accountScenario = options['scenario'] == 'm3';
+  final authOnly = options['scenario'] == 'm3-auth';
+  final accountScenario = options['scenario'] != 'm2';
   final logs = await Directory(
     p.join(
       root,
@@ -496,6 +497,7 @@ Future<void> main(List<String> arguments) async {
           ? runAccountScenario(
               control,
               participants,
+              authOnly: authOnly,
               wallClock: (participant) async =>
                   appClocks[participant.name] == null
                   ? DateTime.now().millisecondsSinceEpoch ~/ 1000
@@ -574,7 +576,9 @@ Future<void> main(List<String> arguments) async {
     if (code == 0) {
       stdout.writeln(
         accountScenario
-            ? '$profile M3 PASS: local signed records, native stores, pairing, restart, revoke and recovery.'
+            ? authOnly
+                  ? '$profile M3 auth PASS: fresh/cache proof, failed proof, disconnect and restart.'
+                  : '$profile M3 PASS: local signed records, native stores, pairing, restart, revoke and recovery.'
             : '$profile scenario PASS: six directions, offline recovery, no replay, Disconnect and fresh restart address.',
       );
     }
@@ -682,8 +686,10 @@ class _CommandFailure extends StateError {
 class _OwnedChildFailure extends StateError {
   _OwnedChildFailure(this.code, String executable, List<String> args)
     : kind = switch (p.basename(executable)) {
-        'chat_node' || 'chat_node.exe' => args.isNotEmpty && args.first == 'relay'
-            ? 'owned_relay_exit' : 'owned_chat_node_exit',
+        'chat_node' || 'chat_node.exe' =>
+          args.isNotEmpty && args.first == 'relay'
+              ? 'owned_relay_exit'
+              : 'owned_chat_node_exit',
         'emulator' || 'emulator.exe' => 'owned_emulator_exit',
         'chat_app' || 'chat_app.exe' => 'owned_windows_exit',
         _ => 'owned_child_exit',

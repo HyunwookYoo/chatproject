@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:typed_data';
 import 'package:chat_app/account/account_model.dart';
 import 'package:chat_app/core_client.dart';
 import 'package:chat_app/src/rust/api/account.dart' as account;
@@ -21,6 +22,10 @@ void main() {
       final model = AccountModel(core.account);
       await model.open();
       expect(model.snapshot!.phase, account.AccountPhase.unconfigured);
+      expect(await model.pairConfirmCode(Uint8List(16), true), false);
+      expect(model.errorCode, rust.ErrorCode.pairExpired);
+      expect(model.error, '연결 시간이 지났어요. 새 QR로 다시 연결해 주세요.');
+      expect(await model.pairCancel(Uint8List(16)), true);
       final events = <rust.ChatEvent>[];
       final subscription = core.events().listen(events.add);
       final display = await model.beginCreate();
@@ -40,6 +45,14 @@ void main() {
         true,
       );
       expect(view.publicPeerId != null, true);
+      final invite = await core.account.createInvite('공개 초대 만료 시험');
+      final preview = await core.account.parseInvite(
+        invite,
+        BigInt.from(DateTime.now().millisecondsSinceEpoch ~/ 1000),
+      );
+      expect(await model.parseInvite(invite, preview.expiresAt), isNull);
+      expect(model.errorCode, rust.ErrorCode.inviteExpired);
+      expect(model.error, '초대가 만료됐어요. 새 초대를 받아 주세요.');
       expect(await model.beginCreate(), isNull);
       expect(model.errorCode, rust.ErrorCode.accountExists);
       expect(

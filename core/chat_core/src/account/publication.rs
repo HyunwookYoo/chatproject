@@ -232,7 +232,7 @@ impl RecordState {
                 "Device limit reached",
             ));
         }
-        if local.pairs.existing.len() + self.pending.len() >= 32 {
+        if local.pairs.unfinished() + self.pending.len() >= 32 {
             return Err(full());
         }
         let mut record = base.record.clone();
@@ -353,7 +353,7 @@ impl RecordState {
         revoke_nonce: Option<[u8; 16]>,
         now: u64,
     ) -> Result<(), CoreError> {
-        if self.pending.len() + local.pairs.existing.len() >= 32 {
+        if self.pending.len() + local.pairs.unfinished() >= 32 {
             return Err(full());
         }
         let seq = self.sequence(now)?;

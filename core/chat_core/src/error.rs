@@ -33,6 +33,7 @@ pub enum ErrorCode {
     RecordUnavailable,
     AuthFailed,
     AccountRestricted,
+    PairHistoryFull,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

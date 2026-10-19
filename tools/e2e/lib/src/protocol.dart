@@ -30,6 +30,7 @@ const _errorCodes = {
   'StorageMissing',
   'StorageCorrupt',
   'StorageFull',
+  'PairHistoryFull',
   'AccountExists',
   'WriterBusy',
   'InvalidInvite',
@@ -116,6 +117,8 @@ sealed class WireRecord {
           'peer_changed',
           'probe_text_received',
           'account_changed',
+          'account_auth_changed',
+          'account_cache_used',
         }.contains(event['kind'])) {
           throw StateError('invalid protocol event kind');
         }

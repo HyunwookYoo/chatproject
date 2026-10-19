@@ -122,6 +122,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   List<PublishIntent> dco_decode_list_publish_intent(dynamic raw);
 
   @protected
+  List<RemoteRecordView> dco_decode_list_remote_record_view(dynamic raw);
+
+  @protected
   List<RevocationView> dco_decode_list_revocation_view(dynamic raw);
 
   @protected
@@ -195,6 +198,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   RecoveryDisplay dco_decode_recovery_display(dynamic raw);
+
+  @protected
+  RemoteRecordView dco_decode_remote_record_view(dynamic raw);
 
   @protected
   RevocationView dco_decode_revocation_view(dynamic raw);
@@ -325,6 +331,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  List<RemoteRecordView> sse_decode_list_remote_record_view(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   List<RevocationView> sse_decode_list_revocation_view(
     SseDeserializer deserializer,
   );
@@ -406,6 +417,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   RecoveryDisplay sse_decode_recovery_display(SseDeserializer deserializer);
+
+  @protected
+  RemoteRecordView sse_decode_remote_record_view(SseDeserializer deserializer);
 
   @protected
   RevocationView sse_decode_revocation_view(SseDeserializer deserializer);
@@ -570,6 +584,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_list_remote_record_view(
+    List<RemoteRecordView> self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_list_revocation_view(
     List<RevocationView> self,
     SseSerializer serializer,
@@ -671,6 +691,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   @protected
   void sse_encode_recovery_display(
     RecoveryDisplay self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_remote_record_view(
+    RemoteRecordView self,
     SseSerializer serializer,
   );
 

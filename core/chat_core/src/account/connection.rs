@@ -16,6 +16,15 @@ use std::{
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RemoteRecordView {
+    pub peer: PeerId,
+    pub accepted_generation: super::Generation,
+    pub conflict_hash: Option<[u8; 32]>,
+    pub conflict: Option<super::IdentityRecord>,
+    /// Provenance of a current live proof, never authorization by itself.
+    pub cached: bool,
+}
 #[derive(Clone)]
 pub(crate) struct RemoteRecord {
     pub(crate) peer: PeerId,
@@ -30,6 +39,7 @@ impl RemoteRecord {
             return if self.conflict.is_none() {
                 Ok(())
             } else {
+                self.conflict = Some(found);
                 Err(conflict())
             };
         }
@@ -131,6 +141,7 @@ pub(crate) struct Session {
     pub(crate) conn: Connection,
     pub(crate) grant: AuthGrant,
     pub(crate) ready: bool,
+    pub(crate) cached: bool,
 }
 #[derive(Clone, Default)]
 pub(crate) struct Registry(
@@ -316,6 +327,7 @@ pub(crate) fn reader(conn: Connection, input: mpsc::Sender<Input>, cancel: Cance
     });
 }
 pub(crate) struct Runtime {
+    pub(crate) cached_lookups: std::collections::BTreeSet<PeerId>,
     pub(crate) registry: Registry,
     pub(crate) input: mpsc::Receiver<Input>,
     pub(crate) send: mpsc::Sender<Input>,
@@ -325,6 +337,7 @@ impl Default for Runtime {
     fn default() -> Self {
         let (send, input) = mpsc::channel(8);
         Self {
+            cached_lookups: Default::default(),
             registry: Registry::default(),
             input,
             send,

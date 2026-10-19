@@ -10,6 +10,39 @@ use std::{
     time::Duration,
 };
 const NOW: u64 = 1_800_000_000;
+
+#[tokio::test]
+async fn ended_pair_cancel_is_idempotent_and_never_cancels_replacement() {
+    let n = Fixture::new(false, Arc::new(Backend::default())).await;
+    let old = n.a.pair_begin(PairDirection::NewDisplays, None).await.unwrap();
+    n.clock.advance_monotonic_ms(300_000);
+    assert_eq!(n.a.pair_confirm_code(old.flow, true).await.unwrap_err().code, chat_core::ErrorCode::PairExpired);
+    n.a.pair_cancel(old.flow).await.unwrap();
+    n.a.pair_cancel(old.flow).await.unwrap();
+    let next = n.a.pair_begin(PairDirection::NewDisplays, None).await.unwrap();
+    n.a.pair_cancel(old.flow).await.unwrap();
+    assert_eq!(n.a.pair_view().await.unwrap().unwrap().flow, next.flow);
+    n.a.pair_cancel(next.flow).await.unwrap();
+    assert!(n.a.pair_view().await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn remote_close_and_lifecycle_ended_flow_can_be_abandoned() {
+    let (e, n, flow, _) = connected(PairDirection::NewDisplays).await;
+    e.a.pair_cancel(flow).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while n.a.pair_view().await.unwrap().is_some() { tokio::task::yield_now().await; }
+    }).await.unwrap();
+    n.a.pair_cancel(flow).await.unwrap();
+    let next = n.a.pair_begin(PairDirection::NewDisplays, None).await.unwrap();
+    n.a.request_suspend();
+    while n.a.lifecycle_status() == 1 { tokio::task::yield_now().await; }
+    assert_eq!(n.a.pair_cancel(next.flow).await.unwrap_err().code, chat_core::ErrorCode::StorageLocked);
+    n.a.request_resume();
+    while n.a.lifecycle_status() == 1 { tokio::task::yield_now().await; }
+    n.a.pair_cancel(next.flow).await.unwrap();
+    assert!(n.a.pair_view().await.unwrap().is_none());
+}
 struct Protector;
 impl KeyProtector for Protector {
     fn protect(&self, _: StoreId, s: &Secret32) -> Result<Vec<u8>, CoreError> {

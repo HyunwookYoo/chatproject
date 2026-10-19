@@ -229,6 +229,7 @@ pub(crate) async fn authenticate(
     local: &LocalIdentity,
     record: &SignedRecord,
     clock: &dyn Clock,
+    evidence: &mut Option<SignedRecord>,
 ) -> Result<AuthGrant, CoreError> {
     let own = hello(local)?;
     conn.set_max_concurrent_uni_streams(0u32.into());
@@ -242,6 +243,7 @@ pub(crate) async fn authenticate(
         local,
         record,
         clock,
+        evidence,
         own,
         Preface {
             send,
@@ -257,17 +259,20 @@ pub(crate) async fn authenticate_incoming(
     record: &SignedRecord,
     clock: &dyn Clock,
     mut preface: Preface,
+    evidence: &mut Option<SignedRecord>,
 ) -> Result<AuthGrant, CoreError> {
     let own = hello(local)?;
     write_frame(&mut preface.send, &envelope(0, &own.encode())).await?;
-    finish(conn, preface.hello.peer, local, record, clock, own, preface).await
+    finish(conn, preface.hello.peer, local, record, clock, evidence, own, preface).await
 }
+#[allow(clippy::too_many_arguments)]
 async fn finish(
     conn: &Connection,
     expected: PeerId,
     local: &LocalIdentity,
     record: &SignedRecord,
     clock: &dyn Clock,
+    evidence: &mut Option<SignedRecord>,
     own: AuthHello,
     preface: Preface,
 ) -> Result<AuthGrant, CoreError> {
@@ -279,24 +284,25 @@ async fn finish(
     if conn.alpn() != ALPN
         || remote.peer != expected
         || remote.cert.transport_public_key != *conn.remote_id().as_bytes()
-        || remote.generation != record.record.generation
     {
         return Err(wire::invalid());
     }
     verify_cert(&remote.cert, expected)?;
+    let own_record = local.records.accepted.as_ref().ok_or_else(wire::invalid)?;
+    write_frame(&mut send, &envelope(2, own_record.packet.as_bytes())).await?;
+    let packet = payload(&read_frame(&mut recv, 1100).await?, 2)?;
+    let exchanged = SignedRecord::decode(&packet, expected)?;
+    // Identity-signature/canonical evidence survives a denied installation proof.
+    *evidence = Some(exchanged.clone());
+    super::parse_record(&exchanged.packet, expected, clock.unix_seconds())?;
+    if exchanged.hash != record.hash || remote.generation != record.record.generation {
+        return Err(wire::invalid());
+    }
     if !record.record.devices.iter().any(|d| {
         d.installation_id == remote.cert.installation_id
             && d.transport_public_key == remote.cert.transport_public_key
             && d.kind == remote.cert.kind
     }) {
-        return Err(wire::invalid());
-    }
-    let own_record = local.records.accepted.as_ref().ok_or_else(wire::invalid)?;
-    write_frame(&mut send, &envelope(2, own_record.packet.as_bytes())).await?;
-    let packet = payload(&read_frame(&mut recv, 1100).await?, 2)?;
-    let exchanged = SignedRecord::decode(&packet, expected)?;
-    super::parse_record(&exchanged.packet, expected, clock.unix_seconds())?;
-    if exchanged.hash != record.hash {
         return Err(wire::invalid());
     }
     let grant = AuthGrant {

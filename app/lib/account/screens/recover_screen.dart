@@ -27,7 +27,7 @@ class _RecoverScreenState extends State<RecoverScreen> {
       const Text('계정 ID는 돌아오지만 내 연락처와 대화 기록은 돌아오지 않아요'),
       const SizedBox(height: 12),
       const Text(
-        '침해된 기기가 문구를 알고 있다면 같은 계정 ID 복구만으로 접근을 막을 수 없어요. 기존 기기를 새 기기로 교체하는 공개 목록 변경을 요청해요.',
+        '이전에 신뢰한 기기는 복구 문구를 받은 적이 없어도 계정 서명 키 사본을 가지고 있을 수 있어요. 공개 목록을 새 기기로 교체해도 그 사본은 지워지지 않아요. 키 유출이 의심되면 새 계정 ID를 만들어야 해요.',
       ),
       const SizedBox(height: 16),
       TextField(

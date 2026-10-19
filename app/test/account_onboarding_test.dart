@@ -3,6 +3,7 @@ import 'package:chat_app/account/account_client.dart';
 import 'package:chat_app/account/account_model.dart';
 import 'package:chat_app/account/account_routes.dart';
 import 'package:chat_app/account/sensitive_screen.dart';
+import 'package:chat_app/account/screens/recover_screen.dart';
 import 'package:chat_app/src/rust/api/account.dart' as a;
 import 'package:chat_app/src/rust/api/chat.dart' as r;
 import 'package:flutter/material.dart';
@@ -12,6 +13,38 @@ import 'package:flutter_test/flutter_test.dart';
 
 // Public invalid fixture words, never a real mnemonic.
 class ScreenClient implements AccountClient {
+  final remoteConfirmations = <(List<int>, List<int>)>[];
+  @override
+  Future<void> confirmRemoteRecord(List<int> peer, List<int> hash) async {
+    remoteConfirmations.add((List.of(peer), List.of(hash)));
+    check();
+  }
+
+  final connectedPeers = <List<int>>[];
+  bool proofFails = false;
+  @override
+  Future<void> connectAccount(List<int> peer) async {
+    connectedPeers.add(List.of(peer));
+    if (proofFails) {
+      throw const r.CoreError(
+        code: r.ErrorCode.authFailed,
+        detail: 'public failed proof fixture',
+      );
+    }
+    saved = saved
+        .map(
+          (c) => a.ContactView(
+            peerId: c.peerId,
+            alias: c.alias,
+            verified: c.verified,
+            newDevice: c.newDevice,
+            deviceUnverified: false,
+          ),
+        )
+        .toList();
+    emit();
+  }
+
   final controller = StreamController<r.ChatEvent>.broadcast(sync: true);
   a.AccountPhase phase = a.AccountPhase.unconfigured;
   int revision = 1,
@@ -30,6 +63,7 @@ class ScreenClient implements AccountClient {
   Completer<a.SafetyDisplay>? safetyWait;
   final safetyRequests = <(List<int>, List<int>)>[];
   final canceledFlows = <List<int>>[];
+  List<a.RemoteRecordView> remoteRecords = [];
   List<int>? verifiedPeer, verifiedDigest;
   Uint8List? localPeer;
   Uint8List? nextFlow;
@@ -42,6 +76,7 @@ class ScreenClient implements AccountClient {
         : localPeer ?? Uint8List(32),
     devices: [],
     contacts: saved,
+    remoteRecords: remoteRecords,
     publishIntents: [],
     publication: a.PublicationView(
       state: a.PublicationState.pending,
@@ -245,6 +280,165 @@ Future<void> completeSensitiveRaster(WidgetTester t) async {
 }
 
 void main() {
+  testWidgets(
+    'contact conflict consent pins selected peer and displayed hash',
+    (t) async {
+      final peer = Uint8List.fromList(List.filled(32, 8));
+      final hash = Uint8List.fromList(List.filled(32, 19));
+      final c = ScreenClient()..phase = a.AccountPhase.active;
+      c.saved = [
+        a.ContactView(
+          peerId: peer,
+          alias: '상대 A',
+          verified: true,
+          newDevice: false,
+          deviceUnverified: true,
+        ),
+      ];
+      c.remoteRecords = [
+        a.RemoteRecordView(
+          peer: peer,
+          acceptedGeneration: Uint8List(16),
+          conflictHash: hash,
+          cached: false,
+          conflict: a.RecordView(
+            generation: Uint8List.fromList(List.filled(16, 3)),
+            issuedAt: BigInt.one,
+            expiresAt: BigInt.from(9999999999),
+            devices: [
+              a.DeviceView(
+                installationId: Uint8List.fromList(List.filled(32, 9)),
+                transportPublicKey: Uint8List(32),
+                kind: a.DeviceKind.mobile,
+              ),
+            ],
+          ),
+        ),
+      ];
+      await mountAccount(t, c);
+      await t.tap(find.textContaining('상대 A'));
+      await t.pumpAndSettle();
+      expect(find.textContaining('계정 세대가 바뀌었어요'), findsOneWidget);
+      await tapText(t, '이 목록 확인');
+      c.failure = r.ErrorCode.recordConflict;
+      await tapText(t, '확인한 목록 적용');
+      expect(c.remoteConfirmations, hasLength(1));
+      expect(c.remoteConfirmations.single.$1, peer);
+      expect(c.remoteConfirmations.single.$2, hash);
+      expect(find.text('현재 기기 인증됨'), findsNothing);
+      expect(find.textContaining('다른 기기에서 목록이 바뀌었어요'), findsOneWidget);
+    },
+  );
+  testWidgets(
+    'coherent proof cache snapshots resist late events and contact switching',
+    (t) async {
+      final aPeer = Uint8List.fromList(List.filled(32, 8));
+      final bPeer = Uint8List.fromList(List.filled(32, 9));
+      final c = ScreenClient()..phase = a.AccountPhase.active;
+      a.ContactView contact(Uint8List peer, String alias, bool unverified) =>
+          a.ContactView(
+            peerId: peer,
+            alias: alias,
+            verified: true,
+            newDevice: false,
+            deviceUnverified: unverified,
+          );
+      c.saved = [contact(aPeer, '상대 A', true), contact(bPeer, '상대 B', true)];
+      await mountAccount(t, c);
+      await t.tap(find.textContaining('상대 A'));
+      await t.pumpAndSettle();
+      final old = c.view();
+      c.controller.add(
+        const r.ChatEvent.accountAuthChanged(
+          peerId: 'other',
+          installationId: 'other',
+          ready: true,
+        ),
+      );
+      c.controller.add(const r.ChatEvent.accountCacheUsed(peerId: 'other'));
+      await t.pumpAndSettle();
+      expect(find.text('현재 기기 인증됨'), findsNothing);
+      c.saved = [contact(aPeer, '상대 A', false), contact(bPeer, '상대 B', true)];
+      c.remoteRecords = [
+        a.RemoteRecordView(
+          peer: aPeer,
+          acceptedGeneration: Uint8List(16),
+          cached: true,
+        ),
+      ];
+      c.emit();
+      c.controller.add(
+        r.ChatEvent.accountChanged(revision: old.revision, view: old),
+      );
+      await t.pumpAndSettle();
+      expect(find.text('현재 기기 인증됨'), findsOneWidget);
+      expect(find.textContaining('저장된 기기 목록으로 인증했어요'), findsOneWidget);
+      await t.tap(find.byTooltip('취소'));
+      await t.pumpAndSettle();
+      await t.tap(find.textContaining('상대 B'));
+      await t.pumpAndSettle();
+      expect(find.text('현재 기기 인증됨'), findsNothing);
+      expect(find.textContaining('저장된 기기 목록으로 인증했어요'), findsNothing);
+      c.saved = [contact(aPeer, '상대 A', true), contact(bPeer, '상대 B', true)];
+      c.remoteRecords = [];
+      c.emit();
+      await t.pumpAndSettle();
+      expect(find.text('현재 기기 인증됨'), findsNothing);
+    },
+  );
+  for (final fails in [false, true]) {
+    testWidgets(
+      'contact route deliberately starts real model account proof fails=$fails',
+      (t) async {
+        final c = ScreenClient()
+          ..phase = a.AccountPhase.active
+          ..proofFails = fails;
+        c.saved = [
+          a.ContactView(
+            peerId: Uint8List.fromList(List.filled(32, 8)),
+            alias: '선택한 상대',
+            verified: true,
+            newDevice: false,
+            deviceUnverified: true,
+          ),
+        ];
+        await mountAccount(t, c);
+        await t.tap(find.textContaining('선택한 상대'));
+        await t.pumpAndSettle();
+        expect(find.text('현재 기기 인증'), findsOneWidget);
+        await tapText(t, '현재 기기 인증');
+        expect(c.connectedPeers, [List.filled(32, 8)]);
+        expect(find.text('현재 기기 인증됨'), fails ? findsNothing : findsOneWidget);
+        expect(
+          find.text('기기 목록을 확인하지 못했어요'),
+          fails ? findsOneWidget : findsNothing,
+        );
+        await t.pumpWidget(const SizedBox());
+      },
+    );
+  }
+  testWidgets(
+    'recovery consent warns paired devices retain signing keys without phrase',
+    (t) async {
+      await t.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: RecoverScreen(busy: false, onRecover: (_) async {}),
+          ),
+        ),
+      );
+      expect(find.textContaining('문구를 받은 적이 없어도'), findsOneWidget);
+      expect(find.textContaining('계정 서명 키 사본'), findsOneWidget);
+      expect(find.textContaining('새 계정 ID'), findsOneWidget);
+      expect(find.text('계정 ID는 돌아오지만 내 연락처와 대화 기록은 돌아오지 않아요'), findsOneWidget);
+      expect(
+        t
+            .widget<FilledButton>(find.widgetWithText(FilledButton, '계정 복구'))
+            .onPressed,
+        isNull,
+      );
+    },
+  );
   setUp(() {
     fixtureFrame = 10;
     SensitiveScreen.frameNumberForTesting = () => fixtureFrame++;
@@ -648,7 +842,7 @@ void main() {
     await mountAccount(t, c);
     await tapText(t, '복구 문구로 복구');
     expect(find.text('계정 ID는 돌아오지만 내 연락처와 대화 기록은 돌아오지 않아요'), findsOneWidget);
-    expect(find.textContaining('침해된 기기'), findsOneWidget);
+    expect(find.textContaining('이전에 신뢰한 기기는'), findsOneWidget);
     await t.enterText(find.byType(TextField), 'PUBLIC_INVALID_RECOVERY');
     await tapText(t, '기존 기기 교체에 동의해요');
     await tapText(t, '계정 복구');

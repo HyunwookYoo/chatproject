@@ -85,6 +85,14 @@ pub struct PublicationView {
     pub pending_notifications: Vec<RevocationView>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteRecordView {
+    pub peer: Vec<u8>,
+    pub accepted_generation: Vec<u8>,
+    pub conflict_hash: Option<Vec<u8>>,
+    pub conflict: Option<RecordView>,
+    pub cached: bool,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContactView {
     pub peer_id: Vec<u8>,
     pub alias: String,
@@ -118,6 +126,7 @@ pub struct AccountView {
     pub installation: Option<Vec<u8>>,
     pub devices: Vec<DeviceView>,
     pub contacts: Vec<ContactView>,
+    pub remote_records: Vec<RemoteRecordView>,
     pub pair: Option<PairView>,
     pub publish_intents: Vec<PublishIntent>,
     pub publication: PublicationView,
@@ -293,6 +302,9 @@ pub async fn revoke_device(target: Vec<u8>) -> Result<(), CoreError> {
         .revoke_device(chat_core::account::InstallationId(id(target)?))
         .await
         .map_err(Into::into)
+}
+pub async fn confirm_remote_record(peer: Vec<u8>, hash: Vec<u8>) -> Result<(), CoreError> {
+    handle()?.confirm_remote_record(chat_core::account::PeerId(id(peer)?), id(hash)?).await.map_err(Into::into)
 }
 pub async fn confirm_record_conflict(base_hash: Vec<u8>) -> Result<(), CoreError> {
     handle()?

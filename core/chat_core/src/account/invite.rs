@@ -95,6 +95,15 @@ fn optional_text(d: &mut Decoder<'_>) -> Result<Option<String>, CoreError> {
     }
 }
 pub fn parse_invite(input: &str, now: u64) -> Result<InvitePreview, CoreError> {
+    parse_validated(input, now).map_err(|error| {
+        if error.code == crate::ErrorCode::InviteExpired {
+            error
+        } else {
+            CoreError::new(crate::ErrorCode::InvalidInvite, "Invalid identity invitation")
+        }
+    })
+}
+fn parse_validated(input: &str, now: u64) -> Result<InvitePreview, CoreError> {
     let payload = input.strip_prefix(SCHEME).ok_or_else(wire::invalid)?;
     if payload.len() > (LIMIT * 4).div_ceil(3) {
         return Err(wire::invalid());
@@ -153,9 +162,11 @@ pub fn parse_invite(input: &str, now: u64) -> Result<InvitePreview, CoreError> {
     if expires_at <= issued_at
         || expires_at - issued_at > 604800
         || issued_at > now.saturating_add(300)
-        || expires_at <= now
     {
         return Err(wire::invalid());
+    }
+    if expires_at <= now {
+        return Err(CoreError::new(crate::ErrorCode::InviteExpired, "Identity invitation expired"));
     }
     Ok(invite.preview)
 }

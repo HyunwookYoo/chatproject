@@ -111,6 +111,20 @@ class LinkClient extends ScreenClient {
 }
 
 class UiPairClient extends ScreenClient {
+  a.PublicationView? publication;
+  final confirmedHashes = <List<int>>[];
+  bool staleConflict = false;
+  @override
+  Future<void> confirmRecordConflict(List<int> hash) async {
+    confirmedHashes.add(List.of(hash));
+    if (staleConflict) {
+      throw const r.CoreError(
+        code: r.ErrorCode.recordConflict,
+        detail: 'changed fixture',
+      );
+    }
+  }
+
   a.PairView? pairing;
   a.PairRole role = a.PairRole.existing;
   a.PairDirection? beganDirection;
@@ -132,9 +146,10 @@ class UiPairClient extends ScreenClient {
       installation: Uint8List(32),
       devices: devices,
       contacts: [],
+      remoteRecords: [],
       pair: pairing,
       publishIntents: [],
-      publication: base.publication,
+      publication: publication ?? base.publication,
       disclosurePossible: disclosed,
       pendingPairTransactions: resumes.map((e) => e.transaction).toList(),
       pairResumes: resumes,
@@ -308,6 +323,174 @@ Future<void> keyboardActivate(
 }
 
 void expandedTests() {
+  testWidgets(
+    'conflict review five devices at 200 percent supports keyboard and stale hash',
+    (t) async {
+      t.view.physicalSize = const Size(360, 640);
+      t.view.devicePixelRatio = 1;
+      addTearDown(t.view.resetPhysicalSize);
+      addTearDown(t.view.resetDevicePixelRatio);
+      final hash = Uint8List.fromList(List.filled(32, 19));
+      final newer = Uint8List.fromList(List.filled(32, 20));
+      final generation = Uint8List.fromList(List.filled(16, 3));
+      final devices = List.generate(
+        5,
+        (i) => a.DeviceView(
+          installationId: Uint8List.fromList(List.filled(32, i)),
+          transportPublicKey: Uint8List(32),
+          kind: a.DeviceKind.desktop,
+        ),
+      );
+      a.PublicationView publication(Uint8List h) => a.PublicationView(
+        state: a.PublicationState.conflict,
+        observedSeq: BigInt.one,
+        allocatedSeq: BigInt.one,
+        conflictHash: h,
+        conflict: a.RecordView(
+          generation: generation,
+          issuedAt: BigInt.one,
+          expiresAt: BigInt.from(9999999999),
+          devices: devices,
+        ),
+        tombstones: [],
+        pendingCount: 1,
+        pendingNotifications: [],
+      );
+      final c = UiPairClient()
+        ..phase = a.AccountPhase.conflict
+        ..publication = publication(hash);
+      await mountPair(t, c, devices: true, scale: 2);
+      Future<void> keyboardActivate(String label) async {
+        final button = find.widgetWithText(FilledButton, label);
+        await t.ensureVisible(button);
+        bool focused() =>
+            FocusManager.instance.primaryFocus?.context
+                ?.findAncestorWidgetOfExactType<FilledButton>() ==
+            t.widget<FilledButton>(button);
+        for (var i = 0; i < 20 && !focused(); i++) {
+          await t.sendKeyEvent(LogicalKeyboardKey.tab);
+          await t.pumpAndSettle();
+        }
+        expect(focused(), isTrue, reason: 'keyboard must reach $label');
+        await t.sendKeyEvent(LogicalKeyboardKey.enter);
+        await t.pumpAndSettle();
+      }
+
+      expect(find.textContaining(publicId(hash)), findsOneWidget);
+      expect(find.text('세대: ${publicId(generation)}'), findsOneWidget);
+      for (final d in devices) {
+        expect(find.textContaining(publicId(d.installationId)), findsWidgets);
+      }
+      await keyboardActivate('이 목록 확인');
+      final dialog = find.byType(AlertDialog);
+      expect(
+        find.descendant(
+          of: dialog,
+          matching: find.textContaining(publicId(hash)),
+        ),
+        findsOneWidget,
+      );
+      expect(
+        find.descendant(
+          of: dialog,
+          matching: find.textContaining(publicId(generation)),
+        ),
+        findsOneWidget,
+      );
+      for (final d in devices) {
+        expect(
+          find.descendant(
+            of: dialog,
+            matching: find.textContaining(publicId(d.installationId)),
+          ),
+          findsOneWidget,
+        );
+      }
+      c.publication = publication(newer);
+      c.staleConflict = true;
+      c.emit();
+      await t.pumpAndSettle();
+      expect(
+        find.descendant(
+          of: dialog,
+          matching: find.textContaining(publicId(hash)),
+        ),
+        findsOneWidget,
+      );
+      expect(
+        find.descendant(
+          of: dialog,
+          matching: find.textContaining(publicId(newer)),
+        ),
+        findsNothing,
+      );
+      await keyboardActivate('확인한 목록 적용');
+      expect(c.confirmedHashes, [hash]);
+      expect(find.text('목록 충돌'), findsOneWidget);
+      expect(t.takeException(), isNull);
+    },
+  );
+  for (final excluded in [false, true]) {
+    testWidgets(
+      'own conflict displays exact competing membership excluded=$excluded',
+      (t) async {
+        final hash = Uint8List.fromList(List.filled(32, 19));
+        final installation = Uint8List.fromList(
+          List.filled(32, excluded ? 9 : 0),
+        );
+        final record = a.RecordView(
+          generation: Uint8List.fromList(List.filled(16, 3)),
+          issuedAt: BigInt.one,
+          expiresAt: BigInt.from(9999999999),
+          devices: [
+            a.DeviceView(
+              installationId: installation,
+              transportPublicKey: Uint8List(32),
+              kind: a.DeviceKind.desktop,
+            ),
+          ],
+        );
+        final c = UiPairClient()
+          ..phase = a.AccountPhase.conflict
+          ..publication = a.PublicationView(
+            state: a.PublicationState.conflict,
+            observedSeq: BigInt.one,
+            allocatedSeq: BigInt.one,
+            conflictHash: hash,
+            conflict: record,
+            tombstones: [],
+            pendingCount: 1,
+            pendingNotifications: [],
+          );
+        await mountPair(t, c, devices: true);
+        expect(find.text('검토할 현재 공개 목록'), findsOneWidget);
+        expect(find.textContaining(publicId(installation)), findsOneWidget);
+        expect(find.textContaining(publicId(hash)), findsOneWidget);
+        if (excluded) {
+          expect(find.textContaining('이 기기가 현재 목록에 없어요'), findsOneWidget);
+          expect(
+            t
+                .widget<FilledButton>(
+                  find.widgetWithText(FilledButton, '이 목록 확인'),
+                )
+                .onPressed,
+            isNull,
+          );
+        } else {
+          await t.ensureVisible(find.text('이 목록 확인'));
+          await t.tap(find.text('이 목록 확인'));
+          await t.pumpAndSettle();
+          c.staleConflict = true;
+          await t.tap(find.text('확인한 목록 적용'));
+          await t.pumpAndSettle();
+          expect(c.confirmedHashes, [hash]);
+          expect(find.textContaining('다른 기기에서 목록이 바뀌었어요'), findsOneWidget);
+          expect(find.text('목록 충돌'), findsOneWidget);
+        }
+        await t.pumpWidget(const SizedBox());
+      },
+    );
+  }
   testWidgets(
     'successful SAS rejection clears owned cached and visible QR through disposal',
     (t) async {

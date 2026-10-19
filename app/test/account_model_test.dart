@@ -14,6 +14,7 @@ account.AccountView view(
   phase: phase,
   devices: [],
   contacts: [],
+  remoteRecords: [],
   publishIntents: [],
   publication: account.PublicationView(
     state: account.PublicationState.localBlocked,
@@ -25,7 +26,7 @@ account.AccountView view(
   ),
   disclosurePossible: false,
   pendingPairTransactions: [],
-    pairResumes: [],
+  pairResumes: [],
   pendingImportRequiresRemoteRevoke: false,
 );
 

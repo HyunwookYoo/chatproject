@@ -10,6 +10,84 @@ import 'controller_test.dart' show MockParticipant;
 // Public markers, never generated recovery words.
 const marker = 'PUBLIC_MNEMONIC_QR_PSK_FIXTURE';
 void main() {
+  for (final kind in [
+    'account_auth_changed',
+    'account_cache_used',
+    'unknown_account_event',
+  ]) {
+    test(
+      'account diagnostic event delivery and prelog redaction $kind',
+      () async {
+        final logs = await Directory.systemTemp.createTemp(
+          'account-diagnostic-',
+        );
+        final controller = await Controller.start(port: 0, logDir: logs);
+        final peer = await MockParticipant.connect(controller);
+        try {
+          await peer.next();
+          final participant = await controller.waitParticipant('node');
+          final payload = {
+            'kind': kind,
+            'peer_id': 'public-peer',
+            'installation_id': 'public-installation',
+            'ready': true,
+            'unexpected': marker,
+          };
+          final received = participant.expectEvent((_) => true);
+          final checked = kind == 'unknown_account_event'
+              ? expectLater(received, throwsA(isA<StateError>()))
+              : expectLater(received, completion(payload));
+          peer.send({
+            'type': 'event',
+            'seq': 1,
+            'instance': 'one',
+            'event': payload,
+          });
+          await checked;
+          if (kind == 'unknown_account_event') {
+            await expectLater(controller.close(), throwsA(isA<StateError>()));
+          } else {
+            await controller.close();
+          }
+          final text = await File('${logs.path}/wire.jsonl').readAsString();
+          expect(text, isNot(contains(marker)));
+          expect(text, isNot(contains('public-installation')));
+          expect(text, contains('[redacted]'));
+        } finally {
+          await peer.close();
+          try {
+            await controller.close();
+          } catch (_) {
+            /* expected fatal record */
+          }
+          await logs.delete(recursive: true);
+        }
+      },
+    );
+  }
+
+  test(
+    'auth-only scenario exercises proof provenance and avoids pairing',
+    () async {
+      final fixture = AccountFixture();
+      await fixture.start();
+      try {
+        await fixture.run(authOnly: true);
+        expect(
+          fixture.stages,
+          containsAll([
+            'auth_fresh',
+            'auth_cached',
+            'auth_disconnected',
+            'auth_restarted',
+          ]),
+        );
+        expect(fixture.stages.where((s) => s.startsWith('paired_')), isEmpty);
+      } finally {
+        await fixture.close();
+      }
+    },
+  );
   for (final changed in [false, true]) {
     test(
       'm3_restart_same_endpoint_m2_restart_different_m3_changed_$changed',
@@ -143,6 +221,12 @@ void main() {
       final peer = packet.take(32).toList();
       expect(await request({'op': 'lookup', 'peer': peer}), {'absent': true});
       expect(await request({'op': 'publish', 'packet': packet}), {'ok': true});
+      expect((await request({'op': 'lookup', 'peer': peer}))['packet'], packet);
+      controller.recordLookupsPaused = true;
+      expect(await request({'op': 'lookup', 'peer': peer}), {
+        'unavailable': true,
+      });
+      controller.recordLookupsPaused = false;
       expect((await request({'op': 'lookup', 'peer': peer}))['packet'], packet);
       controller.recordPublicationsPaused = true;
       final updated = [...packet]..[103] = 8;
@@ -349,6 +433,8 @@ class AccountFixture {
   final stages = <String>[];
   var restarts = 0;
   var serial = 0;
+  bool networkStopped = false;
+  bool startingTicket = false;
   List<int> transport(String name) => [
     name == 'a' ? 1 : 2,
     stores[name]!,
@@ -417,8 +503,57 @@ class AccountFixture {
                         64,
                         changedEndpoint && restarts == 2 ? 'ff' : '00',
                       ),
-            'ticket': 'public-fixture-ticket',
+            'ticket': networkStopped || startingTicket
+                ? null
+                : 'public-fixture-ticket',
           };
+          startingTicket = false;
+        case 'network_stop':
+          networkStopped = true;
+          for (final s in states.values) {
+            s['contacts'] = [
+              {'verified': true, 'device_unverified': true},
+            ];
+            s['remote_records'] = [];
+          }
+        case 'network_start':
+          networkStopped = false;
+          startingTicket = true;
+        case 'account_local_route':
+          if (args['ticket'] is! String) {
+            socket.add(
+              jsonEncode({
+                'type': 'result',
+                'id': wire['id'],
+                'ok': false,
+                'error': {'code': 'InvalidConfig', 'detail': 'route not ready'},
+              }),
+            );
+            return;
+          }
+        case 'account_local_connect_account':
+          if (networkStopped) {
+            socket.add(
+              jsonEncode({
+                'type': 'result',
+                'id': wire['id'],
+                'ok': false,
+                'error': {
+                  'code': 'TransportFailed',
+                  'detail': 'stopped fixture',
+                },
+              }),
+            );
+            return;
+          }
+          for (final s in states.values) {
+            s['contacts'] = [
+              {'verified': true, 'device_unverified': false},
+            ];
+            s['remote_records'] = [
+              {'cached': controller.recordLookupsPaused},
+            ];
+          }
         case 'account_local_snapshot':
           result = state;
         case 'account_local_begin_create':
@@ -460,8 +595,6 @@ class AccountFixture {
             'qr': marker,
             'expires_at': 123,
           };
-        case 'account_local_route':
-          break;
         case 'account_local_pair_scan':
           for (final s in states.values) {
             s['pair'] = {'sas': 'PUBLICSAS', 'phase': 'AwaitingApproval'};
@@ -529,11 +662,17 @@ class AccountFixture {
     return next;
   }
 
-  Future<void> run() => runAccountScenario(
+  Future<void> run({bool authOnly = false}) => runAccountScenario(
     controller,
     [peers['a']!, peers['b']!],
+    authOnly: authOnly,
     restart: (old, {bool freshStore = false}) async {
       restarts++;
+      networkStopped = authOnly;
+      states[old.name]!['contacts'] = [
+        {'verified': true, 'device_unverified': true},
+      ];
+      states[old.name]!['remote_records'] = [];
       if (freshStore) {
         stores[old.name] = stores[old.name]! + 1;
         states[old.name] = fresh(old.name);

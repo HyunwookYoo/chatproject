@@ -52,6 +52,7 @@ class Controller {
   final _records = <String, List<int>>{};
   final _recordSockets = <WebSocket>{};
   bool recordPublicationsPaused = false;
+  bool recordLookupsPaused = false;
   late final StreamSubscription<HttpRequest> _listener;
   final _requests = <Future<void>>{};
   final _connections = <_Connection>{};
@@ -147,7 +148,9 @@ class Controller {
           ? v.cast<int>()
           : null;
       Map<String, Object?> reply = {'unavailable': true};
-      if (value['op'] == 'lookup' && value.length == 2) {
+      if (value['op'] == 'lookup' &&
+          value.length == 2 &&
+          !recordLookupsPaused) {
         final peer = bytes(value['peer'], 32, 32);
         if (peer != null) {
           final packet = _records[peer.join(',')];

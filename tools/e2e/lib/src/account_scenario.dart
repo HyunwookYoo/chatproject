@@ -12,6 +12,7 @@ Future<void> runAccountScenario(
   Controller controller,
   List<Participant> participants, {
   required AccountRestart restart,
+  bool authOnly = false,
   Future<int> Function(Participant)? wallClock,
   void Function(String, Map<String, Object?>)? evidence,
   Duration timeout = const Duration(seconds: 45),
@@ -269,6 +270,93 @@ Future<void> runAccountScenario(
       ),
       'safety verification not saved',
     );
+    if (authOnly) {
+      Future<void> routeBoth() async {
+        for (final pair in [(a, b), (b, a)]) {
+          final deadline = DateTime.now().add(timeout);
+          Object? ticket;
+          while (DateTime.now().isBefore(deadline)) {
+            ticket = object(await pair.$2.call('network_info', {}))['ticket'];
+            if (ticket is String) break;
+            await Future<void>.delayed(const Duration(milliseconds: 100));
+          }
+          require(ticket is String, 'public route did not become ready');
+          await call(pair.$1, 'route', {'ticket': ticket});
+        }
+      }
+
+      bool proved(Map<String, Object?> v) => (v['contacts'] as List).any(
+        (c) => (c as Map)['device_unverified'] == false,
+      );
+      bool cached(Map<String, Object?> v) => (v['remote_records'] as List).any(
+        (r) => (r as Map)['cached'] == true,
+      );
+      Future<void> proof(
+        String stage,
+        Participant initiator,
+        Object? peer,
+        bool useCache,
+      ) async {
+        await call(initiator, 'connect_account', {'peer': peer});
+        for (final p in [a, b]) {
+          final v = await until(p, proved);
+          require(
+            cached(v) == useCache,
+            'incorrect cache provenance at $stage',
+          );
+          evidence?.call(stage, {
+            'instance': p.instance,
+            'contacts': v['contacts'],
+            'remote_records': v['remote_records'],
+          });
+        }
+      }
+
+      await routeBoth();
+      await proof('auth_fresh', a, bPeer, false);
+      controller.recordLookupsPaused = true;
+      await proof('auth_cached', a, bPeer, true);
+      controller.recordLookupsPaused = false;
+      await proof('auth_fresh_again', a, bPeer, false);
+      await b.call('network_stop', {});
+      final disconnected = await until(a, (v) => !proved(v));
+      require(
+        !cached(disconnected),
+        'disconnected proof retained cache status',
+      );
+      var failed = false;
+      try {
+        await call(a, 'connect_account', {'peer': bPeer});
+      } on RpcError {
+        failed = true;
+      }
+      require(
+        failed && !proved(await snapshot(a)),
+        'failed proof showed ready',
+      );
+      await record('auth_disconnected', a);
+      final beforeRestart = await snapshot(b);
+      final oldInstance = b.instance;
+      b = await restart(b);
+      final afterRestart = await until(b, (_) => true);
+      require(
+        b.instance != oldInstance &&
+            same(
+              beforeRestart['public_peer_id'],
+              afterRestart['public_peer_id'],
+            ) &&
+            same(beforeRestart['installation'], afterRestart['installation']),
+        'auth restart identity changed',
+      );
+      require(
+        !proved(await snapshot(b)) && !cached(await snapshot(b)),
+        'restart retained authorization',
+      );
+      await b.call('network_start', {});
+      await routeBoth();
+      await proof('auth_restarted', b, aPeer, false);
+      return;
+    }
     b = await restarted(b, freshStore: true);
     await call(b, 'prepare_candidate');
     b = await restarted(b);
@@ -315,5 +403,6 @@ Future<void> runAccountScenario(
   } finally {
     recovery.clear();
     controller.recordPublicationsPaused = false;
+    controller.recordLookupsPaused = false;
   }
 }

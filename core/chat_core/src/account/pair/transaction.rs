@@ -57,19 +57,18 @@ pub(crate) struct PairTransaction {
 impl PairTransaction {
     pub(crate) fn envelope(&self) -> Result<Envelope, CoreError> {
         Ok(Envelope {
-            tx: Payload::decode(&self.payload)?.tx,
+            tx: self.tx,
             total: self.payload.len(),
             hash: transfer::hash(&self.payload),
         })
     }
     fn bytes(&self) -> Zeroizing<Vec<u8>> {
-        let payload = Payload::decode(&self.payload).expect("validated transaction payload");
         let mut e = Encoder::new(Vec::with_capacity(self.payload.len() + 512));
         e.array(11)
             .unwrap()
             .u8(1)
             .unwrap()
-            .bytes(&payload.tx.0)
+            .bytes(&self.tx.0)
             .unwrap()
             .bytes(&self.pin.peer.0)
             .unwrap()
@@ -217,6 +216,19 @@ pub(crate) struct PairState {
     pub origin: Option<Origin>,
 }
 impl PairState {
+    pub(crate) fn unfinished(&self) -> usize {
+        self.existing.iter().filter(|t| t.stage != Stage::Observed).count()
+    }
+    pub(crate) fn admit_new(&self, pending: usize) -> Result<(), CoreError> {
+        if self.existing.len() >= 256 {
+            return Err(CoreError::new(crate::ErrorCode::PairHistoryFull, "Retained pairing history capacity reached"));
+        }
+        // Reserve one additional intent for publishing the newly received device.
+        if pending != 0 || self.unfinished() + pending >= 31 {
+            return Err(CoreError::new(crate::ErrorCode::StorageFull, "Pending account operation capacity reached"));
+        }
+        Ok(())
+    }
     pub(crate) fn encode(&self) -> Zeroizing<Vec<u8>> {
         let capacity = 64
             + self
@@ -254,7 +266,7 @@ impl PairState {
             return Err(invalid());
         }
         let n = d.array().map_err(|_| invalid())?.ok_or_else(invalid)? as usize;
-        if n > 32 || n + pending > 32 {
+        if n > 256 {
             return Err(invalid());
         }
         let mut s = Self::default();
@@ -268,12 +280,13 @@ impl PairState {
                 })
                 || s.existing
                     .iter()
-                    .any(|old| old.envelope().ok().map(|v| v.tx) == t.envelope().ok().map(|v| v.tx))
+                    .any(|old| old.tx == t.tx)
             {
                 return Err(invalid());
             }
             s.existing.push(t);
         }
+        if s.unfinished() + pending > 32 { return Err(invalid()); }
         s.origin = if d.datatype().map_err(|_| invalid())? == Type::Null {
             d.null().map_err(|_| invalid())?;
             None
@@ -291,6 +304,7 @@ impl PairState {
         Ok(s)
     }
 }
+
 pub(crate) struct CandidatePinned {
     pub device: DeviceKeys,
     pub revision: u64,
@@ -317,5 +331,60 @@ impl PendingImport {
             hash: transfer::hash(&self.payload),
             receipt: self.receipt.clone(),
         })
+    }
+}
+
+#[cfg(test)]
+mod capacity_tests {
+    use super::*;
+    use crate::account::{Secret32, derive_account, derive_device, sign_cert, DeviceKind};
+
+    #[test]
+    fn retained_history_and_unfinished_intents_have_separate_bounded_budgets() {
+        let keys = derive_account(&Secret32::from([7; 32])).unwrap();
+        let device = derive_device(Secret32::from([8; 32])).unwrap();
+        let cert = sign_cert(&keys, &device, DeviceKind::Desktop, 1000).unwrap();
+        let mut state = PairState::default();
+        for i in 0..256u16 {
+            let mut tx = TxId([0; 16]);
+            tx.0[..2].copy_from_slice(&i.to_be_bytes());
+            let payload = Payload::encode_parts(tx, &keys, &cert, Generation([3; 16]), [4; 32], &[]);
+            let receipt = Receipt::sign(tx, transfer::hash(&payload), &device, FlowId([5; 16]), [6; 32]);
+            state.existing.push(PairTransaction {
+                tx, pin: ExistingPin { peer: keys.peer_id(), installation: device.installation_id(), transport: device.transport_public_key() },
+                payload, approved_flow: FlowId([5; 16]), approved_hash: [6; 32], stage: Stage::Observed,
+                receipt: Some(receipt), publication: Some([9; 32]),
+            });
+            if i == 31 {
+                assert!(state.admit_new(0).is_ok());
+                assert!(PairState::decode(&state.encode(), keys.peer_id(), &device, 32).is_ok());
+            }
+        }
+        assert_eq!(state.admit_new(0).unwrap_err().code, crate::ErrorCode::PairHistoryFull);
+        let decoded = PairState::decode(&state.encode(), keys.peer_id(), &device, 32).unwrap();
+        assert_eq!(decoded.existing.len(), 256);
+        assert_eq!(decoded.existing[0].payload, state.existing[0].payload);
+        assert_eq!(decoded.existing[0].envelope().unwrap().tx, state.existing[0].tx);
+        let original_tx = state.existing[0].tx;
+        state.existing[0].tx = TxId([99; 16]);
+        assert!(PairState::decode(&state.encode(), keys.peer_id(), &device, 0).is_err());
+        state.existing[0].tx = original_tx;
+        let mut duplicate = Encoder::new(Vec::new());
+        duplicate.array(3).unwrap().u8(1).unwrap().array(2).unwrap()
+            .bytes(&state.existing[0].bytes()).unwrap()
+            .bytes(&state.existing[0].bytes()).unwrap().null().unwrap();
+        assert!(PairState::decode(&duplicate.into_writer(), keys.peer_id(), &device, 0).is_err());
+        let mut oversized = Encoder::new(Vec::new());
+        oversized.array(3).unwrap().u8(1).unwrap().array(257).unwrap();
+        assert!(PairState::decode(&oversized.into_writer(), keys.peer_id(), &device, 0).is_err());
+        state.existing.truncate(32);
+        for entry in &mut state.existing {
+            entry.stage = Stage::DisclosurePossible;
+            entry.receipt = None;
+            entry.publication = None;
+        }
+        assert_eq!(state.admit_new(0).unwrap_err().code, crate::ErrorCode::StorageFull);
+        assert!(PairState::decode(&state.encode(), keys.peer_id(), &device, 0).is_ok());
+        assert!(PairState::decode(&state.encode(), keys.peer_id(), &device, 1).is_err());
     }
 }

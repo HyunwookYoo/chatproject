@@ -3,6 +3,7 @@ import 'package:flutter/foundation.dart';
 import '../../src/rust/api/account.dart' as a;
 import '../account_model.dart';
 import '../public_id.dart';
+import '../record_review.dart';
 import 'device_warning_screen.dart';
 
 class DevicesScreen extends StatelessWidget {
@@ -68,6 +69,33 @@ class DevicesScreen extends StatelessWidget {
                   const DeviceWarningScreen(disclosurePossible: true),
                 if (view.pendingImportRequiresRemoteRevoke)
                   const Text('로컬에서 버려도 공개 목록은 바뀌지 않아요. 기존 기기에서 해제해 주세요.'),
+                if (view.publication.conflict
+                    case final a.RecordView conflict) ...[
+                  if (!conflict.devices.any(
+                    (d) => listEquals(d.installationId, view.installation),
+                  ))
+                    const Text(
+                      '이 기기가 현재 목록에 없어요. 목록 확인으로 권한을 되찾을 수 없어요. 신뢰하는 기기를 통해 다시 연결하거나 복구 방법을 확인해 주세요.',
+                    ),
+                  if (view.publication.conflictHash case final List<int> hash)
+                    RecordReview(
+                      record: conflict,
+                      hash: hash,
+                      enabled:
+                          !model.busy &&
+                          conflict.devices.any(
+                            (d) =>
+                                listEquals(d.installationId, view.installation),
+                          ),
+                      generationChanged: !listEquals(
+                        conflict.generation,
+                        view.publication.generation,
+                      ),
+                      onConfirm: model.confirmRecordConflict,
+                    ),
+                ],
+                Text('게시 대기 작업: ${view.publication.pendingCount}'),
+                const Text('이전에 수용한 기기 목록'),
                 for (final device in view.devices)
                   ListTile(
                     isThreeLine: true,

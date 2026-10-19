@@ -210,6 +210,7 @@ String networkErrorMessage(rust.ErrorCode code) => switch (code) {
   rust.ErrorCode.deviceLimit ||
   rust.ErrorCode.pairMismatch ||
   rust.ErrorCode.pairExpired ||
+  rust.ErrorCode.pairHistoryFull ||
   rust.ErrorCode.recordConflict ||
   rust.ErrorCode.recordUnavailable ||
   rust.ErrorCode.authFailed ||

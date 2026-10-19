@@ -43,3 +43,5 @@ pub(crate) mod pair;
 pub use pair::{PairDirection, PairDisplay, PairPhase, PairView, PairRole, PairResumeView};
 #[cfg(all(feature="test-hooks",debug_assertions))]
 pub use pair::PairTestStop;
+
+pub use connection::RemoteRecordView;

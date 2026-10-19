@@ -33,6 +33,8 @@ class AccountModel extends ChangeNotifier {
     _subscription = client.events().listen(
       (event) {
         if (!_current(generation)) return;
+        // The sequenced coherent snapshot owns live proof and cache provenance.
+        // Diagnostic auth/cache events cannot independently grant UI readiness.
         if (event case rust.ChatEvent_AccountChanged(
           :final revision,
           :final view,
@@ -226,6 +228,8 @@ class AccountModel extends ChangeNotifier {
       _command(() => client.refreshRecord(peer));
   Future<bool> revokeDevice(List<int> target) =>
       _command(() => client.revokeDevice(target));
+  Future<bool> confirmRemoteRecord(List<int> peer, List<int> hash) =>
+      _command(() => client.confirmRemoteRecord(peer, hash));
   Future<bool> confirmRecordConflict(List<int> baseHash) =>
       _command(() => client.confirmRecordConflict(baseHash));
   Future<Uint8List?> pairScan(String qr, {List<int>? expectedResume}) async {
@@ -341,6 +345,7 @@ account.AccountView lockedAccountView(
   lockError: code,
   devices: [],
   contacts: [],
+  remoteRecords: [],
   publishIntents: [],
   disclosurePossible: previous?.disclosurePossible ?? false,
   pendingPairTransactions: previous?.pendingPairTransactions ?? [],

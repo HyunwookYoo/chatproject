@@ -380,6 +380,40 @@ async fn durable_transfer_activates_exact_candidate() {
 }
 
 #[tokio::test]
+async fn completed_history_releases_pending_quota_and_retains_exact_resume() {
+    let backend = Arc::new(Backend::default());
+    let mut e = Fixture::new(true, backend.clone()).await;
+    let first = Fixture::new(false, backend.clone()).await;
+    let flow = fresh(&e, &first, None).await;
+    confirm_wait(&e, &first, flow).await;
+    e.a.pair_approve(flow).await.unwrap();
+    active(&first).await;
+    let tx = first.a.snapshot().await.unwrap().pair_resumes[0].transaction;
+    e.a.pair_cancel(flow).await.unwrap();
+    first.a.pair_cancel(flow).await.unwrap();
+    for cycle in 1..33 {
+        let n = Fixture::new(false, backend.clone()).await;
+        let flow = fresh(&e, &n, None).await;
+        confirm_wait(&e, &n, flow).await;
+        e.a.pair_approve(flow).await.unwrap_or_else(|error| panic!("cycle {cycle}: {error}"));
+        active(&n).await;
+        let target = n.a.snapshot().await.unwrap().installation.unwrap();
+        e.a.pair_cancel(flow).await.unwrap();
+        n.a.pair_cancel(flow).await.unwrap();
+        e.a.revoke_device(target).await.unwrap();
+        let peer = e.a.snapshot().await.unwrap().public_peer_id.unwrap();
+        e.a.refresh_record(peer).await.unwrap();
+        assert!(e.a.snapshot().await.unwrap().pending_pair_transactions.is_empty());
+    }
+    e = e.restart().await;
+    assert!(e.a.snapshot().await.unwrap().disclosure_possible);
+    let flow = fresh(&e, &first, Some(tx)).await;
+    confirm_wait(&e, &first, flow).await;
+    e.a.pair_approve(flow).await.unwrap();
+    assert_eq!(first.a.snapshot().await.unwrap().pair_resumes[0].transaction, tx);
+}
+
+#[tokio::test]
 async fn failed_disclosure_commit_sends_zero() {
     use std::sync::atomic::Ordering::SeqCst;
     let (e, n, f, _) = connected(PairDirection::NewDisplays).await;

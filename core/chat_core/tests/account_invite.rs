@@ -59,6 +59,17 @@ fn name_64_bytes_accept_65_reject() {
     assert!(parse_invite(&invite(Some(&"a".repeat(65)), NOW, NOW + 86400, None), NOW).is_err());
     assert!(parse_invite(&invite(Some(&"가".repeat(22)), NOW, NOW + 86400, None), NOW).is_err());
 }
+
+#[test]
+fn public_invite_errors_distinguish_verified_expiry_from_invalid() {
+    let expired = invite(None, NOW - 86400, NOW, None);
+    assert_eq!(parse_invite(&expired, NOW).unwrap_err().code, chat_core::ErrorCode::InviteExpired);
+    assert_eq!(parse_invite("malformed", NOW).unwrap_err().code, chat_core::ErrorCode::InvalidInvite);
+    let mut bytes = data_encoding::BASE64URL_NOPAD.decode(expired.rsplit('/').next().unwrap().as_bytes()).unwrap();
+    *bytes.last_mut().unwrap() ^= 1;
+    let forged = format!("chatproject:identity-invite/1/{}", data_encoding::BASE64URL_NOPAD.encode(&bytes));
+    assert_eq!(parse_invite(&forged, NOW).unwrap_err().code, chat_core::ErrorCode::InvalidInvite);
+}
 #[test]
 fn unicode_controls_bidi_not_trusted_name() {
     for name in ["a\nb", "a\0b", "a\u{0085}b"] {
