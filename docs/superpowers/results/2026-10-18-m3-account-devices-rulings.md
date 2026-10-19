@@ -224,7 +224,7 @@ Ruling: I5 may add per-instance debug+test-hooks hold_next_key_transition_for_te
 
 ## C ledger
 
-Source: `.superpowers/sdd/2026-10-18-m3-c-app-validation/progress.md`. 51 ruling-bearing paragraphs, 51 individual `Ruling:` occurrences. Source SHA256 `f99d864a3bafe0e6ecfcf46cb632c31ae1c097a929deb5f661e6aad2f14d5500`.
+Source: `.superpowers/sdd/2026-10-18-m3-c-app-validation/progress.md`. 51 ruling-bearing paragraphs, 51 individual `Ruling:` occurrences. Source SHA256 `ed4f21868247bda3a2b52cf82af5ab569716be131165f4d37800029b84e01e87`.
 
 ### C-01
 

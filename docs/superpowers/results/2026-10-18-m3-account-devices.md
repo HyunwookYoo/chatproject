@@ -1,6 +1,6 @@
 # M3 account and devices — implementation and validation results
 
-Status: **Whole-M3 review completed (0 Critical / 6 Important / 2 Minor); all eight findings are addressed in the single combined fix wave with amended local validation complete; scoped re-review is pending. M3 §10 is not complete**. Source base for C4: `116ef3b83f24b967098056d73c2c06cc5143fcbf`; whole M3 review base: `aadd2db`; reviewed HEAD / final-fix base: `eaf1b5a0583d8fd99d83fc9481db30d4eefb1b1f`; amended source: `9d1f3945b4b2f475cf757688c14e968e87319d49`. The approved scope is the [M3 plan](../plans/2026-10-18-m3-account-devices.md) and [design §10](../specs/2026-10-18-m3-account-devices-design.md). Local checks ran on Windows x86_64 with Rust 1.92.0, Flutter 3.44.6/Dart 3.12.2, FRB 2.11.1 and the existing pinned Android SDK/NDK setup. There is no Apple build/runtime or signed iPhone evidence on this host.
+Status: **Scoped final review accepted: all eight original findings addressed, 0 open, and 0 new Critical / Important / Minor findings. Reviewed M3 source is ready for integration and local closure; full M3 §10 acceptance remains incomplete**. Source base for C4: `116ef3b83f24b967098056d73c2c06cc5143fcbf`; whole M3 review base: `aadd2db`; reviewed HEAD / final-fix base: `eaf1b5a0583d8fd99d83fc9481db30d4eefb1b1f`; amended source: `9d1f3945b4b2f475cf757688c14e968e87319d49`; re-reviewed fix HEAD: `8678a727dc58625d162a1c801363a87fe6ef145f`. The approved scope is the [M3 plan](../plans/2026-10-18-m3-account-devices.md) and [design §10](../specs/2026-10-18-m3-account-devices-design.md). Local checks ran on Windows x86_64 with Rust 1.92.0, Flutter 3.44.6/Dart 3.12.2, FRB 2.11.1 and the existing pinned Android SDK/NDK setup. There is no Apple build/runtime or signed iPhone evidence on this host.
 
 Historical task reports and current C4 executions are separate below. All source, failure logs, review reports and scratch probes remain preserved for controller review. No push, merge, signed upload, registry change, public DHT/relay test or physical-device run occurred in C4.
 
@@ -487,3 +487,38 @@ Both Android Release smoke ownership files have empty processes/activities. Befo
 Final350 source hashes still match; only the previously listed four tool/test files differ from the initial350 freeze. Generated11 remain twice-stable; protected3 M2 hashes are exact and those files were never staged. Final audit verifies all103 A/B/C ruling-bearing paragraphs (A13/B39/C51;107 literal Ruling occurrences) verbatim with matching ledger SHA256. Self-review covered the handwritten source/test diff, coherent grant/cache ownership, exact consent binding, full input validation with cached transaction IDs, bounded retained history, generated forwarding and narrow native fixture changes; scoped `git diff --check` passed.
 
 No additional acceptance is inferred: Apple/iPhone, physical camera capture and permission/privacy UX, real public DHT/relay, signed distribution and remaining OS/provider gates still require §10 evidence. Finite256 retained history and4MiB encrypted snapshot capacity, retained signing-key copies and the one Windows SIGINT test skip remain explicit limitations.
+
+
+## Final scoped review and local source closure
+
+The controller accepted the final scoped review recorded in `.superpowers/sdd/2026-10-18-m3-c-app-validation/whole-m3-fix-review.md`. It reviewed **`eaf1b5a0583d8fd99d83fc9481db30d4eefb1b1f..8678a727dc58625d162a1c801363a87fe6ef145f`**, against the eight original findings and approved rulings. The original whole-M3 review was `aadd2db..eaf1b5a`; this was one scoped correction review, not a second whole-branch review. The accepted source remains **`9d1f3945b4b2f475cf757688c14e968e87319d49`**. Later commits, including this closeout, change result documentation only.
+
+**Final verdict: all eight findings addressed; 0/8 original source findings open; 0 new Critical, 0 Important, 0 Minor findings.** The source is ready for controller integration and local closure with the explicit finite-retention contract and recorded limitations. This records readiness, not an executed merge, deployment, signing/distribution action or full M3 §10 acceptance. Earlier pending checkpoints remain historical and are superseded by this verdict.
+
+| Finding | Scoped disposition |
+|---|---|
+| I1 remote-contact conflict recovery | ADDRESSED: fresh signed lookup, exact displayed hash, durable floor/time/expiry checks, old grant closure and fresh proof. |
+| I2 own-account conflict confirmation UI | ADDRESSED: actual competing evidence, immutable consent, excluded-writer restriction and keyboard/200% coverage. |
+| I3 terminal exact-flow cancellation | ADDRESSED: idempotent ended-flow cleanup, replacement protection and genuine lifecycle failure handling. |
+| I4 signed evidence from denied handshake | ADDRESSED: durable own/foreign observation, stale-grant restriction and persistence failure closure without granting proof authority. |
+| I5 normal account proof/cache UI | ADDRESSED: normal route/model/bridge consumer plus coherent live/cache projection and actual native two-participant proofs. |
+| I6 recovery signing-key warning | ADDRESSED: retained trusted-device key copies without phrase receipt are disclosed before recovery consent. |
+| M1 public invalid/expiry errors | ADDRESSED: validated signed expiry distinguished from invalid invitation, actual pair expiry and native Korean error boundary. |
+| M2 retained history/pending quota | ADDRESSED under the approved256-history/32-unfinished/4MiB contract, preserving exact payload/receipt/pin/disclosure and old resume. |
+
+The reviewer read all handwritten fix changes and relevant authority callers, structurally checked generated correspondence, inspected retained behavioral/native/Release evidence and independently hashed final inputs/artifacts. No tests, generation, builds, native/device/UI or remote actions were executed during review or this documentation closeout. All350 final frozen input hashes remain unchanged after that freeze; the four previously recorded tool/test amendments differ only from the initial350 freeze. No post-closeout artifact rebuild is needed because no build input changed. Flutter/e2e evidence remains composed passing coverage with its original failures, one Windows SIGINT delivery skip and the first native run's historical uncertain cleanup preserved. No stronger claim replaces those records.
+
+All ten acceptance groups retain their dispositions:
+
+1. Physical Windows↔Android camera pairing, camera permission handling and optical reliability remain open; public-image decoding does not establish them.
+2. Apple compilation/linking/signing/entitlements, actual Keychain and scene/protected-data/extension behavior remain open.
+3. Actual Windows Peek and Android/iOS app-switch snapshot concealment remain open; handler/fence evidence does not prove shell rendering.
+4. Windows OS URI registration/warm forwarding and actual Android/iOS native URI launch remain open.
+5. OS screen-reader/accessibility behavior remains open beyond the widget semantics, keyboard and200% layout evidence.
+6. Public pkarr/Mainline propagation, real Internet paths and multi-network convergence remain open; local signed-record proof is narrower.
+7. Real OS lock/key-loss/provisioning, other-user/machine DPAPI, Android key destruction and Apple reinstall/accessibility behavior remain open.
+8. Whole-process memory-forensic erasure across Snow, generated/transit/Dart and OS-owned allocations is not guaranteed; app-owned zeroization remains required.
+9. Inherited M2 500ms target acceptance and deferred iOS LAN evidence remain under M2 ownership.
+10. Message history, MLS/message security and full Invite v2/KeyPackage behavior remain outside M3 and belong to later milestones, including M4/M5.
+
+The prior B4 behavioral-RED chronology debt, inherited diagnostics/toolchain notices and memory-erasure limits retain their recorded dispositions. No new out-of-scope source defect was identified or silently waived. The ruling appendix preserves every current A/B/C ruling paragraph and cost verbatim, with raw ledger hashes refreshed after the controller's final acceptance bookkeeping.
