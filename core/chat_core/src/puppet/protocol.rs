@@ -6,18 +6,25 @@ use serde_json::Value;
 
 pub const PROTOCOL: &str = "chat-test-hooks:v1";
 pub const RELAY: &str = "http://127.0.0.1:3340";
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Incoming {
     Config {
         #[serde(deserialize_with = "Option::deserialize")]
         relay: Option<String>,
+        #[serde(default)]
+        records: Option<String>,
     },
     Cmd {
         id: u64,
         op: String,
         args: Value,
     },
+}
+impl std::fmt::Debug for Incoming {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Incoming([redacted])")
+    }
 }
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -51,6 +58,7 @@ pub enum ValueReply {
     Info(NetworkInfo),
     Peer(PeerInfo),
     Done,
+    Account(super::account::SecretJson),
 }
 #[derive(Serialize)]
 pub struct WireError {
@@ -75,6 +83,14 @@ impl From<Result<NetworkReply, CoreError>> for Outcome {
                     detail: error.detail,
                 },
             },
+        }
+    }
+}
+impl Outcome {
+    pub fn account(result: Result<Value, CoreError>) -> Self {
+        match result {
+            Ok(value) => Self::Success { ok: true, value: ValueReply::Account(super::account::SecretJson(value)) },
+            Err(error) => Self::Failure { ok: false, error: WireError { code: error.code, detail: "Account action failed".into() } },
         }
     }
 }
@@ -180,4 +196,11 @@ pub fn command(op: &str, value: Value) -> Result<NetworkOp, CoreError> {
             ));
         }
     })
+}
+#[cfg(test)]
+mod account_config_tests {
+    #[test]
+    fn local_account_services_configuration_is_accepted_before_open() {
+        assert!(super::parse(r#"{"type":"config","relay":null,"records":"ws://127.0.0.1:47000/records"}"#).is_ok());
+    }
 }

@@ -257,10 +257,10 @@ Future<void> runSmoke({
       final ready =
           state.current &&
           (contractNonce == null
-              ? state.text.contains('대화') &&
-                    state.text.contains('아직 대화가 없어요') &&
-                    state.text.contains('연결 없음') &&
-                    RegExp(r'코어 \d+\.\d+\.\d+').hasMatch(state.text)
+              ? state.text.contains('내 계정 시작하기') &&
+                    state.text.contains('새 계정 만들기') &&
+                    state.text.contains('복구 문구로 복구') &&
+                    state.text.contains('다른 기기로 연결')
               : _contractProof(state.output, contractNonce));
       if (ready) {
         readyAt ??= timer.elapsed;

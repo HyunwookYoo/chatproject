@@ -5,6 +5,7 @@ import sys
 import zipfile
 
 MARKER = b"chat-test-hooks:v1"
+MARKERS = (MARKER, b"account_local_", b"Local record fixture unavailable")
 MACHO = {bytes.fromhex(value) for value in (
     "feedface", "cefaedfe", "feedfacf", "cffaedfe", "cafebabe", "bebafeca", "cafebabf", "bfbafeca"
 )}
@@ -14,9 +15,9 @@ def scan(stream):
     tail = b""
     while block := stream.read(1024 * 1024):
         data = tail + block
-        if MARKER in data:
+        if any(marker in data for marker in MARKERS):
             raise ValueError("native artifact contains test controller marker")
-        tail = data[-len(MARKER):]
+        tail = data[-max(map(len, MARKERS)):]
 
 
 def check(artifact):

@@ -5,6 +5,7 @@ import 'dart:io';
 import 'package:args/args.dart';
 import 'package:chat_e2e/src/android_sdk.dart';
 import 'package:chat_e2e/src/controller.dart';
+import 'package:chat_e2e/src/account_scenario.dart';
 import 'package:chat_e2e/src/emulators.dart';
 import 'package:chat_e2e/src/owned_resources.dart';
 import 'package:chat_e2e/src/process_runner.dart';
@@ -18,6 +19,7 @@ Future<void> main(List<String> arguments) async {
       defaultsTo: Platform.isWindows ? 'mixed' : 'android',
       allowed: ['mixed', 'android', 'windows'],
     )
+    ..addOption('scenario', defaultsTo: 'm2', allowed: ['m2', 'm3'])
     ..addOption('repo-root', mandatory: true);
   late ArgResults options;
   try {
@@ -31,13 +33,14 @@ Future<void> main(List<String> arguments) async {
     }
   } on FormatException {
     stderr.writeln(
-      'Usage: dart run bin/run.dart --profile mixed|android|windows --repo-root <absolute>',
+      'Usage: dart run bin/run.dart --profile mixed|android|windows --scenario m2|m3 --repo-root <absolute>',
     );
     exitCode = 64;
     return;
   }
   final root = p.normalize(options['repo-root'] as String);
   final profile = options['profile'] as String;
+  final accountScenario = options['scenario'] == 'm3';
   final logs = await Directory(
     p.join(
       root,
@@ -161,38 +164,61 @@ Future<void> main(List<String> arguments) async {
     }, const Duration(seconds: 10));
     run.token.check();
     run.phase = _Phase.controllerStart;
-    controller = await Controller.start(logDir: logs);
+    controller = await Controller.start(
+      logDir: logs,
+      accountRecords: accountScenario,
+    );
     run.owned.add('controller', controller.close);
     final control = controller;
     final participants = <Participant>[];
+    final appRestarts = <String, AccountRestart>{};
+    final appClocks = <String, Future<int> Function()>{};
     for (var i = 1; i <= windowsCount; i++) {
       run.phase = _Phase.windowsStart;
       final name = 'windows-$i';
-      final directory = p.join(logs.path, name);
-      await Directory(directory).create();
-      await run.start(
-        p.join(
-          root,
-          'app',
-          'build',
-          'windows',
-          'x64',
-          'runner',
-          'Debug',
-          'chat_app.exe',
-        ),
-        [
-          '--data-dir',
-          directory,
-          '--control-url',
-          'ws://127.0.0.1:47000',
-          '--name',
-          name,
-        ],
-        logDir: logs,
-      );
-      run.phase = _Phase.windowsParticipant;
-      participants.add(await run.wait(control.waitParticipant(name)));
+      var store = 0;
+      OwnedProcess? process;
+      Future<Participant> launch(
+        Participant? old, {
+        bool freshStore = false,
+      }) async {
+        if (freshStore) store++;
+        if (process != null) await run.stop(process!);
+        final directory = p.join(logs.path, name, 'store-$store');
+        await Directory(directory).create(recursive: true);
+        process = await run.start(
+          p.join(
+            root,
+            'app',
+            'build',
+            'windows',
+            'x64',
+            'runner',
+            'Debug',
+            'chat_app.exe',
+          ),
+          [
+            '--data-dir',
+            directory,
+            '--control-url',
+            'ws://127.0.0.1:47000',
+            '--name',
+            name,
+          ],
+          logDir: logs,
+        );
+        Participant? next;
+        run.phase = _Phase.windowsParticipant;
+        await run.until(() async {
+          next = await control.waitParticipant(name);
+          return old == null || next!.instance != old.instance;
+        }, const Duration(seconds: 30));
+        return next!;
+      }
+
+      participants.add(await launch(null));
+      appRestarts[name] = (old, {bool freshStore = false}) =>
+          launch(old, freshStore: freshStore);
     }
     if (androidCount > 0) {
       run.phase = _Phase.sdkPreflight;
@@ -275,43 +301,106 @@ Future<void> main(List<String> arguments) async {
           run.activities.remove(activity);
           run.save();
         });
-        run.phase = _Phase.androidLaunch;
-        await run.command(sdk.adb, [
-          ...adb,
-          'shell',
-          'am',
-          'start',
-          '-W',
-          '-n',
-          '$package/.MainActivity',
-          '--es',
-          'chat_control_url',
-          'ws://127.0.0.1:47000',
-          '--es',
-          'chat_name',
-          name,
-        ]);
-        run.phase = _Phase.androidPid;
         var appPid = '';
-        await run.until(() async {
+        var restarting = false;
+        var store = 0;
+        Future<Participant> launch(
+          Participant? old, {
+          bool freshStore = false,
+        }) async {
+          restarting = true;
+          try {
+            if (old != null) {
+              final current = await run.command(sdk.adb, [
+                ...adb,
+                'shell',
+                'pidof',
+                package,
+              ]);
+              if ((current.stdout as String).trim() != appPid) {
+                throw StateError('Owned Android process changed');
+              }
+              await run.command(sdk.adb, [
+                ...adb,
+                'shell',
+                'am',
+                'force-stop',
+                package,
+              ]);
+            }
+            if (freshStore) store++;
+            run.phase = _Phase.androidLaunch;
+            await run.command(sdk.adb, [
+              ...adb,
+              'shell',
+              'am',
+              'start',
+              '-W',
+              '-n',
+              '$package/.MainActivity',
+              '--es',
+              'chat_control_url',
+              'ws://127.0.0.1:47000',
+              '--es',
+              'chat_name',
+              name,
+              if (accountScenario) ...[
+                '--es',
+                'chat_data_dir',
+                '/data/user/0/$package/files/e2e/${p.basename(logs.parent.path)}/$name/store-$store',
+              ],
+            ]);
+            run.phase = _Phase.androidPid;
+            await run.until(() async {
+              final result = await run.command(sdk.adb, [
+                ...adb,
+                'shell',
+                'pidof',
+                package,
+              ], requireSuccess: false);
+              appPid = (result.stdout as String).trim();
+              return RegExp(r'^\d+$').hasMatch(appPid);
+            }, const Duration(seconds: 15));
+            activity['pid'] = appPid;
+            run.save();
+            Participant? next;
+            run.phase = _Phase.androidParticipant;
+            await run.until(() async {
+              next = await control.waitParticipant(name);
+              return old == null || next!.instance != old.instance;
+            }, const Duration(seconds: 30));
+            return next!;
+          } finally {
+            restarting = false;
+            run.phase = _Phase.scenario;
+          }
+        }
+
+        final first = await launch(null);
+        appRestarts[name] = (old, {bool freshStore = false}) =>
+            launch(old, freshStore: freshStore);
+        appClocks[name] = () async {
           final result = await run.command(sdk.adb, [
             ...adb,
             'shell',
-            'pidof',
-            package,
-          ], requireSuccess: false);
-          appPid = (result.stdout as String).trim();
-          return RegExp(r'^\d+$').hasMatch(appPid);
-        }, const Duration(seconds: 15));
-        activity['pid'] = appPid;
-        run.save();
-        await run.start(sdk.adb, [
-          ...adb,
-          'logcat',
-          '--pid=$appPid',
-          '-v',
-          'threadtime',
-        ], logDir: logs);
+            'date',
+            '+%s',
+          ]);
+          final value = (result.stdout as String).trim();
+          if (!RegExp(r'^\d{10,}$').hasMatch(value)) {
+            throw StateError('Invalid owned clock sample');
+          }
+          return int.parse(value);
+        };
+        if (!accountScenario) {
+          await run.start(sdk.adb, [
+            ...adb,
+            'logcat',
+            '--pid=$appPid',
+            '-v',
+            'threadtime',
+          ], logDir: logs);
+        }
         final watching = Completer<void>();
         run.monitorStops.add(watching);
         run.monitorTasks.add(() async {
@@ -323,13 +412,17 @@ Future<void> main(List<String> arguments) async {
                 run.token.cancelled,
               ]);
               if (watching.isCompleted || run.token.isCancelled) return;
-              final result = await run.command(sdk.adb, [
-                ...adb,
-                'shell',
-                'pidof',
-                package,
-              ], requireSuccess: false, failurePhase: 'android_pid_monitor');
-              if ((result.stdout as String).trim() != appPid) {
+              if (restarting) continue;
+              final observedPid = appPid;
+              final result = await run.command(
+                sdk.adb,
+                [...adb, 'shell', 'pidof', package],
+                requireSuccess: false,
+                failurePhase: 'android_pid_monitor',
+              );
+              if (!restarting &&
+                  appPid == observedPid &&
+                  (result.stdout as String).trim() != appPid) {
                 throw StateError('Android owned activity exited');
               }
             }
@@ -340,38 +433,34 @@ Future<void> main(List<String> arguments) async {
             }
           }
         }());
-        run.owned.add('Android diagnostics', () async {
-          final screenshot = '/sdcard/chat-e2e-$name.png';
-          await run.command(sdk.adb, [
-            ...adb,
-            'shell',
-            'screencap',
-            '-p',
-            screenshot,
-          ], cleanup: true);
-          try {
-            await run.command(sdk.adb, [
-              ...adb,
-              'pull',
-              screenshot,
-              p.join(logs.path, '$name.png'),
-            ], cleanup: true);
-          } finally {
+        if (!accountScenario) {
+          run.owned.add('Android diagnostics', () async {
+            final screenshot = '/sdcard/chat-e2e-$name.png';
             await run.command(sdk.adb, [
               ...adb,
               'shell',
-              'rm',
+              'screencap',
+              '-p',
               screenshot,
             ], cleanup: true);
-          }
-        });
-        run.phase = _Phase.androidParticipant;
-        participants.add(
-          await run.wait(
-            control.waitParticipant(name),
-            timeout: const Duration(seconds: 30),
-          ),
-        );
+            try {
+              await run.command(sdk.adb, [
+                ...adb,
+                'pull',
+                screenshot,
+                p.join(logs.path, '$name.png'),
+              ], cleanup: true);
+            } finally {
+              await run.command(sdk.adb, [
+                ...adb,
+                'shell',
+                'rm',
+                screenshot,
+              ], cleanup: true);
+            }
+          });
+        }
+        participants.add(first);
       }
     }
     OwnedProcess? nodeProcess;
@@ -400,16 +489,44 @@ Future<void> main(List<String> arguments) async {
       return next!;
     }
 
-    participants.add(await launchNode());
+    if (!accountScenario) participants.add(await launchNode());
     run.phase = _Phase.scenario;
     await run.wait(
-      runScenario(
-        control, participants, restart: launchNode,
-        onFailure: (error, phase, kind) => run.recordFailure(
-          error, failurePhase: phase, timeoutKind: kind,
-        ),
-      ),
-      timeout: const Duration(minutes: 4),
+      accountScenario
+          ? runAccountScenario(
+              control,
+              participants,
+              wallClock: (participant) async =>
+                  appClocks[participant.name] == null
+                  ? DateTime.now().millisecondsSinceEpoch ~/ 1000
+                  : await appClocks[participant.name]!(),
+              restart: (old, {bool freshStore = false}) {
+                final action = appRestarts[old.name];
+                if (action == null) {
+                  throw StateError('Restart participant is not owned');
+                }
+                return action(old, freshStore: freshStore);
+              },
+              evidence: (stage, data) =>
+                  File(
+                    p.join(logs.path, 'account-public-evidence.jsonl'),
+                  ).writeAsStringSync(
+                    '${jsonEncode({'stage': stage, ...data})}\n',
+                    mode: FileMode.append,
+                    flush: true,
+                  ),
+            )
+          : runScenario(
+              control,
+              participants,
+              restart: launchNode,
+              onFailure: (error, phase, kind) => run.recordFailure(
+                error,
+                failurePhase: phase,
+                timeoutKind: kind,
+              ),
+            ),
+      timeout: Duration(minutes: accountScenario ? 8 : 4),
       failurePhase: 'scenario',
     );
   } catch (error, stack) {
@@ -419,7 +536,7 @@ Future<void> main(List<String> arguments) async {
     await run.interrupt(controller);
     File(
       p.join(logs.path, 'failure.log'),
-    ).writeAsStringSync('$error\n$stack', flush: true);
+    ).writeAsStringSync('${jsonEncode(run.safeFailure)}\n$stack', flush: true);
     stderr.writeln(
       '$profile scenario failed; details retained in ignored build/e2e logs.',
     );
@@ -450,13 +567,15 @@ Future<void> main(List<String> arguments) async {
     if (run.firstFailure != null) {
       File(
         p.join(logs.path, 'lifecycle.log'),
-      ).writeAsStringSync('${run.firstFailure}', flush: true);
+      ).writeAsStringSync(jsonEncode(run.safeFailure), flush: true);
       if (code == 0) code = 1;
     }
     if (userInterrupted && code == 0) code = 130;
     if (code == 0) {
       stdout.writeln(
-        '$profile scenario PASS: six directions, offline recovery, no replay, Disconnect and fresh restart address.',
+        accountScenario
+            ? '$profile M3 PASS: local signed records, native stores, pairing, restart, revoke and recovery.'
+            : '$profile scenario PASS: six directions, offline recovery, no replay, Disconnect and fresh restart address.',
       );
     }
     stdout.writeln(
@@ -602,8 +721,10 @@ class _Run extends IoProcessRunner {
   Map<String, Object?>? safeFailure;
 
   void recordFailure(
-    Object? error, {String? failurePhase, String? timeoutKind}
-  ) {
+    Object? error, {
+    String? failurePhase,
+    String? timeoutKind,
+  }) {
     safeFailure ??= {
       'phase': failurePhase ?? phase.value,
       'failure_kind': switch (error) {
@@ -879,6 +1000,14 @@ class _Run extends IoProcessRunner {
       cleanupFailures.add('controller interrupt: $error');
     }
     for (final process in active.reversed.toList()) {
+      // These exact acquired emulators own the activity/reverse dependencies.
+      // Their registered cleanup runs after those callbacks in owned.close().
+      if (processes.any(
+        (entry) => entry['pid'] == process.pid && entry.containsKey('avd'),
+      )) {
+        continue;
+      }
+
       try {
         await stop(process);
       } catch (error) {

@@ -1,3 +1,5 @@
+mod account;
+pub(crate) mod records;
 pub mod protocol;
 
 use crate::{CoreError, CoreEvent, ErrorCode, EventBus, EventSink, NetworkHandle};
@@ -50,19 +52,22 @@ fn failed() -> CoreError {
     CoreError::new(ErrorCode::TransportFailed, "control connection failed")
 }
 async fn send(socket: &mut Socket, record: Outgoing<'_>) -> Result<(), CoreError> {
-    let text = serde_json::to_string(&record).map_err(|_| failed())?;
+    let text = zeroize::Zeroizing::new(serde_json::to_string(&record).map_err(|_| failed())?);
     tokio::time::timeout(
         Duration::from_secs(5),
-        socket.send(Message::Text(text.into())),
+        socket.send(Message::Text(text.as_str().into())),
     )
     .await
     .map_err(|_| failed())?
     .map_err(|_| failed())
 }
+// Keep independently owned lifecycle handles explicit; avoid a wrapper used only here.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn start(
     handle: &tokio::runtime::Handle,
     state: Arc<HookState>,
     network: NetworkHandle,
+    account: Arc<std::sync::Mutex<crate::runtime::AccountSlot>>,
     bus: EventBus,
     instance: String,
     control_url: String,
@@ -86,7 +91,7 @@ pub(crate) async fn start(
         let result = tokio::select! {
             biased;
             _ = state.cancel.cancelled() => Err(failed()),
-            result = run(&state, network, &bus, &instance, &control_url, &name, &mut ready) => result,
+            result = run(&state, network, account, &bus, &instance, &control_url, &name, &mut ready) => result,
         };
         if let Err(error) = result {
             if let Some(ready) = ready.take() { let _ = ready.send(Err(error.clone())); }
@@ -95,9 +100,12 @@ pub(crate) async fn start(
     });
     received.await.map_err(|_| failed())?
 }
+// Mirrors start with borrowed connection metadata and the readiness sender.
+#[allow(clippy::too_many_arguments)]
 async fn run(
     state: &HookState,
     network: NetworkHandle,
+    account: Arc<std::sync::Mutex<crate::runtime::AccountSlot>>,
     bus: &EventBus,
     instance: &str,
     control_url: &str,
@@ -132,7 +140,7 @@ async fn run(
     let Message::Text(text) = message else {
         return Err(protocol::invalid());
     };
-    let Incoming::Config { relay } = protocol::parse(&text)? else {
+    let Incoming::Config { relay, records } = protocol::parse(&text)? else {
         return Err(protocol::invalid());
     };
     let relay = relay
@@ -141,7 +149,18 @@ async fn run(
             value.parse().map_err(|_| protocol::invalid())
         })
         .transpose()?;
-    network.configure_local(relay).await?;
+    // Account open uses this same mutex. Install first and retain configuration
+    // even if native opening subsequently fails. No owned-task/core Arc cycle.
+    if let Some(url) = records {
+        self::records::validate(&url)?;
+        let mut slot = account.lock().expect("account slot lock poisoned");
+        if slot.handle.is_some() || slot.records.is_some() { return Err(protocol::invalid()); }
+        slot.records = Some(url);
+        slot.configuring = true;
+    }
+    let configured = network.configure_local(relay).await;
+    if configured.is_ok() { account.lock().expect("account slot lock poisoned").configuring = false; }
+    configured?;
     let (sender, mut events) = mpsc::channel(256);
     let overflow = CancellationToken::new();
     bus.subscribe(Arc::new(Sink {
@@ -151,7 +170,7 @@ async fn run(
     let _ = ready.take().unwrap().send(Ok(()));
     let mut ids = protocol::RequestIds::default();
     let mut pending: FuturesUnordered<
-        futures_util::future::BoxFuture<'static, (u64, Result<crate::NetworkReply, CoreError>)>,
+        futures_util::future::BoxFuture<'static, (u64, protocol::Outcome)>,
     > = FuturesUnordered::new();
     let result = tokio::select! {
         biased;
@@ -167,7 +186,7 @@ async fn run(
                     state.sequence.store(seq, Ordering::Relaxed);
                 }
                 Some((id, result)) = pending.next(), if !pending.is_empty() => {
-                    send(&mut socket, Outgoing::Result { id, result: result.into() }).await?;
+                    send(&mut socket, Outgoing::Result { id, result }).await?;
                 }
                 message = socket.next() => {
                     let Some(message) = message else { return Err(failed()); };
@@ -178,12 +197,19 @@ async fn run(
                             let Incoming::Cmd { id, op, args } = protocol::parse(&text)? else { return Err(protocol::invalid()); };
                             // Invalid/duplicate IDs terminate the connection: emitting another
                             // result with that ID could resolve the wrong pending request.
+                            let mut args = account::SecretJson(args);
                             ids.accept(id)?;
-                            let command = protocol::command(&op, args);
-                            let command = if pending.len() >= 64 { Err(CoreError::new(ErrorCode::Busy, "control request limit")) } else { command };
-                            match command {
-                                Ok(op) => { let network = network.clone(); pending.push(Box::pin(async move { (id, network.execute(op).await) })); }
-                                Err(error) => send(&mut socket, Outgoing::Result { id, result: Err(error).into() }).await?,
+                            if pending.len() >= 64 {
+                                send(&mut socket, Outgoing::Result { id, result: protocol::Outcome::account(Err(CoreError::new(ErrorCode::Busy, "control request limit"))) }).await?;
+                            } else if op.starts_with("account_local_") {
+                                let handle = account.lock().expect("account slot lock poisoned").handle.clone();
+                                let network = network.clone();
+                                pending.push(Box::pin(async move { (id, protocol::Outcome::account(account::execute(handle, network, &op, args).await)) }));
+                            } else {
+                                match protocol::command(&op, std::mem::take(&mut args.0)) {
+                                    Ok(op) => { let network = network.clone(); pending.push(Box::pin(async move { (id, network.execute(op).await.into()) })); }
+                                    Err(error) => send(&mut socket, Outgoing::Result { id, result: Err(error).into() }).await?,
+                                }
                             }
                         }
                         _ => return Err(protocol::invalid()),

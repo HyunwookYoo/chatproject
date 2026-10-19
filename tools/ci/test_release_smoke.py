@@ -58,7 +58,7 @@ class Fake implements ProcessRunner {
       }
       if (args.contains('force-stop')) { forceStopped = true; launched = false; }
       if (args.contains('activities')) output = mode == 'android-wrong-activity' ? 'topResumedActivity=ActivityRecord{other.app/.Other}' : 'topResumedActivity=ActivityRecord{dev.chatproject.chat_app/.MainActivity}';
-      if (args.contains('uiautomator')) output = '<node package="dev.chatproject.chat_app" text="대화 아직 대화가 없어요 연결 없음 코어 0.1.0" />';
+      if (args.contains('uiautomator')) output = '<node package="dev.chatproject.chat_app" text="내 계정 시작하기 새 계정 만들기 복구 문구로 복구 다른 기기로 연결" />';
       if (args.contains('logcat')) {
         if (!args.contains('--pid=321') || !args.contains('-T') || !args.contains('1790000000.123456789')) throw StateError('unscoped log read');
         polls++;
@@ -77,7 +77,7 @@ class Fake implements ProcessRunner {
     } else {
       polls++;
       output = jsonEncode({'pid': mode == 'foreign' ? 999 : 100, 'window': mode == 'no-window' ? 0 : 123,
-        'texts': mode == 'pid-only' || mode == 'cleanup' ? <String>[] : ['대화', '연결 없음', '아직 대화가 없어요', '코어 0.1.0']});
+        'texts': mode == 'pid-only' || mode == 'cleanup' ? <String>[] : ['내 계정 시작하기', '새 계정 만들기', '복구 문구로 복구', '다른 기기로 연결']});
       if (mode == 'late' && polls >= 2) File('${logDir.path}/100.stderr.log').writeAsStringSync('Unhandled Exception: native failed');
       child.code.complete(0);
     }

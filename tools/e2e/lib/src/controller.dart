@@ -6,7 +6,12 @@ import 'protocol.dart';
 
 /// Owns only its loopback listener, sockets and diagnostic log.
 class Controller {
-  Controller._(this._server, this._log, this._relay) {
+  Controller._(
+    this._server,
+    this._log,
+    this._relay, [
+    this._accountRecords = false,
+  ]) {
     _listener = _server.listen((request) {
       final handling = _accept(request);
       _requests.add(handling);
@@ -18,6 +23,7 @@ class Controller {
     int port = 47000,
     required Directory logDir,
     String? relay = localRelay,
+    bool accountRecords = false,
   }) async {
     if (relay != null && relay != localRelay) {
       throw ArgumentError.value(relay, 'relay');
@@ -32,7 +38,7 @@ class Controller {
       final log = File(
         '${logDir.path}/wire.jsonl',
       ).openSync(mode: FileMode.append);
-      return Controller._(server, log, relay);
+      return Controller._(server, log, relay, accountRecords);
     } catch (_) {
       await server.close(force: true);
       rethrow;
@@ -42,6 +48,10 @@ class Controller {
   final HttpServer _server;
   final RandomAccessFile _log;
   final String? _relay;
+  final bool _accountRecords;
+  final _records = <String, List<int>>{};
+  final _recordSockets = <WebSocket>{};
+  bool recordPublicationsPaused = false;
   late final StreamSubscription<HttpRequest> _listener;
   final _requests = <Future<void>>{};
   final _connections = <_Connection>{};
@@ -81,6 +91,14 @@ class Controller {
 
   Future<void> _accept(HttpRequest request) async {
     try {
+      if (!_closed &&
+          _accountRecords &&
+          request.uri.path == '/records' &&
+          !request.uri.hasQuery &&
+          WebSocketTransformer.isUpgradeRequest(request)) {
+        await _serveRecord(request);
+        return;
+      }
       if (_closed ||
           request.uri.path != '/' ||
           request.uri.hasQuery ||
@@ -110,10 +128,113 @@ class Controller {
     }
   }
 
+  // One bounded request per socket; bytes are public signed DNS packets only.
+  // No raw fixture requests/responses enter wire or process logs.
+  Future<void> _serveRecord(HttpRequest request) async {
+    final socket = await WebSocketTransformer.upgrade(request);
+    _recordSockets.add(socket);
+    try {
+      if (_recordSockets.length > 64) return;
+      final raw = await socket.first.timeout(const Duration(seconds: 5));
+      if (raw is! String || raw.length > 8192) return;
+      final value = jsonDecode(raw);
+      if (value is! Map) return;
+      List<int>? bytes(Object? v, int min, int max) =>
+          v is List &&
+              v.length >= min &&
+              v.length <= max &&
+              v.every((b) => b is int && b >= 0 && b <= 255)
+          ? v.cast<int>()
+          : null;
+      Map<String, Object?> reply = {'unavailable': true};
+      if (value['op'] == 'lookup' && value.length == 2) {
+        final peer = bytes(value['peer'], 32, 32);
+        if (peer != null) {
+          final packet = _records[peer.join(',')];
+          reply = packet == null ? {'absent': true} : {'packet': packet};
+        }
+      } else if (value['op'] == 'publish' &&
+          value.length == 2 &&
+          !recordPublicationsPaused) {
+        final packet = bytes(value['packet'], 104, 1000);
+        if (packet != null) {
+          final key = packet.take(32).join(',');
+          final old = _records[key];
+          int seq(List<int> p) =>
+              p.sublist(96, 104).fold(0, (a, b) => (a << 8) | b);
+          if (old != null &&
+              (seq(old) > seq(packet) ||
+                  (seq(old) == seq(packet) &&
+                      old.join(',') != packet.join(',')))) {
+            reply = {'conflict': true};
+          } else if (_records.length < 64 || old != null) {
+            _records[key] = packet;
+            reply = {'ok': true};
+          }
+        }
+      }
+      socket.add(jsonEncode(reply));
+    } catch (_) {
+      // Malformed fixture input is unavailable, never a raw diagnostic.
+    } finally {
+      await socket.close();
+      _recordSockets.remove(socket);
+    }
+  }
+
   void _record(_Connection connection, String direction, Object? wire) {
     _log.writeStringSync(
-      '${jsonEncode({'connection': connection.id, 'direction': direction, 'wire': wire})}\n',
+      '${jsonEncode({'connection': connection.id, 'direction': direction, 'wire': _safeWire(connection, wire)})}\n',
     );
+  }
+
+  // Parse/classify before any file write. Unknown and malformed frames never
+  // reach diagnostics, including late results whose pending context is gone.
+  Object _safeWire(_Connection connection, Object? wire) {
+    if (wire is! String) return '[redacted]';
+    try {
+      final value = jsonDecode(wire);
+      if (value is! Map<String, dynamic>) return '[redacted]';
+      final safe = Map<String, dynamic>.of(value);
+      if (safe['type'] != 'cmd' && safe['type'] != 'config') {
+        WireRecord.parse(
+          wire,
+        ); // Reject unknown fields before logging any payload.
+      }
+      switch (safe['type']) {
+        case 'cmd':
+          if ((safe['op'] as String?)?.startsWith('account_local_') ?? false) {
+            safe['args'] = '[redacted]';
+          }
+        case 'result':
+          final op = connection.participant?._operations[safe['id']];
+          if (op == null || op.startsWith('account_local_')) {
+            return jsonEncode({
+              'type': 'result',
+              'id': safe['id'],
+              'payload': '[redacted]',
+              if (safe['ok'] == false)
+                'error_code': (safe['error'] as Map)['code'],
+            });
+          }
+          if (safe.containsKey('error')) safe['error'] = '[redacted]';
+        case 'event':
+          final event = safe['event'];
+          if (event is! Map ||
+              event['kind'] == 'error' ||
+              event['kind'] == 'account_changed') {
+            safe['event'] = '[redacted]';
+          }
+        case 'hello':
+        case 'config':
+          break;
+        default:
+          return '[redacted]';
+      }
+      return jsonEncode(safe);
+    } catch (_) {
+      return '[redacted]';
+    }
   }
 
   void _send(_Connection connection, Map<String, Object?> record) {
@@ -136,7 +257,11 @@ class Controller {
       final record = WireRecord.parse(raw);
       if (participant == null) {
         if (record is! HelloRecord) throw StateError('protocol expected hello');
-        _send(connection, {'type': 'config', 'relay': _relay});
+        _send(connection, {
+          'type': 'config',
+          'relay': _relay,
+          if (_accountRecords) 'records': 'ws://127.0.0.1:47000/records',
+        });
         connection.helloTimeout?.cancel();
         final next = Participant._(
           this,
@@ -161,7 +286,14 @@ class Controller {
             throw StateError('protocol unmatched result id');
           }
           if (record.error != null) {
-            pending.completeError(record.error!);
+            pending.completeError(
+              participant._operations[record.id]?.startsWith(
+                        'account_local_',
+                      ) ==
+                      true
+                  ? RpcError(record.error!.code, '[redacted]')
+                  : record.error!,
+            );
           } else {
             pending.complete(record.value);
           }
@@ -184,7 +316,7 @@ class Controller {
   void _detach(_Connection connection, Object error) {
     connection.helloTimeout?.cancel();
     try {
-      _record(connection, 'failure', error.toString());
+      _record(connection, 'failure', null);
     } catch (logError) {
       _fail(logError);
     }
@@ -240,6 +372,9 @@ class Controller {
     await clean(() async {
       await _server.close(force: true);
     });
+    for (final socket in _recordSockets.toList()) {
+      await clean(() => socket.close());
+    }
     await clean(() async {
       await Future.wait(_requests.toList());
     });
@@ -275,6 +410,7 @@ class Participant {
   final String name;
   final String instance;
   final _pending = <int, Completer<Object?>>{};
+  final _operations = <int, String>{};
   final _events = <Map<String, Object?>>[];
   final _eventWaiters = <_EventWaiter>[];
   int _id = 0;
@@ -300,6 +436,7 @@ class Participant {
     final id = ++_id;
     final completer = Completer<Object?>();
     _pending[id] = completer;
+    _operations[id] = op;
     // Attach the timeout/error handler before any write can fail the scenario.
     final result = completer.future.timeout(timeout);
     try {
@@ -316,6 +453,7 @@ class Participant {
       return await result;
     } finally {
       _pending.remove(id);
+      _operations.remove(id);
     }
   }
 

@@ -639,6 +639,7 @@ dependencies = [
  "iroh",
  "iroh-mainline-address-lookup",
  "iroh-tickets",
+ "libc",
  "minicbor",
  "pkarr",
  "serde",

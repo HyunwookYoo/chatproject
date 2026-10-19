@@ -4,9 +4,25 @@ import 'dart:mirrors';
 
 import 'package:test/test.dart';
 import 'package:chat_e2e/src/emulators.dart';
+import 'package:chat_e2e/src/process_runner.dart';
 
 import '../bin/run.dart' as cli;
 import 'emulators_test.dart' as fixtures;
+
+class OwnedFixture implements OwnedProcess {
+  OwnedFixture(this.pid, this.order);
+  @override
+  final int pid;
+  final List<String> order;
+  final done = Completer<int>();
+  @override
+  Future<int> get exitCode => done.future;
+  @override
+  Future<void> stop() async {
+    order.add('emulator');
+    if (!done.isCompleted) done.complete(0);
+  }
+}
 
 void main() {
   final library =
@@ -38,6 +54,40 @@ void main() {
     await runner.owned.close();
     await logs.delete(recursive: true);
   });
+
+  for (final registered in [false, true]) {
+    test(
+      'runner owned emulator cleanup order after acquisition registered=$registered',
+      () async {
+        final runner = run.reflectee as dynamic;
+        final order = <String>[];
+        final emulator = OwnedFixture(12345, order);
+        runner.active.add(emulator);
+        runner.processes.add(<String, Object?>{
+          'pid': 12345,
+          'avd': 'chat_e2e_1',
+        });
+        runner.owned.add('emulator', () async {
+          await runner.stop(emulator);
+        });
+        if (registered) {
+          runner.owned.add('reverse', () async {
+            expect(order, isEmpty);
+            order.add('reverse');
+          });
+          runner.owned.add('activity', () async {
+            expect(order, isEmpty);
+          });
+        }
+        runner.token.cancel();
+        await runner.interrupt(null);
+        expect(order, isEmpty);
+        expect(await runner.owned.close(), isEmpty);
+        expect(order, registered ? ['reverse', 'emulator'] : ['emulator']);
+        expect(runner.active, isEmpty);
+      },
+    );
+  }
 
   for (final origin in ['android_pid_monitor', 'scenario']) {
     test('$origin deadline keeps immutable origin during node restart phase', () async {

@@ -13,6 +13,39 @@ class AccountKeyStoreTest {
     private external fun nativeWorkerRoundTrip(id: ByteArray): Boolean
     private val context = InstrumentationRegistry.getInstrumentation().targetContext
     private fun id() = ByteArray(16).also { SecureRandom().nextBytes(it) }
+    private fun ownedPathFixture(): java.io.File =
+        java.io.File(context.cacheDir, "owned-path-test-${java.util.UUID.randomUUID()}").also { assertTrue(it.mkdir()) }
+    private fun deniedOwnedPath(files: java.io.File, path: String) {
+        try {
+            ownedTestDataDir(files, path)
+            fail("Escaping or non-child test directory accepted")
+        } catch (_: IllegalStateException) { /* Expected containment refusal. */ }
+    }
+    @Test fun ownedTestPathAcceptsOnlyAbsoluteChildren() {
+        val root = ownedPathFixture()
+        val files = java.io.File(root, "files").also { assertTrue(it.mkdir()) }
+        val child = java.io.File(files, "e2e/run/store")
+        assertEquals(child.canonicalPath, ownedTestDataDir(files, child.path))
+        deniedOwnedPath(files, "e2e/run/store")
+        deniedOwnedPath(files, java.io.File(files, "e2e").path)
+        deniedOwnedPath(files, java.io.File(files, "e2e-other/store").path)
+    }
+    @Test fun ownedTestPathRejectsChildSymlinkEscape() {
+        val root = ownedPathFixture()
+        val files = java.io.File(root, "files").also { assertTrue(it.mkdir()) }
+        val owned = java.io.File(files, "e2e").also { assertTrue(it.mkdir()) }
+        val outside = java.io.File(root, "outside").also { assertTrue(it.mkdir()) }
+        android.system.Os.symlink(outside.path, java.io.File(owned, "link").path)
+        deniedOwnedPath(files, java.io.File(owned, "link/store").path)
+    }
+    @Test fun ownedTestPathRejectsRootSymlinkEscape() {
+        val root = ownedPathFixture()
+        val files = java.io.File(root, "files").also { assertTrue(it.mkdir()) }
+        val outside = java.io.File(root, "outside").also { assertTrue(it.mkdir()) }
+        android.system.Os.symlink(outside.path, java.io.File(files, "e2e").path)
+        deniedOwnedPath(files, java.io.File(files, "e2e/run/store").path)
+    }
+
     @Test fun nativeWorkerUsesCachedHelperAndThreadLocalEnvironment() {
         System.loadLibrary("chat_ffi")
         lateinit var activity: MainActivity

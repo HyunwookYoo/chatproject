@@ -39,11 +39,20 @@ pub struct CoreSlot {
 struct RunningCore {
     info: CoreInfo,
     network: NetworkHandle,
-    account: Mutex<Option<AccountHandle>>,
+    account: Arc<Mutex<AccountSlot>>,
     runtime: Option<Runtime>,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     hooks: Arc<crate::puppet::HookState>,
     bus: EventBus,
+}
+
+#[derive(Default)]
+pub(crate) struct AccountSlot {
+    pub handle: Option<AccountHandle>,
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    pub records: Option<String>,
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    pub configuring: bool,
 }
 
 impl Drop for RunningCore {
@@ -98,7 +107,7 @@ impl CoreSlot {
         *running = Some(Arc::new(RunningCore {
             info: info.clone(),
             network,
-            account: Mutex::new(None),
+            account: Arc::default(),
             runtime: Some(runtime),
             #[cfg(all(feature = "test-hooks", debug_assertions))]
             hooks: Arc::default(),
@@ -120,15 +129,22 @@ impl CoreSlot {
         let core = self.running.lock().expect("core slot lock poisoned").clone()
             .ok_or_else(|| CoreError::new(ErrorCode::CoreNotStarted, "core not started"))?;
         let mut account = core.account.lock().expect("account slot lock poisoned");
-        if let Some(account) = account.as_ref() { return Ok(account.clone()); }
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        if account.configuring { return Err(CoreError::new(ErrorCode::Busy, "Local service configuration pending")); }
+        if let Some(account) = account.handle.as_ref() { return Ok(account.clone()); }
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        let services = match &account.records {
+            Some(url) => crate::puppet::records::services(url.clone())?,
+            None => services,
+        };
         let handle = AccountHandle::open(core.runtime.as_ref().unwrap().handle(), &core.info.data_dir, protector, core.network.clone(), services, core.bus.clone())?;
-        *account = Some(handle.clone());
+        account.handle = Some(handle.clone());
         Ok(handle)
     }
     pub fn account(&self) -> Result<AccountHandle, CoreError> {
         let core = self.running.lock().expect("core slot lock poisoned").clone()
             .ok_or_else(|| CoreError::new(ErrorCode::CoreNotStarted, "core not started"))?;
-        let account = core.account.lock().expect("account slot lock poisoned").clone();
+        let account = core.account.lock().expect("account slot lock poisoned").handle.clone();
         account.ok_or_else(|| CoreError::new(ErrorCode::NotAvailable, "account not opened"))
     }
     /// Native lifecycle callers do not wait for initialization or another slot caller.
@@ -139,7 +155,7 @@ impl CoreSlot {
         let Ok(running) = self.running.try_lock() else { return 1; };
         let Some(core) = running.as_ref() else { return 0; };
         let Ok(account) = core.account.try_lock() else { return 1; };
-        match account.as_ref() {
+        match account.handle.as_ref() {
             Some(account) if suspend => account.request_suspend(),
             Some(account) => account.request_resume(),
             None => 0,
@@ -156,7 +172,7 @@ impl CoreSlot {
         let core = self.running.lock().expect("core slot lock poisoned").clone()
             .ok_or_else(|| CoreError::new(ErrorCode::CoreNotStarted, "core not started"))?;
         crate::puppet::start(core.runtime.as_ref().unwrap().handle(), core.hooks.clone(),
-            core.network.clone(), core.bus.clone(), core.info.instance_id.clone(), control_url, name).await
+            core.network.clone(), core.account.clone(), core.bus.clone(), core.info.instance_id.clone(), control_url, name).await
     }
 
     pub fn info(&self) -> Option<CoreInfo> {

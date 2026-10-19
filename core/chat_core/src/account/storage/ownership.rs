@@ -19,6 +19,25 @@ fn acquire(root: &Path) -> Result<File, CoreError> {
         .truncate(false)
         .open(root.join(".account.lock"))
         .map_err(|_| CoreError::new(ErrorCode::StorageLocked, "Cannot open account lock"))?;
+    #[cfg(target_os = "android")]
+    {
+        use std::os::fd::AsRawFd;
+        // Rust 1.92's File::try_lock is unsupported on Android. Bionic's flock
+        // locks this borrowed descriptor; retaining File retains ownership.
+        // SAFETY: file owns a valid open descriptor throughout this call.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let code = if std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock {
+                ErrorCode::WriterBusy
+            } else {
+                ErrorCode::StorageLocked
+            };
+            return Err(CoreError::new(
+                code,
+                "Cannot acquire account writer ownership",
+            ));
+        }
+    }
+    #[cfg(not(target_os = "android"))]
     file.try_lock().map_err(|e| {
         let code = match e {
             std::fs::TryLockError::WouldBlock => ErrorCode::WriterBusy,

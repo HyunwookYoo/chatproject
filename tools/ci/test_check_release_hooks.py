@@ -34,6 +34,9 @@ class ReleaseHooksTests(unittest.TestCase):
     def test_marker_in_only_one_abi_fails(self):
         self.check(self.apk({"lib/x86_64/libchat_ffi.so": b"clean", "lib/arm64-v8a/other.so": MARKER}), False)
 
+    def test_release_rejects_account_test_commands(self):
+        self.check(self.apk({"lib/x86_64/libchat_ffi.so": b"account_local_pair_approve"}), False)
+
     def test_no_native_apk_fails(self):
         self.check(self.apk({"assets/readme": b"clean"}), False)
 

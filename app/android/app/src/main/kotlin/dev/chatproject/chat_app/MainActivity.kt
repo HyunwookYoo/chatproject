@@ -11,6 +11,18 @@ import io.flutter.plugin.common.MethodChannel
 import uniffi.chat_ffi.nativeInstanceId
 import uniffi.chat_ffi.uniffiEnsureInitialized
 
+// Only the debug entrypoint below accepts this owned fixture directory.
+internal fun ownedTestDataDir(filesDir: java.io.File, requestedPath: String): String {
+    // Resolve the app parent, but not an e2e leaf that could itself be a symlink.
+    val ownedRoot = java.io.File(filesDir.canonicalFile, "e2e")
+    val requested = java.io.File(requestedPath)
+    val canonical = requested.canonicalFile
+    check(requested.isAbsolute && canonical.path.startsWith(ownedRoot.path + java.io.File.separator)) {
+        "Invalid owned test data directory"
+    }
+    return canonical.path
+}
+
 class MainActivity : FlutterActivity() {
     private external fun initializeNetworkContext(context: Context): Boolean
     private external fun initializeAccountKeyStore(store: AccountKeyStore): Boolean
@@ -46,10 +58,13 @@ class MainActivity : FlutterActivity() {
         if ((applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0) {
             val controlUrl = intent.getStringExtra("chat_control_url")
             val name = intent.getStringExtra("chat_name")
-            if (controlUrl != null || name != null) {
+            val requestedDir = intent.getStringExtra("chat_data_dir")
+            val dataDir = requestedDir?.let { ownedTestDataDir(filesDir, it) }
+            if (controlUrl != null || name != null || dataDir != null) {
                 return (args ?: emptyList()) + buildList {
                     if (controlUrl != null) addAll(listOf("--control-url", controlUrl))
                     if (name != null) addAll(listOf("--name", name))
+                    if (dataDir != null) addAll(listOf("--data-dir", dataDir))
                 }
             }
         }

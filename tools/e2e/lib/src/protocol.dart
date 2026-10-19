@@ -9,7 +9,7 @@ class RpcError implements Exception {
   final String code;
   final String detail;
   @override
-  String toString() => '$code: $detail';
+  String toString() => 'RPC failed: $code';
 }
 
 const _errorCodes = {
@@ -25,6 +25,22 @@ const _errorCodes = {
   'NetworkTimeout',
   'TransportFailed',
   'NotAvailable',
+  'InvalidRecovery',
+  'StorageLocked',
+  'StorageMissing',
+  'StorageCorrupt',
+  'StorageFull',
+  'AccountExists',
+  'WriterBusy',
+  'InvalidInvite',
+  'InviteExpired',
+  'DeviceLimit',
+  'PairMismatch',
+  'PairExpired',
+  'RecordConflict',
+  'RecordUnavailable',
+  'AuthFailed',
+  'AccountRestricted',
 };
 
 Map<String, Object?> _wireObject(Object? value) {
@@ -99,6 +115,7 @@ sealed class WireRecord {
           'network_changed',
           'peer_changed',
           'probe_text_received',
+          'account_changed',
         }.contains(event['kind'])) {
           throw StateError('invalid protocol event kind');
         }

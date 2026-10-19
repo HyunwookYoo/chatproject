@@ -149,8 +149,15 @@ jobs:
       - name: Every Windows integration file in a fresh Flutter process
         run: |
           # Flutter 3.44.6 closes DesktopDevice's log reader after the first file.
-          foreach ($test in Get-ChildItem integration_test -Filter '*_test.dart' | Sort-Object Name) {
+          foreach ($test in Get-ChildItem integration_test -Filter '*_test.dart' | Where-Object Name -ne 'account_storage_test.dart' | Sort-Object Name) {
             flutter test $test.FullName -d windows
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+      - name: Native account storage across Windows processes
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP ('account-' + [Guid]::NewGuid().ToString('N'))
+          foreach ($phase in @('write', 'read', 'locked', 'missing', 'read')) {
+            flutter test integration_test/account_storage_test.dart -d windows "--dart-define=ACCOUNT_STORAGE_PHASE=$phase" "--dart-define=ACCOUNT_STORAGE_ROOT=$root"
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
       - name: Ordinary Release build and pinned native toolchain
@@ -159,7 +166,7 @@ jobs:
           flutter build windows --release --target lib/main.dart -v *> "$env:RUNNER_TEMP/windows-release.log"
           if ($LASTEXITCODE -ne 0) { Get-Content "$env:RUNNER_TEMP/windows-release.log"; exit $LASTEXITCODE }
           if (!(Select-String -Path "$env:RUNNER_TEMP/windows-release.log" -SimpleMatch 'Running command rustup run 1.92.0 cargo build')) { throw 'Native toolchain proof missing' }
-      - name: Ordinary Release marker and Home/native smoke
+      - name: Ordinary Release marker and account welcome smoke
         working-directory: .
         run: |
           Push-Location tools/e2e
@@ -291,7 +298,14 @@ jobs:
           emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           disable-animations: true
           script: |
-            (cd app && flutter test integration_test -d emulator-5554)
+            set -e
+            for test in app/integration_test/*_test.dart; do
+              case "$test" in *account_storage_test.dart) continue ;; esac
+              (cd app && flutter test "${test#app/}" -d emulator-5554)
+            done
+            for phase in write read locked missing read; do
+              (cd app && flutter test integration_test/account_storage_test.dart -d emulator-5554 --no-uninstall --dart-define=ACCOUNT_STORAGE_PHASE="$phase" --dart-define=ACCOUNT_STORAGE_ROOT=/data/user/0/dev.chatproject.chat_app/files/ci-account-storage)
+            done
             dart --packages=tools/e2e/.dart_tool/package_config.json tools/ci/release_smoke.dart --platform android --artifact "$RUNNER_TEMP/ordinary-release.apk" --serial emulator-5554
             dart --packages=tools/e2e/.dart_tool/package_config.json tools/ci/release_smoke.dart --platform android --artifact "$RUNNER_TEMP/contract-release.apk" --serial emulator-5554 --contract-nonce "$RELEASE_CONTRACT_NONCE"
 
@@ -390,6 +404,15 @@ jobs:
           pkill -f "log stream" || true
           xcrun simctl terminate "${{ steps.sim.outputs.udid }}" dev.chatproject.chatapp || true
           flutter test -v integration_test/core_test.dart -d "${{ steps.sim.outputs.udid }}"
+      - name: Account and privacy native simulator integration
+        working-directory: app
+        run: |
+          flutter test integration_test/account_test.dart -d "${{ steps.sim.outputs.udid }}" --no-uninstall
+          flutter test integration_test/account_privacy_test.dart -d "${{ steps.sim.outputs.udid }}" --no-uninstall
+          container="$(xcrun simctl get_app_container '${{ steps.sim.outputs.udid }}' dev.chatproject.chatapp data)"
+          for phase in write read locked missing read; do
+            flutter test integration_test/account_storage_test.dart -d "${{ steps.sim.outputs.udid }}" --no-uninstall --dart-define=ACCOUNT_STORAGE_PHASE="$phase" --dart-define=ACCOUNT_STORAGE_ROOT="$container/Library/Application Support/ci-account-storage"
+          done
       - name: Check the app and its extension (test build)
         run: bash tools/ci/check_ios_app.sh app/build/ios/iphonesimulator/Runner.app
       - name: Simulator diagnostics

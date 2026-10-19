@@ -141,6 +141,34 @@ jobs:
           path: ${{ runner.temp }}/e2e-summary.json
           if-no-files-found: error
           retention-days: 14
+      - name: M3 local account lifecycle
+        id: account_scenario
+        if: steps.scenario.outcome == 'success'
+        working-directory: tools/e2e
+        env:
+          E2E_DIAGNOSTIC_FILE: ${{ runner.temp }}/m3-diagnostic.json
+        run: |
+          set +e
+          dart run bin/run.dart --profile android --scenario m3 --repo-root "$GITHUB_WORKSPACE" > "$RUNNER_TEMP/m3-private.log" 2>&1
+          code=$?
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          exit "$code"
+      - name: M3 sanitized account summary
+        if: always() && steps.account_scenario.outcome != 'skipped'
+        env:
+          ACCOUNT_CODE: ${{ steps.account_scenario.outputs.exit_code }}
+        run: |
+          code="${ACCOUNT_CODE:-1}"
+          outcome=failure; if [ "$code" = 0 ]; then outcome=success; fi
+          python3 tools/ci/write_e2e_summary.py --profile android --stage scenario --outcome "$outcome" --exit-code "$code" --diagnostic-file "$RUNNER_TEMP/m3-diagnostic.json" --output "$RUNNER_TEMP/m3-summary.json"
+      - name: Retain sanitized M3 summary only
+        if: always() && steps.account_scenario.outcome != 'skipped'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: android-m3-account-summary
+          path: ${{ runner.temp }}/m3-summary.json
+          if-no-files-found: error
+          retention-days: 14
 
   windows:
     runs-on: windows-latest
@@ -198,5 +226,34 @@ jobs:
         with:
           name: windows-e2e-summary
           path: ${{ runner.temp }}/e2e-summary.json
+          if-no-files-found: error
+          retention-days: 14
+      - name: M3 local account lifecycle
+        id: account_scenario
+        if: steps.scenario.outcome == 'success'
+        working-directory: tools/e2e
+        env:
+          E2E_DIAGNOSTIC_FILE: ${{ runner.temp }}/m3-diagnostic.json
+        run: |
+          dart run bin/run.dart --profile windows --scenario m3 --repo-root "$env:GITHUB_WORKSPACE" *> "$env:RUNNER_TEMP/m3-private.log"
+          $code = $LASTEXITCODE
+          "exit_code=$code" >> $env:GITHUB_OUTPUT
+          exit $code
+      - name: M3 sanitized account summary
+        if: always() && steps.account_scenario.outcome != 'skipped'
+        env:
+          ACCOUNT_CODE: ${{ steps.account_scenario.outputs.exit_code }}
+        run: |
+          $code = 1; $outcome = 'failure'
+          if ($env:ACCOUNT_CODE) { $code = [int]$env:ACCOUNT_CODE }
+          if ($code -eq 0) { $outcome = 'success' }
+          python tools/ci/write_e2e_summary.py --profile windows --stage scenario --outcome $outcome --exit-code $code --diagnostic-file "$env:RUNNER_TEMP/m3-diagnostic.json" --output "$env:RUNNER_TEMP/m3-summary.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Retain sanitized M3 summary only
+        if: always() && steps.account_scenario.outcome != 'skipped'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: windows-m3-account-summary
+          path: ${{ runner.temp }}/m3-summary.json
           if-no-files-found: error
           retention-days: 14
