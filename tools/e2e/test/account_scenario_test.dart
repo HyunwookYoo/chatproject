@@ -167,6 +167,166 @@ void main() {
     },
   );
 
+  for (final frame in <Map<String, Object?>>[
+    {'type': 'config', 'relay': null, 'records': marker},
+    {'type': 'cmd', 'id': 1, 'op': 'network_info', 'args': {}, 'extra': marker},
+    {
+      'type': 'cmd',
+      'id': 1,
+      'op': 'account_local_recover',
+      'args': {'words': marker},
+      'extra': marker,
+    },
+    {
+      'type': 'hello',
+      'protocol': puppetProtocol,
+      'name': 'node',
+      'instance': 'one',
+      'relay': localRelay,
+      'extra': marker,
+    },
+    {'type': 'result', 'id': 1, 'ok': true, 'value': null, 'extra': marker},
+    {
+      'type': 'event',
+      'seq': 1,
+      'instance': 'one',
+      'event': {'kind': 'network_changed'},
+      'extra': marker,
+    },
+  ]) {
+    test('prelog rejects inbound ${frame['type']} ${frame['op']}', () async {
+      final logs = await Directory.systemTemp.createTemp('prelog-rejection-');
+      final controller = await Controller.start(port: 0, logDir: logs);
+      final peer = await MockParticipant.connect(controller);
+      try {
+        await peer.next();
+        final participant = await controller.waitParticipant('node');
+        final call = participant.call('network_info', {});
+        final rejected = expectLater(
+          call,
+          throwsA(
+            isA<StateError>().having(
+              (error) => error.toString().contains(marker),
+              'secret diagnostic',
+              false,
+            ),
+          ),
+        );
+        await peer.next();
+        peer.send(frame);
+        await rejected;
+        await expectLater(controller.close(), throwsA(isA<StateError>()));
+        expect(
+          await File('${logs.path}/wire.jsonl').readAsString(),
+          isNot(contains(marker)),
+        );
+      } finally {
+        await peer.close();
+        try {
+          await controller.close();
+        } catch (_) {
+          /* expected fatal record */
+        }
+        await logs.delete(recursive: true);
+      }
+    });
+  }
+
+  for (final mode in ['result', 'network', 'peer', 'probe', 'metric_type']) {
+    test(
+      'prelog projects nested $mode while preserving full consumers',
+      () async {
+        final logs = await Directory.systemTemp.createTemp(
+          'prelog-projection-',
+        );
+        final controller = await Controller.start(port: 0, logDir: logs);
+        final peer = await MockParticipant.connect(controller);
+        try {
+          await peer.next();
+          final participant = await controller.waitParticipant('node');
+          final publicPeer = <String, Object?>{
+            'peer_id': 'public-peer',
+            'phase': 'Connected',
+            'path': 'Direct',
+            'connect_ms': 7,
+            'direct_ms': 8,
+          };
+          final peerPayload = {
+            ...publicPeer,
+            'unexpected': marker,
+            if (mode == 'metric_type') 'connect_ms': {'unexpected': marker},
+          };
+          final network = {
+            'revision': 3,
+            'state': 'Online',
+            'endpoint_id': 'public-endpoint',
+            'ticket': 'public-ticket',
+            'peers': [peerPayload],
+            'unexpected': marker,
+          };
+          final Map<String, Object?> payload;
+          if (mode == 'result') {
+            payload = network;
+            final call = participant.call('network_info', {});
+            final cmd = await peer.next();
+            peer.result(cmd['id'] as int, payload);
+            expect(await call, payload);
+          } else {
+            payload = switch (mode) {
+              'network' => {'kind': 'network_changed', ...network},
+              'peer' || 'metric_type' => {
+                'kind': 'peer_changed',
+                'revision': 3,
+                'peer': peerPayload,
+                'unexpected': marker,
+              },
+              _ => {
+                'kind': 'probe_text_received',
+                'peer_id': 'public-peer',
+                'text': 'public M2 probe body',
+                'unexpected': marker,
+              },
+            };
+            peer.send({
+              'type': 'event',
+              'seq': 1,
+              'instance': 'one',
+              'event': payload,
+            });
+            expect(await participant.expectEvent((_) => true), payload);
+          }
+          await controller.close();
+          final text = await File('${logs.path}/wire.jsonl').readAsString();
+          expect(text, isNot(contains(marker)));
+          final last =
+              jsonDecode(
+                    (jsonDecode(const LineSplitter().convert(text).last)
+                            as Map)['wire']
+                        as String,
+                  )
+                  as Map;
+          if (mode == 'probe') {
+            expect(last['event'], {
+              'kind': 'probe_text_received',
+              'peer_id': 'public-peer',
+              'text': 'public M2 probe body',
+            });
+          } else if (mode != 'metric_type') {
+            final logged = mode == 'result' ? last['value'] : last['event'];
+            expect(
+              mode == 'peer' ? logged['peer'] : logged['peers'].single,
+              publicPeer,
+            );
+          }
+        } finally {
+          await peer.close();
+          await controller.close();
+          await logs.delete(recursive: true);
+        }
+      },
+    );
+  }
+
   test('account error toString is safe for structured failure diagnostics', () {
     expect(
       const RpcError('InvalidConfig', marker).toString(),

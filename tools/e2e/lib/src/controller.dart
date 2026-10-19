@@ -184,28 +184,45 @@ class Controller {
 
   void _record(_Connection connection, String direction, Object? wire) {
     _log.writeStringSync(
-      '${jsonEncode({'connection': connection.id, 'direction': direction, 'wire': _safeWire(connection, wire)})}\n',
+      '${jsonEncode({'connection': connection.id, 'direction': direction, 'wire': _safeWire(connection, direction, wire)})}\n',
     );
   }
 
   // Parse/classify before any file write. Unknown and malformed frames never
   // reach diagnostics, including late results whose pending context is gone.
-  Object _safeWire(_Connection connection, Object? wire) {
+  Object _safeWire(_Connection connection, String direction, Object? wire) {
     if (wire is! String) return '[redacted]';
     try {
       final value = jsonDecode(wire);
       if (value is! Map<String, dynamic>) return '[redacted]';
-      final safe = Map<String, dynamic>.of(value);
-      if (safe['type'] != 'cmd' && safe['type'] != 'config') {
-        WireRecord.parse(
-          wire,
-        ); // Reject unknown fields before logging any payload.
+      if (direction == 'sent') {
+        if (value['type'] == 'config') {
+          return jsonEncode({
+            'type': 'config',
+            'relay': _relay,
+            if (_accountRecords) 'records': 'ws://127.0.0.1:47000/records',
+          });
+        }
+        if (value case {
+          'type': 'cmd',
+          'id': final int id,
+          'op': final String op,
+        }) {
+          return jsonEncode({
+            'type': 'cmd',
+            'id': id,
+            'op': op,
+            'args': _publicCommandArgs(op, value['args']) ?? '[redacted]',
+          });
+        }
+        return '[redacted]';
       }
+      if (direction != 'received') return '[redacted]';
+      WireRecord.parse(
+        wire,
+      ); // Inbound cmd/config and unknown top fields fail closed.
+      final safe = Map<String, dynamic>.of(value);
       switch (safe['type']) {
-        case 'cmd':
-          if ((safe['op'] as String?)?.startsWith('account_local_') ?? false) {
-            safe['args'] = '[redacted]';
-          }
         case 'result':
           final op = connection.participant?._operations[safe['id']];
           if (op == null || op.startsWith('account_local_')) {
@@ -217,16 +234,23 @@ class Controller {
                 'error_code': (safe['error'] as Map)['code'],
             });
           }
-          if (safe.containsKey('error')) safe['error'] = '[redacted]';
-        case 'event':
-          final event = safe['event'];
-          if (event is! Map ||
-              event['kind'] == 'error' ||
-              event['kind'] == 'account_changed') {
-            safe['event'] = '[redacted]';
+          if (safe.containsKey('error')) {
+            safe['error'] = '[redacted]';
+          } else {
+            safe['value'] = switch (op) {
+              'network_start' ||
+              'network_info' ||
+              'network_stop' ||
+              'set_offline' => _publicNetwork(safe['value']) ?? '[redacted]',
+              'connect_peer' => _publicPeer(safe['value']) ?? '[redacted]',
+              'disconnect_peer' ||
+              'send_probe_text' when safe['value'] == null => null,
+              _ => '[redacted]',
+            };
           }
+        case 'event':
+          safe['event'] = _publicEvent(safe['event']) ?? '[redacted]';
         case 'hello':
-        case 'config':
           break;
         default:
           return '[redacted]';
@@ -236,6 +260,120 @@ class Controller {
       return '[redacted]';
     }
   }
+
+  // These projections are only for diagnostics. Never return an input map or
+  // list: even known events/results can contain unknown nested secret fields.
+  Map<String, Object?>? _publicPeer(Object? value) {
+    if (value
+        case {
+          'peer_id': final String id,
+          'phase': final String phase,
+          'path': final String path,
+          'connect_ms': final int? connect,
+          'direct_ms': final int? direct,
+        }
+        when const [
+              'Connecting',
+              'Connected',
+              'Reconnecting',
+              'Disconnected',
+            ].contains(phase) &&
+            const ['Unknown', 'Relay', 'Direct'].contains(path) &&
+            (connect == null || connect >= 0) &&
+            (direct == null || direct >= 0)) {
+      return {
+        'peer_id': id,
+        'phase': phase,
+        'path': path,
+        'connect_ms': connect,
+        'direct_ms': direct,
+      };
+    }
+    return null;
+  }
+
+  Map<String, Object?>? _publicNetwork(Object? value) {
+    if (value
+        case {
+          'revision': final int revision,
+          'state': final String state,
+          'endpoint_id': final String? endpoint,
+          'ticket': final String? ticket,
+          'peers': final List peers,
+        }
+        when revision >= 0 &&
+            const ['Stopped', 'Starting', 'Online', 'Failed'].contains(state)) {
+      final projected = <Map<String, Object?>>[];
+      for (final peer in peers) {
+        final public = _publicPeer(peer);
+        if (public == null) return null;
+        projected.add(public);
+      }
+      return {
+        'revision': revision,
+        'state': state,
+        'endpoint_id': endpoint,
+        'ticket': ticket,
+        'peers': projected,
+      };
+    }
+    return null;
+  }
+
+  Map<String, Object?>? _publicEvent(Object? value) {
+    switch (value) {
+      case {'kind': 'network_changed'}:
+        final network = _publicNetwork(value);
+        return network == null ? null : {'kind': 'network_changed', ...network};
+      case {
+            'kind': 'peer_changed',
+            'revision': final int revision,
+            'peer': final Object peer,
+          }
+          when revision >= 0:
+        final public = _publicPeer(peer);
+        return public == null
+            ? null
+            : {'kind': 'peer_changed', 'revision': revision, 'peer': public};
+      case {
+        'kind': 'probe_text_received',
+        'peer_id': final String id,
+        'text': final String text,
+      }:
+        return {'kind': 'probe_text_received', 'peer_id': id, 'text': text};
+      case {
+            'kind': 'connection_state',
+            'direct_peers': final int peers,
+            'mailbox_ok': final bool mailbox,
+            'queue_ok': final bool? queue,
+          }
+          when peers >= 0:
+        return {
+          'kind': 'connection_state',
+          'direct_peers': peers,
+          'mailbox_ok': mailbox,
+          'queue_ok': queue,
+        };
+      default:
+        return null;
+    }
+  }
+
+  Map<String, Object?>? _publicCommandArgs(String op, Object? value) =>
+      switch ((op, value)) {
+        ('network_start' || 'network_info' || 'network_stop', Map()) => {},
+        ('connect_peer', {'target': final String target}) => {'target': target},
+        ('disconnect_peer', {'peer_id': final String id}) => {'peer_id': id},
+        (
+          'send_probe_text',
+          {'peer_id': final String id, 'text': final String text},
+        ) =>
+          {'peer_id': id, 'text': text},
+        ('set_offline', {'offline': final bool offline}) => {
+          'offline': offline,
+        },
+        _ => null,
+      };
 
   void _send(_Connection connection, Map<String, Object?> record) {
     final wire = jsonEncode(record);
