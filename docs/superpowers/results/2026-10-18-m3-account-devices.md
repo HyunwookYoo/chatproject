@@ -522,3 +522,7 @@ All ten acceptance groups retain their dispositions:
 10. Message history, MLS/message security and full Invite v2/KeyPackage behavior remain outside M3 and belong to later milestones, including M4/M5.
 
 The prior B4 behavioral-RED chronology debt, inherited diagnostics/toolchain notices and memory-erasure limits retain their recorded dispositions. No new out-of-scope source defect was identified or silently waived. The ruling appendix preserves every current A/B/C ruling paragraph and cost verbatim, with raw ledger hashes refreshed after the controller's final acceptance bookkeeping.
+
+## 2026-10-20 native URI follow-up
+
+The [Android public URI follow-up](2026-10-20-m3-native-uri.md) records an actual passing cold/warm implicit OS launch, queued signed preview, explicit UI save, invalid-input handling and pair-prefix exclusion using the accepted Debug APK on an owned API36 emulator. It supersedes the previously unexecuted Android URI status only within that scope. Release/physical Android URI behavior, Windows registration/warm forwarding, Apple and the other external acceptance groups remain open. No product source changed; all350 frozen inputs and the three protected M2 documents remained unchanged.
