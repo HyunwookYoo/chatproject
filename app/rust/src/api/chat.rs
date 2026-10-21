@@ -49,6 +49,12 @@ pub enum ErrorCode {
     AuthFailed,
     AccountRestricted,
     PairHistoryFull,
+    InvalidMessage,
+    MessageConflict,
+    MessageNotFound,
+    ContactRequired,
+    UnsupportedMessageVersion,
+    StorageUncertain,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

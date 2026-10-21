@@ -7,6 +7,10 @@ use std::{
 };
 
 pub(super) fn read_bounded(path: &Path) -> Result<Vec<u8>, CoreError> {
+    read_with_limit(path, FILE_LIMIT)
+}
+
+pub(crate) fn read_with_limit(path: &Path, limit: usize) -> Result<Vec<u8>, CoreError> {
     let file = File::open(path).map_err(|_| {
         CoreError::new(
             ErrorCode::StorageMissing,
@@ -17,17 +21,17 @@ pub(super) fn read_bounded(path: &Path) -> Result<Vec<u8>, CoreError> {
         .metadata()
         .map_err(|_| CoreError::new(ErrorCode::StorageCorrupt, "Cannot inspect account file"))?
         .len();
-    if size > FILE_LIMIT as u64 {
+    if size > limit as u64 {
         return Err(CoreError::new(
             ErrorCode::StorageFull,
             "Account file exceeds limit",
         ));
     }
     let mut bytes = Vec::with_capacity(size as usize);
-    file.take(FILE_LIMIT as u64 + 1)
+    file.take(limit as u64 + 1)
         .read_to_end(&mut bytes)
         .map_err(|_| CoreError::new(ErrorCode::StorageCorrupt, "Cannot read account file"))?;
-    if bytes.len() > FILE_LIMIT {
+    if bytes.len() > limit {
         return Err(CoreError::new(
             ErrorCode::StorageFull,
             "Account file exceeds limit",
@@ -81,7 +85,7 @@ fn replace_file(temporary: &Path, destination: &Path) -> std::io::Result<()> {
     std::fs::rename(temporary, destination)
 }
 
-pub(super) fn sync_directory(root: &Path) -> Result<(), CoreError> {
+pub(crate) fn sync_directory(root: &Path) -> Result<(), CoreError> {
     #[cfg(unix)]
     File::open(root)
         .and_then(|directory| directory.sync_all())
@@ -92,7 +96,7 @@ pub(super) fn sync_directory(root: &Path) -> Result<(), CoreError> {
     Ok(())
 }
 
-pub(super) fn replace(root: &Path, name: &str, bytes: &[u8]) -> Result<(), CoreError> {
+pub(crate) fn replace(root: &Path, name: &str, bytes: &[u8]) -> Result<(), CoreError> {
     let temporary = root.join(format!(".{name}.tmp"));
     let destination = root.join(name);
     #[cfg(test)]

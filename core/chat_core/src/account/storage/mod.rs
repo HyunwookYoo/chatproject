@@ -3,10 +3,10 @@ use super::{Secret32, StoreId};
 use crate::{CoreError, ErrorCode};
 use std::{fs, path::Path, sync::Arc};
 use zeroize::Zeroizing;
-mod atomic;
+pub(crate) mod atomic;
 #[cfg(all(test, feature = "test-hooks", debug_assertions))]
 pub(crate) use atomic::with_after_replace_failure;
-mod ownership;
+pub(crate) mod ownership;
 pub(crate) mod schema;
 
 pub trait KeyProtector: Send + Sync {

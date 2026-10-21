@@ -1700,6 +1700,12 @@ impl SseDecode for crate::api::chat::ErrorCode {
             26 => crate::api::chat::ErrorCode::AuthFailed,
             27 => crate::api::chat::ErrorCode::AccountRestricted,
             28 => crate::api::chat::ErrorCode::PairHistoryFull,
+            29 => crate::api::chat::ErrorCode::InvalidMessage,
+            30 => crate::api::chat::ErrorCode::MessageConflict,
+            31 => crate::api::chat::ErrorCode::MessageNotFound,
+            32 => crate::api::chat::ErrorCode::ContactRequired,
+            33 => crate::api::chat::ErrorCode::UnsupportedMessageVersion,
+            34 => crate::api::chat::ErrorCode::StorageUncertain,
             _ => unreachable!("Invalid variant for ErrorCode: {}", inner),
         };
     }
@@ -2655,6 +2661,12 @@ impl flutter_rust_bridge::IntoDart for crate::api::chat::ErrorCode {
             Self::AuthFailed => 26.into_dart(),
             Self::AccountRestricted => 27.into_dart(),
             Self::PairHistoryFull => 28.into_dart(),
+            Self::InvalidMessage => 29.into_dart(),
+            Self::MessageConflict => 30.into_dart(),
+            Self::MessageNotFound => 31.into_dart(),
+            Self::ContactRequired => 32.into_dart(),
+            Self::UnsupportedMessageVersion => 33.into_dart(),
+            Self::StorageUncertain => 34.into_dart(),
             _ => unreachable!(),
         }
     }
@@ -3353,6 +3365,12 @@ impl SseEncode for crate::api::chat::ErrorCode {
                 crate::api::chat::ErrorCode::AuthFailed => 26,
                 crate::api::chat::ErrorCode::AccountRestricted => 27,
                 crate::api::chat::ErrorCode::PairHistoryFull => 28,
+                crate::api::chat::ErrorCode::InvalidMessage => 29,
+                crate::api::chat::ErrorCode::MessageConflict => 30,
+                crate::api::chat::ErrorCode::MessageNotFound => 31,
+                crate::api::chat::ErrorCode::ContactRequired => 32,
+                crate::api::chat::ErrorCode::UnsupportedMessageVersion => 33,
+                crate::api::chat::ErrorCode::StorageUncertain => 34,
                 _ => {
                     unimplemented!("");
                 }

@@ -19,3 +19,7 @@ pub use transport::{
 pub mod puppet;
 
 pub use account::{AccountHandle, CandidateInfo};
+
+#[cfg(all(feature = "test-hooks", debug_assertions))]
+#[path = "storage/fixture.rs"]
+pub mod storage_fixture;

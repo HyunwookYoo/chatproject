@@ -149,6 +149,12 @@ enum ErrorCode {
   authFailed,
   accountRestricted,
   pairHistoryFull,
+  invalidMessage,
+  messageConflict,
+  messageNotFound,
+  contactRequired,
+  unsupportedMessageVersion,
+  storageUncertain,
 }
 
 class NetworkInfo {

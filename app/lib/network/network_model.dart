@@ -211,6 +211,12 @@ String networkErrorMessage(rust.ErrorCode code) => switch (code) {
   rust.ErrorCode.pairMismatch ||
   rust.ErrorCode.pairExpired ||
   rust.ErrorCode.pairHistoryFull ||
+  rust.ErrorCode.invalidMessage ||
+  rust.ErrorCode.messageConflict ||
+  rust.ErrorCode.messageNotFound ||
+  rust.ErrorCode.contactRequired ||
+  rust.ErrorCode.unsupportedMessageVersion ||
+  rust.ErrorCode.storageUncertain ||
   rust.ErrorCode.recordConflict ||
   rust.ErrorCode.recordUnavailable ||
   rust.ErrorCode.authFailed ||

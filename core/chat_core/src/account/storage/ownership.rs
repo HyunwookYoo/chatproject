@@ -4,8 +4,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub(super) struct Ownership {
-    pub(super) root: PathBuf,
+pub(crate) struct Ownership {
+    pub(crate) root: PathBuf,
     held: Option<File>,
     short_lived: bool,
     suspended: bool,
@@ -49,7 +49,7 @@ fn acquire(root: &Path) -> Result<File, CoreError> {
 }
 
 impl Ownership {
-    pub(super) fn open(root: &Path) -> Result<Self, CoreError> {
+    pub(crate) fn open(root: &Path) -> Result<Self, CoreError> {
         fs::create_dir_all(root).map_err(|_| {
             CoreError::new(ErrorCode::StorageMissing, "Cannot create account folder")
         })?;
@@ -66,7 +66,7 @@ impl Ownership {
         })
     }
 
-    pub(super) fn with_lock<T>(
+    pub(crate) fn with_lock<T>(
         &mut self,
         action: impl FnOnce(&Path) -> Result<T, CoreError>,
     ) -> Result<T, CoreError> {
@@ -85,14 +85,14 @@ impl Ownership {
         action(&self.root)
     }
 
-    pub(super) fn suspend(&mut self) {
+    pub(crate) fn suspend(&mut self) {
         self.suspended = true;
         if self.short_lived {
             self.held.take();
         }
     }
 
-    pub(super) fn resume(&mut self) -> Result<(), CoreError> {
+    pub(crate) fn resume(&mut self) -> Result<(), CoreError> {
         if !self.suspended {
             return Ok(());
         }
