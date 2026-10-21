@@ -437,3 +437,23 @@ async fn oversized_os_wrapping_blob_keeps_pending_ownership() {
     assert!(!dir.path().join("db.keys").exists());
     assert!(Fixture::open(dir.path(), protector()).await.is_err());
 }
+#[tokio::test(flavor = "current_thread")]
+async fn pending_suspend_completion_is_rejected_after_resume() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = Fixture::open(dir.path(), protector()).await.unwrap();
+    let mut suspend = Box::pin(f.handle.suspend());
+    assert!(futures_util::poll!(&mut suspend).is_pending());
+    let pause = f.pause().await;
+    pause.wait_entered().await;
+    assert_eq!(f.live_connections(), 0);
+    pause.release();
+    f.handle.resume().await.unwrap();
+    assert_eq!(
+        f.live_connections(),
+        if cfg!(target_os = "ios") { 0 } else { 1 }
+    );
+    assert!(f.handle.load_account().await.is_ok());
+    assert_eq!(f.handle.accepted_ticket(), 0);
+    assert_eq!(suspend.await.unwrap_err().code, ErrorCode::StorageLocked);
+    f.close().await;
+}

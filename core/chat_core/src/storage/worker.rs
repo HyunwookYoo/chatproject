@@ -382,11 +382,18 @@ impl StorageHandle {
     fn send<T>(
         &self,
         op: impl FnOnce(oneshot::Sender<R<T>>) -> DbOp,
-        allow_blocked: bool,
+        lifecycle: bool,
     ) -> R<Pending<T>> {
-        let guard = self.fence.lock().map_err(|_| locked())?;
-        if guard.blocked && !allow_blocked {
+        let mut guard = self.fence.lock().map_err(|_| locked())?;
+        if guard.blocked && !lifecycle {
             return Err(locked());
+        }
+        if lifecycle {
+            // Both transitions supersede prior operations and pending completions.
+            // Fence, capture and enqueue under one lock; never change network authority.
+            guard.cancellation.cancel();
+            guard.cancellation = CancellationToken::new();
+            guard.blocked = true;
         }
         let (reply, rx) = oneshot::channel();
         self.sender
@@ -434,12 +441,6 @@ impl StorageHandle {
         }
     }
     pub(crate) async fn suspend(&self) -> R<()> {
-        {
-            let mut f = self.fence.lock().map_err(|_| locked())?;
-            f.cancellation.cancel();
-            f.cancellation = CancellationToken::new();
-            f.blocked = true;
-        }
         self.receive(self.send(DbOp::Suspend, true)?).await
     }
     pub(crate) async fn resume(&self) -> R<()> {
