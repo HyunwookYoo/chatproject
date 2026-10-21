@@ -19,7 +19,7 @@ use std::{
 use std::{
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
@@ -85,6 +85,139 @@ impl KeyProtector for Resources {
             Err(_) => panic!("fixture resource deletion failed"),
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum RecoveryFault {
+    None,
+    MissingKey,
+    MissingSalt,
+    WrongKey,
+    WrongSalt,
+}
+struct PersistedProtector {
+    resources: Arc<Resources>,
+    legacy: StoreId,
+    fault: RecoveryFault,
+    slots: Mutex<Vec<StoreId>>,
+    events: Mutex<Vec<&'static str>>,
+}
+impl KeyProtector for PersistedProtector {
+    fn protect(&self, id: StoreId, secret: &Secret32) -> Result<Vec<u8>, CoreError> {
+        let blob = self.resources.protect(id, secret)?;
+        self.slots.lock().unwrap().push(id);
+        Ok(blob)
+    }
+    fn unprotect(&self, id: StoreId, blob: &[u8]) -> Result<Secret32, CoreError> {
+        if id == self.legacy {
+            return self.resources.unprotect(id, blob);
+        }
+        let slot = self
+            .slots
+            .lock()
+            .unwrap()
+            .iter()
+            .position(|s| *s == id)
+            .unwrap();
+        self.events
+            .lock()
+            .unwrap()
+            .push(if slot == 0 { "read-key" } else { "read-salt" });
+        if matches!(
+            (self.fault, slot),
+            (RecoveryFault::MissingKey, 0) | (RecoveryFault::MissingSalt, 1)
+        ) {
+            return Err(CoreError::new(
+                ErrorCode::StorageMissing,
+                "fixture_saved_material_unreadable",
+            ));
+        }
+        let secret = self.resources.unprotect(id, blob)?;
+        if matches!(
+            (self.fault, slot),
+            (RecoveryFault::WrongKey, 0) | (RecoveryFault::WrongSalt, 1)
+        ) {
+            return Ok(Secret32::from(std::array::from_fn(|i| {
+                secret.as_bytes()[i] ^ u8::from(i == 0)
+            })));
+        }
+        Ok(secret)
+    }
+    fn delete(&self, id: StoreId) -> Result<(), CoreError> {
+        if id == self.legacy {
+            self.events.lock().unwrap().push("delete-legacy");
+        }
+        self.resources.delete(id)
+    }
+}
+fn persisted_protector(root: &Path, fault: RecoveryFault) -> Arc<PersistedProtector> {
+    legacy(root);
+    Arc::new(PersistedProtector {
+        resources: resources(root),
+        legacy: StoreId(fs::read(root.join("store.id")).unwrap().try_into().unwrap()),
+        fault,
+        slots: Mutex::new(Vec::new()),
+        events: Mutex::new(Vec::new()),
+    })
+}
+async fn rejected_persisted_recovery(fault: RecoveryFault) {
+    let dir = tempfile::tempdir().unwrap();
+    let p = persisted_protector(dir.path(), fault);
+    let snapshot = fs::read(dir.path().join("account.bin")).unwrap();
+    let wrapping = fs::read(dir.path().join("key.wrap")).unwrap();
+    let result = Fixture::open(dir.path(), p.clone()).await;
+    if let Ok(f) = result {
+        f.close().await;
+        panic!("unrecoverable saved DB material accepted");
+    }
+    assert!(fs::read(dir.path().join("account.bin")).unwrap() == snapshot);
+    assert!(fs::read(dir.path().join("key.wrap")).unwrap() == wrapping);
+    assert_eq!(fs::read(dir.path().join("store.id")).unwrap(), p.legacy.0);
+    assert!(p.resources.slot(p.legacy).is_file());
+    assert!(!dir.path().join("storage.mode").exists());
+    let events = p.events.lock().unwrap();
+    assert!(events.contains(&"read-key"));
+    assert!(!events.contains(&"delete-legacy"));
+    drop(events);
+    assert_eq!(p.slots.lock().unwrap().len(), 2);
+    for slot in p.slots.lock().unwrap().iter() {
+        assert!(p.resources.slot(*slot).is_file());
+    }
+    cleanup_fixture(dir, "unrecoverable-persisted-material");
+}
+#[tokio::test]
+async fn persisted_db_material_missing_key_preserves_legacy() {
+    rejected_persisted_recovery(RecoveryFault::MissingKey).await;
+}
+#[tokio::test]
+async fn persisted_db_material_missing_salt_preserves_legacy() {
+    rejected_persisted_recovery(RecoveryFault::MissingSalt).await;
+}
+#[tokio::test]
+async fn persisted_db_material_wrong_key_preserves_legacy() {
+    rejected_persisted_recovery(RecoveryFault::WrongKey).await;
+}
+#[tokio::test]
+async fn persisted_db_material_wrong_salt_preserves_legacy() {
+    rejected_persisted_recovery(RecoveryFault::WrongSalt).await;
+}
+#[tokio::test]
+async fn persisted_db_material_is_recovered_before_legacy_cleanup() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = persisted_protector(dir.path(), RecoveryFault::None);
+    let f = Fixture::open(dir.path(), p.clone()).await.unwrap();
+    let loaded = f.handle.load_account().await.unwrap().unwrap();
+    assert_eq!(loaded.installation, state(17).installation);
+    assert!(bool::from(loaded.payload.ct_eq(&state(17).payload)));
+    f.close().await;
+    assert_eq!(
+        *p.events.lock().unwrap(),
+        vec!["read-key", "read-salt", "delete-legacy"]
+    );
+    assert!(!p.resources.slot(p.legacy).exists());
+    assert_eq!(p.resources.count(), 2);
+    assert!(dir.path().join("storage.mode").is_file());
+    cleanup_fixture(dir, "verified-persisted-material");
 }
 
 fn legacy(root: &Path) {

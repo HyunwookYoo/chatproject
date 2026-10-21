@@ -435,6 +435,12 @@ fn open_locked(root: &Path, protector: &dyn KeyProtector) -> R<(Connection, DbSe
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     checkpoint(root, MigrationStage::AfterImport);
     drop(conn);
+    let db_id = secrets.db_id;
+    drop(secrets);
+    let secrets = keys::load_existing(root, protector, p.legacy)?;
+    if secrets.db_id != db_id {
+        return Err(corrupt());
+    }
     let conn = open(root, &secrets)?;
     let loaded = ready(&conn, &secrets.db_id, &p)?;
     if !has_mode && !same(legacy.as_ref(), loaded.as_ref()) {

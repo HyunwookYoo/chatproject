@@ -98,6 +98,31 @@ impl Metadata {
         }
         Ok(m)
     }
+    fn recover(&self, protector: &dyn KeyProtector, legacy: Option<StoreId>) -> R<DbSecrets> {
+        if legacy.is_some_and(|old| [self.db, self.key.0, self.salt.0].contains(&old.0)) {
+            return Err(invalid());
+        }
+        let key = protector.unprotect(self.key, &self.wrapped_key)?;
+        let salt = protector.unprotect(self.salt, &self.wrapped_salt)?;
+        if salt.as_bytes()[16..] != [0; 16] {
+            return Err(invalid());
+        }
+        Ok(DbSecrets {
+            db_id: self.db,
+            key,
+            salt,
+        })
+    }
+}
+/// Recover only committed protection metadata; missing resources never prepare
+/// replacements. Used after closing the import to prove restart recoverability.
+pub(crate) fn load_existing(
+    root: &Path,
+    protector: &dyn KeyProtector,
+    legacy: Option<StoreId>,
+) -> R<DbSecrets> {
+    Metadata::decode(&atomic::read_with_limit(&root.join("db.keys"), META_LIMIT)?)?
+        .recover(protector, legacy)
 }
 pub(crate) fn load_or_prepare(
     root: &Path,
@@ -142,14 +167,7 @@ pub(crate) fn load_or_prepare(
     };
     if exists(root, "db.keys")? {
         let m = Metadata::decode(&atomic::read_with_limit(&root.join("db.keys"), META_LIMIT)?)?;
-        if legacy.is_some_and(|old| [m.db, m.key.0, m.salt.0].contains(&old.0)) {
-            return Err(invalid());
-        }
-        let key = protector.unprotect(m.key, &m.wrapped_key)?;
-        let salt = protector.unprotect(m.salt, &m.wrapped_salt)?;
-        if salt.as_bytes()[16..] != [0; 16] {
-            return Err(invalid());
-        }
+        let secrets = m.recover(protector, legacy)?;
         if let Some(ids) = pending {
             if ids != [m.db, m.key.0, m.salt.0] {
                 return Err(invalid());
@@ -159,11 +177,7 @@ pub(crate) fn load_or_prepare(
         for name in [".db.keys.pending.tmp", ".db.keys.tmp"] {
             remove(root, name)?;
         }
-        return Ok(DbSecrets {
-            db_id: m.db,
-            key,
-            salt,
-        });
+        return Ok(secrets);
     }
     for name in [
         "db.sqlite3",
