@@ -8,6 +8,9 @@ pub(crate) mod atomic;
 pub(crate) use atomic::with_after_replace_failure;
 pub(crate) mod ownership;
 pub(crate) mod schema;
+#[cfg(all(feature = "test-hooks", debug_assertions))]
+#[path = "../../../tests/support/m4_migration.rs"]
+pub(crate) mod migration_fixtures;
 
 pub trait KeyProtector: Send + Sync {
     fn protect(&self, id: StoreId, secret: &Secret32) -> Result<Vec<u8>, CoreError>;
@@ -69,6 +72,14 @@ fn load_locked(
     let secret = protector.unprotect(id, &wrapped)?;
     let state = schema::unseal(id, &secret, &encoded)?;
     Ok(Some((id, secret, state)))
+}
+
+/// Migration holds the canonical writer lock; reuse the legacy envelope codec.
+pub(crate) fn load_for_migration(
+    root: &Path,
+    protector: &dyn KeyProtector,
+) -> Result<Option<StoredPlaintext>, CoreError> {
+    Ok(load_locked(root, protector)?.map(|(_, _, state)| state))
 }
 
 impl Store {

@@ -335,11 +335,13 @@ async fn failed_os_protection_preserves_owned_pending_ids() {
     assert_ne!(key, salt);
     assert!(!dir.path().join("db.keys").exists());
     p.fail_protect.store(false, Ordering::SeqCst);
-    assert!(Fixture::open(dir.path(), p).await.is_err());
-    assert_eq!(
-        pending,
-        fs::read(dir.path().join("db.keys.pending")).unwrap()
-    );
+    // T3 provenance proves this is owned, pre-DB preparation, so retry may
+    // remove only the recorded partial resources and finish initialization.
+    let f = Fixture::open(dir.path(), p).await.unwrap();
+    assert!(f.handle.load_account().await.unwrap().is_none());
+    assert!(dir.path().join("storage.mode").is_file());
+    assert!(!dir.path().join("db.keys.pending").exists());
+    f.close().await;
 }
 #[tokio::test]
 async fn metadata_io_failure_never_acknowledges_initialization() {
@@ -435,7 +437,11 @@ async fn oversized_os_wrapping_blob_keeps_pending_ownership() {
     );
     assert!(dir.path().join("db.keys.pending").is_file());
     assert!(!dir.path().join("db.keys").exists());
-    assert!(Fixture::open(dir.path(), protector()).await.is_err());
+    let f = Fixture::open(dir.path(), protector()).await.unwrap();
+    assert!(f.handle.load_account().await.unwrap().is_none());
+    assert!(dir.path().join("storage.mode").is_file());
+    assert!(!dir.path().join("db.keys.pending").exists());
+    f.close().await;
 }
 #[tokio::test(flavor = "current_thread")]
 async fn pending_suspend_completion_is_rejected_after_resume() {

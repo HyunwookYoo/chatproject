@@ -1,24 +1,18 @@
 //! One bounded, typed writer. SQL and OS protection run only on blocking threads.
-use super::{
-    engine,
-    keys::{self, DbSecrets},
-};
+use super::migration::{self, binding, load};
 use crate::{
     CoreError, ErrorCode,
-    account::storage::{
-        KeyProtector, StoredPlaintext, atomic, ownership::Ownership, schema::AccountState,
-    },
+    account::storage::{KeyProtector, StoredPlaintext, ownership::Ownership, schema::AccountState},
 };
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, params};
 use std::{
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{Arc, Mutex},
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
-use zeroize::Zeroizing;
 type R<T> = Result<T, CoreError>;
-const DB: &str = "db.sqlite3";
+#[cfg(all(feature = "test-hooks", debug_assertions))]
 fn corrupt() -> CoreError {
     CoreError::new(ErrorCode::StorageCorrupt, "db_binding_invalid")
 }
@@ -27,108 +21,6 @@ fn locked() -> CoreError {
 }
 fn uncertain() -> CoreError {
     CoreError::new(ErrorCode::StorageUncertain, "storage_commit_uncertain")
-}
-fn binding(state: Option<&StoredPlaintext>) -> R<Vec<u8>> {
-    let mut e = minicbor::Encoder::new(Vec::new());
-    match state {
-        None => {
-            e.array(2).unwrap().u8(1).unwrap().u8(0).unwrap();
-        }
-        Some(stored) => match AccountState::decode(stored)? {
-            AccountState::Active(a) => {
-                e.array(4)
-                    .unwrap()
-                    .u8(1)
-                    .unwrap()
-                    .u8(2)
-                    .unwrap()
-                    .bytes(&a.keys.peer_id().0)
-                    .unwrap()
-                    .bytes(&stored.installation)
-                    .unwrap();
-            }
-            _ => {
-                e.array(3)
-                    .unwrap()
-                    .u8(1)
-                    .unwrap()
-                    .u8(1)
-                    .unwrap()
-                    .bytes(&stored.installation)
-                    .unwrap();
-            }
-        },
-    }
-    Ok(e.into_writer())
-}
-fn load(conn: &Connection, id: &[u8; 16]) -> R<Option<StoredPlaintext>> {
-    let (version, db, stored_binding): (i64, Vec<u8>, Vec<u8>) = conn
-        .query_row(
-            "SELECT schema_version,db_id,binding FROM storage_meta WHERE singleton=1",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
-        .map_err(|_| corrupt())?;
-    if version != 1 || db != id {
-        return Err(corrupt());
-    }
-    let state = conn
-        .query_row(
-            "SELECT installation,payload FROM account_state WHERE singleton=1",
-            [],
-            |r| {
-                Ok((
-                    r.get::<_, Vec<u8>>(0)?,
-                    Zeroizing::new(r.get::<_, Vec<u8>>(1)?),
-                ))
-            },
-        )
-        .optional()
-        .map_err(|_| corrupt())?
-        .map(|(installation, payload)| {
-            Ok(StoredPlaintext {
-                installation: installation.try_into().map_err(|_| corrupt())?,
-                payload,
-            })
-        })
-        .transpose()?;
-    if binding(state.as_ref())? != stored_binding {
-        return Err(corrupt());
-    }
-    Ok(state)
-}
-// T3 replaces this fresh-store policy with verified migration/mode authority.
-fn check_layout(root: &Path) -> R<()> {
-    for name in [
-        "storage.mode",
-        ".storage.mode.tmp",
-        "account.bin",
-        "key.wrap",
-        ".account.bin.tmp",
-        ".key.wrap.tmp",
-        ".store.id.tmp",
-    ] {
-        if root.join(name).try_exists().map_err(|_| corrupt())? {
-            return Err(corrupt());
-        }
-    }
-    Ok(())
-}
-fn open_existing(root: &Path, protector: &dyn KeyProtector, id: &[u8; 16]) -> R<Connection> {
-    check_layout(root)?;
-    if !root.join(DB).is_file() || atomic::read_with_limit(&root.join("store.id"), 16)? != id {
-        return Err(corrupt());
-    }
-    let secrets = keys::load_or_prepare(root, protector)?;
-    if &secrets.db_id != id {
-        return Err(corrupt());
-    }
-    let salt = secrets.salt.as_bytes()[..16]
-        .try_into()
-        .map_err(|_| corrupt())?;
-    let conn = engine::open(&root.join(DB), &secrets.key, &salt)?;
-    load(&conn, id)?;
-    Ok(conn)
 }
 struct Fence {
     // Exact last accepted M3 network lifecycle ticket. Never minted here.
@@ -167,6 +59,35 @@ struct Worker {
     fault: Option<CommitFault>,
 }
 impl Worker {
+    fn discard_pending(&mut self) -> R<()> {
+        let id = self.id;
+        let result = self.operation(|conn| {
+            if let Some(stored) = load(conn, &id)? {
+                if matches!(AccountState::decode(&stored)?, AccountState::Active(_)) {
+                    return Err(CoreError::new(
+                        ErrorCode::AccountExists,
+                        "active_binding_immutable",
+                    ));
+                }
+            }
+            let tx = conn.transaction().map_err(|_| uncertain())?;
+            tx.execute("DELETE FROM account_state WHERE singleton=1", [])
+                .map_err(|_| uncertain())?;
+            tx.execute(
+                "UPDATE storage_meta SET binding=?1 WHERE singleton=1",
+                params![binding(None)?],
+            )
+            .map_err(|_| uncertain())?;
+            tx.commit().map_err(|_| uncertain())
+        });
+        if result
+            .as_ref()
+            .is_err_and(|e| e.code == ErrorCode::StorageUncertain)
+        {
+            self.close(true);
+        }
+        result
+    }
     fn close(&mut self, uncertain: bool) {
         let previous = std::mem::replace(
             &mut self.state,
@@ -193,7 +114,7 @@ impl Worker {
         ownership.with_lock(|root| {
             if !matches!(state, State::Open(_)) {
                 // Re-key, read binding and requery account after every uncertain result.
-                let conn = open_existing(root, &**protector, id)?;
+                let conn = migration::reopen(root, &**protector, id)?;
                 counts.opened();
                 *state = State::Open(conn);
             }
@@ -288,6 +209,7 @@ struct Pending<T> {
 enum DbOp {
     Load(oneshot::Sender<R<Option<StoredPlaintext>>>),
     Commit(StoredPlaintext, oneshot::Sender<R<()>>),
+    DiscardPending(oneshot::Sender<R<()>>),
     Suspend(oneshot::Sender<R<()>>),
     Resume(oneshot::Sender<R<()>>),
     #[cfg(all(feature = "test-hooks", debug_assertions))]
@@ -308,43 +230,13 @@ impl StorageHandle {
         root: PathBuf,
         protector: Arc<dyn KeyProtector>,
     ) -> R<(Self, Option<StoredPlaintext>)> {
-        let mut ownership = Ownership::open(&root)?;
-        let (id, conn, initial) = ownership.with_lock(|root| {
-            check_layout(root)?;
-            let existed = root.join("db.keys").try_exists().map_err(|_| corrupt())?;
-            let DbSecrets { db_id, key, salt } = keys::load_or_prepare(root, &*protector)?;
-            let salt = salt.as_bytes()[..16].try_into().map_err(|_| corrupt())?;
-            if existed
-                && (!root.join(DB).is_file()
-                    || atomic::read_with_limit(&root.join("store.id"), 16)? != db_id)
-            {
-                return Err(corrupt());
-            }
-            let mut conn = engine::open(&root.join(DB), &key, &salt)?;
-            if !existed {
-                let tx = conn.transaction().map_err(|_| uncertain())?;
-                tx.execute_batch(include_str!("schema.sql"))
-                    .map_err(|_| corrupt())?;
-                tx.execute(
-                    "INSERT INTO storage_meta VALUES(1,1,?1,?2,NULL,0,0)",
-                    params![db_id.as_slice(), binding(None)?],
-                )
-                .map_err(|_| corrupt())?;
-                tx.commit().map_err(|_| uncertain())?;
-                atomic::replace(root, "store.id", &db_id)?;
-            }
-            let initial = load(&conn, &db_id)?;
-            Ok((
-                db_id,
-                if cfg!(target_os = "ios") {
-                    drop(conn);
-                    None
-                } else {
-                    Some(conn)
-                },
-                initial,
-            ))
-        })?;
+        let migration::OpenedStore {
+            connection: conn,
+            secrets,
+            ownership,
+            initial,
+        } = migration::open_or_migrate(&root, &*protector)?;
+        let id = secrets.db_id;
         let counts = Arc::new(Counts::default());
         if conn.is_some() {
             counts.opened();
@@ -429,6 +321,10 @@ impl StorageHandle {
         self.receive(self.send(|reply| DbOp::Commit(state, reply), false)?)
             .await
     }
+    /// Only never-active state may be cleared. SQL identity/keys/mode remain.
+    pub(crate) async fn discard_pending(&self) -> R<()> {
+        self.receive(self.send(DbOp::DiscardPending, false)?).await
+    }
     pub(crate) fn invalidate(&self, ticket: u64) {
         if let Ok(mut f) = self.fence.lock() {
             f.cancellation.cancel();
@@ -469,6 +365,17 @@ fn run(mut w: Worker, mut rx: mpsc::Receiver<Request>, fence: Arc<Mutex<Fence>>)
                 });
                 let result = if allowed {
                     w.commit(state)
+                } else {
+                    Err(locked())
+                };
+                let _ = reply.send(if valid() { result } else { Err(locked()) });
+            }
+            DbOp::DiscardPending(reply) => {
+                let allowed = fence.lock().is_ok_and(|f| {
+                    f.ticket == request.ticket && !request.cancellation.is_cancelled() && !f.blocked
+                });
+                let result = if allowed {
+                    w.discard_pending()
                 } else {
                     Err(locked())
                 };

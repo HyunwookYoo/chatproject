@@ -11,6 +11,7 @@ bip39 = { version = "=2.2.2", default-features = false, features = ["std", "zero
 ed25519-dalek = { version = "=2.2.0", features = ["zeroize"] }
 hkdf = "=0.12.4"
 sha2 = "=0.10.9"
+subtle = "=2.6.1"
 getrandom = "=0.3.4"
 zeroize = { version = "=1.9.0", features = ["zeroize_derive"] }
 data-encoding = "=2.11.1"

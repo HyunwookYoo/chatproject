@@ -1,4 +1,6 @@
 //! Debug-only fixtures for the real private worker. No SQL/key controls reach FFI.
+pub use crate::account::storage::migration_fixtures::{assert_account_preserved, migration_states};
+pub use crate::storage::migration::MigrationStage;
 pub use crate::storage::worker::CommitFault;
 use crate::{
     CoreError, ErrorCode,
@@ -16,6 +18,9 @@ pub struct Fixture {
 #[derive(Clone)]
 pub struct Handle(StorageHandle);
 impl Handle {
+    pub async fn discard_pending(&self) -> Result<(), CoreError> {
+        self.0.discard_pending().await
+    }
     pub async fn load_account(&self) -> Result<Option<StoredPlaintext>, CoreError> {
         self.0.load_account().await
     }
@@ -55,6 +60,17 @@ impl Drop for Pause {
     }
 }
 impl Fixture {
+    /// Narrow corruption fixture, never an arbitrary SQL/key interface.
+    pub fn set_unknown_schema(root: &Path, p: Arc<dyn KeyProtector>) -> Result<(), CoreError> {
+        let mut opened = crate::storage::migration::open_or_migrate(root, &*p)?;
+        drop(opened.connection.take());
+        opened.ownership.with_lock(|root| {
+            let c = crate::storage::migration::reopen(root, &*p, &opened.secrets.db_id)?;
+            c.pragma_update(None, "user_version", 99).map_err(|_| {
+                CoreError::new(ErrorCode::StorageCorrupt, "fixture_schema_write_failed")
+            })
+        })
+    }
     pub async fn open(root: &Path, p: Arc<dyn KeyProtector>) -> Result<Self, CoreError> {
         let root = root.to_owned();
         tokio::task::spawn_blocking(move || {

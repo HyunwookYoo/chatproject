@@ -99,19 +99,65 @@ impl Metadata {
         Ok(m)
     }
 }
-pub(crate) fn load_or_prepare(root: &Path, protector: &dyn KeyProtector) -> R<DbSecrets> {
-    // Any incomplete material is preserved for the migration/recovery authority.
-    for name in ["db.keys.pending", ".db.keys.pending.tmp", ".db.keys.tmp"] {
-        if exists(root, name)? {
+pub(crate) fn load_or_prepare(
+    root: &Path,
+    protector: &dyn KeyProtector,
+    legacy: Option<StoreId>,
+) -> R<DbSecrets> {
+    // Caller has validated durable migration preparation and unchanged source.
+    let pending = if exists(root, "db.keys.pending")? {
+        let bytes = atomic::read_with_limit(&root.join("db.keys.pending"), 128)?;
+        let mut d = minicbor::Decoder::new(&bytes);
+        if d.array().map_err(|_| invalid())? != Some(4) || d.u8().map_err(|_| invalid())? != 1 {
             return Err(invalid());
         }
-    }
+        let ids: [[u8; 16]; 3] = [
+            d.bytes()
+                .map_err(|_| invalid())?
+                .try_into()
+                .map_err(|_| invalid())?,
+            d.bytes()
+                .map_err(|_| invalid())?
+                .try_into()
+                .map_err(|_| invalid())?,
+            d.bytes()
+                .map_err(|_| invalid())?
+                .try_into()
+                .map_err(|_| invalid())?,
+        ];
+        let mut e = minicbor::Encoder::new(Vec::new());
+        e.array(4).unwrap().u8(1).unwrap();
+        for id in ids {
+            e.bytes(&id).unwrap();
+        }
+        if e.into_writer() != bytes || ids[0] == ids[1] || ids[0] == ids[2] || ids[1] == ids[2] {
+            return Err(invalid());
+        }
+        if legacy.is_some_and(|old| ids.contains(&old.0)) {
+            return Err(invalid());
+        }
+        Some(ids)
+    } else {
+        None
+    };
     if exists(root, "db.keys")? {
         let m = Metadata::decode(&atomic::read_with_limit(&root.join("db.keys"), META_LIMIT)?)?;
+        if legacy.is_some_and(|old| [m.db, m.key.0, m.salt.0].contains(&old.0)) {
+            return Err(invalid());
+        }
         let key = protector.unprotect(m.key, &m.wrapped_key)?;
         let salt = protector.unprotect(m.salt, &m.wrapped_salt)?;
         if salt.as_bytes()[16..] != [0; 16] {
             return Err(invalid());
+        }
+        if let Some(ids) = pending {
+            if ids != [m.db, m.key.0, m.salt.0] {
+                return Err(invalid());
+            }
+            remove(root, "db.keys.pending")?;
+        }
+        for name in [".db.keys.pending.tmp", ".db.keys.tmp"] {
+            remove(root, name)?;
         }
         return Ok(DbSecrets {
             db_id: m.db,
@@ -124,25 +170,31 @@ pub(crate) fn load_or_prepare(root: &Path, protector: &dyn KeyProtector) -> R<Db
         "db.sqlite3-wal",
         "db.sqlite3-shm",
         "storage.mode",
-        ".storage.mode.tmp",
-        "account.bin",
-        "key.wrap",
-        "store.id",
-        ".account.bin.tmp",
-        ".key.wrap.tmp",
-        ".store.id.tmp",
     ] {
         if exists(root, name)? {
             return Err(invalid());
         }
     }
-    let db = id()?;
+    if let Some(ids) = pending {
+        // Only these recorded pre-DB resources may be reset after partial protection.
+        protector.delete(StoreId(ids[1]))?;
+        protector.delete(StoreId(ids[2]))?;
+        remove(root, ".db.keys.tmp")?;
+        remove(root, "db.keys.pending")?;
+    } else if exists(root, ".db.keys.tmp")? {
+        return Err(invalid());
+    }
+    remove(root, ".db.keys.pending.tmp")?;
+    let mut db = id()?;
+    while legacy.is_some_and(|old| old.0 == db) {
+        db = id()?;
+    }
     let mut key = StoreId(id()?);
-    while key.0 == db {
+    while key.0 == db || legacy == Some(key) {
         key = StoreId(id()?);
     }
     let mut salt = StoreId(id()?);
-    while salt.0 == db || salt == key {
+    while salt.0 == db || salt == key || legacy == Some(salt) {
         salt = StoreId(id()?);
     }
     let mut pending = minicbor::Encoder::new(Vec::new());
@@ -163,6 +215,8 @@ pub(crate) fn load_or_prepare(root: &Path, protector: &dyn KeyProtector) -> R<Db
     getrandom::fill(&mut db_salt.as_mut_bytes()[..16])
         .map_err(|_| CoreError::new(ErrorCode::NotAvailable, "secure_random_unavailable"))?;
     let wrapped_key = protector.protect(key, &db_key)?;
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    super::migration::checkpoint(root, super::migration::MigrationStage::KeyProtected);
     let wrapped_salt = protector.protect(salt, &db_salt)?;
     if wrapped_key.len() > WRAP_LIMIT || wrapped_salt.len() > WRAP_LIMIT {
         return Err(CoreError::new(
@@ -189,4 +243,12 @@ pub(crate) fn load_or_prepare(root: &Path, protector: &dyn KeyProtector) -> R<Db
         key: db_key,
         salt: db_salt,
     })
+}
+
+fn remove(root: &Path, name: &str) -> R<()> {
+    match fs::remove_file(root.join(name)) {
+        Ok(()) => atomic::sync_directory(root),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(invalid()),
+    }
 }
