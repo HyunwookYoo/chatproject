@@ -43,6 +43,14 @@ windows-sys = { version = "=0.61.2", features = ["Win32_Storage_FileSystem"] }
 [target.'cfg(target_os = "android")'.dependencies]
 libc = "=0.2.189"
 
+[target.'cfg(target_vendor = "apple")'.dependencies]
+rusqlite = { version = "=0.40.2", features = ["bundled-sqlcipher"] }
+libsqlite3-sys = { version = "=0.38.2", features = ["bundled-sqlcipher"] }
+
+[target.'cfg(not(target_vendor = "apple"))'.dependencies]
+rusqlite = { version = "=0.40.2", features = ["bundled-sqlcipher-vendored-openssl"] }
+libsqlite3-sys = { version = "=0.38.2", features = ["bundled-sqlcipher-vendored-openssl"] }
+
 [[test]]
 name = "transport"
 required-features = ["test-hooks"]
