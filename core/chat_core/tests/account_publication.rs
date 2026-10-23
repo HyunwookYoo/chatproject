@@ -831,19 +831,67 @@ async fn legacy_a5_snapshot_is_rejected_without_file_modification() {
 async fn revoke_is_durable_before_notification_and_failed_notification_blocks_publish() {
     use chat_core::account::{RevocationNotifier, RevokeIntent};
     use std::sync::atomic::{AtomicBool, Ordering};
+    fn committed_notification(stored: &StoredPlaintext, intent: &RevokeIntent) -> bool {
+        let mut account = minicbor::Decoder::new(&stored.payload);
+        assert_eq!(account.array().unwrap(), Some(11));
+        for _ in 0..7 {
+            account.skip().unwrap();
+        }
+        let mut records = minicbor::Decoder::new(account.bytes().unwrap());
+        assert_eq!(records.array().unwrap(), Some(9));
+        for _ in 0..7 {
+            records.skip().unwrap();
+        }
+        let expected = intent.to_bytes();
+        let mut tombstone = false;
+        for _ in 0..records.array().unwrap().unwrap() {
+            tombstone |= records.bytes().unwrap() == expected;
+        }
+        let mut notification = false;
+        for _ in 0..records.array().unwrap().unwrap() {
+            assert_eq!(records.array().unwrap(), Some(6));
+            records.skip().unwrap(); // Exact committed signed packet is validated by worker load.
+            records.skip().unwrap(); // Packet base hash.
+            let operation = records.u8().unwrap(); // Revoke = 3.
+            let status = records.u8().unwrap(); // AwaitingNotification = 1.
+            let nonce = if records.datatype().unwrap() == minicbor::data::Type::Null {
+                records.null().unwrap();
+                None
+            } else {
+                Some(records.bytes().unwrap())
+            };
+            let start = records.position();
+            records.skip().unwrap();
+            let empty_recipients = &records.input()[start..records.position()] == [0x80];
+            notification |= operation == 3
+                && status == 1
+                && nonce == Some(intent.nonce.as_slice())
+                && empty_recipients;
+        }
+        tombstone && notification
+    }
     struct Notifier {
-        path: std::path::PathBuf,
+        store: tokio::sync::watch::Sender<Option<chat_core::storage_fixture::Handle>>,
         clock: Arc<FakeClock>,
         fail: AtomicBool,
-        calls: Mutex<Vec<(RevokeIntent, Vec<u8>)>>,
+        calls: Mutex<Vec<(RevokeIntent, StoredPlaintext)>>,
     }
     impl RevocationNotifier for Notifier {
         fn notify<'a>(&'a self, intent: &'a RevokeIntent) -> RecordFuture<'a, ()> {
             Box::pin(async move {
+                let mut binding = self.store.subscribe();
+                let handle = loop {
+                    if let Some(handle) = binding.borrow_and_update().clone() {
+                        break handle;
+                    }
+                    binding.changed().await.unwrap();
+                };
+                let stored = handle.load_account().await.unwrap().unwrap();
+                assert!(committed_notification(&stored, intent), "notification preceded its committed tombstone/obligation");
                 self.calls
                     .lock()
                     .unwrap()
-                    .push((intent.clone(), std::fs::read(&self.path).unwrap()));
+                    .push((intent.clone(), stored));
                 if self.fail.load(Ordering::SeqCst) {
                     Err(CoreError::new(
                         ErrorCode::RecordUnavailable,
@@ -860,7 +908,7 @@ async fn revoke_is_durable_before_notification_and_failed_notification_blocks_pu
     let backend = Arc::new(Backend::new());
     let clock = Arc::new(FakeClock::new(1_800_000_000, 0));
     let notifier = Arc::new(Notifier {
-        path: dir.path().join("db.sqlite3-wal"),
+        store: tokio::sync::watch::channel(None).0,
         clock: clock.clone(),
         fail: AtomicBool::new(true),
         calls: Mutex::new(vec![]),
@@ -870,6 +918,7 @@ async fn revoke_is_durable_before_notification_and_failed_notification_blocks_pu
         AccountServices::new(backend.clone(), clock.clone()).with_notifier(notifier.clone()),
     )
     .await;
+    notifier.store.send_replace(Some(account.storage_test_fixture().handle));
     let f = Fixture {
         _sql: sql_store::Store::from_fixture(account.storage_test_fixture()),
         _dir: dir,
@@ -898,7 +947,7 @@ async fn revoke_is_durable_before_notification_and_failed_notification_blocks_pu
         .unwrap();
     f.backend.answer(Answer::Found(f.backend.last()));
     f.refresh().await.unwrap();
-    let before = std::fs::read(&notifier.path).unwrap();
+    let before = f.account.storage_test_fixture().handle.load_account().await.unwrap().unwrap();
     let sent = f.backend.sent.lock().unwrap().len();
     assert_eq!(
         f.account
@@ -911,9 +960,17 @@ async fn revoke_is_durable_before_notification_and_failed_notification_blocks_pu
     let view = f.view().await;
     assert_eq!(view.publication.pending_notifications.len(), 1);
     assert_eq!(f.backend.sent.lock().unwrap().len(), sent);
-    let at_notification = notifier.calls.lock().unwrap()[0].1.clone();
-    assert_ne!(at_notification, before);
-    assert_eq!(at_notification, std::fs::read(&notifier.path).unwrap());
+    let after = f.account.storage_test_fixture().handle.load_account().await.unwrap().unwrap();
+    {
+        let calls = notifier.calls.lock().unwrap();
+        let (intent, at_notification) = &calls[0];
+        assert!(!committed_notification(&before, intent));
+        let mut wrong = intent.clone();
+        wrong.nonce[0] ^= 1;
+        assert!(!committed_notification(at_notification, &wrong));
+        assert!(at_notification.payload != before.payload);
+        assert!(at_notification.payload == after.payload);
+    }
     f.account.request_suspend();
     while f.account.lifecycle_status() == 1 {
         tokio::task::yield_now().await;
@@ -941,12 +998,14 @@ async fn revoke_is_durable_before_notification_and_failed_notification_blocks_pu
             .any(|w| w == signed_intent)
     );
     drop(store);
+    notifier.store.send_replace(None);
     notifier.fail.store(false, Ordering::SeqCst);
     let (_slot, account) = open_services(
         dir.path(),
         AccountServices::new(backend.clone(), clock.clone()).with_notifier(notifier.clone()),
     )
     .await;
+    notifier.store.send_replace(Some(account.storage_test_fixture().handle));
     let _sql = sql_store::Store::from_fixture(account.storage_test_fixture());
     let resumed = account.snapshot().await.unwrap();
     assert_eq!(resumed.publication.pending_notifications.len(), 0);
