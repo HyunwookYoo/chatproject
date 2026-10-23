@@ -55,25 +55,20 @@ struct Worker {
     protector: Arc<dyn KeyProtector>,
     id: [u8; 16],
     state: State,
-    pending_message: Option<crate::message::types::MessageKey>,
+    pending_message: Option<messages::PendingMessage>,
     counts: Arc<Counts>,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     hook: Option<(usize, CommitAction)>,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     message_fault: Option<CommitFault>,
+    #[cfg(all(feature="test-hooks",debug_assertions))]
+    message_reply_pause: Option<(oneshot::Sender<()>,std::sync::mpsc::Receiver<()>)>,
+    #[cfg(all(feature="test-hooks",debug_assertions))]
+    message_clock: Option<(Arc<crate::account::clock::FakeClock>,u64)>,
 }
 impl Worker {
     fn message(&mut self, identity: Identity, op: MessageDbOp) -> R<MessageDbReply> {
-        let key = if let MessageDbOp::Enqueue(peer, id, _, _) = &op {
-            Some(crate::message::types::MessageKey {
-                conversation: messages::conversation_id(identity.peer, *peer)?,
-                sender: identity.peer,
-                installation: identity.installation,
-                id: *id,
-            })
-        } else {
-            None
-        };
+        let key = op.pending(identity)?;
         let db_id = self.id;
         let pending = self.pending_message;
         let mut reconciled = false;
@@ -83,6 +78,8 @@ impl Worker {
         } else {
             None
         };
+        #[cfg(all(feature="test-hooks",debug_assertions))]
+        let clock=if key.is_some() {self.message_clock.take()} else {None};
         let result = self.operation(|c| {
             let stored = load(c, &db_id)?.ok_or_else(|| {
                 CoreError::new(ErrorCode::AccountRestricted, "active_account_required")
@@ -105,6 +102,7 @@ impl Worker {
                 messages::reconcile(c, key)?;
             }
             reconciled = true;
+            messages::authorize(c,&local,&op)?;
             messages::execute(
                 c,
                 identity,
@@ -113,6 +111,10 @@ impl Worker {
                 fault,
             )
         });
+        #[cfg(all(feature="test-hooks",debug_assertions))]
+        if key.is_some() && result.is_ok() && let Some((entered,release))=self.message_reply_pause.take() {let _=entered.send(());let _=release.recv();}
+        #[cfg(all(feature="test-hooks",debug_assertions))]
+        if result.is_ok() && let Some((clock,seconds))=clock {clock.set_unix_seconds(seconds);}
         if result
             .as_ref()
             .is_err_and(|e| e.code == ErrorCode::StorageUncertain)
@@ -378,6 +380,10 @@ impl StorageHandle {
             hook: None,
             #[cfg(all(feature = "test-hooks", debug_assertions))]
             message_fault: None,
+            #[cfg(all(feature="test-hooks",debug_assertions))]
+            message_clock: None,
+            #[cfg(all(feature="test-hooks",debug_assertions))]
+            message_reply_pause: None,
         };
         let (sender, receiver) = mpsc::channel(32);
         let fence = Arc::new(Mutex::new(Fence {
@@ -571,6 +577,8 @@ fn run(mut w: Worker, mut rx: mpsc::Receiver<Request>, fence: Arc<Mutex<Fence>>)
                         Ok(())
                     });
                 }
+                TestOp::MessageReplyPause(entered,release,reply)=>{w.message_reply_pause=Some((entered,release));let _=reply.send(());}
+                TestOp::MessageClock(clock,seconds,reply)=>{w.message_clock=Some((clock,seconds));let _=reply.send(());}
                 TestOp::MessageFault(fault, reply) => {
                     w.message_fault = Some(fault);
                     let _ = reply.send(());
@@ -626,6 +634,8 @@ pub(crate) enum TestOp {
     MessageCounts(oneshot::Sender<R<(i64, i64, i64, i64)>>),
     Message(messages::FixtureOp),
     MessageFault(CommitFault, oneshot::Sender<()>),
+    MessageReplyPause(oneshot::Sender<()>,std::sync::mpsc::Receiver<()>,oneshot::Sender<()>),
+    MessageClock(Arc<crate::account::clock::FakeClock>,u64,oneshot::Sender<()>),
     Pause(oneshot::Sender<()>, std::sync::mpsc::Receiver<()>),
     Fault(CommitFault, oneshot::Sender<()>),
     CommitAction(usize, CommitAction, oneshot::Sender<()>),

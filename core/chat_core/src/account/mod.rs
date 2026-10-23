@@ -45,3 +45,6 @@ pub use pair::{PairDirection, PairDisplay, PairPhase, PairView, PairRole, PairRe
 pub use pair::PairTestStop;
 
 pub use connection::RemoteRecordView;
+
+#[cfg(all(feature="test-hooks",debug_assertions))]
+pub use manager::{MessageMutation,MessagePause,MessagePoint};

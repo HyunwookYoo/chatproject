@@ -1,5 +1,5 @@
 use super::types::*;
-use super::wire::TextFrame;
+use super::wire::{Frame, ReceiptFrame, ReceiptKind, TextFrame};
 use crate::{
     CoreError, ErrorCode,
     account::{InstallationId, PeerId, storage::schema::LocalAccount},
@@ -7,6 +7,7 @@ use crate::{
 };
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 type R<T> = Result<T, CoreError>;
 #[derive(Clone, Copy)]
 pub(crate) struct Identity {
@@ -19,6 +20,13 @@ pub(crate) struct MessageRepo {
     identity: Identity,
 }
 pub(crate) enum MessageDbOp {
+    ResetUnlaunched(MessageKey),
+    Receive(TextFrame, [u8; 32], u64),
+    Prepare(MessageKey, InstallationId, bool, u64),
+    Target(MessageKey, bool),
+    ApplyReceipt(ReceiptFrame, PeerId, u64),
+    Applied(ReceiptFrame, PeerId),
+    AttemptOutcome(MessageKey, Option<BlockReason>, Option<ErrorCode>, bool),
     Open(PeerId, PeerId),
     Enqueue(PeerId, MessageId, String, u64),
     Messages(ConversationId, Option<MessageCursor>, u32),
@@ -189,7 +197,75 @@ pub(crate) fn execute(
         crate::storage::worker::CommitFault,
     >,
 ) -> R<MessageDbReply> {
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    if fault == Some(crate::storage::worker::CommitFault::WriteDenied)
+        && op.key(identity)?.is_some()
+    {
+        c.pragma_update(None, "query_only", true)
+            .map_err(sql_error)?;
+    }
     match op {
+        MessageDbOp::ResetUnlaunched(k) => {
+            if k.sender != identity.peer || k.installation != identity.installation {
+                return Err(invalid());
+            }
+            let tx = c.transaction().map_err(sql_error)?;
+            tx.execute("UPDATE outbox SET dispatch_state=0 WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4 AND dispatch_state=1 AND EXISTS(SELECT 1 FROM message m WHERE m.conversation=?1 AND m.sender_peer=?2 AND m.sender_install=?3 AND m.msg_id=?4 AND m.cancel_requested=0 AND m.delivered_at_ms IS NULL)",params![k.conversation.0.as_slice(),k.sender.0.as_slice(),k.installation.0.as_slice(),k.id.0.as_slice()]).map_err(sql_error)?;
+            commit(
+                tx,
+                #[cfg(all(feature = "test-hooks", debug_assertions))]
+                fault,
+            )?;
+            Ok(MessageDbReply::Done)
+        }
+        MessageDbOp::Receive(text, hash, now) => receive(
+            c,
+            identity,
+            text,
+            hash,
+            now,
+            #[cfg(all(feature = "test-hooks", debug_assertions))]
+            fault,
+        ),
+        MessageDbOp::Target(key, receipt) => {
+            target(c, identity, key, receipt).map(MessageDbReply::Peer)
+        }
+        MessageDbOp::Prepare(key, receiver, receipt, now) => prepare(
+            c,
+            identity,
+            key,
+            receiver,
+            receipt,
+            now,
+            #[cfg(all(feature = "test-hooks", debug_assertions))]
+            fault,
+        ),
+        MessageDbOp::ApplyReceipt(r, peer, now) => apply_receipt(
+            c,
+            identity,
+            r,
+            peer,
+            now,
+            #[cfg(all(feature = "test-hooks", debug_assertions))]
+            fault,
+        ),
+        MessageDbOp::Applied(r, peer) => applied(
+            c,
+            identity,
+            r,
+            peer,
+            #[cfg(all(feature = "test-hooks", debug_assertions))]
+            fault,
+        ),
+        MessageDbOp::AttemptOutcome(key, block, failure, written) => attempt_outcome(
+            c,
+            key,
+            block,
+            failure,
+            written,
+            #[cfg(all(feature = "test-hooks", debug_assertions))]
+            fault,
+        ),
         MessageDbOp::Open(local, peer) => {
             if local != identity.peer {
                 return Err(CoreError::new(
@@ -416,9 +492,21 @@ fn insert_outgoing(tx: &Transaction<'_>, frame: &TextFrame, hash: &[u8; 32], wir
     Ok(())
 }
 /// Query the actual outcome after reopening before any further message work.
-pub(crate) fn reconcile(c: &Connection, key: MessageKey) -> R<()> {
+pub(crate) fn reconcile(c: &mut Connection, pending: PendingMessage) -> R<()> {
+    let key = pending.key;
     if let Some(m) = find(c, key)? {
         let (prev,hash,wire):(Vec<u8>,Vec<u8>,Option<Vec<u8>>)=c.query_row("SELECT m.prev_hash,m.payload_hash,o.wire FROM message m LEFT JOIN outbox o USING(conversation,sender_peer,sender_install,msg_id) WHERE m.conversation=?1 AND m.sender_peer=?2 AND m.sender_install=?3 AND m.msg_id=?4",params![key.conversation.0.as_slice(),key.sender.0.as_slice(),key.installation.0.as_slice(),key.id.0.as_slice()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(sql_error)?;
+        let raw:Vec<u8>=c.query_row("SELECT attempted_receivers FROM message WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",params![key.conversation.0.as_slice(),key.sender.0.as_slice(),key.installation.0.as_slice(),key.id.0.as_slice()],|r|r.get(0)).map_err(sql_error)?;
+        receivers(&raw)?;
+        if !m.outgoing {
+            let processed:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM processed_ct WHERE codec=1 AND sender_peer=?1 AND sender_install=?2 AND hash=?3)",params![key.sender.0.as_slice(),key.installation.0.as_slice(),hash.as_slice()],|r|r.get(0)).map_err(sql_error)?;
+            if !processed || wire.is_some() {
+                return Err(CoreError::new(
+                    ErrorCode::StorageCorrupt,
+                    "message_outcome_invalid",
+                ));
+            }
+        }
         let frame = TextFrame {
             key,
             lamport: m.lamport,
@@ -429,7 +517,8 @@ pub(crate) fn reconcile(c: &Connection, key: MessageKey) -> R<()> {
         let (canonical, digest) = frame.encode();
         if digest.as_slice() != hash
             || wire.as_ref().is_some_and(|w| *w != *canonical)
-            || (wire.is_none()
+            || (m.outgoing
+                && wire.is_none()
                 && matches!(
                     m.state,
                     DeliveryState::Queued | DeliveryState::SentDirect | DeliveryState::Blocked
@@ -441,6 +530,9 @@ pub(crate) fn reconcile(c: &Connection, key: MessageKey) -> R<()> {
             ));
         }
     }
+    if pending.prebyte_attempt {
+        c.execute("UPDATE outbox SET dispatch_state=0 WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4 AND dispatch_state=1 AND EXISTS(SELECT 1 FROM message m WHERE m.conversation=?1 AND m.sender_peer=?2 AND m.sender_install=?3 AND m.msg_id=?4 AND m.cancel_requested=0 AND m.delivered_at_ms IS NULL)",params![key.conversation.0.as_slice(),key.sender.0.as_slice(),key.installation.0.as_slice(),key.id.0.as_slice()]).map_err(sql_error)?;
+    }
     Ok(())
 }
 
@@ -451,9 +543,15 @@ pub struct MessageFacts {
     pub quota_bytes: u64,
     pub wire: Vec<u8>,
     pub hash: [u8; 32],
+    pub prev_hash: [u8; 32],
+    pub attempted_receivers: Vec<InstallationId>,
+    pub receipt_jobs: u64,
+    pub processed: u64,
+    pub dispatch_state: Option<u64>,
 }
 #[cfg(all(feature = "test-hooks", debug_assertions))]
 pub(crate) enum FixtureOp {
+    Counts(tokio::sync::oneshot::Sender<R<(u64, u64, u64, u64)>>),
     Facts(MessageKey, tokio::sync::oneshot::Sender<R<MessageFacts>>),
     Fill(
         MessageKey,
@@ -467,11 +565,23 @@ pub(crate) enum FixtureOp {
 #[cfg(all(feature = "test-hooks", debug_assertions))]
 pub(crate) fn fixture(c: &mut Connection, op: FixtureOp) {
     match op {
+        FixtureOp::Counts(reply) => {
+            let result=c.query_row("SELECT (SELECT count(*) FROM message),(SELECT count(*) FROM processed_ct),(SELECT count(*) FROM receipt_job),message_revision FROM storage_meta WHERE singleton=1",[],|r|Ok((uint(r,0)?,uint(r,1)?,uint(r,2)?,uint(r,3)?))).map_err(sql_error);
+            let _ = reply.send(result);
+        }
         FixtureOp::Facts(key, tx) => {
             let result = (|| {
                 let (messages,jobs,quota_bytes):(u64,u64,u64)=c.query_row("SELECT (SELECT count(*) FROM message),count(*),coalesce(sum(length(wire)),0) FROM outbox",[],|r|Ok((uint(r,0)?,uint(r,1)?,uint(r,2)?))).map_err(sql_error)?;
                 let (hash,wire):([u8;32],Vec<u8>)=c.query_row("SELECT payload_hash,coalesce(o.wire,X'') FROM message m LEFT JOIN outbox o USING(conversation,sender_peer,sender_install,msg_id) WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",params![key.conversation.0.as_slice(),key.sender.0.as_slice(),key.installation.0.as_slice(),key.id.0.as_slice()],|r|Ok((bytes(r,0)?,r.get(1)?))).map_err(sql_error)?;
+                let (prev_hash,attempted):( [u8;32],Vec<u8>)=c.query_row("SELECT prev_hash,attempted_receivers FROM message WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",params![key.conversation.0.as_slice(),key.sender.0.as_slice(),key.installation.0.as_slice(),key.id.0.as_slice()],|r|Ok((bytes(r,0)?,r.get(1)?))).map_err(sql_error)?;
+                let (receipt_jobs,processed):(u64,u64)=c.query_row("SELECT (SELECT count(*) FROM receipt_job),(SELECT count(*) FROM processed_ct)",[],|r|Ok((uint(r,0)?,uint(r,1)?))).map_err(sql_error)?;
+                let dispatch_state=c.query_row("SELECT dispatch_state FROM outbox WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",params![key.conversation.0.as_slice(),key.sender.0.as_slice(),key.installation.0.as_slice(),key.id.0.as_slice()],|r|uint(r,0)).optional().map_err(sql_error)?;
                 Ok(MessageFacts {
+                    prev_hash,
+                    attempted_receivers: receivers(&attempted)?,
+                    receipt_jobs,
+                    processed,
+                    dispatch_state,
                     messages,
                     jobs,
                     quota_bytes,
@@ -582,6 +692,10 @@ fn fill(c: &mut Connection, key: MessageKey, count: u64, target: Option<u64>) ->
     tx.commit().map_err(sql_error)
 }
 pub(crate) enum MessageDbReply {
+    Receipt(ReceiptFrame),
+    Prepared(Zeroizing<Vec<u8>>, Option<ReceiptFrame>),
+    Peer(PeerId),
+    Done,
     Conversation(ConversationView),
     Message(MessageView),
     Messages(MessagePage),
@@ -654,5 +768,428 @@ impl MessageRepo {
             MessageDbReply::Conversations(v) => Ok(v),
             _ => unreachable!(),
         }
+    }
+}
+
+impl MessageDbOp {
+    pub(crate) fn key(&self, identity: Identity) -> R<Option<MessageKey>> {
+        Ok(match self {
+            Self::Enqueue(peer, id, _, _) => Some(MessageKey {
+                conversation: conversation_id(identity.peer, *peer)?,
+                sender: identity.peer,
+                installation: identity.installation,
+                id: *id,
+            }),
+            Self::Receive(t, _, _) => Some(t.key),
+            Self::ResetUnlaunched(k)
+            | Self::Prepare(k, _, _, _)
+            | Self::AttemptOutcome(k, _, _, _) => Some(*k),
+            Self::ApplyReceipt(r, _, _) | Self::Applied(r, _) => Some(r.key),
+            _ => None,
+        })
+    }
+}
+impl MessageRepo {
+    pub(crate) async fn operation(&self, op: MessageDbOp) -> R<MessageDbReply> {
+        self.storage.message(self.identity, op).await
+    }
+}
+fn conflict() -> CoreError {
+    CoreError::new(ErrorCode::MessageConflict, "message_conflict")
+}
+fn missing() -> CoreError {
+    CoreError::new(ErrorCode::MessageNotFound, "message_not_found")
+}
+fn receipt_for(
+    c: &Connection,
+    key: MessageKey,
+    recipient: InstallationId,
+    kind: ReceiptKind,
+) -> R<ReceiptFrame> {
+    let hash=c.query_row("SELECT payload_hash FROM message WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",params![key.conversation.0.as_slice(),key.sender.0.as_slice(),key.installation.0.as_slice(),key.id.0.as_slice()],|r|bytes(r,0)).optional().map_err(sql_error)?.ok_or_else(missing)?;
+    Ok(ReceiptFrame {
+        kind,
+        key,
+        text_hash: hash,
+        recipient,
+    })
+}
+fn commit(
+    tx: Transaction<'_>,
+    #[cfg(all(feature = "test-hooks", debug_assertions))] fault: Option<
+        crate::storage::worker::CommitFault,
+    >,
+) -> R<()> {
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    if fault == Some(crate::storage::worker::CommitFault::BeforeCommit) {
+        return Err(CoreError::new(
+            ErrorCode::StorageUncertain,
+            "message_storage_uncertain",
+        ));
+    }
+    tx.commit().map_err(sql_error)?;
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    if fault == Some(crate::storage::worker::CommitFault::AfterCommit) {
+        return Err(CoreError::new(
+            ErrorCode::StorageUncertain,
+            "message_storage_uncertain",
+        ));
+    }
+    Ok(())
+}
+fn receive(
+    c: &mut Connection,
+    identity: Identity,
+    text: TextFrame,
+    hash: [u8; 32],
+    now: u64,
+    #[cfg(all(feature = "test-hooks", debug_assertions))] fault: Option<
+        crate::storage::worker::CommitFault,
+    >,
+) -> R<MessageDbReply> {
+    let k = text.key;
+    if conversation_id(identity.peer, k.sender)? != k.conversation {
+        return Err(invalid());
+    }
+    let now = integer(now)?;
+    let tx = c.transaction().map_err(sql_error)?;
+    if let Some(existing) = find(&tx, k)? {
+        let receipt = receipt_for(&tx, k, identity.installation, ReceiptKind::Delivered)?;
+        if existing.outgoing || receipt.text_hash != hash {
+            return Err(conflict());
+        }
+        return Ok(MessageDbReply::Receipt(receipt));
+    }
+    let maximum: Option<u64> = tx
+        .query_row(
+            "SELECT lamport_max FROM conversation WHERE id=?1",
+            params![k.conversation.0.as_slice()],
+            |r| uint(r, 0),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    if text.lamport
+        > maximum
+            .unwrap_or(0)
+            .saturating_add(1_000_000)
+            .min(i64::MAX as u64)
+    {
+        return Err(invalid());
+    }
+    let collision:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM message WHERE conversation=?1 AND lamport=?2 AND sender_install=?3 AND msg_id=?4)",params![k.conversation.0.as_slice(),integer(text.lamport)?,k.installation.0.as_slice(),k.id.0.as_slice()],|r|r.get(0)).map_err(sql_error)?;
+    if collision {
+        return Err(conflict());
+    }
+    ensure_conversation(&tx, k.conversation, k.sender)?;
+    tx.execute(
+        "INSERT INTO message VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,0,0,?9,NULL,0,0,NULL,NULL,X'')",
+        params![
+            k.conversation.0.as_slice(),
+            k.sender.0.as_slice(),
+            k.installation.0.as_slice(),
+            k.id.0.as_slice(),
+            integer(text.lamport)?,
+            text.prev_hash.as_slice(),
+            hash.as_slice(),
+            integer(text.sent_at_ms)?,
+            now,
+            text.body
+        ],
+    )
+    .map_err(sql_error)?;
+    tx.execute(
+        "INSERT INTO processed_ct VALUES(1,?1,?2,?3,?4)",
+        params![
+            k.sender.0.as_slice(),
+            k.installation.0.as_slice(),
+            hash.as_slice(),
+            now
+        ],
+    )
+    .map_err(sql_error)?;
+    tx.execute(
+        "INSERT INTO receipt_job VALUES(?1,?2,?3,?4,?5,1,?6,0)",
+        params![
+            k.conversation.0.as_slice(),
+            k.sender.0.as_slice(),
+            k.installation.0.as_slice(),
+            k.id.0.as_slice(),
+            identity.installation.0.as_slice(),
+            now
+        ],
+    )
+    .map_err(sql_error)?;
+    let rev = bump(&tx)?;
+    tx.execute("UPDATE conversation SET lamport_max=max(lamport_max,?2),unread=unread+1,change_revision=?3 WHERE id=?1",params![k.conversation.0.as_slice(),integer(text.lamport)?,integer(rev)?]).map_err(sql_error)?;
+    let receipt = receipt_for(&tx, k, identity.installation, ReceiptKind::Delivered)?;
+    commit(
+        tx,
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        fault,
+    )?;
+    Ok(MessageDbReply::Receipt(receipt))
+}
+fn target(c: &Connection, identity: Identity, key: MessageKey, receipt: bool) -> R<PeerId> {
+    let m = find(c, key)?.ok_or_else(missing)?;
+    if receipt {
+        if m.outgoing || key.sender == identity.peer {
+            return Err(invalid());
+        }
+        Ok(key.sender)
+    } else {
+        if !m.outgoing || key.sender != identity.peer || key.installation != identity.installation {
+            return Err(invalid());
+        }
+        Ok(conversation(c, key.conversation)?.peer)
+    }
+}
+pub(crate) fn receivers(raw: &[u8]) -> R<Vec<InstallationId>> {
+    if raw.len() > 160 || raw.len() % 32 != 0 {
+        return Err(invalid());
+    }
+    let ids: Vec<_> = raw
+        .chunks_exact(32)
+        .map(|b| InstallationId(b.try_into().unwrap()))
+        .collect();
+    if ids.windows(2).any(|w| w[0] >= w[1]) {
+        return Err(invalid());
+    }
+    Ok(ids)
+}
+fn prepare(
+    c: &mut Connection,
+    identity: Identity,
+    k: MessageKey,
+    receiver: InstallationId,
+    receipt: bool,
+    now: u64,
+    #[cfg(all(feature = "test-hooks", debug_assertions))] fault: Option<
+        crate::storage::worker::CommitFault,
+    >,
+) -> R<MessageDbReply> {
+    target(c, identity, k, receipt)?;
+    let tx = c.transaction().map_err(sql_error)?;
+    let prepared = if receipt {
+        if receiver != k.installation {
+            return Err(invalid());
+        }
+        let kind:u64=tx.query_row("SELECT kind FROM receipt_job WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4 AND recipient_install=?5 ORDER BY kind DESC LIMIT 1",params![k.conversation.0.as_slice(),k.sender.0.as_slice(),k.installation.0.as_slice(),k.id.0.as_slice(),identity.installation.0.as_slice()],|r|uint(r,0)).optional().map_err(sql_error)?.ok_or_else(missing)?;
+        let r = receipt_for(
+            &tx,
+            k,
+            identity.installation,
+            if kind == 2 {
+                ReceiptKind::Read
+            } else {
+                ReceiptKind::Delivered
+            },
+        )?;
+        tx.execute("UPDATE receipt_job SET attempts=min(attempts+1,4294967295) WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4 AND recipient_install=?5 AND kind=?6",params![k.conversation.0.as_slice(),k.sender.0.as_slice(),k.installation.0.as_slice(),k.id.0.as_slice(),identity.installation.0.as_slice(),integer(kind)?]).map_err(sql_error)?;
+        MessageDbReply::Prepared(Frame::Receipt(r.clone()).envelope(), Some(r))
+    } else {
+        let (raw,wire,state):(Vec<u8>,Vec<u8>,u64)=tx.query_row("SELECT attempted_receivers,wire,dispatch_state FROM message JOIN outbox USING(conversation,sender_peer,sender_install,msg_id) WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4 AND cancel_requested=0",params![k.conversation.0.as_slice(),k.sender.0.as_slice(),k.installation.0.as_slice(),k.id.0.as_slice()],|r|Ok((r.get(0)?,r.get(1)?,uint(r,2)?))).optional().map_err(sql_error)?.ok_or_else(missing)?;
+        if state == 1 {
+            return Err(CoreError::new(ErrorCode::Busy, "message_in_flight"));
+        }
+        let mut allowed = receivers(&raw)?;
+        if !allowed.contains(&receiver) {
+            if allowed.len() == 5 {
+                return Err(CoreError::new(
+                    ErrorCode::AccountRestricted,
+                    "receiver_limit",
+                ));
+            }
+            allowed.push(receiver);
+            allowed.sort();
+        }
+        let packed: Vec<_> = allowed.iter().flat_map(|i| i.0).collect();
+        tx.execute("UPDATE message SET attempted_receivers=?5 WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",params![k.conversation.0.as_slice(),k.sender.0.as_slice(),k.installation.0.as_slice(),k.id.0.as_slice(),packed]).map_err(sql_error)?;
+        tx.execute("UPDATE outbox SET dispatch_state=1,attempts=min(attempts+1,4294967295),next_retry_at_ms=?5 WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",params![k.conversation.0.as_slice(),k.sender.0.as_slice(),k.installation.0.as_slice(),k.id.0.as_slice(),integer(now)?]).map_err(sql_error)?;
+        MessageDbReply::Prepared(Zeroizing::new(wire), None)
+    };
+    commit(
+        tx,
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        fault,
+    )?;
+    Ok(prepared)
+}
+fn apply_receipt(
+    c: &mut Connection,
+    identity: Identity,
+    r: ReceiptFrame,
+    peer: PeerId,
+    now: u64,
+    #[cfg(all(feature = "test-hooks", debug_assertions))] fault: Option<
+        crate::storage::worker::CommitFault,
+    >,
+) -> R<MessageDbReply> {
+    let k = r.key;
+    let tx = c.transaction().map_err(sql_error)?;
+    let m = find(&tx, k)?.ok_or_else(missing)?;
+    let expected = receipt_for(&tx, k, r.recipient, r.kind)?;
+    if !m.outgoing
+        || k.sender != identity.peer
+        || k.installation != identity.installation
+        || conversation_id(identity.peer, peer)? != k.conversation
+        || expected.text_hash != r.text_hash
+    {
+        return Err(invalid());
+    }
+    let raw:Vec<u8>=tx.query_row("SELECT attempted_receivers FROM message WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",params![k.conversation.0.as_slice(),k.sender.0.as_slice(),k.installation.0.as_slice(),k.id.0.as_slice()],|r|r.get(0)).map_err(sql_error)?;
+    if !receivers(&raw)?.contains(&r.recipient) {
+        return Err(invalid());
+    }
+    let changed=tx.execute("UPDATE message SET delivered_at_ms=coalesce(delivered_at_ms,?5),read_at_ms=CASE WHEN ?6=2 THEN coalesce(read_at_ms,?5) ELSE read_at_ms END WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4 AND (delivered_at_ms IS NULL OR (?6=2 AND read_at_ms IS NULL))",params![k.conversation.0.as_slice(),k.sender.0.as_slice(),k.installation.0.as_slice(),k.id.0.as_slice(),integer(now)?,r.kind.number()]).map_err(sql_error)?;
+    tx.execute("DELETE FROM outbox WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",params![k.conversation.0.as_slice(),k.sender.0.as_slice(),k.installation.0.as_slice(),k.id.0.as_slice()]).map_err(sql_error)?;
+    if changed > 0 {
+        let rev = bump(&tx)?;
+        tx.execute(
+            "UPDATE conversation SET change_revision=?2 WHERE id=?1",
+            params![k.conversation.0.as_slice(), integer(rev)?],
+        )
+        .map_err(sql_error)?;
+    }
+    commit(
+        tx,
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        fault,
+    )?;
+    Ok(MessageDbReply::Receipt(r))
+}
+fn applied(
+    c: &mut Connection,
+    identity: Identity,
+    r: ReceiptFrame,
+    peer: PeerId,
+    #[cfg(all(feature = "test-hooks", debug_assertions))] fault: Option<
+        crate::storage::worker::CommitFault,
+    >,
+) -> R<MessageDbReply> {
+    let k = r.key;
+    let tx = c.transaction().map_err(sql_error)?;
+    let m = find(&tx, k)?.ok_or_else(missing)?;
+    let expected = receipt_for(&tx, k, identity.installation, r.kind)?;
+    if m.outgoing || k.sender != peer || expected != r {
+        return Err(invalid());
+    }
+    tx.execute("DELETE FROM receipt_job WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4 AND recipient_install=?5 AND kind<=?6",params![k.conversation.0.as_slice(),k.sender.0.as_slice(),k.installation.0.as_slice(),k.id.0.as_slice(),r.recipient.0.as_slice(),r.kind.number()]).map_err(sql_error)?;
+    commit(
+        tx,
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        fault,
+    )?;
+    Ok(MessageDbReply::Done)
+}
+fn attempt_outcome(
+    c: &mut Connection,
+    k: MessageKey,
+    block: Option<BlockReason>,
+    failure: Option<ErrorCode>,
+    written: bool,
+    #[cfg(all(feature = "test-hooks", debug_assertions))] fault: Option<
+        crate::storage::worker::CommitFault,
+    >,
+) -> R<MessageDbReply> {
+    let tx = c.transaction().map_err(sql_error)?;
+    let exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM outbox WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4)",params![k.conversation.0.as_slice(),k.sender.0.as_slice(),k.installation.0.as_slice(),k.id.0.as_slice()],|r|r.get(0)).map_err(sql_error)?;
+    if exists {
+        let reason = block.map(|b| match b {
+            BlockReason::Account => 1,
+            BlockReason::ContactRequired => 2,
+            BlockReason::Storage => 3,
+        });
+        let code = failure.map(|c| match c {
+            ErrorCode::UnsupportedMessageVersion => "UnsupportedMessageVersion",
+            _ => "InvalidMessage",
+        });
+        tx.execute("UPDATE message SET outcome=CASE WHEN ?5 IS NOT NULL THEN 2 WHEN ?6 IS NOT NULL THEN 3 WHEN ?7 THEN 1 ELSE outcome END,block_reason=?5,failure_code=?6 WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",params![k.conversation.0.as_slice(),k.sender.0.as_slice(),k.installation.0.as_slice(),k.id.0.as_slice(),reason,code,written]).map_err(sql_error)?;
+        if failure.is_some() {
+            tx.execute("DELETE FROM outbox WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",params![k.conversation.0.as_slice(),k.sender.0.as_slice(),k.installation.0.as_slice(),k.id.0.as_slice()]).map_err(sql_error)?;
+        } else {
+            tx.execute("UPDATE outbox SET dispatch_state=?5 WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",params![k.conversation.0.as_slice(),k.sender.0.as_slice(),k.installation.0.as_slice(),k.id.0.as_slice(),if block.is_some() {2} else {0}]).map_err(sql_error)?;
+        }
+        let rev = bump(&tx)?;
+        tx.execute(
+            "UPDATE conversation SET change_revision=?2 WHERE id=?1",
+            params![k.conversation.0.as_slice(), integer(rev)?],
+        )
+        .map_err(sql_error)?;
+    }
+    commit(
+        tx,
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        fault,
+    )?;
+    Ok(MessageDbReply::Done)
+}
+
+/// The worker checks the actual SQL account membership before recording a receiver.
+/// A caller's installation ID is never itself a membership grant.
+pub(crate) fn authorize(c: &Connection, local: &LocalAccount, op: &MessageDbOp) -> R<()> {
+    if let MessageDbOp::Prepare(key, receiver, receipt, now) = op {
+        let identity = Identity {
+            peer: local.keys.peer_id(),
+            installation: local.device.installation_id(),
+        };
+        let peer = target(c, identity, *key, *receipt)?;
+        let accepted = local
+            .remote
+            .iter()
+            .find(|r| r.peer == peer)
+            .filter(|r| {
+                r.conflict.is_none() && r.accepted.seq >= r.floor && r.accepted.current(now / 1000)
+            })
+            .ok_or_else(|| {
+                CoreError::new(ErrorCode::AccountRestricted, "receiver_not_authorized")
+            })?;
+        if !local.contacts.iter().any(|c| c.peer == peer)
+            || !accepted
+                .accepted
+                .record
+                .devices
+                .iter()
+                .any(|d| d.installation_id == *receiver)
+        {
+            return Err(CoreError::new(
+                ErrorCode::AccountRestricted,
+                "receiver_not_authorized",
+            ));
+        }
+    }
+    Ok(())
+}
+#[cfg(test)]
+mod receiver_tests {
+    use super::*;
+    #[test]
+    fn packed_receivers_require_sorted_distinct_bounded_fixed_width_ids() {
+        assert!(receivers(&[]).unwrap().is_empty());
+        assert_eq!(receivers(&[1; 32]).unwrap(), vec![InstallationId([1; 32])]);
+        let valid: Vec<u8> = (1..=5).flat_map(|n| [n; 32]).collect();
+        assert_eq!(receivers(&valid).unwrap().len(), 5);
+        for invalid in [
+            vec![1; 31],
+            vec![1; 64],
+            vec![1; 161],
+            (1..=6).flat_map(|n| [n; 32]).collect(),
+            [vec![2; 32], vec![1; 32]].concat(),
+        ] {
+            assert!(receivers(&invalid).is_err());
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct PendingMessage {
+    pub key: MessageKey,
+    pub prebyte_attempt: bool,
+}
+impl MessageDbOp {
+    pub(crate) fn pending(&self, identity: Identity) -> R<Option<PendingMessage>> {
+        Ok(self.key(identity)?.map(|key| PendingMessage {
+            key,
+            prebyte_attempt: matches!(self, Self::Prepare(_, _, false, _)),
+        }))
     }
 }

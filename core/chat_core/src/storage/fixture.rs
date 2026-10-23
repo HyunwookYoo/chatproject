@@ -101,6 +101,19 @@ impl Drop for Pause {
     }
 }
 impl Fixture {
+    pub async fn pause_message_reply(&self)->Pause {
+        let (entered,rx)=oneshot::channel();let (release,wait)=std::sync::mpsc::channel();let (tx,done)=oneshot::channel();
+        self.handle.0.test(TestOp::MessageReplyPause(entered,wait,tx)).await;done.await.unwrap();
+        Pause {entered:tokio::sync::Mutex::new(Some(rx)),release:Some(release)}
+    }
+
+    pub async fn message_counts(&self)->Result<(u64,u64,u64,u64),CoreError> {
+        let (tx,rx)=oneshot::channel();self.handle.0.test(TestOp::Message(FixtureOp::Counts(tx))).await;rx.await.unwrap()
+    }
+    pub async fn message_clock_after_operation(&self,clock:Arc<crate::account::clock::FakeClock>,seconds:u64) {
+        let (tx,rx)=oneshot::channel();self.handle.0.test(TestOp::MessageClock(clock,seconds,tx)).await;rx.await.unwrap()
+    }
+
     pub async fn message_fault(&self, fault: CommitFault) {
         let (tx, rx) = oneshot::channel();
         self.handle.0.test(TestOp::MessageFault(fault, tx)).await;
@@ -253,3 +266,7 @@ impl Fixture {
         rx.await.unwrap().unwrap()
     }
 }
+
+// Codec fixtures expose the real decoder only in debug test-hook builds.
+pub use crate::message::wire::{decode as decode_message, Frame as MessageFrame};
+pub use crate::account::MessageMutation;

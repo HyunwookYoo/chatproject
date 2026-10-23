@@ -62,6 +62,12 @@ pub struct CandidateInfo {
     pub endpoint_id: String,
 }
 enum Command {
+    #[cfg(all(feature="test-hooks",debug_assertions))]
+    MessageWriteStarts(oneshot::Sender<Result<(usize,usize),CoreError>>),
+    #[cfg(all(feature="test-hooks",debug_assertions))]
+    MessagePause(messages::MessagePoint,oneshot::Sender<Result<messages::MessagePause,CoreError>>),
+    #[cfg(all(feature="test-hooks",debug_assertions))]
+    MessageAttempt(crate::message::types::MessageKey,bool,MessageMutation,oneshot::Sender<Result<(),CoreError>>),
     Retry(oneshot::Sender<Result<u64, CoreError>>),
     #[cfg(all(feature="test-hooks",debug_assertions))]
     PairTestStop(super::PairTestStop,oneshot::Sender<Result<(),CoreError>>),
@@ -115,6 +121,12 @@ struct Queued {
 impl Command {
     fn reject(self, error: CoreError) {
         match self {
+            #[cfg(all(feature="test-hooks",debug_assertions))]
+            Self::MessageWriteStarts(reply)=>{let _=reply.send(Err(error));}
+            #[cfg(all(feature="test-hooks",debug_assertions))]
+            Self::MessagePause(_,reply)=>{let _=reply.send(Err(error));}
+            #[cfg(all(feature="test-hooks",debug_assertions))]
+            Self::MessageAttempt(_,_,_,reply)=>{let _=reply.send(Err(error));}
             Self::Retry(reply) => { let _ = reply.send(Err(error)); }
             #[cfg(all(feature="test-hooks",debug_assertions))]
             Self::PairTestStop(_,reply)=>{let _=reply.send(Err(error));}
@@ -229,7 +241,7 @@ impl AccountHandle {
             requests,
             status: AtomicU64::new(ticket << 2),
         });
-        let (commands, input) = mpsc::channel(8);
+        let (commands, input) = mpsc::channel(32);
         let auth = super::connection::Runtime::default();
         let pair=super::pair::session::Runtime::default();
         shared.network.register_pair(pair.send.clone())?;
@@ -242,6 +254,7 @@ impl AccountHandle {
         }
         runtime.spawn(
             Manager {
+                messages: Default::default(),
                 pair,
                 auth,
                 bus,
@@ -400,6 +413,7 @@ impl AccountHandle {
     }
 }
 struct Manager {
+    messages: messages::Runtime,
     pair:super::pair::session::Runtime,
     auth: super::connection::Runtime,
     bus: crate::EventBus,
@@ -1142,6 +1156,12 @@ impl Manager {
                         continue;
                     }
                     match queued.command {
+                        #[cfg(all(feature="test-hooks",debug_assertions))]
+                        Command::MessageWriteStarts(reply)=>{let _=reply.send(Ok(self.message_write_starts()));}
+                        #[cfg(all(feature="test-hooks",debug_assertions))]
+                        Command::MessagePause(response,reply)=>{let _=reply.send(Ok(self.message_pause(response)));}
+                        #[cfg(all(feature="test-hooks",debug_assertions))]
+                        Command::MessageAttempt(key,receipt,mutation,reply)=>{self.message_attempt(key,receipt,mutation,reply).await;}
                         Command::Retry(reply) => { let result = self.retry_open(); let _ = reply.send(result); }
                         #[cfg(all(feature="test-hooks",debug_assertions))]
                         Command::PairTestStop(stop,reply)=>{self.pair.stop=Some(stop);self.pair.reached=None;let _=reply.send(Ok(()));}
@@ -1266,6 +1286,7 @@ impl Manager {
                 return Err(error);
             }
         }
+        self.reset_unlaunched(request).await?;
         let result = self.restore(request).await;
         if result.is_err() && self.current(request) {
             self.store.suspend().await?;
@@ -1864,6 +1885,7 @@ mod tests {
         });
         bus.subscribe(sink.clone());
         let mut manager = Manager {
+            messages: Default::default(),
             pair: super::super::pair::session::Runtime::default(),
             auth: super::super::connection::Runtime::default(),
             bus,
@@ -1993,6 +2015,7 @@ mod tests {
             sent: std::sync::Mutex::new(vec![]),
         });
         let mut manager = Manager {
+            messages: Default::default(),
             pair: super::super::pair::session::Runtime::default(),
             auth: super::super::connection::Runtime::default(),
             bus: EventBus::new(),
@@ -2080,6 +2103,7 @@ mod tests {
         let (store, _) = tokio::task::spawn_blocking(move || StorageHandle::open_blocking(root, Arc::new(Protector))).await.unwrap().unwrap();
         store.invalidate(ticket);
             let mut manager = Manager {
+            messages: Default::default(),
                 pair: Default::default(),
                 auth: Default::default(),
                 bus: EventBus::new(),
@@ -2229,6 +2253,7 @@ mod tests {
             status: AtomicU64::new(ticket << 2),
         });
         let mut manager = Manager {
+            messages: Default::default(),
             pair: super::super::pair::session::Runtime::default(),
             auth: super::super::connection::Runtime::default(),
             bus: EventBus::new(),
@@ -2326,6 +2351,7 @@ mod tests {
             status: AtomicU64::new(ticket << 2),
         });
         let mut manager = Manager {
+            messages: Default::default(),
             pair: super::super::pair::session::Runtime::default(),
             auth: super::super::connection::Runtime::default(),
             bus: EventBus::new(),
@@ -2818,6 +2844,7 @@ impl Manager {
         use super::connection::Input;
         self.restrict_grants();
         match input {
+            Input::MessageAttempt(result)=>self.message_attempt_result(result).await,
             Input::Incoming(conn) => {
                 let result = async {
                     let request = self.ready()?;
@@ -2859,6 +2886,10 @@ impl Manager {
                 reply,
             } => {
                 let result = self.receive_control(&connection, &body).await;
+                let result=result.and_then(|body| {
+                    let gate=if super::auth::payload(&body,16).is_ok() {Some(self.message_response_gate(&connection)?)} else {None};
+                    Ok(super::connection::Response {body,gate})
+                });
                 let _ = reply.send(result);
             }
             Input::Closed(id) => {
@@ -3004,6 +3035,10 @@ impl Manager {
         }
         if !ready || !self.grant_authorized(&grant) {
             return Err(unavailable(ErrorCode::AccountRestricted));
+        }
+        if let Ok(inner)=super::auth::payload(body,16) {
+            if body.len()>61440 { return Ok(crate::message::wire::Frame::Reject(crate::message::wire::RejectReason::InvalidMessage).envelope().to_vec()); }
+            return self.receive_message(conn,&inner,request).await;
         }
         let mut frame = (body.len() as u32).to_be_bytes().to_vec();
         frame.extend_from_slice(body);
@@ -3626,3 +3661,7 @@ impl Manager {
         result
     }
 }
+
+pub(super) mod messages;
+#[cfg(all(feature="test-hooks",debug_assertions))]
+pub use messages::{MessageMutation,MessagePause,MessagePoint};

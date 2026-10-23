@@ -127,12 +127,17 @@ pub(crate) fn decode_cache(input: &[u8], own: PeerId) -> Result<Vec<RemoteRecord
     wire::canonical(input, &encode_cache(&cache))?;
     Ok(cache)
 }
+pub(crate) struct Response {
+    pub(crate) body:Vec<u8>,
+    pub(crate) gate:Option<super::manager::messages::ResponseGate>,
+}
 pub(crate) enum Input {
+    MessageAttempt(super::manager::messages::AttemptResult),
     Incoming(Connection),
     Control {
         connection: Connection,
         body: Vec<u8>,
-        reply: oneshot::Sender<Result<Vec<u8>, CoreError>>,
+        reply: oneshot::Sender<Result<Response, CoreError>>,
     },
     Closed(usize),
 }
@@ -313,7 +318,14 @@ pub(crate) fn reader(conn: Connection, input: mpsc::Sender<Input>, cancel: Cance
                     })
                     .map_err(|_| wire::invalid())?;
                 let response = result.await.map_err(|_| wire::invalid())??;
-                auth::write_frame(&mut send, &response).await?;
+                #[cfg(all(feature="test-hooks",debug_assertions))]
+                let mut response=response;
+                #[cfg(all(feature="test-hooks",debug_assertions))]
+                if let Some(gate)=&mut response.gate {gate.checkpoint().await;}
+                if response.gate.as_ref().is_some_and(|gate|!gate.permits()) {return Err(wire::invalid());}
+                #[cfg(all(feature="test-hooks",debug_assertions))]
+                if let Some(gate)=&response.gate {gate.write_started();}
+                auth::write_frame(&mut send, &response.body).await?;
                 send.finish().map_err(|_| wire::invalid())?;
                 Ok::<(), CoreError>(())
             };
@@ -335,7 +347,7 @@ pub(crate) struct Runtime {
 }
 impl Default for Runtime {
     fn default() -> Self {
-        let (send, input) = mpsc::channel(8);
+        let (send, input) = mpsc::channel(32);
         Self {
             cached_lookups: Default::default(),
             registry: Registry::default(),
