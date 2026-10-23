@@ -556,6 +556,62 @@ impl From<chat_core::DeliveryState> for crate::api::chat::DeliveryState {
     }
 }
 
+impl TryFrom<crate::api::chat::MessageKey> for chat_core::MessageKey {
+    type Error = CoreError;
+    fn try_from(k: crate::api::chat::MessageKey) -> Result<Self, Self::Error> {
+        use crate::api::message::id;
+        Ok(Self { conversation: chat_core::ConversationId(id(k.conversation)?), sender: chat_core::account::PeerId(id(k.sender)?), installation: chat_core::account::InstallationId(id(k.installation)?), id: chat_core::MessageId(id(k.id)?) })
+    }
+}
+impl TryFrom<crate::api::message::MessageCursor> for chat_core::MessageCursor {
+    type Error = CoreError;
+    fn try_from(v: crate::api::message::MessageCursor) -> Result<Self, Self::Error> {
+        use crate::api::message::id;
+        Ok(Self { lamport: crate::api::message::integer(v.lamport)?, installation: chat_core::account::InstallationId(id(v.installation)?), id: chat_core::MessageId(id(v.id)?) })
+    }
+}
+impl TryFrom<crate::api::message::ConversationCursor> for chat_core::ConversationCursor {
+    type Error = CoreError;
+    fn try_from(v: crate::api::message::ConversationCursor) -> Result<Self, Self::Error> {
+        Ok(Self { change_revision: crate::api::message::integer(v.change_revision)?, id: chat_core::ConversationId(crate::api::message::id(v.id)?) })
+    }
+}
+impl From<chat_core::MessageCursor> for crate::api::message::MessageCursor {
+    fn from(v: chat_core::MessageCursor) -> Self {
+        Self { lamport: v.lamport, installation: v.installation.0.to_vec(), id: v.id.0.to_vec() }
+    }
+}
+impl From<chat_core::ConversationCursor> for crate::api::message::ConversationCursor {
+    fn from(v: chat_core::ConversationCursor) -> Self {
+        Self { change_revision: v.change_revision, id: v.id.0.to_vec() }
+    }
+}
+impl From<chat_core::BlockReason> for crate::api::message::BlockReason {
+    fn from(v: chat_core::BlockReason) -> Self {
+        match v { chat_core::BlockReason::Account => Self::Account, chat_core::BlockReason::ContactRequired => Self::ContactRequired, chat_core::BlockReason::Storage => Self::Storage }
+    }
+}
+impl From<chat_core::MessageView> for crate::api::message::MessageView {
+    fn from(v: chat_core::MessageView) -> Self {
+        Self { key: v.key.into(), lamport: v.lamport, sent_at_ms: v.sent_at_ms, body: v.body, outgoing: v.outgoing, state: v.state.into(), cancel_requested: v.cancel_requested, block: v.block.map(Into::into) }
+    }
+}
+impl From<chat_core::MessagePage> for crate::api::message::MessagePage {
+    fn from(v: chat_core::MessagePage) -> Self {
+        Self { revision: v.revision, items: v.items.into_iter().map(Into::into).collect(), next: v.next.map(Into::into) }
+    }
+}
+impl From<chat_core::ConversationView> for crate::api::message::ConversationView {
+    fn from(v: chat_core::ConversationView) -> Self {
+        Self { id: v.id.0.to_vec(), peer: v.peer.0.to_vec(), last: v.last.map(Into::into), unread: v.unread, change_revision: v.change_revision }
+    }
+}
+impl From<chat_core::ConversationPage> for crate::api::message::ConversationPage {
+    fn from(v: chat_core::ConversationPage) -> Self {
+        Self { revision: v.revision, items: v.items.into_iter().map(Into::into).collect(), next: v.next.map(Into::into) }
+    }
+}
+
 #[cfg(test)]
 mod message_event_tests {
     use super::*;

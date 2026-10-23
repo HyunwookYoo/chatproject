@@ -5,6 +5,7 @@
 
 import 'api/account.dart';
 import 'api/chat.dart';
+import 'api/message.dart';
 import 'dart:async';
 import 'dart:convert';
 import 'dart:ffi' as ffi;
@@ -35,13 +36,22 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   AccountView dco_decode_account_view(dynamic raw);
 
   @protected
+  BlockReason dco_decode_block_reason(dynamic raw);
+
+  @protected
   bool dco_decode_bool(dynamic raw);
 
   @protected
   AccountView dco_decode_box_account_view(dynamic raw);
 
   @protected
+  BlockReason dco_decode_box_autoadd_block_reason(dynamic raw);
+
+  @protected
   bool dco_decode_box_autoadd_bool(dynamic raw);
+
+  @protected
+  ConversationCursor dco_decode_box_autoadd_conversation_cursor(dynamic raw);
 
   @protected
   DeviceKind dco_decode_box_autoadd_device_kind(dynamic raw);
@@ -50,7 +60,13 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   ErrorCode dco_decode_box_autoadd_error_code(dynamic raw);
 
   @protected
+  MessageCursor dco_decode_box_autoadd_message_cursor(dynamic raw);
+
+  @protected
   MessageKey dco_decode_box_autoadd_message_key(dynamic raw);
+
+  @protected
+  MessageView dco_decode_box_autoadd_message_view(dynamic raw);
 
   @protected
   NetworkInfo dco_decode_box_autoadd_network_info(dynamic raw);
@@ -75,6 +91,15 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   ContactView dco_decode_contact_view(dynamic raw);
+
+  @protected
+  ConversationCursor dco_decode_conversation_cursor(dynamic raw);
+
+  @protected
+  ConversationPage dco_decode_conversation_page(dynamic raw);
+
+  @protected
+  ConversationView dco_decode_conversation_view(dynamic raw);
 
   @protected
   CoreError dco_decode_core_error(dynamic raw);
@@ -107,10 +132,19 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   List<ContactView> dco_decode_list_contact_view(dynamic raw);
 
   @protected
+  List<ConversationView> dco_decode_list_conversation_view(dynamic raw);
+
+  @protected
   List<DeviceView> dco_decode_list_device_view(dynamic raw);
 
   @protected
   List<Uint8List> dco_decode_list_list_prim_u_8_strict(dynamic raw);
+
+  @protected
+  List<MessageKey> dco_decode_list_message_key(dynamic raw);
+
+  @protected
+  List<MessageView> dco_decode_list_message_view(dynamic raw);
 
   @protected
   List<PairResumeView> dco_decode_list_pair_resume_view(dynamic raw);
@@ -134,7 +168,16 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   List<RevocationView> dco_decode_list_revocation_view(dynamic raw);
 
   @protected
+  MessageCursor dco_decode_message_cursor(dynamic raw);
+
+  @protected
   MessageKey dco_decode_message_key(dynamic raw);
+
+  @protected
+  MessagePage dco_decode_message_page(dynamic raw);
+
+  @protected
+  MessageView dco_decode_message_view(dynamic raw);
 
   @protected
   NetworkInfo dco_decode_network_info(dynamic raw);
@@ -146,13 +189,27 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   String? dco_decode_opt_String(dynamic raw);
 
   @protected
+  BlockReason? dco_decode_opt_box_autoadd_block_reason(dynamic raw);
+
+  @protected
   bool? dco_decode_opt_box_autoadd_bool(dynamic raw);
+
+  @protected
+  ConversationCursor? dco_decode_opt_box_autoadd_conversation_cursor(
+    dynamic raw,
+  );
 
   @protected
   DeviceKind? dco_decode_opt_box_autoadd_device_kind(dynamic raw);
 
   @protected
   ErrorCode? dco_decode_opt_box_autoadd_error_code(dynamic raw);
+
+  @protected
+  MessageCursor? dco_decode_opt_box_autoadd_message_cursor(dynamic raw);
+
+  @protected
+  MessageView? dco_decode_opt_box_autoadd_message_view(dynamic raw);
 
   @protected
   PairView? dco_decode_opt_box_autoadd_pair_view(dynamic raw);
@@ -247,13 +304,24 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   AccountView sse_decode_account_view(SseDeserializer deserializer);
 
   @protected
+  BlockReason sse_decode_block_reason(SseDeserializer deserializer);
+
+  @protected
   bool sse_decode_bool(SseDeserializer deserializer);
 
   @protected
   AccountView sse_decode_box_account_view(SseDeserializer deserializer);
 
   @protected
+  BlockReason sse_decode_box_autoadd_block_reason(SseDeserializer deserializer);
+
+  @protected
   bool sse_decode_box_autoadd_bool(SseDeserializer deserializer);
+
+  @protected
+  ConversationCursor sse_decode_box_autoadd_conversation_cursor(
+    SseDeserializer deserializer,
+  );
 
   @protected
   DeviceKind sse_decode_box_autoadd_device_kind(SseDeserializer deserializer);
@@ -262,7 +330,15 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   ErrorCode sse_decode_box_autoadd_error_code(SseDeserializer deserializer);
 
   @protected
+  MessageCursor sse_decode_box_autoadd_message_cursor(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   MessageKey sse_decode_box_autoadd_message_key(SseDeserializer deserializer);
+
+  @protected
+  MessageView sse_decode_box_autoadd_message_view(SseDeserializer deserializer);
 
   @protected
   NetworkInfo sse_decode_box_autoadd_network_info(SseDeserializer deserializer);
@@ -287,6 +363,17 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   ContactView sse_decode_contact_view(SseDeserializer deserializer);
+
+  @protected
+  ConversationCursor sse_decode_conversation_cursor(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  ConversationPage sse_decode_conversation_page(SseDeserializer deserializer);
+
+  @protected
+  ConversationView sse_decode_conversation_view(SseDeserializer deserializer);
 
   @protected
   CoreError sse_decode_core_error(SseDeserializer deserializer);
@@ -319,12 +406,23 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   List<ContactView> sse_decode_list_contact_view(SseDeserializer deserializer);
 
   @protected
+  List<ConversationView> sse_decode_list_conversation_view(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   List<DeviceView> sse_decode_list_device_view(SseDeserializer deserializer);
 
   @protected
   List<Uint8List> sse_decode_list_list_prim_u_8_strict(
     SseDeserializer deserializer,
   );
+
+  @protected
+  List<MessageKey> sse_decode_list_message_key(SseDeserializer deserializer);
+
+  @protected
+  List<MessageView> sse_decode_list_message_view(SseDeserializer deserializer);
 
   @protected
   List<PairResumeView> sse_decode_list_pair_resume_view(
@@ -356,7 +454,16 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  MessageCursor sse_decode_message_cursor(SseDeserializer deserializer);
+
+  @protected
   MessageKey sse_decode_message_key(SseDeserializer deserializer);
+
+  @protected
+  MessagePage sse_decode_message_page(SseDeserializer deserializer);
+
+  @protected
+  MessageView sse_decode_message_view(SseDeserializer deserializer);
 
   @protected
   NetworkInfo sse_decode_network_info(SseDeserializer deserializer);
@@ -368,7 +475,17 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   String? sse_decode_opt_String(SseDeserializer deserializer);
 
   @protected
+  BlockReason? sse_decode_opt_box_autoadd_block_reason(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   bool? sse_decode_opt_box_autoadd_bool(SseDeserializer deserializer);
+
+  @protected
+  ConversationCursor? sse_decode_opt_box_autoadd_conversation_cursor(
+    SseDeserializer deserializer,
+  );
 
   @protected
   DeviceKind? sse_decode_opt_box_autoadd_device_kind(
@@ -377,6 +494,16 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   ErrorCode? sse_decode_opt_box_autoadd_error_code(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  MessageCursor? sse_decode_opt_box_autoadd_message_cursor(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  MessageView? sse_decode_opt_box_autoadd_message_view(
     SseDeserializer deserializer,
   );
 
@@ -479,13 +606,28 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_account_view(AccountView self, SseSerializer serializer);
 
   @protected
+  void sse_encode_block_reason(BlockReason self, SseSerializer serializer);
+
+  @protected
   void sse_encode_bool(bool self, SseSerializer serializer);
 
   @protected
   void sse_encode_box_account_view(AccountView self, SseSerializer serializer);
 
   @protected
+  void sse_encode_box_autoadd_block_reason(
+    BlockReason self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_box_autoadd_bool(bool self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_box_autoadd_conversation_cursor(
+    ConversationCursor self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_box_autoadd_device_kind(
@@ -500,8 +642,20 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_box_autoadd_message_cursor(
+    MessageCursor self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_box_autoadd_message_key(
     MessageKey self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_box_autoadd_message_view(
+    MessageView self,
     SseSerializer serializer,
   );
 
@@ -542,6 +696,24 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_contact_view(ContactView self, SseSerializer serializer);
 
   @protected
+  void sse_encode_conversation_cursor(
+    ConversationCursor self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_conversation_page(
+    ConversationPage self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_conversation_view(
+    ConversationView self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_core_error(CoreError self, SseSerializer serializer);
 
   @protected
@@ -575,6 +747,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_list_conversation_view(
+    List<ConversationView> self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_list_device_view(
     List<DeviceView> self,
     SseSerializer serializer,
@@ -583,6 +761,18 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   @protected
   void sse_encode_list_list_prim_u_8_strict(
     List<Uint8List> self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_list_message_key(
+    List<MessageKey> self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_list_message_view(
+    List<MessageView> self,
     SseSerializer serializer,
   );
 
@@ -623,7 +813,16 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_message_cursor(MessageCursor self, SseSerializer serializer);
+
+  @protected
   void sse_encode_message_key(MessageKey self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_message_page(MessagePage self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_message_view(MessageView self, SseSerializer serializer);
 
   @protected
   void sse_encode_network_info(NetworkInfo self, SseSerializer serializer);
@@ -635,7 +834,19 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_opt_String(String? self, SseSerializer serializer);
 
   @protected
+  void sse_encode_opt_box_autoadd_block_reason(
+    BlockReason? self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_opt_box_autoadd_bool(bool? self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_opt_box_autoadd_conversation_cursor(
+    ConversationCursor? self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_opt_box_autoadd_device_kind(
@@ -646,6 +857,18 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   @protected
   void sse_encode_opt_box_autoadd_error_code(
     ErrorCode? self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_opt_box_autoadd_message_cursor(
+    MessageCursor? self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_opt_box_autoadd_message_view(
+    MessageView? self,
     SseSerializer serializer,
   );
 

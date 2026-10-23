@@ -27,6 +27,19 @@ void main() {
       expect(accountErrorMessage(code), isNot(contains(code.name)));
     }
     expect(accountErrorMessage(ErrorCode.invalidInvite), '서명을 확인할 수 없는 초대예요.');
+    for (final code in [
+      ErrorCode.invalidMessage,
+      ErrorCode.messageConflict,
+      ErrorCode.messageNotFound,
+      ErrorCode.contactRequired,
+      ErrorCode.unsupportedMessageVersion,
+      ErrorCode.storageUncertain,
+    ]) {
+      expect(
+        accountErrorMessage(code),
+        isNot(accountErrorMessage(ErrorCode.busy)),
+      );
+    }
     expect(
       accountErrorMessage(ErrorCode.recordConflict),
       '다른 기기에서 목록이 바뀌었어요. 현재 목록을 확인해 주세요.',

@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:typed_data';
 
 import 'package:chat_app/network/network_model.dart';
 import 'package:chat_app/src/rust/api/chat.dart' as rust;
