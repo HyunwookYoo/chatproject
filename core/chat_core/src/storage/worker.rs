@@ -551,6 +551,20 @@ fn run(mut w: Worker, mut rx: mpsc::Receiver<Request>, fence: Arc<Mutex<Fence>>)
             }
             #[cfg(all(feature = "test-hooks", debug_assertions))]
             DbOp::Test(op) => match op {
+                #[cfg(test)]
+                TestOp::MessageCounts(reply) => {
+                    let result = w.operation(|c| {
+                        c.query_row(
+                            "SELECT (SELECT count(*) FROM conversation), \
+                             (SELECT count(*) FROM message), (SELECT count(*) FROM outbox), \
+                             message_revision FROM storage_meta WHERE singleton=1",
+                            [],
+                            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                        )
+                        .map_err(|_| corrupt())
+                    });
+                    let _ = reply.send(result);
+                }
                 TestOp::Message(op) => {
                     let _ = w.operation(|c| {
                         messages::fixture(c, op);
@@ -608,6 +622,8 @@ pub(crate) enum CommitAction {
 }
 #[cfg(all(feature = "test-hooks", debug_assertions))]
 pub(crate) enum TestOp {
+    #[cfg(test)]
+    MessageCounts(oneshot::Sender<R<(i64, i64, i64, i64)>>),
     Message(messages::FixtureOp),
     MessageFault(CommitFault, oneshot::Sender<()>),
     Pause(oneshot::Sender<()>, std::sync::mpsc::Receiver<()>),
@@ -615,6 +631,154 @@ pub(crate) enum TestOp {
     CommitAction(usize, CommitAction, oneshot::Sender<()>),
     Rows(oneshot::Sender<R<usize>>),
     Stop(oneshot::Sender<()>),
+}
+
+#[cfg(all(test, feature = "test-hooks", debug_assertions))]
+mod tests {
+    use super::*;
+    use crate::account::{PeerId, Secret32, StoreId, derive_account, derive_device};
+    use crate::message::types::MessageId;
+
+    struct Protector;
+    impl KeyProtector for Protector {
+        fn protect(&self, id: StoreId, secret: &Secret32) -> R<Vec<u8>> {
+            let mut blob = id.0.to_vec();
+            blob.extend(secret.as_bytes().iter().map(|b| b ^ 0xa7));
+            Ok(blob)
+        }
+        fn unprotect(&self, id: StoreId, blob: &[u8]) -> R<Secret32> {
+            if blob.len() != 48 || blob[..16] != id.0 {
+                return Err(CoreError::new(
+                    ErrorCode::StorageMissing,
+                    "fixture_key_missing",
+                ));
+            }
+            Ok(Secret32::from(std::array::from_fn(|i| blob[16 + i] ^ 0xa7)))
+        }
+        fn delete(&self, _: StoreId) -> R<()> {
+            Ok(())
+        }
+    }
+
+    struct OwnedStore {
+        handle: StorageHandle,
+        _root: tempfile::TempDir,
+    }
+    impl Drop for OwnedStore {
+        fn drop(&mut self) {
+            let handle = self.handle.clone();
+            // Join real worker teardown before the owned root, even on assertion unwind.
+            std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async move {
+                        let (tx, rx) = oneshot::channel();
+                        handle.test(TestOp::Stop(tx)).await;
+                        rx.await.unwrap();
+                    });
+            })
+            .join()
+            .unwrap();
+        }
+    }
+    impl OwnedStore {
+        async fn open() -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().to_owned();
+            let (handle, initial) = tokio::task::spawn_blocking(move || {
+                StorageHandle::open_blocking(path, Arc::new(Protector))
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            let owned = Self {
+                handle,
+                _root: root,
+            };
+            assert!(initial.is_none());
+            owned
+        }
+        async fn counts(&self) -> (i64, i64, i64, i64) {
+            let (tx, rx) = oneshot::channel();
+            self.handle.test(TestOp::MessageCounts(tx)).await;
+            rx.await.unwrap().unwrap()
+        }
+    }
+
+    enum SqlBinding {
+        Unconfigured,
+        WrongPeer,
+        WrongInstallation,
+    }
+    async fn check_restricted_binding(binding: SqlBinding) {
+        let store = OwnedStore::open().await;
+        let stored = crate::account::storage::migration_fixtures::migration_states()
+            .pop()
+            .unwrap()
+            .unwrap();
+        let AccountState::Active(local) = AccountState::decode(&stored).unwrap() else {
+            unreachable!()
+        };
+        let mut captured = Identity {
+            peer: local.keys.peer_id(),
+            installation: local.device.installation_id(),
+        };
+        match binding {
+            SqlBinding::Unconfigured => {}
+            SqlBinding::WrongPeer => {
+                store.handle.commit_account(stored).await.unwrap();
+                captured.peer = derive_account(&Secret32::from([91; 32])).unwrap().peer_id();
+                assert_ne!(captured.peer, local.keys.peer_id());
+            }
+            SqlBinding::WrongInstallation => {
+                store.handle.commit_account(stored).await.unwrap();
+                captured.installation = derive_device(Secret32::from([92; 32]))
+                    .unwrap()
+                    .installation_id();
+                assert_ne!(captured.installation, local.device.installation_id());
+            }
+        }
+        let before = store.counts().await;
+        let result = store
+            .handle
+            .message(
+                captured,
+                MessageDbOp::Enqueue(
+                    PeerId([2; 32]),
+                    MessageId([1; 16]),
+                    "unreturned fixture body".into(),
+                    1,
+                ),
+            )
+            .await;
+        let private_result = result.is_ok();
+        let code = result.err().map(|e| e.code);
+        let after = store.counts().await;
+        assert!(
+            !private_result,
+            "restricted worker returned a private message result"
+        );
+        assert_eq!(code, Some(ErrorCode::AccountRestricted));
+        assert_eq!(before, (0, 0, 0, 0));
+        assert_eq!(
+            after, before,
+            "restricted worker changed conversation/message/outbox/revision"
+        );
+    }
+    #[tokio::test]
+    async fn message_identity_unconfigured_sql_rejects_without_mutation() {
+        check_restricted_binding(SqlBinding::Unconfigured).await;
+    }
+    #[tokio::test]
+    async fn message_identity_wrong_peer_rejects_without_mutation() {
+        check_restricted_binding(SqlBinding::WrongPeer).await;
+    }
+    #[tokio::test]
+    async fn message_identity_wrong_installation_rejects_without_mutation() {
+        check_restricted_binding(SqlBinding::WrongInstallation).await;
+    }
 }
 #[cfg(all(feature = "test-hooks", debug_assertions))]
 impl StorageHandle {
