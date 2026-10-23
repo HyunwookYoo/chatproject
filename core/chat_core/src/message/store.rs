@@ -21,9 +21,18 @@ pub(crate) struct MessageRepo {
     identity: Identity,
 }
 pub(crate) enum MessageDbOp {
+    #[cfg(all(feature="test-hooks",debug_assertions))]
+    RejectedPrepare(MessageKey, InstallationId, u64, PrepareTransition),
+    Due(u64, Vec<PeerId>),
+    RecoverScheduler(u64),
+    SettleCompleted(MessageKey),
+    Defer(MessageKey, bool, u64),
+    Cancel(MessageKey),
+    Retry(MessageKey, u64),
+    ReleasePeer(PeerId, u64),
     ResetUnlaunched(MessageKey, PrepareToken),
-    Receive(TextFrame, [u8; 32], u64),
-    Prepare(MessageKey, InstallationId, bool, u64, PrepareTransition),
+    Receive(TextFrame, [u8; 32], u64, u64),
+    Prepare(MessageKey, InstallationId, bool, u64, u64, PrepareTransition),
     Target(MessageKey, bool),
     ApplyReceipt(ReceiptFrame, PeerId, u64),
     Applied(ReceiptFrame, PeerId),
@@ -244,6 +253,58 @@ pub(crate) fn execute(
             .map_err(sql_error)?;
     }
     match op {
+        #[cfg(all(feature="test-hooks",debug_assertions))]
+        MessageDbOp::RejectedPrepare(key,receiver,now,transition) => {
+            let state:Option<u64>=c.query_row("SELECT dispatch_state FROM outbox WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",params![key.conversation.0.as_slice(),key.sender.0.as_slice(),key.installation.0.as_slice(),key.id.0.as_slice()],|r|uint(r,0)).optional().map_err(sql_error)?;
+            if state!=Some(1) {return Err(invalid());}
+            prepare(c,identity,key,receiver,false,now,transition,fault)
+        }
+        MessageDbOp::Retry(key, _) => {
+            let peer=target(c,identity,key,false)?;
+            release_blocked(c,peer,Some(key),#[cfg(all(feature="test-hooks",debug_assertions))] fault)?;
+            Ok(MessageDbReply::Message(find(c,key)?.ok_or_else(missing)?))
+        }
+        MessageDbOp::ReleasePeer(peer, _) => {
+            release_blocked(c,peer,None,#[cfg(all(feature="test-hooks",debug_assertions))] fault)?;
+            Ok(MessageDbReply::Done)
+        }
+        MessageDbOp::Cancel(key) => {
+            let tx=c.transaction().map_err(sql_error)?;
+            let view=find(&tx,key)?.ok_or_else(missing)?;
+            if !view.outgoing || key.sender!=identity.peer || key.installation!=identity.installation {return Err(invalid());}
+            if !view.cancel_requested {
+                tx.execute("UPDATE message SET cancel_requested=1 WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",params![key.conversation.0.as_slice(),key.sender.0.as_slice(),key.installation.0.as_slice(),key.id.0.as_slice()]).map_err(sql_error)?;
+                tx.execute("DELETE FROM outbox WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",params![key.conversation.0.as_slice(),key.sender.0.as_slice(),key.installation.0.as_slice(),key.id.0.as_slice()]).map_err(sql_error)?;
+                let revision=bump(&tx)?;
+                tx.execute("UPDATE conversation SET change_revision=?2 WHERE id=?1",params![key.conversation.0.as_slice(),integer(revision)?]).map_err(sql_error)?;
+            }
+            let view=find(&tx,key)?.unwrap();
+            commit(tx,#[cfg(all(feature="test-hooks",debug_assertions))] fault)?;
+            Ok(MessageDbReply::Message(view))
+        },
+        MessageDbOp::Due(now, excluded) => due(c, identity, now, excluded),
+        MessageDbOp::RecoverScheduler(now) => {
+            let tx = c.transaction().map_err(sql_error)?;
+            let now = integer(now)?;
+            // Called only once by a new Manager before any local launch.
+            tx.execute("UPDATE outbox SET dispatch_state=CASE WHEN dispatch_state=1 THEN 0 ELSE dispatch_state END,next_retry_at_ms=?1+min(max(next_retry_at_ms-?1,0),retry_delay_ms,300000)",params![now]).map_err(sql_error)?;
+            tx.execute("UPDATE receipt_job SET next_retry_at_ms=?1+min(max(next_retry_at_ms-?1,0),300000)",params![now]).map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+            Ok(MessageDbReply::Done)
+        }
+        MessageDbOp::SettleCompleted(k) => {
+            // Exact actor-owned completed launch. Never reconstruct a deleted job.
+            let tx=c.transaction().map_err(sql_error)?;
+            tx.execute("UPDATE outbox SET dispatch_state=0 WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4 AND dispatch_state=1",params![k.conversation.0.as_slice(),k.sender.0.as_slice(),k.installation.0.as_slice(),k.id.0.as_slice()]).map_err(sql_error)?;
+            commit(tx,#[cfg(all(feature="test-hooks",debug_assertions))] fault)?;
+            Ok(MessageDbReply::Done)
+        }
+        MessageDbOp::Defer(k, receipt, now) => {
+            let tx = c.transaction().map_err(sql_error)?;
+            schedule_retry(&tx, k, receipt, now)?;
+            commit(tx,#[cfg(all(feature="test-hooks",debug_assertions))] fault)?;
+            Ok(MessageDbReply::Done)
+        }
         MessageDbOp::ResetUnlaunched(k, provenance) => {
             if k.sender != identity.peer || k.installation != identity.installation {
                 return Err(invalid());
@@ -261,19 +322,20 @@ pub(crate) fn execute(
             )?;
             Ok(MessageDbReply::Done)
         }
-        MessageDbOp::Receive(text, hash, now) => receive(
+        MessageDbOp::Receive(text, hash, now, schedule_now) => receive(
             c,
             identity,
             text,
             hash,
             now,
+            schedule_now,
             #[cfg(all(feature = "test-hooks", debug_assertions))]
             fault,
         ),
         MessageDbOp::Target(key, receipt) => {
             target(c, identity, key, receipt).map(MessageDbReply::Peer)
         }
-        MessageDbOp::Prepare(key, receiver, receipt, now, transition) => prepare(
+        MessageDbOp::Prepare(key, receiver, receipt, _wall, now, transition) => prepare(
             c,
             identity,
             key,
@@ -522,14 +584,13 @@ fn insert_outgoing(tx: &Transaction<'_>, frame: &TextFrame, hash: &[u8; 32], wir
     )
     .map_err(sql_error)?;
     tx.execute(
-        "INSERT INTO outbox VALUES(?1,?2,?3,?4,1,?5,0,1000,?6,0)",
+        "INSERT INTO outbox VALUES(?1,?2,?3,?4,1,?5,0,1000,0,0)",
         params![
             k.conversation.0.as_slice(),
             k.sender.0.as_slice(),
             k.installation.0.as_slice(),
             k.id.0.as_slice(),
-            wire,
-            integer(frame.sent_at_ms)?
+            wire
         ],
     )
     .map_err(sql_error)?;
@@ -598,9 +659,12 @@ pub struct MessageFacts {
     pub receipt_jobs: u64,
     pub processed: u64,
     pub dispatch_state: Option<u64>,
+    pub retry: Option<(u64, u64, u64)>,
+    pub receipt_retry: Option<(u64, u64)>,
 }
 #[cfg(all(feature = "test-hooks", debug_assertions))]
 pub(crate) enum FixtureOp {
+    SaturateAttempts(MessageKey, bool, tokio::sync::oneshot::Sender<R<()>>),
     Counts(tokio::sync::oneshot::Sender<R<(u64, u64, u64, u64)>>),
     Facts(MessageKey, tokio::sync::oneshot::Sender<R<MessageFacts>>),
     Fill(
@@ -615,6 +679,11 @@ pub(crate) enum FixtureOp {
 #[cfg(all(feature = "test-hooks", debug_assertions))]
 pub(crate) fn fixture(c: &mut Connection, op: FixtureOp) {
     match op {
+        FixtureOp::SaturateAttempts(k,receipt,reply) => {
+            let table=if receipt {"receipt_job"} else {"outbox"};
+            let result=c.execute(&format!("UPDATE {table} SET attempts=4294967295 WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4"),params![k.conversation.0.as_slice(),k.sender.0.as_slice(),k.installation.0.as_slice(),k.id.0.as_slice()]).map(|_|()).map_err(sql_error);
+            let _=reply.send(result);
+        }
         FixtureOp::Counts(reply) => {
             let result=c.query_row("SELECT (SELECT count(*) FROM message),(SELECT count(*) FROM processed_ct),(SELECT count(*) FROM receipt_job),message_revision FROM storage_meta WHERE singleton=1",[],|r|Ok((uint(r,0)?,uint(r,1)?,uint(r,2)?,uint(r,3)?))).map_err(sql_error);
             let _ = reply.send(result);
@@ -629,6 +698,8 @@ pub(crate) fn fixture(c: &mut Connection, op: FixtureOp) {
                 Ok(MessageFacts {
                     prev_hash,
                     attempted_receivers: receivers(&attempted)?,
+                    retry: c.query_row("SELECT attempts,retry_delay_ms,next_retry_at_ms FROM outbox WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",params![key.conversation.0.as_slice(),key.sender.0.as_slice(),key.installation.0.as_slice(),key.id.0.as_slice()],|r|Ok((uint(r,0)?,uint(r,1)?,uint(r,2)?))).optional().map_err(sql_error)?,
+                    receipt_retry: c.query_row("SELECT attempts,next_retry_at_ms FROM receipt_job WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4 ORDER BY kind DESC LIMIT 1",params![key.conversation.0.as_slice(),key.sender.0.as_slice(),key.installation.0.as_slice(),key.id.0.as_slice()],|r|Ok((uint(r,0)?,uint(r,1)?))).optional().map_err(sql_error)?,
                     receipt_jobs,
                     processed,
                     dispatch_state,
@@ -742,6 +813,7 @@ fn fill(c: &mut Connection, key: MessageKey, count: u64, target: Option<u64>) ->
     tx.commit().map_err(sql_error)
 }
 pub(crate) enum MessageDbReply {
+    Due(Vec<super::scheduler::Dispatch>, Vec<super::scheduler::Dispatch>),
     Receipt(ReceiptFrame),
     Prepared(Zeroizing<Vec<u8>>, Option<ReceiptFrame>),
     Peer(PeerId),
@@ -759,6 +831,16 @@ impl MessageRepo {
                 peer: local.keys.peer_id(),
                 installation: local.device.installation_id(),
             },
+        }
+    }
+    pub(crate) async fn retry_send(&self, key: MessageKey, now_ms: u64) -> R<MessageView> {
+        match self.operation(MessageDbOp::Retry(key,now_ms)).await? {
+            MessageDbReply::Message(view)=>Ok(view), _=>unreachable!()
+        }
+    }
+    pub(crate) async fn cancel_send(&self, key: MessageKey) -> R<MessageView> {
+        match self.operation(MessageDbOp::Cancel(key)).await? {
+            MessageDbReply::Message(view)=>Ok(view), _=>unreachable!()
         }
     }
     pub(crate) fn local_peer(&self) -> PeerId {
@@ -830,9 +912,15 @@ impl MessageDbOp {
                 installation: identity.installation,
                 id: *id,
             }),
-            Self::Receive(t, _, _) => Some(t.key),
-            Self::ResetUnlaunched(k, _)
-            | Self::Prepare(k, _, _, _, _)
+            Self::Receive(t, _, _, _) => Some(t.key),
+            #[cfg(all(feature="test-hooks",debug_assertions))]
+            Self::RejectedPrepare(k,_,_,_) => Some(*k),
+            Self::Retry(k, _)
+            | Self::Cancel(k)
+            | Self::SettleCompleted(k)
+            | Self::Defer(k, _, _)
+            | Self::ResetUnlaunched(k, _)
+            | Self::Prepare(k, _, _, _, _, _)
             | Self::AttemptOutcome(k, _, _, _) => Some(*k),
             Self::ApplyReceipt(r, _, _) | Self::Applied(r, _) => Some(r.key),
             _ => None,
@@ -893,6 +981,7 @@ fn receive(
     text: TextFrame,
     hash: [u8; 32],
     now: u64,
+    schedule_now: u64,
     #[cfg(all(feature = "test-hooks", debug_assertions))] fault: Option<
         crate::storage::worker::CommitFault,
     >,
@@ -958,14 +1047,14 @@ fn receive(
     )
     .map_err(sql_error)?;
     tx.execute(
-        "INSERT INTO receipt_job VALUES(?1,?2,?3,?4,?5,1,?6,0)",
+        "INSERT INTO receipt_job VALUES(?1,?2,?3,?4,?5,1,?6,1)",
         params![
             k.conversation.0.as_slice(),
             k.sender.0.as_slice(),
             k.installation.0.as_slice(),
             k.id.0.as_slice(),
             identity.installation.0.as_slice(),
-            now
+            integer(schedule_now.checked_add(1000).ok_or_else(invalid)?)?
         ],
     )
     .map_err(sql_error)?;
@@ -1035,7 +1124,7 @@ fn prepare(
                 ReceiptKind::Delivered
             },
         )?;
-        tx.execute("UPDATE receipt_job SET attempts=min(attempts+1,4294967295) WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4 AND recipient_install=?5 AND kind=?6",params![k.conversation.0.as_slice(),k.sender.0.as_slice(),k.installation.0.as_slice(),k.id.0.as_slice(),identity.installation.0.as_slice(),integer(kind)?]).map_err(sql_error)?;
+        schedule_retry(&tx, k, true, now)?;
         MessageDbReply::Prepared(Frame::Receipt(r.clone()).envelope(), Some(r))
     } else {
         let (raw,wire,state):(Vec<u8>,Vec<u8>,u64)=tx.query_row("SELECT attempted_receivers,wire,dispatch_state FROM message JOIN outbox USING(conversation,sender_peer,sender_install,msg_id) WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4 AND cancel_requested=0",params![k.conversation.0.as_slice(),k.sender.0.as_slice(),k.installation.0.as_slice(),k.id.0.as_slice()],|r|Ok((r.get(0)?,r.get(1)?,uint(r,2)?))).optional().map_err(sql_error)?.ok_or_else(missing)?;
@@ -1054,12 +1143,13 @@ fn prepare(
             allowed.sort();
         }
         let packed: Vec<_> = allowed.iter().flat_map(|i| i.0).collect();
-        let next_retry = integer(now)?;
+        integer(now)?;
         // All definite no-mutation validation has passed. From here a storage
         // error/fenced reply may hide this attempt's own transition.
         transition.eligible();
         tx.execute("UPDATE message SET attempted_receivers=?5 WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",params![k.conversation.0.as_slice(),k.sender.0.as_slice(),k.installation.0.as_slice(),k.id.0.as_slice(),packed]).map_err(sql_error)?;
-        tx.execute("UPDATE outbox SET dispatch_state=1,attempts=min(attempts+1,4294967295),next_retry_at_ms=?5 WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",params![k.conversation.0.as_slice(),k.sender.0.as_slice(),k.installation.0.as_slice(),k.id.0.as_slice(),next_retry]).map_err(sql_error)?;
+        schedule_retry(&tx, k, false, now)?;
+        tx.execute("UPDATE outbox SET dispatch_state=1 WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",params![k.conversation.0.as_slice(),k.sender.0.as_slice(),k.installation.0.as_slice(),k.id.0.as_slice()]).map_err(sql_error)?;
         MessageDbReply::Prepared(Zeroizing::new(wire), None)
     };
     commit(
@@ -1182,12 +1272,36 @@ fn attempt_outcome(
 /// The worker checks the actual SQL account membership before recording a receiver.
 /// A caller's installation ID is never itself a membership grant.
 pub(crate) fn authorize(c: &Connection, local: &LocalAccount, op: &MessageDbOp) -> R<()> {
-    if let MessageDbOp::Prepare(key, receiver, receipt, now, _) = op {
+    let retry = match op {
+        MessageDbOp::Retry(key, now) => Some((target(c,Identity { peer:local.keys.peer_id(),installation:local.device.installation_id() },*key,false)?,*now)),
+        MessageDbOp::ReleasePeer(peer, now) => Some((*peer,*now)),
+        _=>None,
+    };
+    if let Some((peer,now))=retry {
+        let now=now/1000;
+        let own=local.records.accepted.as_ref().filter(|r|
+            local.records.conflict.is_none() && local.records.state!=crate::account::PublicationState::Conflict
+            && r.seq>=local.records.observed_seq && r.record.generation==local.records.generation
+            && r.current(now) && !r.record.is_expired(now)
+            && r.record.devices.iter().any(|d|d.installation_id==local.device.installation_id() && d.transport_public_key==local.device.transport_public_key())
+            && !local.records.tombstones.iter().any(|t|t.target_installation==local.device.installation_id() || t.target_transport==local.device.transport_public_key()));
+        let remote=local.remote.iter().find(|r|r.peer==peer && r.conflict.is_none() && r.accepted.seq>=r.floor
+            && r.accepted.current(now) && !r.accepted.record.is_expired(now));
+        if own.is_none() || remote.is_none() {return Err(CoreError::new(ErrorCode::AccountRestricted,"retry_not_authorized"));}
+        if !local.contacts.iter().any(|c|c.peer==peer) {return Err(CoreError::new(ErrorCode::ContactRequired,"retry_contact_required"));}
+    }
+    let prepare = match op {
+        MessageDbOp::Prepare(key,receiver,receipt,now,_,_) => Some((key,receiver,*receipt,now)),
+        #[cfg(all(feature="test-hooks",debug_assertions))]
+        MessageDbOp::RejectedPrepare(key,receiver,now,_) => Some((key,receiver,false,now)),
+        _=>None,
+    };
+    if let Some((key,receiver,receipt,now)) = prepare {
         let identity = Identity {
             peer: local.keys.peer_id(),
             installation: local.device.installation_id(),
         };
-        let peer = target(c, identity, *key, *receipt)?;
+        let peer = target(c, identity, *key, receipt)?;
         let accepted = local
             .remote
             .iter()
@@ -1230,7 +1344,7 @@ mod receiver_tests {
             id: MessageId([4; 16]),
         };
         let (token, transition) = PrepareToken::new();
-        let op = MessageDbOp::Prepare(key, InstallationId([5; 32]), false, 1, transition);
+        let op = MessageDbOp::Prepare(key, InstallationId([5; 32]), false, 1, 1, transition);
         let pending = op.pending(identity).unwrap().unwrap();
         let retained = pending.clone();
         assert!(token.eligible().is_err());
@@ -1280,10 +1394,74 @@ impl MessageDbOp {
         Ok(self.key(identity)?.map(|key| PendingMessage {
             key,
             prebyte_attempt: match self {
-                Self::Prepare(_, _, false, _, transition) => Some(transition.0.clone()),
+                Self::Prepare(_, _, false, _, _, transition) => Some(transition.0.clone()),
                 Self::ResetUnlaunched(_, token) => Some(token.clone()),
                 _ => None,
             },
         }))
     }
+}
+
+fn schedule_retry(tx: &Transaction<'_>, k: MessageKey, receipt: bool, now: u64) -> R<()> {
+    let table = if receipt { "receipt_job" } else { "outbox" };
+    let filter = "conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4";
+    let count = tx.query_row(&format!("SELECT max(attempts) FROM {table} WHERE {filter}"),
+        params![k.conversation.0.as_slice(),k.sender.0.as_slice(),k.installation.0.as_slice(),k.id.0.as_slice()],
+        |r| r.get::<_,Option<i64>>(0)).map_err(sql_error)?;
+    let Some(count) = count else { return Ok(()) };
+    let count = (count as u64).saturating_add(1).min(u32::MAX as u64);
+    let delay = super::scheduler::retry_delay(count);
+    let next = integer(now.checked_add(delay).ok_or_else(invalid)?)?;
+    let extra = if receipt { String::new() } else { format!(",retry_delay_ms={delay}") };
+    tx.execute(&format!("UPDATE {table} SET attempts=?5,next_retry_at_ms=?6{extra} WHERE {filter}"),
+        params![k.conversation.0.as_slice(),k.sender.0.as_slice(),k.installation.0.as_slice(),k.id.0.as_slice(),integer(count)?,next]).map_err(sql_error)?;
+    Ok(())
+}
+fn due(c: &Connection, identity: Identity, now: u64, excluded: Vec<PeerId>) -> R<MessageDbReply> {
+    use super::scheduler::Dispatch;
+    let mut batches = Vec::new();
+    for receipt in [false, true] {
+        let table = if receipt { "receipt_job" } else { "outbox" };
+        let state = if receipt { "" } else { "AND dispatch_state=0" };
+        // Index bounds the due set; group keys before reading payloads, one per peer.
+        let sql = format!("SELECT j.conversation,j.sender_peer,j.sender_install,j.msg_id,c.peer FROM {table} j JOIN conversation c ON c.id=j.conversation WHERE j.rowid IN (SELECT min(rowid) FROM {table} WHERE next_retry_at_ms<=?1 {state} GROUP BY conversation) ORDER BY j.next_retry_at_ms,j.conversation LIMIT 20");
+        let mut stmt = c.prepare(&sql).map_err(sql_error)?;
+        let rows = stmt.query_map(params![integer(now)?], |r| Ok((MessageKey {
+            conversation:ConversationId(bytes(r,0)?), sender:PeerId(bytes(r,1)?),
+            installation:InstallationId(bytes(r,2)?), id:MessageId(bytes(r,3)?),
+        },PeerId(bytes(r,4)?)))).map_err(sql_error)?;
+        let mut jobs = Vec::new();
+        for row in rows {
+            let (key,peer) = row.map_err(sql_error)?;
+            if excluded.contains(&peer) { continue; }
+            let wire = if receipt {
+                let kind:u64=c.query_row("SELECT max(kind) FROM receipt_job WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",params![key.conversation.0.as_slice(),key.sender.0.as_slice(),key.installation.0.as_slice(),key.id.0.as_slice()],|r|uint(r,0)).map_err(sql_error)?;
+                Frame::Receipt(receipt_for(c,key,identity.installation,if kind==2 {ReceiptKind::Read} else {ReceiptKind::Delivered})?).envelope()
+            } else {
+                Zeroizing::new(c.query_row("SELECT wire FROM outbox WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",params![key.conversation.0.as_slice(),key.sender.0.as_slice(),key.installation.0.as_slice(),key.id.0.as_slice()],|r|r.get(0)).map_err(sql_error)?)
+            };
+            jobs.push(Dispatch {key,peer,wire,ticket:0});
+            if jobs.len()==16 { break; }
+        }
+        batches.push(jobs);
+    }
+    let receipts = batches.pop().unwrap();
+    Ok(MessageDbReply::Due(batches.pop().unwrap(),receipts))
+}
+
+fn release_blocked(c:&mut Connection,peer:PeerId,key:Option<MessageKey>,
+    #[cfg(all(feature="test-hooks",debug_assertions))] fault:Option<crate::storage::worker::CommitFault>) -> R<()> {
+    let tx=c.transaction().map_err(sql_error)?;
+    let condition=if key.is_some() {" AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4"} else {""};
+    let mut values:Vec<rusqlite::types::Value>=vec![peer.0.to_vec().into()];
+    if let Some(k)=key {values.extend([k.sender.0.to_vec().into(),k.installation.0.to_vec().into(),k.id.0.to_vec().into()]);}
+    let filter=format!("conversation=(SELECT id FROM conversation WHERE peer=?1){condition} AND cancel_requested=0 AND delivered_at_ms IS NULL AND outcome=2");
+    // Only rows with retained retry work can be released; never recreate terminal payloads.
+    let changed=tx.execute(&format!("UPDATE message SET outcome=0,block_reason=NULL WHERE {filter} AND EXISTS(SELECT 1 FROM outbox o WHERE o.conversation=message.conversation AND o.sender_peer=message.sender_peer AND o.sender_install=message.sender_install AND o.msg_id=message.msg_id AND o.dispatch_state=2)"),rusqlite::params_from_iter(values.iter())).map_err(sql_error)?;
+    tx.execute(&format!("UPDATE outbox SET dispatch_state=0,next_retry_at_ms=0 WHERE conversation=(SELECT id FROM conversation WHERE peer=?1){condition} AND dispatch_state=2 AND EXISTS(SELECT 1 FROM message m WHERE m.conversation=outbox.conversation AND m.sender_peer=outbox.sender_peer AND m.sender_install=outbox.sender_install AND m.msg_id=outbox.msg_id AND m.outcome=0 AND m.cancel_requested=0 AND m.delivered_at_ms IS NULL)"),rusqlite::params_from_iter(values.iter())).map_err(sql_error)?;
+    if changed>0 {
+        let rev=bump(&tx)?;
+        tx.execute("UPDATE conversation SET change_revision=?2 WHERE peer=?1",params![peer.0.as_slice(),integer(rev)?]).map_err(sql_error)?;
+    }
+    commit(tx,#[cfg(all(feature="test-hooks",debug_assertions))] fault)
 }

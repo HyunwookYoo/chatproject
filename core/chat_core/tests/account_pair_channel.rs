@@ -842,6 +842,8 @@ async fn restart_keeps_candidate_but_discards_flow_psk_and_approval() {
         .execute(NetworkOp::Stop)
         .await
         .unwrap();
+    let storage = n.a.storage_test_fixture();
+    let observer = n.a.storage_test_fixture();
     let Fixture {
         _dir: dir,
         slot,
@@ -850,6 +852,8 @@ async fn restart_keeps_candidate_but_discards_flow_psk_and_approval() {
     } = n;
     drop(a);
     drop(slot);
+    storage.close().await;
+    assert_eq!(observer.live_connections(), 0);
     let slot = CoreSlot::new();
     slot.start(
         CoreConfig {

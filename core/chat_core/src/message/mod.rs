@@ -3,3 +3,4 @@
 pub(crate) mod store;
 pub(crate) mod types;
 pub(crate) mod wire;
+pub(crate) mod scheduler;

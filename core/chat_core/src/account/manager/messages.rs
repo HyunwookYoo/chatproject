@@ -12,12 +12,7 @@ use crate::message::{
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
-pub(crate) struct Dispatch {
-    pub key: MessageKey,
-    pub peer: PeerId,
-    pub wire: Zeroizing<Vec<u8>>,
-    pub ticket: u64,
-}
+use crate::message::scheduler::Dispatch;
 #[derive(Clone)]
 pub(crate) struct SessionLease {
     pub session: Session,
@@ -40,18 +35,28 @@ struct Pending {
     peer: PeerId,
     lease: SessionLease,
     receipt: Option<ReceiptFrame>,
-    reply: oneshot::Sender<Result<(), CoreError>>,
+    reply: Option<oneshot::Sender<Result<(), CoreError>>>,
+    completed: bool,
 }
 #[derive(Default)]
 pub(super) struct Runtime {
     pending: BTreeMap<MessageKey, Pending>,
-    unlaunched: BTreeMap<MessageKey, (u64, PrepareToken)>,
+    unlaunched: BTreeMap<MessageKey, (u64, PrepareToken, PeerId)>,
+    acquiring: BTreeMap<MessageKey, Acquisition>,
+    scheduler: Option<crate::message::scheduler::Scheduler>,
+    recovered: bool,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     writes: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     replies: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     prelaunch_pause: Option<TestPause>,
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    proof_pause: Option<TestPause>,
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    signature_pause: Option<TestPause>,
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    proof_writes: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     reply_pause: Option<TestPause>,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
@@ -90,6 +95,8 @@ pub enum MessagePoint {
     Response,
     FirstByte,
     Prelaunch,
+    Proof,
+    Signature,
 }
 #[cfg(all(feature = "test-hooks", debug_assertions))]
 #[derive(Clone, Copy, Default)]
@@ -104,8 +111,14 @@ pub enum MessageMutation {
     Trailing,
     ConflictingText,
     ReceiptAsApplied,
+    ReadReceipt,
 }
 impl AccountHandle {
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    pub async fn message_test_proof_write_starts(&self) -> Result<usize, CoreError> {
+        self.send(Command::MessageProofWriteStarts).await
+    }
+
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     pub async fn message_test_write_starts(&self) -> Result<(usize, usize), CoreError> {
         self.send(Command::MessageWriteStarts).await
@@ -284,6 +297,9 @@ fn mutate(wire: Zeroizing<Vec<u8>>, mutation: MessageMutation) -> Zeroizing<Vec<
                     r.recipient = InstallationId([0; 32])
                 }
                 (Frame::Receipt(r), MessageMutation::ReceiptHash) => r.text_hash = [0; 32],
+                (Frame::Receipt(r), MessageMutation::ReadReceipt) => {
+                    r.kind = crate::message::wire::ReceiptKind::Read
+                }
                 _ => {}
             }
             if matches!(mutation, MessageMutation::ReceiptAsApplied)
@@ -297,6 +313,11 @@ fn mutate(wire: Zeroizing<Vec<u8>>, mutation: MessageMutation) -> Zeroizing<Vec<
     Zeroizing::new(auth::envelope(16, &inner))
 }
 impl Manager {
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    pub(super) fn message_proof_write_starts(&self) -> usize {
+        self.messages.proof_writes.load(Ordering::SeqCst)
+    }
+
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     pub(super) fn message_write_starts(&self) -> (usize, usize) {
         (
@@ -317,6 +338,8 @@ impl Manager {
             MessagePoint::Response => self.messages.reply_pause = pause,
             MessagePoint::FirstByte => self.messages.write_pause = pause,
             MessagePoint::Prelaunch => self.messages.prelaunch_pause = pause,
+            MessagePoint::Proof => self.messages.proof_pause = pause,
+            MessagePoint::Signature => self.messages.signature_pause = pause,
         }
         MessagePause {
             entered: Some(rx),
@@ -328,7 +351,7 @@ impl Manager {
             .messages
             .unlaunched
             .iter()
-            .map(|(k, (_, token))| (*k, token.clone()))
+            .map(|(k, (_, token, _))| (*k, token.clone()))
             .collect();
         for (key, token) in keys {
             if !self.current(request) {
@@ -342,6 +365,20 @@ impl Manager {
             }
             self.messages.unlaunched.remove(&key);
         }
+        Ok(())
+    }
+    pub(super) async fn release_message_peer(&mut self, peer: PeerId) -> Result<(), CoreError> {
+        // Normal M3 supports sessions without contacts and self-device proofs.
+        // Those have no releasable M4 text jobs and retain their M3 behavior.
+        if peer == self.local()?.keys.peer_id() || self.message_contact(peer).is_err() {
+            return Ok(());
+        }
+        let request = self.ready()?;
+        self.message_db(
+            MessageDbOp::ReleasePeer(peer, self.services.clock.wall_ms()),
+            request,
+        )
+        .await?;
         Ok(())
     }
     fn message_repo(&self) -> Result<MessageRepo, CoreError> {
@@ -410,6 +447,17 @@ impl Manager {
             pause: self.messages.reply_pause.take(),
         })
     }
+    fn message_storage_failure(&mut self, code: ErrorCode, request: Request) {
+        if code == ErrorCode::StorageUncertain && self.current(request) {
+            self.close_auth();
+            let ticket = self.shared.network.block();
+            self.store.invalidate(ticket);
+            self.lock_error = Some(code);
+            self.shared
+                .status
+                .fetch_max((request.ticket << 2) | 2, Ordering::AcqRel);
+        }
+    }
     async fn message_db(
         &mut self,
         op: MessageDbOp,
@@ -418,15 +466,7 @@ impl Manager {
         self.ensure_ready(request)?;
         let result = self.message_repo()?.operation(op).await;
         if let Err(e) = &result {
-            if e.code == ErrorCode::StorageUncertain && self.current(request) {
-                self.close_auth();
-                let ticket = self.shared.network.block();
-                self.store.invalidate(ticket);
-                self.lock_error = Some(e.code);
-                self.shared
-                    .status
-                    .fetch_max((request.ticket << 2) | 2, Ordering::AcqRel);
-            }
+            self.message_storage_failure(e.code, request);
         }
         match result {
             Ok(reply) => {
@@ -459,7 +499,11 @@ impl Manager {
                         MessageDbOp::Receive(
                             text,
                             Sha256::digest(inner).into(),
-                            self.services.clock.unix_seconds().saturating_mul(1000),
+                            self.services.clock.wall_ms(),
+                            self.messages
+                                .scheduler
+                                .as_ref()
+                                .map_or_else(|| self.services.clock.wall_ms(), |s| s.now_ms()),
                         ),
                         request,
                     )
@@ -474,7 +518,7 @@ impl Manager {
                             MessageDbOp::ApplyReceipt(
                                 r,
                                 session.grant.peer,
-                                self.services.clock.unix_seconds().saturating_mul(1000),
+                                self.services.clock.wall_ms(),
                             ),
                             request,
                         )
@@ -533,7 +577,13 @@ impl Manager {
     ) {
         let result = async {
             let request = self.ready()?;
-            if self.messages.pending.len() + self.messages.unlaunched.len() >= 4
+            if self.messages.scheduler.is_none() {
+                self.restore_message_scheduler(request).await?;
+            }
+            if self.messages.pending.len()
+                + self.messages.unlaunched.len()
+                + self.messages.acquiring.len()
+                >= 4
                 || self.messages.pending.contains_key(&key)
                 || self.messages.unlaunched.contains_key(&key)
             {
@@ -563,6 +613,12 @@ impl Manager {
             if self.messages.pending.len() >= 4
                 || self.messages.pending.contains_key(&key)
                 || self.messages.pending.values().any(|p| p.peer == peer)
+                || self.messages.acquiring.values().any(|p| p.peer == peer)
+                || self
+                    .messages
+                    .unlaunched
+                    .values()
+                    .any(|(_, _, p)| *p == peer)
             {
                 return Err(unavailable(ErrorCode::Busy));
             }
@@ -586,7 +642,7 @@ impl Manager {
             if !receipt {
                 self.messages
                     .unlaunched
-                    .insert(key, (request.ticket, token));
+                    .insert(key, (request.ticket, token, peer));
             }
             let MessageDbReply::Prepared(wire, receipt) = self
                 .message_db(
@@ -594,7 +650,11 @@ impl Manager {
                         key,
                         session.grant.installation,
                         receipt,
-                        self.services.clock.unix_seconds().saturating_mul(1000),
+                        self.services.clock.wall_ms(),
+                        self.messages
+                            .scheduler
+                            .as_ref()
+                            .map_or_else(|| self.services.clock.wall_ms(), |s| s.now_ms()),
                         transition,
                     ),
                     request,
@@ -637,7 +697,7 @@ impl Manager {
         match result {
             Err(e) => {
                 if let Ok(request) = self.ready()
-                    && let Some((ticket, token)) = self.messages.unlaunched.get(&key)
+                    && let Some((ticket, token, _)) = self.messages.unlaunched.get(&key)
                     && *ticket == request.ticket
                 {
                     let token = token.clone();
@@ -658,7 +718,8 @@ impl Manager {
                         peer,
                         lease: lease.clone(),
                         receipt,
-                        reply,
+                        reply: Some(reply),
+                        completed: false,
                     },
                 );
                 let mailbox = self.auth.send.clone();
@@ -681,7 +742,8 @@ impl Manager {
         {
             return;
         }
-        let pending = self.messages.pending.remove(&result.key).unwrap();
+        let mut pending = self.messages.pending.remove(&result.key).unwrap();
+        pending.completed = true;
         let outcome = async {
             let request = self.ready()?;
             if request.ticket != result.lease.ticket {
@@ -694,9 +756,18 @@ impl Manager {
                     self.message_db(
                         MessageDbOp::AttemptOutcome(
                             result.key,
-                            Some(BlockReason::Account),
+                            if self.grant_authorized(&result.lease.session.grant) {
+                                None
+                            } else {
+                                Some(BlockReason::Account)
+                            },
                             None,
-                            false,
+                            matches!(
+                                result.outcome,
+                                AttemptOutcome::Written
+                                    | AttemptOutcome::Receipt(_)
+                                    | AttemptOutcome::ReceiptApplied(_)
+                            ),
                         ),
                         request,
                     )
@@ -710,11 +781,7 @@ impl Manager {
                         && r.key == result.key
                         && r.recipient == result.lease.session.grant.installation =>
                 {
-                    MessageDbOp::ApplyReceipt(
-                        r,
-                        pending.peer,
-                        self.services.clock.unix_seconds().saturating_mul(1000),
-                    )
+                    MessageDbOp::ApplyReceipt(r, pending.peer, self.services.clock.wall_ms())
                 }
                 AttemptOutcome::ReceiptApplied(r) if pending.receipt.as_ref() == Some(&r) => {
                     MessageDbOp::Applied(r, pending.peer)
@@ -789,6 +856,610 @@ impl Manager {
                 )
                 .await;
         }
-        let _ = pending.reply.send(outcome);
+        if let Some(reply) = pending.reply.take() {
+            let _ = reply.send(outcome);
+        }
+        // Actual network completion is known; a stale lease supplies no receipt authority.
+        // Keep ownership until a fresh current request durably settles this exact key.
+        let settled = if let Ok(request) = self.ready() {
+            self.message_db(MessageDbOp::SettleCompleted(result.key), request)
+                .await
+                .is_ok()
+        } else {
+            false
+        };
+        if !settled {
+            self.messages.pending.insert(result.key, pending);
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AcquisitionPhase {
+    Lookup,
+    Proof(InstallationId),
+    Completed,
+}
+struct Acquisition {
+    peer: PeerId,
+    ticket: u64,
+    receipt: bool,
+    phase: AcquisitionPhase,
+    remaining: Vec<InstallationId>,
+    cancel: tokio_util::sync::CancellationToken,
+    snapshot: Option<ProofSnapshot>,
+}
+struct ProofSnapshot {
+    own: [u8; 32],
+    remote: [u8; 32],
+    installation: InstallationId,
+    transport: [u8; 32],
+}
+pub(crate) struct ProofGate {
+    shared: Arc<Shared>,
+    ticket: u64,
+    cancel: tokio_util::sync::CancellationToken,
+    clock: Arc<dyn crate::account::clock::Clock>,
+    own_expires: u64,
+    remote_expires: u64,
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    pause: Option<TestPause>,
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    writes: Arc<std::sync::atomic::AtomicUsize>,
+}
+impl ProofGate {
+    pub(crate) fn check(&self) -> Result<(), CoreError> {
+        if !acquisition_current(&self.shared, self.ticket) {
+            return Err(unavailable(ErrorCode::StorageLocked));
+        }
+        if self.cancel.is_cancelled()
+            || self.clock.unix_seconds() >= self.own_expires
+            || self.clock.unix_seconds() >= self.remote_expires
+        {
+            return Err(unavailable(ErrorCode::AccountRestricted));
+        }
+        Ok(())
+    }
+    pub(crate) async fn before_signature(&mut self) {
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        if let Some(pause) = self.pause.take() {
+            pause.wait().await;
+        }
+    }
+    pub(crate) fn signature_write(&self) {
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        self.writes.fetch_add(1, Ordering::SeqCst);
+    }
+}
+pub(crate) struct ProofResult {
+    key: MessageKey,
+    ticket: u64,
+    installation: InstallationId,
+    conn: Option<iroh::endpoint::Connection>,
+    evidence: Option<crate::account::publication::SignedRecord>,
+    result: Result<auth::AuthGrant, CoreError>,
+}
+impl Drop for ProofResult {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            conn.close(0u32.into(), b"unused message proof");
+        }
+    }
+}
+fn acquisition_current(shared: &Shared, ticket: u64) -> bool {
+    let request = *shared.requests.borrow();
+    request.ticket == ticket
+        && !request.suspend
+        && !shared.network.desired_suspend()
+        && shared.status.load(Ordering::Acquire) == (ticket << 2) | 1
+}
+impl Manager {
+    pub(super) fn cancel_message_proofs(&self, peer: PeerId) {
+        for a in self.messages.acquiring.values().filter(|a| a.peer == peer) {
+            a.cancel.cancel();
+        }
+    }
+    pub(super) fn restrict_message_acquisitions(&self, local: Option<&LocalAccount>) {
+        let now = self.services.clock.unix_seconds();
+        for a in self.messages.acquiring.values() {
+            let valid = local.is_some_and(|local| {
+                if !acquisition_current(&self.shared, a.ticket)
+                    || !Self::local_authorized_at(local, now)
+                    || !local.contacts.iter().any(|c| c.peer == a.peer)
+                {
+                    return false;
+                }
+                let Some(snapshot) = &a.snapshot else {
+                    return true;
+                };
+                local
+                    .records
+                    .accepted
+                    .as_ref()
+                    .is_some_and(|r| r.hash == snapshot.own)
+                    && local
+                        .remote
+                        .iter()
+                        .find(|r| r.peer == a.peer)
+                        .is_some_and(|r| {
+                            r.conflict.is_none()
+                                && r.accepted.seq >= r.floor
+                                && r.accepted.hash == snapshot.remote
+                                && r.accepted.current(now)
+                                && !r.accepted.record.is_expired(now)
+                                && r.accepted.record.devices.iter().any(|d| {
+                                    d.installation_id == snapshot.installation
+                                        && d.transport_public_key == snapshot.transport
+                                })
+                        })
+            });
+            if !valid {
+                a.cancel.cancel();
+            }
+        }
+    }
+    pub(super) async fn restore_message_scheduler(
+        &mut self,
+        request: Request,
+    ) -> Result<(), CoreError> {
+        if self.local().is_err() {
+            return Ok(());
+        }
+        if !self.current(request) {
+            return Err(unavailable(ErrorCode::StorageLocked));
+        }
+        let repo = self.message_repo()?;
+        if !self.messages.recovered {
+            repo.operation(MessageDbOp::RecoverScheduler(self.services.clock.wall_ms()))
+                .await?;
+            if !self.current(request) {
+                return Err(unavailable(ErrorCode::StorageLocked));
+            }
+            self.messages.recovered = true;
+            self.messages.scheduler = Some(crate::message::scheduler::Scheduler::new(
+                repo.clone(),
+                self.services.clock.clone(),
+            ));
+        }
+        let completed: Vec<_> = self
+            .messages
+            .pending
+            .iter()
+            .filter(|(_, p)| p.completed)
+            .map(|(k, _)| *k)
+            .collect();
+        for key in completed {
+            repo.operation(MessageDbOp::SettleCompleted(key)).await?;
+            if !self.current(request) {
+                return Err(unavailable(ErrorCode::StorageLocked));
+            }
+            self.messages.pending.remove(&key);
+        }
+        let completed: Vec<_> = self
+            .messages
+            .acquiring
+            .iter()
+            .filter(|(_, p)| p.phase == AcquisitionPhase::Completed)
+            .map(|(k, p)| (*k, p.receipt))
+            .collect();
+        for (key, receipt) in completed {
+            let now = self.messages.scheduler.as_ref().unwrap().now_ms();
+            repo.operation(MessageDbOp::Defer(key, receipt, now))
+                .await?;
+            if !self.current(request) {
+                return Err(unavailable(ErrorCode::StorageLocked));
+            }
+            self.messages.acquiring.remove(&key);
+        }
+        Ok(())
+    }
+    pub(super) async fn poll_messages(&mut self) {
+        let Ok(request) = self.ready() else { return };
+        if self.messages.scheduler.is_none() {
+            if let Err(e) = self.restore_message_scheduler(request).await {
+                self.message_storage_failure(e.code, request);
+                return;
+            }
+            if self.messages.scheduler.is_none() {
+                return;
+            }
+        }
+        if self.messages.pending.len()
+            + self.messages.unlaunched.len()
+            + self.messages.acquiring.len()
+            >= 4
+        {
+            return;
+        }
+        let mut excluded: Vec<_> = self.messages.pending.values().map(|p| p.peer).collect();
+        excluded.extend(self.messages.unlaunched.values().map(|(_, _, peer)| *peer));
+        excluded.extend(self.messages.acquiring.values().map(|p| p.peer));
+        let scheduler = self.messages.scheduler.as_mut().unwrap();
+        scheduler.ticket = request.ticket;
+        scheduler.excluded = excluded;
+        let now = scheduler.now_ms();
+        let jobs = match scheduler.poll_due(now).await {
+            Ok(jobs) => jobs,
+            Err(e) => {
+                self.message_storage_failure(e.code, request);
+                return;
+            }
+        };
+        for job in jobs {
+            if self.ensure_ready(request).is_err() {
+                break;
+            }
+            if self.messages.pending.len()
+                + self.messages.unlaunched.len()
+                + self.messages.acquiring.len()
+                >= 4
+            {
+                break;
+            }
+            let receipt = job.key.sender != self.local().unwrap().keys.peer_id();
+            if let Err(error) = self.message_contact(job.peer) {
+                let _ = self
+                    .scheduling_failure(job.key, receipt, error.code, request)
+                    .await;
+                continue;
+            }
+            if !self.local_authorized() {
+                let _ = self
+                    .scheduling_failure(job.key, receipt, ErrorCode::AccountRestricted, request)
+                    .await;
+                continue;
+            }
+            let ready = self.auth.registry.0.lock().unwrap().iter().any(|s| {
+                s.grant.peer == job.peer
+                    && (!receipt || s.grant.installation == job.key.installation)
+                    && s.ready
+                    && self.grant_authorized(&s.grant)
+                    && s.conn.close_reason().is_none()
+            });
+            if ready {
+                let (reply, _) = oneshot::channel();
+                self.start_message_attempt(
+                    job.key,
+                    receipt,
+                    reply,
+                    #[cfg(all(feature = "test-hooks", debug_assertions))]
+                    MessageMutation::None,
+                )
+                .await;
+                if self.messages.pending.contains_key(&job.key) {
+                    self.messages
+                        .scheduler
+                        .as_mut()
+                        .unwrap()
+                        .dispatched(receipt);
+                }
+            } else {
+                self.start_message_lookup(job.key, job.peer, receipt, request)
+                    .await;
+            }
+        }
+    }
+    async fn scheduling_failure(
+        &mut self,
+        key: MessageKey,
+        receipt: bool,
+        code: ErrorCode,
+        request: Request,
+    ) -> Result<(), CoreError> {
+        let block = match code {
+            ErrorCode::ContactRequired => Some(BlockReason::ContactRequired),
+            ErrorCode::AccountRestricted | ErrorCode::AuthFailed | ErrorCode::RecordConflict => {
+                Some(BlockReason::Account)
+            }
+            ErrorCode::StorageLocked | ErrorCode::StorageUncertain => Some(BlockReason::Storage),
+            _ => None,
+        };
+        if !receipt && block.is_some() {
+            self.message_db(
+                MessageDbOp::AttemptOutcome(key, block, None, false),
+                request,
+            )
+            .await?;
+        } else {
+            let now = self.messages.scheduler.as_ref().unwrap().now_ms();
+            self.message_db(MessageDbOp::Defer(key, receipt, now), request)
+                .await?;
+        }
+        Ok(())
+    }
+    async fn start_message_lookup(
+        &mut self,
+        key: MessageKey,
+        peer: PeerId,
+        receipt: bool,
+        request: Request,
+    ) {
+        let backend = match self.services.backend() {
+            Ok(b) => b,
+            Err(e) => {
+                let _ = self.scheduling_failure(key, receipt, e.code, request).await;
+                return;
+            }
+        };
+        self.restrict_peer_grants(peer, false);
+        let cancel = self.auth.cancel.child_token();
+        self.messages.acquiring.insert(
+            key,
+            Acquisition {
+                peer,
+                ticket: request.ticket,
+                receipt,
+                phase: AcquisitionPhase::Lookup,
+                remaining: Vec::new(),
+                cancel: cancel.clone(),
+                snapshot: None,
+            },
+        );
+        self.messages
+            .scheduler
+            .as_mut()
+            .unwrap()
+            .dispatched(receipt);
+        let shared = self.shared.clone();
+        let mailbox = self.auth.send.clone();
+        tokio::spawn(async move {
+            let result = tokio::select! {biased;
+                _=cancel.cancelled()=>Err(unavailable(ErrorCode::StorageLocked)),
+                result=tokio::time::timeout(Duration::from_secs(10),backend.lookup(peer))=>
+                    result.unwrap_or_else(|_|Err(unavailable(ErrorCode::RecordUnavailable))),
+            };
+            let result = if acquisition_current(&shared, request.ticket) {
+                result
+            } else {
+                Err(unavailable(ErrorCode::StorageLocked))
+            };
+            let _ = mailbox
+                .send(crate::account::connection::Input::MessageLookup(
+                    key,
+                    request.ticket,
+                    result,
+                ))
+                .await;
+        });
+    }
+    pub(super) async fn message_lookup(
+        &mut self,
+        key: MessageKey,
+        ticket: u64,
+        result: Result<super::super::Lookup, CoreError>,
+    ) {
+        let Some(a) = self.messages.acquiring.get(&key) else {
+            return;
+        };
+        if a.ticket != ticket || a.phase != AcquisitionPhase::Lookup {
+            return;
+        }
+        let peer = a.peer;
+        let result = async {
+            let request = self.ready()?;
+            if request.ticket != ticket {
+                return Err(unavailable(ErrorCode::StorageLocked));
+            }
+            if !self.local_authorized() {
+                return Err(unavailable(ErrorCode::AccountRestricted));
+            }
+            let record = self.finish_remote_record(peer, result, request).await?;
+            self.ensure_ready(request)?;
+            let a = self.messages.acquiring.get_mut(&key).unwrap();
+            a.remaining = record
+                .record
+                .devices
+                .iter()
+                .filter(|d| !a.receipt || d.installation_id == key.installation)
+                .map(|d| d.installation_id)
+                .collect();
+            self.start_message_proof(key, request)
+        }
+        .await;
+        if let Err(e) = result {
+            self.finish_acquisition(key, e.code).await;
+        }
+    }
+    fn start_message_proof(&mut self, key: MessageKey, request: Request) -> Result<(), CoreError> {
+        self.ensure_ready(request)?;
+        if !self.local_authorized() {
+            return Err(unavailable(ErrorCode::AccountRestricted));
+        }
+        let a = self.messages.acquiring.get_mut(&key).unwrap();
+        if a.cancel.is_cancelled() {
+            return Err(unavailable(ErrorCode::AccountRestricted));
+        }
+        if a.remaining.is_empty() {
+            return Err(unavailable(ErrorCode::TransportFailed));
+        }
+        let installation = a.remaining.remove(0);
+        let peer = a.peer;
+        a.phase = AcquisitionPhase::Proof(installation);
+        let Some(AccountState::Active(local)) = self.copy_state() else {
+            return Err(unavailable(ErrorCode::AccountRestricted));
+        };
+        let remote = local
+            .remote
+            .iter()
+            .find(|r| {
+                r.peer == peer
+                    && r.conflict.is_none()
+                    && r.accepted.seq >= r.floor
+                    && r.accepted.current(self.services.clock.unix_seconds())
+            })
+            .ok_or_else(|| unavailable(ErrorCode::AccountRestricted))?;
+        let record = remote.accepted.clone();
+        let device = record
+            .record
+            .devices
+            .iter()
+            .find(|d| d.installation_id == installation)
+            .ok_or_else(|| unavailable(ErrorCode::AccountRestricted))?;
+        let endpoint = iroh::EndpointId::from_bytes(&device.transport_public_key)
+            .map_err(|_| unavailable(ErrorCode::AuthFailed))?;
+        let shared = self.shared.clone();
+        let clock = self.services.clock.clone();
+        let mailbox = self.auth.send.clone();
+        let a = self.messages.acquiring.get_mut(&key).unwrap();
+        a.snapshot = Some(ProofSnapshot {
+            own: local.records.accepted.as_ref().unwrap().hash,
+            remote: record.hash,
+            installation,
+            transport: device.transport_public_key,
+        });
+        let cancel = a.cancel.clone();
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        let pause = self.messages.proof_pause.take();
+        let mut gate = ProofGate {
+            shared: shared.clone(),
+            ticket: request.ticket,
+            cancel: cancel.clone(),
+            clock: clock.clone(),
+            own_expires: local.records.accepted.as_ref().unwrap().record.expires_at,
+            remote_expires: record.record.expires_at,
+            #[cfg(all(feature = "test-hooks", debug_assertions))]
+            pause: self.messages.signature_pause.take(),
+            #[cfg(all(feature = "test-hooks", debug_assertions))]
+            writes: self.messages.proof_writes.clone(),
+        };
+        tokio::spawn(async move {
+            let mut conn = None;
+            let mut evidence = None;
+            let work = async {
+                if !acquisition_current(&shared, request.ticket) {
+                    return Err(unavailable(ErrorCode::StorageLocked));
+                }
+                let connected = shared
+                    .network
+                    .dial_account(iroh::EndpointAddr::from(endpoint))
+                    .await?;
+                conn = Some(connected.clone());
+                #[cfg(all(feature = "test-hooks", debug_assertions))]
+                if let Some(pause) = pause {
+                    pause.wait().await;
+                }
+                if !acquisition_current(&shared, request.ticket) {
+                    return Err(unavailable(ErrorCode::StorageLocked));
+                }
+                auth::authenticate(
+                    connected,
+                    peer,
+                    &local,
+                    &record,
+                    &*clock,
+                    &mut evidence,
+                    Some(&mut gate),
+                )
+                .await
+            };
+            let result = tokio::select! {biased;
+                _=cancel.cancelled()=>Err(unavailable(ErrorCode::AccountRestricted)),
+                result=tokio::time::timeout(Duration::from_secs(10),work)=>result.unwrap_or_else(|_|Err(unavailable(ErrorCode::NetworkTimeout))),
+            };
+            let result = if acquisition_current(&shared, request.ticket) {
+                result
+            } else {
+                Err(unavailable(ErrorCode::StorageLocked))
+            };
+            if result.is_err()
+                && let Some(conn) = &conn
+            {
+                conn.close(0u32.into(), b"message proof failed");
+            }
+            let message = ProofResult {
+                key,
+                ticket: request.ticket,
+                installation,
+                conn,
+                evidence,
+                result,
+            };
+            // Drop closes an obtained connection on cancellation, stale/missing owner or failed mailbox.
+            let _ = mailbox
+                .send(crate::account::connection::Input::MessageProof(message))
+                .await;
+        });
+        Ok(())
+    }
+    pub(super) async fn message_proof(&mut self, mut proof: ProofResult) {
+        let Some(a) = self.messages.acquiring.get(&proof.key) else {
+            return;
+        };
+        if a.ticket != proof.ticket || a.phase != AcquisitionPhase::Proof(proof.installation) {
+            return;
+        }
+        let (peer, receipt) = (a.peer, a.receipt);
+        let result = async {
+            let request = self.ready()?;
+            if request.ticket != proof.ticket {
+                return Err(unavailable(ErrorCode::StorageLocked));
+            }
+            if let Some(evidence) = proof.evidence.take() {
+                self.observe_auth_record(peer, evidence, request).await?;
+            }
+            self.ensure_ready(request)?;
+            match &proof.result {
+                Ok(grant) => {
+                    let conn = proof.conn.as_ref().unwrap().clone();
+                    self.install_grant(conn, grant.clone()).await?;
+                    self.ensure_ready(request)?;
+                    proof.conn.take();
+                    self.messages.acquiring.remove(&proof.key);
+                    let (reply, _) = oneshot::channel();
+                    self.start_message_attempt(
+                        proof.key,
+                        receipt,
+                        reply,
+                        #[cfg(all(feature = "test-hooks", debug_assertions))]
+                        MessageMutation::None,
+                    )
+                    .await;
+                    Ok(())
+                }
+                Err(e) => {
+                    let code = e.code;
+                    if self
+                        .messages
+                        .acquiring
+                        .get(&proof.key)
+                        .unwrap()
+                        .remaining
+                        .is_empty()
+                    {
+                        Err(unavailable(code))
+                    } else {
+                        self.start_message_proof(proof.key, request)
+                    }
+                }
+            }
+        }
+        .await;
+        if let Err(e) = result {
+            self.finish_acquisition(proof.key, e.code).await;
+        }
+    }
+    async fn finish_acquisition(&mut self, key: MessageKey, code: ErrorCode) {
+        let Some(a) = self.messages.acquiring.get_mut(&key) else {
+            return;
+        };
+        a.phase = AcquisitionPhase::Completed;
+        let (receipt, ticket) = (a.receipt, a.ticket);
+        if let Ok(request) = self.ready()
+            && self
+                .scheduling_failure(
+                    key,
+                    receipt,
+                    if ticket != request.ticket {
+                        ErrorCode::TransportFailed
+                    } else {
+                        code
+                    },
+                    request,
+                )
+                .await
+                .is_ok()
+        {
+            self.messages.acquiring.remove(&key);
+        }
     }
 }

@@ -3,6 +3,12 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 pub trait Clock: Send + Sync {
     fn unix_seconds(&self) -> u64;
     fn monotonic_ms(&self) -> u64;
+    fn wall_ms(&self) -> u64 {
+        self.unix_seconds().saturating_mul(1000)
+    }
+    fn wake(&self) -> Option<std::sync::Arc<tokio::sync::Notify>> {
+        None
+    }
 }
 
 pub struct SystemClock {
@@ -18,6 +24,13 @@ impl Default for SystemClock {
 }
 
 impl Clock for SystemClock {
+    fn wall_ms(&self) -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u64::MAX as u128) as u64
+    }
     fn unix_seconds(&self) -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -42,6 +55,7 @@ mod fake {
     pub struct FakeClock {
         unix_seconds: AtomicU64,
         monotonic_ms: AtomicU64,
+        wake: std::sync::Arc<tokio::sync::Notify>,
     }
 
     impl FakeClock {
@@ -49,19 +63,25 @@ mod fake {
             Self {
                 unix_seconds: AtomicU64::new(unix_seconds),
                 monotonic_ms: AtomicU64::new(monotonic_ms),
+                wake: Default::default(),
             }
         }
 
         pub fn set_unix_seconds(&self, value: u64) {
             self.unix_seconds.store(value, Ordering::SeqCst);
+            self.wake.notify_one();
         }
 
         pub fn advance_monotonic_ms(&self, elapsed: u64) {
             self.monotonic_ms.fetch_add(elapsed, Ordering::SeqCst);
+            self.wake.notify_one();
         }
     }
 
     impl Clock for FakeClock {
+        fn wake(&self) -> Option<std::sync::Arc<tokio::sync::Notify>> {
+            Some(self.wake.clone())
+        }
         fn unix_seconds(&self) -> u64 {
             self.unix_seconds.load(Ordering::SeqCst)
         }

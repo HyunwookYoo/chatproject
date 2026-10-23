@@ -17,7 +17,33 @@ use std::{
 use tokio::sync::oneshot;
 #[derive(Clone)]
 pub struct Messages(MessageRepo);
+pub struct RejectedPrepare {
+    repo: MessageRepo,
+    key: MessageKey,
+    token: crate::message::store::PrepareToken,
+    pub code: ErrorCode,
+}
+impl RejectedPrepare {
+    pub async fn reset(self)->Result<(),CoreError> {
+        self.repo.operation(crate::message::store::MessageDbOp::ResetUnlaunched(self.key,self.token)).await.map(|_|())
+    }
+}
 impl Messages {
+    // Finite negative probe: ordinary SQL Prepare authorization/transition path,
+    // followed by exact provenance reset. It never launches a network operation.
+    pub async fn rejected_prepare(&self,key:MessageKey,receiver:crate::account::InstallationId,now:u64)->Result<RejectedPrepare,CoreError> {
+        let (token,transition)=crate::message::store::PrepareToken::new();
+        let result=self.0.operation(crate::message::store::MessageDbOp::RejectedPrepare(key,receiver,now,transition)).await;
+        let code=result.err().ok_or_else(||CoreError::new(ErrorCode::InvalidMessage,"fixture_expected_rejected_prepare"))?.code;
+        Ok(RejectedPrepare{repo:self.0.clone(),key,token,code})
+    }
+
+    pub async fn retry_send(&self, key: MessageKey, now_ms: u64) -> Result<MessageView,CoreError> {
+        self.0.retry_send(key,now_ms).await
+    }
+    pub async fn cancel_send(&self, key: MessageKey) -> Result<MessageView,CoreError> {
+        self.0.cancel_send(key).await
+    }
     pub fn local_peer(&self) -> crate::account::PeerId {
         self.0.local_peer()
     }
@@ -101,6 +127,11 @@ impl Drop for Pause {
     }
 }
 impl Fixture {
+    pub async fn saturate_message_attempts(&self,key:MessageKey,receipt:bool)->Result<(),CoreError> {
+        let (tx,rx)=oneshot::channel();
+        self.handle.0.test(TestOp::Message(FixtureOp::SaturateAttempts(key,receipt,tx))).await;
+        rx.await.unwrap()
+    }
     pub async fn pause_message_reply(&self)->Pause {
         let (entered,rx)=oneshot::channel();let (release,wait)=std::sync::mpsc::channel();let (tx,done)=oneshot::channel();
         self.handle.0.test(TestOp::MessageReplyPause(entered,wait,tx)).await;done.await.unwrap();

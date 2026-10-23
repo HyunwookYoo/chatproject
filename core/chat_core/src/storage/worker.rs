@@ -802,7 +802,7 @@ mod tests {
             .handle
             .message(
                 identity,
-                MessageDbOp::Prepare(key, identity.installation, false, 1, transition),
+                MessageDbOp::Prepare(key, identity.installation, false, 1, 1, transition),
             )
             .await;
         assert_eq!(result.err().unwrap().code, ErrorCode::AccountRestricted);
@@ -821,7 +821,7 @@ mod tests {
             .handle
             .message(
                 identity,
-                MessageDbOp::Prepare(key, identity.installation, false, 1, transition),
+                MessageDbOp::Prepare(key, identity.installation, false, 1, 1, transition),
             )
             .await;
         assert_eq!(result.err().unwrap().code, ErrorCode::StorageLocked);
@@ -844,7 +844,7 @@ mod tests {
                 |reply| {
                     DbOp::Message(
                         identity,
-                        MessageDbOp::Prepare(key, identity.installation, false, 1, transition),
+                        MessageDbOp::Prepare(key, identity.installation, false, 1, 1, transition),
                         reply,
                     )
                 },

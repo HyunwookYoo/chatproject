@@ -223,6 +223,7 @@ fn proof_message(
     message.extend_from_slice(&*exporter);
     Ok(message)
 }
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn authenticate(
     conn: Connection,
     expected: PeerId,
@@ -230,13 +231,17 @@ pub(crate) async fn authenticate(
     record: &SignedRecord,
     clock: &dyn Clock,
     evidence: &mut Option<SignedRecord>,
+    gate: Option<&mut super::manager::messages::ProofGate>,
 ) -> Result<AuthGrant, CoreError> {
+    check_gate(gate.as_deref())?;
     let own = hello(local)?;
     conn.set_max_concurrent_uni_streams(0u32.into());
     conn.set_max_concurrent_bi_streams(4u32.into());
     let (mut send, mut recv) = conn.open_bi().await.map_err(|_| wire::invalid())?;
-    write_frame(&mut send, &envelope(0, &own.encode())).await?;
+    check_gate(gate.as_deref())?;
+    write_auth_frame(&mut send, &envelope(0, &own.encode()), gate.as_deref()).await?;
     let remote = AuthHello::decode(&payload(&read_frame(&mut recv, 16384).await?, 0)?)?;
+    check_gate(gate.as_deref())?;
     finish(
         &conn,
         expected,
@@ -250,6 +255,7 @@ pub(crate) async fn authenticate(
             recv,
             hello: remote,
         },
+        gate,
     )
     .await
 }
@@ -263,7 +269,18 @@ pub(crate) async fn authenticate_incoming(
 ) -> Result<AuthGrant, CoreError> {
     let own = hello(local)?;
     write_frame(&mut preface.send, &envelope(0, &own.encode())).await?;
-    finish(conn, preface.hello.peer, local, record, clock, evidence, own, preface).await
+    finish(
+        conn,
+        preface.hello.peer,
+        local,
+        record,
+        clock,
+        evidence,
+        own,
+        preface,
+        None,
+    )
+    .await
 }
 #[allow(clippy::too_many_arguments)]
 async fn finish(
@@ -275,6 +292,7 @@ async fn finish(
     evidence: &mut Option<SignedRecord>,
     own: AuthHello,
     preface: Preface,
+    mut gate: Option<&mut super::manager::messages::ProofGate>,
 ) -> Result<AuthGrant, CoreError> {
     let Preface {
         mut send,
@@ -289,8 +307,14 @@ async fn finish(
     }
     verify_cert(&remote.cert, expected)?;
     let own_record = local.records.accepted.as_ref().ok_or_else(wire::invalid)?;
-    write_frame(&mut send, &envelope(2, own_record.packet.as_bytes())).await?;
+    write_auth_frame(
+        &mut send,
+        &envelope(2, own_record.packet.as_bytes()),
+        gate.as_deref(),
+    )
+    .await?;
     let packet = payload(&read_frame(&mut recv, 1100).await?, 2)?;
+    check_gate(gate.as_deref())?;
     let exchanged = SignedRecord::decode(&packet, expected)?;
     // Identity-signature/canonical evidence survives a denied installation proof.
     *evidence = Some(exchanged.clone());
@@ -322,13 +346,22 @@ async fn finish(
         context(&remote, &own)
     };
     let message = proof_message(conn, &context)?;
+    if let Some(gate) = gate.as_mut() {
+        gate.before_signature().await;
+    }
+    check_gate(gate.as_deref())?;
     let sig = SigningKey::from_bytes(local.device.installation().as_bytes())
         .sign(&message)
         .to_bytes();
-    write_frame(&mut send, &envelope(1, &sig)).await?;
+    check_gate(gate.as_deref())?;
+    if let Some(gate) = gate.as_ref() {
+        gate.signature_write();
+    }
+    write_auth_frame(&mut send, &envelope(1, &sig), gate.as_deref()).await?;
     let sig: [u8; 64] = payload(&read_frame(&mut recv, 80).await?, 1)?
         .try_into()
         .map_err(|_| wire::invalid())?;
+    check_gate(gate.as_deref())?;
     VerifyingKey::from_bytes(&remote.cert.installation_id.0)
         .map_err(|_| wire::invalid())?
         .verify_strict(&message, &Signature::from_bytes(&sig))
@@ -338,4 +371,32 @@ async fn finish(
     }
     send.finish().map_err(|_| wire::invalid())?;
     Ok(grant)
+}
+
+fn check_gate(gate: Option<&super::manager::messages::ProofGate>) -> Result<(), CoreError> {
+    if let Some(gate) = gate {
+        gate.check()?;
+    }
+    Ok(())
+}
+// Manual/incoming auth keeps its original IO; only an off-actor acquisition needs
+// a current proof gate at both the length and payload writes of each frame.
+async fn write_auth_frame(
+    send: &mut SendStream,
+    bytes: &[u8],
+    gate: Option<&super::manager::messages::ProofGate>,
+) -> Result<(), CoreError> {
+    let Some(gate) = gate else {
+        return write_frame(send, bytes).await;
+    };
+    if bytes.len() > 65536 {
+        return Err(wire::invalid());
+    }
+    gate.check()?;
+    send.write_all(&(bytes.len() as u32).to_be_bytes())
+        .await
+        .map_err(|_| wire::invalid())?;
+    gate.check()?;
+    send.write_all(bytes).await.map_err(|_| wire::invalid())?;
+    gate.check()
 }

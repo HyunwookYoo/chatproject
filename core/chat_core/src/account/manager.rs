@@ -1,4 +1,5 @@
 //! Single owner of protected account state. A5 extends commands and AccountState.
+use super::storage::schema::LocalAccount;
 use super::{
     AccountServices, FlowId, InstallationId, PeerId, PublicationState,
     PublicationView, RecoveryDisplay,
@@ -63,6 +64,8 @@ pub struct CandidateInfo {
 }
 enum Command {
     #[cfg(all(feature="test-hooks",debug_assertions))]
+    MessageProofWriteStarts(oneshot::Sender<Result<usize,CoreError>>),
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
     MessageWriteStarts(oneshot::Sender<Result<(usize,usize),CoreError>>),
     #[cfg(all(feature="test-hooks",debug_assertions))]
     MessagePause(messages::MessagePoint,oneshot::Sender<Result<messages::MessagePause,CoreError>>),
@@ -122,6 +125,8 @@ impl Command {
     fn reject(self, error: CoreError) {
         match self {
             #[cfg(all(feature="test-hooks",debug_assertions))]
+            Self::MessageProofWriteStarts(reply)=>{let _=reply.send(Err(error));}
+            #[cfg(all(feature = "test-hooks", debug_assertions))]
             Self::MessageWriteStarts(reply)=>{let _=reply.send(Err(error));}
             #[cfg(all(feature="test-hooks",debug_assertions))]
             Self::MessagePause(_,reply)=>{let _=reply.send(Err(error));}
@@ -1135,6 +1140,7 @@ impl Manager {
         let mut import_poll = tokio::time::interval(Duration::from_secs(1));
         let mut refresh = tokio::time::interval(Duration::from_secs(60));
         refresh.tick().await;
+        let message_wake = self.services.clock.wake().unwrap_or_default();
         loop {
             tokio::select! { biased;
                 changed = requests.changed() => {
@@ -1144,7 +1150,8 @@ impl Manager {
                     self.complete(request, result);
                     self.auto_refresh().await;
                 }
-                _ = expiry.tick() => { self.restrict_grants(); self.expire_pair(); }
+                _ = expiry.tick() => { self.restrict_grants(); self.expire_pair(); self.poll_messages().await; }
+                _ = message_wake.notified() => { self.restrict_grants(); self.poll_messages().await; }
                 _ = import_poll.tick(), if self.pair.current.is_some() && matches!(self.state,Some(AccountState::PendingImport(_))) => {let _=self.refresh_import().await;}
                 Some(input)=self.pair.input.recv()=>{self.pair_input(input).await;}
                 Some(input) = self.auth.input.recv() => { self.auth_input(input).await; }
@@ -1157,6 +1164,8 @@ impl Manager {
                     }
                     match queued.command {
                         #[cfg(all(feature="test-hooks",debug_assertions))]
+                        Command::MessageProofWriteStarts(reply)=>{let _=reply.send(Ok(self.message_proof_write_starts()));}
+                        #[cfg(all(feature = "test-hooks", debug_assertions))]
                         Command::MessageWriteStarts(reply)=>{let _=reply.send(Ok(self.message_write_starts()));}
                         #[cfg(all(feature="test-hooks",debug_assertions))]
                         Command::MessagePause(response,reply)=>{let _=reply.send(Ok(self.message_pause(response)));}
@@ -1287,6 +1296,7 @@ impl Manager {
             }
         }
         self.reset_unlaunched(request).await?;
+        self.restore_message_scheduler(request).await?;
         let result = self.restore(request).await;
         if result.is_err() && self.current(request) {
             self.store.suspend().await?;
@@ -1416,6 +1426,12 @@ impl Manager {
     }
     async fn persist(&mut self, state: &AccountState, request: Request) -> Result<(), CoreError> {
         self.ensure_ready(request)?;
+        // Observed/proposed authority changes invalidate off-actor proofs before
+        // the SQL await, including record publication, revocation and pair state.
+        self.restrict_message_acquisitions(match state {
+            AccountState::Active(local) => Some(local),
+            _ => None,
+        });
         if let Err(error) = self.store.commit_account(state.encode()).await {
             // An error can follow atomic replacement. Do not trust the old
             // in-memory state or permit another setup to overwrite the new one.
@@ -2446,15 +2462,11 @@ mod tests {
 
 impl Manager {
     fn local_authorized(&self) -> bool {
-        let Ok(local) = self.local() else {
-            return false;
-        };
-        let Some(record) = &local.records.accepted else {
-            return false;
-        };
-        let now = self.services.clock.unix_seconds();
-        self.ready().is_ok()
-            && local.records.conflict.is_none()
+        self.ready().is_ok() && self.local().is_ok_and(|local| Self::local_authorized_at(local,self.services.clock.unix_seconds()))
+    }
+    fn local_authorized_at(local: &LocalAccount, now:u64) -> bool {
+        let Some(record)=&local.records.accepted else {return false;};
+        local.records.conflict.is_none()
             && local.records.state != PublicationState::Conflict
             && record.seq >= local.records.observed_seq
             && record.record.generation == local.records.generation
@@ -2535,6 +2547,7 @@ impl Manager {
             })
     }
     fn close_auth(&self) {
+        self.restrict_message_acquisitions(None);
         for session in self.auth.registry.0.lock().unwrap().drain(..) {
             session.conn.close(0u32.into(), b"account stopped");
             if session.ready {
@@ -2547,6 +2560,7 @@ impl Manager {
         }
     }
     fn restrict_grants(&self) {
+        self.restrict_message_acquisitions(self.local().ok());
         for grant in self
             .auth
             .registry
@@ -2651,6 +2665,7 @@ impl Manager {
         self.commit_remote(remote, request).await
     }
     fn restrict_peer_grants(&self, peer: PeerId, close: bool) {
+        if close {self.cancel_message_proofs(peer);}
         for grant in self.auth.registry.apply(|grant| (grant.peer != peer, close && grant.peer == peer)) {
             self.bus.publish(crate::CoreEvent::AccountAuthChanged {
                 peer_id: grant.peer.to_string(), installation_id: grant.installation.to_string(), ready: false,
@@ -2670,6 +2685,11 @@ impl Manager {
         }
         let backend = self.services.backend()?;
         let lookup = self.service(request, backend.lookup(peer)).await;
+        self.finish_remote_record(peer, lookup, request).await
+    }
+    async fn finish_remote_record(
+        &mut self, peer: PeerId, lookup: Result<super::Lookup, CoreError>, request: Request,
+    ) -> Result<super::publication::SignedRecord, CoreError> {
         self.ensure_ready(request)?;
         self.auth.cached_lookups.remove(&peer);
         let mut cached = false;
@@ -2777,6 +2797,7 @@ impl Manager {
                         &record,
                         &*self.services.clock,
                         &mut evidence,
+                        None,
                     )),
                 )
                 .await;
@@ -2806,6 +2827,15 @@ impl Manager {
         }
         if let Err(error) = self.observe_contact_device(grant.peer, grant.installation).await {
             conn.close(0u32.into(), b"contact persistence failed");
+            return Err(error);
+        }
+        if !self.grant_authorized(&grant) {
+            conn.close(0u32.into(), b"account restricted");
+            return Err(unavailable(ErrorCode::AccountRestricted));
+        }
+        // Release only current authorized Blocked work before announcing a ready session.
+        if let Err(error) = self.release_message_peer(grant.peer).await {
+            conn.close(0u32.into(), b"message release failed");
             return Err(error);
         }
         if !self.grant_authorized(&grant) {
@@ -2845,6 +2875,8 @@ impl Manager {
         self.restrict_grants();
         match input {
             Input::MessageAttempt(result)=>self.message_attempt_result(result).await,
+            Input::MessageLookup(key,ticket,result)=>self.message_lookup(key,ticket,result).await,
+            Input::MessageProof(result)=>self.message_proof(result).await,
             Input::Incoming(conn) => {
                 let result = async {
                     let request = self.ready()?;
