@@ -1,5 +1,8 @@
 //! Debug-only fixtures for the real private worker. No SQL/key controls reach FFI.
 pub use crate::account::storage::migration_fixtures::{assert_account_preserved, migration_states};
+pub use crate::message::store::MessageFacts;
+use crate::message::store::{FixtureOp, MessageRepo};
+pub use crate::message::types::*;
 pub use crate::storage::migration::MigrationStage;
 pub use crate::storage::worker::CommitFault;
 use crate::{
@@ -12,6 +15,44 @@ use std::{
     sync::{Arc, atomic::Ordering},
 };
 use tokio::sync::oneshot;
+#[derive(Clone)]
+pub struct Messages(MessageRepo);
+impl Messages {
+    pub fn local_peer(&self) -> crate::account::PeerId {
+        self.0.local_peer()
+    }
+    pub async fn open_dm(
+        &self,
+        local: crate::account::PeerId,
+        peer: crate::account::PeerId,
+    ) -> Result<ConversationView, CoreError> {
+        self.0.open_dm(local, peer).await
+    }
+    pub async fn enqueue(
+        &self,
+        peer: crate::account::PeerId,
+        id: MessageId,
+        body: String,
+        now: u64,
+    ) -> Result<MessageView, CoreError> {
+        self.0.enqueue(peer, id, body, now).await
+    }
+    pub async fn load_messages(
+        &self,
+        id: ConversationId,
+        before: Option<MessageCursor>,
+        limit: u32,
+    ) -> Result<MessagePage, CoreError> {
+        self.0.load_messages(id, before, limit).await
+    }
+    pub async fn list_conversations(
+        &self,
+        before: Option<ConversationCursor>,
+        limit: u32,
+    ) -> Result<ConversationPage, CoreError> {
+        self.0.list_conversations(before, limit).await
+    }
+}
 pub struct Fixture {
     pub handle: Handle,
 }
@@ -60,6 +101,65 @@ impl Drop for Pause {
     }
 }
 impl Fixture {
+    pub async fn message_fault(&self, fault: CommitFault) {
+        let (tx, rx) = oneshot::channel();
+        self.handle.0.test(TestOp::MessageFault(fault, tx)).await;
+        rx.await.unwrap();
+    }
+    pub async fn messages(&self) -> Result<Messages, CoreError> {
+        use crate::account::storage::schema::AccountState;
+        let stored = self.handle.load_account().await?.ok_or_else(|| {
+            CoreError::new(ErrorCode::AccountRestricted, "active_account_required")
+        })?;
+        let AccountState::Active(local) = AccountState::decode(&stored)? else {
+            return Err(CoreError::new(
+                ErrorCode::AccountRestricted,
+                "active_account_required",
+            ));
+        };
+        Ok(Messages(MessageRepo::new(self.handle.0.clone(), &local)))
+    }
+    pub async fn message_facts(&self, key: MessageKey) -> Result<MessageFacts, CoreError> {
+        let (tx, rx) = oneshot::channel();
+        self.handle
+            .0
+            .test(TestOp::Message(FixtureOp::Facts(key, tx)))
+            .await;
+        rx.await.unwrap()
+    }
+    pub async fn fill_message_quota(
+        &self,
+        key: MessageKey,
+        count: u64,
+        bytes: Option<u64>,
+    ) -> Result<(), CoreError> {
+        let (tx, rx) = oneshot::channel();
+        self.handle
+            .0
+            .test(TestOp::Message(FixtureOp::Fill(key, count, bytes, tx)))
+            .await;
+        rx.await.unwrap()
+    }
+    pub async fn deliver_message(&self, key: MessageKey) -> Result<(), CoreError> {
+        let (tx, rx) = oneshot::channel();
+        self.handle
+            .0
+            .test(TestOp::Message(FixtureOp::Delivered(key, tx)))
+            .await;
+        rx.await.unwrap()
+    }
+    pub async fn set_message_lamport(
+        &self,
+        id: ConversationId,
+        value: u64,
+    ) -> Result<(), CoreError> {
+        let (tx, rx) = oneshot::channel();
+        self.handle
+            .0
+            .test(TestOp::Message(FixtureOp::Lamport(id, value, tx)))
+            .await;
+        rx.await.unwrap()
+    }
     pub(crate) fn from_handle(handle: StorageHandle) -> Self {
         Self {
             handle: Handle(handle),

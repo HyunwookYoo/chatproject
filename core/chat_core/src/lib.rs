@@ -5,6 +5,7 @@ pub mod account;
 pub mod error;
 pub mod event;
 pub mod runtime;
+mod message;
 mod storage;
 pub mod transport;
 

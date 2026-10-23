@@ -1,5 +1,6 @@
 //! One bounded, typed writer. SQL and OS protection run only on blocking threads.
 use super::migration::{self, binding, load};
+use crate::message::store::{self as messages, Identity, MessageDbOp, MessageDbReply};
 use crate::{
     CoreError, ErrorCode,
     account::storage::{KeyProtector, StoredPlaintext, ownership::Ownership, schema::AccountState},
@@ -54,11 +55,75 @@ struct Worker {
     protector: Arc<dyn KeyProtector>,
     id: [u8; 16],
     state: State,
+    pending_message: Option<crate::message::types::MessageKey>,
     counts: Arc<Counts>,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     hook: Option<(usize, CommitAction)>,
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    message_fault: Option<CommitFault>,
 }
 impl Worker {
+    fn message(&mut self, identity: Identity, op: MessageDbOp) -> R<MessageDbReply> {
+        let key = if let MessageDbOp::Enqueue(peer, id, _, _) = &op {
+            Some(crate::message::types::MessageKey {
+                conversation: messages::conversation_id(identity.peer, *peer)?,
+                sender: identity.peer,
+                installation: identity.installation,
+                id: *id,
+            })
+        } else {
+            None
+        };
+        let db_id = self.id;
+        let pending = self.pending_message;
+        let mut reconciled = false;
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        let fault = if key.is_some() {
+            self.message_fault.take()
+        } else {
+            None
+        };
+        let result = self.operation(|c| {
+            let stored = load(c, &db_id)?.ok_or_else(|| {
+                CoreError::new(ErrorCode::AccountRestricted, "active_account_required")
+            })?;
+            let AccountState::Active(local) = AccountState::decode(&stored)? else {
+                return Err(CoreError::new(
+                    ErrorCode::AccountRestricted,
+                    "active_account_required",
+                ));
+            };
+            if local.keys.peer_id() != identity.peer
+                || local.device.installation_id() != identity.installation
+            {
+                return Err(CoreError::new(
+                    ErrorCode::AccountRestricted,
+                    "message_identity_mismatch",
+                ));
+            }
+            if let Some(key) = pending {
+                messages::reconcile(c, key)?;
+            }
+            reconciled = true;
+            messages::execute(
+                c,
+                identity,
+                op,
+                #[cfg(all(feature = "test-hooks", debug_assertions))]
+                fault,
+            )
+        });
+        if result
+            .as_ref()
+            .is_err_and(|e| e.code == ErrorCode::StorageUncertain)
+        {
+            self.pending_message = if reconciled { key } else { pending.or(key) };
+            self.close(true);
+        } else if result.is_ok() {
+            self.pending_message = None;
+        }
+        result
+    }
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     fn next_commit_action(&mut self) -> Option<CommitAction> {
         match self.hook.as_mut() {
@@ -263,6 +328,7 @@ struct Pending<T> {
     cancellation: CancellationToken,
 }
 enum DbOp {
+    Message(Identity, MessageDbOp, oneshot::Sender<R<MessageDbReply>>),
     Load(oneshot::Sender<R<Option<StoredPlaintext>>>),
     Commit(StoredPlaintext, oneshot::Sender<R<()>>),
     DiscardPending(oneshot::Sender<R<()>>),
@@ -281,6 +347,10 @@ pub(crate) struct StorageHandle {
 }
 #[allow(dead_code)]
 impl StorageHandle {
+    pub(crate) async fn message(&self, identity: Identity, op: MessageDbOp) -> R<MessageDbReply> {
+        self.receive(self.send(|reply| DbOp::Message(identity, op, reply), false)?)
+            .await
+    }
     /// Caller must use a blocking thread/pool; initialization does SQL, OS key work and fsync.
     pub(crate) fn open_blocking(
         root: PathBuf,
@@ -302,9 +372,12 @@ impl StorageHandle {
             protector,
             id,
             state: conn.map(State::Open).unwrap_or(State::Closed),
+            pending_message: None,
             counts: counts.clone(),
             #[cfg(all(feature = "test-hooks", debug_assertions))]
             hook: None,
+            #[cfg(all(feature = "test-hooks", debug_assertions))]
+            message_fault: None,
         };
         let (sender, receiver) = mpsc::channel(32);
         let fence = Arc::new(Mutex::new(Fence {
@@ -406,6 +479,14 @@ fn run(mut w: Worker, mut rx: mpsc::Receiver<Request>, fence: Arc<Mutex<Fence>>)
                 && fence.lock().is_ok_and(|f| f.ticket == request.ticket)
         };
         match request.op {
+            DbOp::Message(identity, op, reply) => {
+                let result = if valid() && fence.lock().is_ok_and(|f| !f.blocked) {
+                    w.message(identity, op)
+                } else {
+                    Err(locked())
+                };
+                let _ = reply.send(if valid() { result } else { Err(locked()) });
+            }
             DbOp::Load(reply) => {
                 let id = w.id;
                 let result = if valid() {
@@ -470,6 +551,16 @@ fn run(mut w: Worker, mut rx: mpsc::Receiver<Request>, fence: Arc<Mutex<Fence>>)
             }
             #[cfg(all(feature = "test-hooks", debug_assertions))]
             DbOp::Test(op) => match op {
+                TestOp::Message(op) => {
+                    let _ = w.operation(|c| {
+                        messages::fixture(c, op);
+                        Ok(())
+                    });
+                }
+                TestOp::MessageFault(fault, reply) => {
+                    w.message_fault = Some(fault);
+                    let _ = reply.send(());
+                }
                 TestOp::Pause(entered, release) => {
                     let _ = entered.send(());
                     let _ = release.recv();
@@ -517,6 +608,8 @@ pub(crate) enum CommitAction {
 }
 #[cfg(all(feature = "test-hooks", debug_assertions))]
 pub(crate) enum TestOp {
+    Message(messages::FixtureOp),
+    MessageFault(CommitFault, oneshot::Sender<()>),
     Pause(oneshot::Sender<()>, std::sync::mpsc::Receiver<()>),
     Fault(CommitFault, oneshot::Sender<()>),
     CommitAction(usize, CommitAction, oneshot::Sender<()>),

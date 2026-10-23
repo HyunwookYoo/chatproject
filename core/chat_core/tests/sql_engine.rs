@@ -107,14 +107,25 @@ fn schema_enforces_version_one_bounds() {
     .unwrap();
     conn.execute_batch(include_str!("../src/storage/schema.sql"))
         .unwrap();
-    let tables: i64 = conn
-        .query_row(
-            "SELECT count(*) FROM sqlite_master WHERE type='table'",
-            [],
-            |r| r.get(0),
-        )
+    let tables: Vec<String> = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
         .unwrap();
-    assert_eq!(tables, 2);
+    assert_eq!(
+        tables,
+        [
+            "account_state",
+            "conversation",
+            "message",
+            "outbox",
+            "processed_ct",
+            "receipt_job",
+            "storage_meta"
+        ]
+    );
     let unconfigured: i64 = conn
         .query_row("SELECT count(*) FROM account_state", [], |r| r.get(0))
         .unwrap();
