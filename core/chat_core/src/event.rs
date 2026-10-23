@@ -21,6 +21,8 @@ impl ConnectionSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CoreEvent {
+    MessagesChanged { revision: u64, conversation: crate::message::ConversationId },
+    MessageStateChanged { revision: u64, key: crate::message::MessageKey, state: crate::message::DeliveryState, cancel_requested: bool },
     AccountChanged { revision: u64, view: Box<crate::account::AccountView> },
     AccountAuthChanged { peer_id: String, installation_id: String, ready: bool },
     AccountCacheUsed { peer_id: String },
@@ -157,6 +159,24 @@ mod tests {
         bus.subscribe(sink.clone());
         bus.publish(state(4));
         assert_eq!(sink.events(), vec![state(3), state(4)]);
+    }
+
+    #[test]
+    fn late_subscription_replays_account_connection_but_not_messages() {
+        let bus = EventBus::new();
+        let account = CoreEvent::AccountChanged { revision: 7, view: Box::new(crate::account::AccountView {
+            disclosure_possible: false, pending_pair_transactions: vec![], pair_resumes: vec![], pending_import_requires_remote_revoke: false,
+            revision: 7, phase: crate::account::AccountPhase::Unconfigured, lock_error: None, public_peer_id: None,
+            installation: None, devices: vec![], contacts: vec![], remote_records: vec![], pair: None,
+            publish_intents: vec![], publication: crate::account::PublicationView::default(),
+        }) };
+        bus.publish(state(2));
+        bus.publish(account.clone());
+        bus.publish(CoreEvent::MessagesChanged { revision: 1, conversation: crate::ConversationId([1; 32]) });
+        bus.publish(CoreEvent::MessageStateChanged { revision: 2, key: crate::MessageKey { conversation: crate::ConversationId([1; 32]), sender: crate::account::PeerId([2; 32]), installation: crate::account::InstallationId([3; 32]), id: crate::MessageId([4; 16]) }, state: crate::DeliveryState::Queued, cancel_requested: false });
+        let sink = Arc::new(RecordingSink::default());
+        bus.subscribe(sink.clone());
+        assert_eq!(sink.events(), vec![state(2), account]);
     }
 
     #[test]

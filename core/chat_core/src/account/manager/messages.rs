@@ -416,6 +416,41 @@ impl Manager {
         .await?;
         Ok(())
     }
+    pub(super) async fn message_request(
+        &mut self,
+        operation: crate::message::service::MessageRequest,
+    ) -> Result<crate::message::service::MessageReply, CoreError> {
+        use crate::message::service::{MessageReply as A, MessageRequest as Q};
+        let request = self.ready()?;
+        let local = self.local()?;
+        // local() requires this owning actor to be Active; Candidate and PendingImport cannot enqueue.
+        let op = match operation {
+            Q::Open(peer) => MessageDbOp::Open(local.keys.peer_id(), peer),
+            Q::Conversations(before, limit) => MessageDbOp::Conversations(before, limit),
+            Q::Messages(id, before, limit) => MessageDbOp::Messages(id, before, limit),
+            Q::Send(peer, id, body) => {
+                MessageDbOp::Enqueue(peer, id, body, self.services.clock.wall_ms())
+            }
+            Q::Cancel(key) => MessageDbOp::Cancel(key),
+            Q::Retry(key) => MessageDbOp::Retry(key, self.services.clock.wall_ms()),
+            Q::Read(id, keys) => MessageDbOp::MarkRead(
+                id,
+                keys,
+                self.messages
+                    .scheduler
+                    .as_ref()
+                    .map_or_else(|| self.services.clock.wall_ms(), |s| s.now_ms()),
+            ),
+        };
+        Ok(match self.message_db(op, request).await? {
+            MessageDbReply::Conversation(v) => A::Conversation(v),
+            MessageDbReply::Conversations(v) => A::Conversations(v),
+            MessageDbReply::Messages(v) => A::Messages(v),
+            MessageDbReply::Message(v) => A::Message(v),
+            MessageDbReply::Done => A::Done,
+            _ => unreachable!(),
+        })
+    }
     fn message_repo(&self) -> Result<MessageRepo, CoreError> {
         Ok(MessageRepo::new(self.store.clone(), self.local()?))
     }
@@ -499,15 +534,17 @@ impl Manager {
         request: Request,
     ) -> Result<MessageDbReply, CoreError> {
         self.ensure_ready(request)?;
-        let result = self.message_repo()?.operation(op).await;
+        let result = self.message_repo()?.operation(MessageDbOp::Observed(Box::new(op))).await;
         if let Err(e) = &result {
             self.message_storage_failure(e.code, request);
         }
         match result {
-            Ok(reply) => {
+            Ok(MessageDbReply::Observed(reply, events)) => {
                 self.ensure_ready(request)?;
-                Ok(reply)
+                for event in events { self.bus.publish(event); }
+                Ok(*reply)
             }
+            Ok(_) => unreachable!(),
             Err(e) => Err(e),
         }
     }

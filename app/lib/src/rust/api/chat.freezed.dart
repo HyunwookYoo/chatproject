@@ -49,6 +49,8 @@ extension ChatEventPatterns on ChatEvent {
 
   @optionalTypeArgs
   TResult maybeMap<TResult extends Object?>({
+    TResult Function(ChatEvent_MessagesChanged value)? messagesChanged,
+    TResult Function(ChatEvent_MessageStateChanged value)? messageStateChanged,
     TResult Function(ChatEvent_AccountChanged value)? accountChanged,
     TResult Function(ChatEvent_AccountAuthChanged value)? accountAuthChanged,
     TResult Function(ChatEvent_AccountCacheUsed value)? accountCacheUsed,
@@ -61,6 +63,10 @@ extension ChatEventPatterns on ChatEvent {
   }) {
     final _that = this;
     switch (_that) {
+      case ChatEvent_MessagesChanged() when messagesChanged != null:
+        return messagesChanged(_that);
+      case ChatEvent_MessageStateChanged() when messageStateChanged != null:
+        return messageStateChanged(_that);
       case ChatEvent_AccountChanged() when accountChanged != null:
         return accountChanged(_that);
       case ChatEvent_AccountAuthChanged() when accountAuthChanged != null:
@@ -97,6 +103,9 @@ extension ChatEventPatterns on ChatEvent {
 
   @optionalTypeArgs
   TResult map<TResult extends Object?>({
+    required TResult Function(ChatEvent_MessagesChanged value) messagesChanged,
+    required TResult Function(ChatEvent_MessageStateChanged value)
+    messageStateChanged,
     required TResult Function(ChatEvent_AccountChanged value) accountChanged,
     required TResult Function(ChatEvent_AccountAuthChanged value)
     accountAuthChanged,
@@ -111,6 +120,10 @@ extension ChatEventPatterns on ChatEvent {
   }) {
     final _that = this;
     switch (_that) {
+      case ChatEvent_MessagesChanged():
+        return messagesChanged(_that);
+      case ChatEvent_MessageStateChanged():
+        return messageStateChanged(_that);
       case ChatEvent_AccountChanged():
         return accountChanged(_that);
       case ChatEvent_AccountAuthChanged():
@@ -144,6 +157,8 @@ extension ChatEventPatterns on ChatEvent {
 
   @optionalTypeArgs
   TResult? mapOrNull<TResult extends Object?>({
+    TResult? Function(ChatEvent_MessagesChanged value)? messagesChanged,
+    TResult? Function(ChatEvent_MessageStateChanged value)? messageStateChanged,
     TResult? Function(ChatEvent_AccountChanged value)? accountChanged,
     TResult? Function(ChatEvent_AccountAuthChanged value)? accountAuthChanged,
     TResult? Function(ChatEvent_AccountCacheUsed value)? accountCacheUsed,
@@ -155,6 +170,10 @@ extension ChatEventPatterns on ChatEvent {
   }) {
     final _that = this;
     switch (_that) {
+      case ChatEvent_MessagesChanged() when messagesChanged != null:
+        return messagesChanged(_that);
+      case ChatEvent_MessageStateChanged() when messageStateChanged != null:
+        return messageStateChanged(_that);
       case ChatEvent_AccountChanged() when accountChanged != null:
         return accountChanged(_that);
       case ChatEvent_AccountAuthChanged() when accountAuthChanged != null:
@@ -190,6 +209,14 @@ extension ChatEventPatterns on ChatEvent {
 
   @optionalTypeArgs
   TResult maybeWhen<TResult extends Object?>({
+    TResult Function(BigInt revision, Uint8List conversation)? messagesChanged,
+    TResult Function(
+      BigInt revision,
+      MessageKey key,
+      DeliveryState state,
+      bool cancelRequested,
+    )?
+    messageStateChanged,
     TResult Function(BigInt revision, AccountView view)? accountChanged,
     TResult Function(String peerId, String installationId, bool ready)?
     accountAuthChanged,
@@ -204,6 +231,15 @@ extension ChatEventPatterns on ChatEvent {
   }) {
     final _that = this;
     switch (_that) {
+      case ChatEvent_MessagesChanged() when messagesChanged != null:
+        return messagesChanged(_that.revision, _that.conversation);
+      case ChatEvent_MessageStateChanged() when messageStateChanged != null:
+        return messageStateChanged(
+          _that.revision,
+          _that.key,
+          _that.state,
+          _that.cancelRequested,
+        );
       case ChatEvent_AccountChanged() when accountChanged != null:
         return accountChanged(_that.revision, _that.view);
       case ChatEvent_AccountAuthChanged() when accountAuthChanged != null:
@@ -248,6 +284,15 @@ extension ChatEventPatterns on ChatEvent {
 
   @optionalTypeArgs
   TResult when<TResult extends Object?>({
+    required TResult Function(BigInt revision, Uint8List conversation)
+    messagesChanged,
+    required TResult Function(
+      BigInt revision,
+      MessageKey key,
+      DeliveryState state,
+      bool cancelRequested,
+    )
+    messageStateChanged,
     required TResult Function(BigInt revision, AccountView view) accountChanged,
     required TResult Function(String peerId, String installationId, bool ready)
     accountAuthChanged,
@@ -261,6 +306,15 @@ extension ChatEventPatterns on ChatEvent {
   }) {
     final _that = this;
     switch (_that) {
+      case ChatEvent_MessagesChanged():
+        return messagesChanged(_that.revision, _that.conversation);
+      case ChatEvent_MessageStateChanged():
+        return messageStateChanged(
+          _that.revision,
+          _that.key,
+          _that.state,
+          _that.cancelRequested,
+        );
       case ChatEvent_AccountChanged():
         return accountChanged(_that.revision, _that.view);
       case ChatEvent_AccountAuthChanged():
@@ -302,6 +356,14 @@ extension ChatEventPatterns on ChatEvent {
 
   @optionalTypeArgs
   TResult? whenOrNull<TResult extends Object?>({
+    TResult? Function(BigInt revision, Uint8List conversation)? messagesChanged,
+    TResult? Function(
+      BigInt revision,
+      MessageKey key,
+      DeliveryState state,
+      bool cancelRequested,
+    )?
+    messageStateChanged,
     TResult? Function(BigInt revision, AccountView view)? accountChanged,
     TResult? Function(String peerId, String installationId, bool ready)?
     accountAuthChanged,
@@ -315,6 +377,15 @@ extension ChatEventPatterns on ChatEvent {
   }) {
     final _that = this;
     switch (_that) {
+      case ChatEvent_MessagesChanged() when messagesChanged != null:
+        return messagesChanged(_that.revision, _that.conversation);
+      case ChatEvent_MessageStateChanged() when messageStateChanged != null:
+        return messageStateChanged(
+          _that.revision,
+          _that.key,
+          _that.state,
+          _that.cancelRequested,
+        );
       case ChatEvent_AccountChanged() when accountChanged != null:
         return accountChanged(_that.revision, _that.view);
       case ChatEvent_AccountAuthChanged() when accountAuthChanged != null:
@@ -342,6 +413,195 @@ extension ChatEventPatterns on ChatEvent {
       case _:
         return null;
     }
+  }
+}
+
+/// @nodoc
+
+class ChatEvent_MessagesChanged extends ChatEvent {
+  const ChatEvent_MessagesChanged({
+    required this.revision,
+    required this.conversation,
+  }) : super._();
+
+  final BigInt revision;
+  final Uint8List conversation;
+
+  /// Create a copy of ChatEvent
+  /// with the given fields replaced by the non-null parameter values.
+  @JsonKey(includeFromJson: false, includeToJson: false)
+  @pragma('vm:prefer-inline')
+  $ChatEvent_MessagesChangedCopyWith<ChatEvent_MessagesChanged> get copyWith =>
+      _$ChatEvent_MessagesChangedCopyWithImpl<ChatEvent_MessagesChanged>(
+        this,
+        _$identity,
+      );
+
+  @override
+  bool operator ==(Object other) {
+    return identical(this, other) ||
+        (other.runtimeType == runtimeType &&
+            other is ChatEvent_MessagesChanged &&
+            (identical(other.revision, revision) ||
+                other.revision == revision) &&
+            const DeepCollectionEquality().equals(
+              other.conversation,
+              conversation,
+            ));
+  }
+
+  @override
+  int get hashCode => Object.hash(
+    runtimeType,
+    revision,
+    const DeepCollectionEquality().hash(conversation),
+  );
+
+  @override
+  String toString() {
+    return 'ChatEvent.messagesChanged(revision: $revision, conversation: $conversation)';
+  }
+}
+
+/// @nodoc
+abstract mixin class $ChatEvent_MessagesChangedCopyWith<$Res>
+    implements $ChatEventCopyWith<$Res> {
+  factory $ChatEvent_MessagesChangedCopyWith(
+    ChatEvent_MessagesChanged value,
+    $Res Function(ChatEvent_MessagesChanged) _then,
+  ) = _$ChatEvent_MessagesChangedCopyWithImpl;
+  @useResult
+  $Res call({BigInt revision, Uint8List conversation});
+}
+
+/// @nodoc
+class _$ChatEvent_MessagesChangedCopyWithImpl<$Res>
+    implements $ChatEvent_MessagesChangedCopyWith<$Res> {
+  _$ChatEvent_MessagesChangedCopyWithImpl(this._self, this._then);
+
+  final ChatEvent_MessagesChanged _self;
+  final $Res Function(ChatEvent_MessagesChanged) _then;
+
+  /// Create a copy of ChatEvent
+  /// with the given fields replaced by the non-null parameter values.
+  @pragma('vm:prefer-inline')
+  $Res call({Object? revision = null, Object? conversation = null}) {
+    return _then(
+      ChatEvent_MessagesChanged(
+        revision: null == revision
+            ? _self.revision
+            : revision // ignore: cast_nullable_to_non_nullable
+                  as BigInt,
+        conversation: null == conversation
+            ? _self.conversation
+            : conversation // ignore: cast_nullable_to_non_nullable
+                  as Uint8List,
+      ),
+    );
+  }
+}
+
+/// @nodoc
+
+class ChatEvent_MessageStateChanged extends ChatEvent {
+  const ChatEvent_MessageStateChanged({
+    required this.revision,
+    required this.key,
+    required this.state,
+    required this.cancelRequested,
+  }) : super._();
+
+  final BigInt revision;
+  final MessageKey key;
+  final DeliveryState state;
+  final bool cancelRequested;
+
+  /// Create a copy of ChatEvent
+  /// with the given fields replaced by the non-null parameter values.
+  @JsonKey(includeFromJson: false, includeToJson: false)
+  @pragma('vm:prefer-inline')
+  $ChatEvent_MessageStateChangedCopyWith<ChatEvent_MessageStateChanged>
+  get copyWith =>
+      _$ChatEvent_MessageStateChangedCopyWithImpl<
+        ChatEvent_MessageStateChanged
+      >(this, _$identity);
+
+  @override
+  bool operator ==(Object other) {
+    return identical(this, other) ||
+        (other.runtimeType == runtimeType &&
+            other is ChatEvent_MessageStateChanged &&
+            (identical(other.revision, revision) ||
+                other.revision == revision) &&
+            (identical(other.key, key) || other.key == key) &&
+            (identical(other.state, state) || other.state == state) &&
+            (identical(other.cancelRequested, cancelRequested) ||
+                other.cancelRequested == cancelRequested));
+  }
+
+  @override
+  int get hashCode =>
+      Object.hash(runtimeType, revision, key, state, cancelRequested);
+
+  @override
+  String toString() {
+    return 'ChatEvent.messageStateChanged(revision: $revision, key: $key, state: $state, cancelRequested: $cancelRequested)';
+  }
+}
+
+/// @nodoc
+abstract mixin class $ChatEvent_MessageStateChangedCopyWith<$Res>
+    implements $ChatEventCopyWith<$Res> {
+  factory $ChatEvent_MessageStateChangedCopyWith(
+    ChatEvent_MessageStateChanged value,
+    $Res Function(ChatEvent_MessageStateChanged) _then,
+  ) = _$ChatEvent_MessageStateChangedCopyWithImpl;
+  @useResult
+  $Res call({
+    BigInt revision,
+    MessageKey key,
+    DeliveryState state,
+    bool cancelRequested,
+  });
+}
+
+/// @nodoc
+class _$ChatEvent_MessageStateChangedCopyWithImpl<$Res>
+    implements $ChatEvent_MessageStateChangedCopyWith<$Res> {
+  _$ChatEvent_MessageStateChangedCopyWithImpl(this._self, this._then);
+
+  final ChatEvent_MessageStateChanged _self;
+  final $Res Function(ChatEvent_MessageStateChanged) _then;
+
+  /// Create a copy of ChatEvent
+  /// with the given fields replaced by the non-null parameter values.
+  @pragma('vm:prefer-inline')
+  $Res call({
+    Object? revision = null,
+    Object? key = null,
+    Object? state = null,
+    Object? cancelRequested = null,
+  }) {
+    return _then(
+      ChatEvent_MessageStateChanged(
+        revision: null == revision
+            ? _self.revision
+            : revision // ignore: cast_nullable_to_non_nullable
+                  as BigInt,
+        key: null == key
+            ? _self.key
+            : key // ignore: cast_nullable_to_non_nullable
+                  as MessageKey,
+        state: null == state
+            ? _self.state
+            : state // ignore: cast_nullable_to_non_nullable
+                  as DeliveryState,
+        cancelRequested: null == cancelRequested
+            ? _self.cancelRequested
+            : cancelRequested // ignore: cast_nullable_to_non_nullable
+                  as bool,
+      ),
+    );
   }
 }
 

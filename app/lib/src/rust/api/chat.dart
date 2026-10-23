@@ -10,7 +10,7 @@ import 'package:freezed_annotation/freezed_annotation.dart' hide protected;
 part 'chat.freezed.dart';
 
 // These functions are ignored because they are not marked as `pub`: `done_reply`, `network_info_reply`, `run_network`, `unexpected_network_reply`
-// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`
+// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`
 
 String coreVersion() => RustLib.instance.api.crateApiChatCoreVersion();
 
@@ -51,6 +51,16 @@ Future<void> testHooksStart({
 sealed class ChatEvent with _$ChatEvent {
   const ChatEvent._();
 
+  const factory ChatEvent.messagesChanged({
+    required BigInt revision,
+    required Uint8List conversation,
+  }) = ChatEvent_MessagesChanged;
+  const factory ChatEvent.messageStateChanged({
+    required BigInt revision,
+    required MessageKey key,
+    required DeliveryState state,
+    required bool cancelRequested,
+  }) = ChatEvent_MessageStateChanged;
   const factory ChatEvent.accountChanged({
     required BigInt revision,
     required AccountView view,
@@ -119,6 +129,16 @@ class CoreInfo {
           instanceId == other.instanceId;
 }
 
+enum DeliveryState {
+  queued,
+  sentDirect,
+  delivered,
+  read,
+  blocked,
+  failed,
+  cancelled,
+}
+
 enum ErrorCode {
   invalidConfig,
   alreadyStartedDifferentConfig,
@@ -155,6 +175,37 @@ enum ErrorCode {
   contactRequired,
   unsupportedMessageVersion,
   storageUncertain,
+}
+
+class MessageKey {
+  final Uint8List conversation;
+  final Uint8List sender;
+  final Uint8List installation;
+  final Uint8List id;
+
+  const MessageKey({
+    required this.conversation,
+    required this.sender,
+    required this.installation,
+    required this.id,
+  });
+
+  @override
+  int get hashCode =>
+      conversation.hashCode ^
+      sender.hashCode ^
+      installation.hashCode ^
+      id.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is MessageKey &&
+          runtimeType == other.runtimeType &&
+          conversation == other.conversation &&
+          sender == other.sender &&
+          installation == other.installation &&
+          id == other.id;
 }
 
 class NetworkInfo {

@@ -54,6 +54,10 @@ async fn sql_pending_import_receipt_survives_restart() {
     let (slot, account) = open(dir.path()).await;
     let before = account.snapshot().await.unwrap();
     assert_eq!(before.phase, AccountPhase::PendingImport);
+    let peer = chat_core::account::PeerId([7; 32]);
+    assert_eq!(account.messages().open_dm(peer).await.unwrap_err().code, ErrorCode::AccountRestricted);
+    assert_eq!(account.messages().send_text(peer, chat_core::MessageId([7; 16]), "pending fixture".into()).await.unwrap_err().code, ErrorCode::AccountRestricted);
+    assert_eq!(account.storage_test_fixture().message_counts().await.unwrap(), (0, 0, 0, 0));
     assert!(!before.pending_pair_transactions.is_empty());
     chat_core::storage_fixture::assert_account_preserved(
         &pending,

@@ -67,6 +67,11 @@ struct Worker {
     message_clock: Option<(Arc<crate::account::clock::FakeClock>,u64)>,
 }
 impl Worker {
+    fn due_hint(&mut self, now: u64) -> R<bool> {
+        // A hint never settles uncertainty; only the next validated operation can.
+        let pending = self.pending_message.is_some();
+        self.operation(|c| messages::due_hint(c, now).map(|due| due || pending))
+    }
     fn message(&mut self, identity: Identity, op: MessageDbOp) -> R<MessageDbReply> {
         let key = op.pending(identity)?;
         let db_id = self.id;
@@ -81,10 +86,10 @@ impl Worker {
         #[cfg(all(feature="test-hooks",debug_assertions))]
         let clock=if key.is_some() {self.message_clock.take()} else {None};
         let result = self.operation(|c| {
-            let stored = load(c, &db_id)?.ok_or_else(|| {
+            let (_, state) = migration::load_validated(c, &db_id)?.ok_or_else(|| {
                 CoreError::new(ErrorCode::AccountRestricted, "active_account_required")
             })?;
-            let AccountState::Active(local) = AccountState::decode(&stored)? else {
+            let AccountState::Active(local) = state else {
                 return Err(CoreError::new(
                     ErrorCode::AccountRestricted,
                     "active_account_required",
@@ -330,6 +335,7 @@ struct Pending<T> {
     cancellation: CancellationToken,
 }
 enum DbOp {
+    DueHint(u64, oneshot::Sender<R<bool>>),
     Message(Identity, MessageDbOp, oneshot::Sender<R<MessageDbReply>>),
     Load(oneshot::Sender<R<Option<StoredPlaintext>>>),
     Commit(StoredPlaintext, oneshot::Sender<R<()>>),
@@ -349,6 +355,9 @@ pub(crate) struct StorageHandle {
 }
 #[allow(dead_code)]
 impl StorageHandle {
+    pub(crate) async fn due_hint(&self, now: u64) -> R<bool> {
+        self.receive(self.send(|reply| DbOp::DueHint(now, reply), false)?).await
+    }
     pub(crate) async fn message(&self, identity: Identity, op: MessageDbOp) -> R<MessageDbReply> {
         self.receive(self.send(|reply| DbOp::Message(identity, op, reply), false)?)
             .await
@@ -485,6 +494,12 @@ fn run(mut w: Worker, mut rx: mpsc::Receiver<Request>, fence: Arc<Mutex<Fence>>)
                 && fence.lock().is_ok_and(|f| f.ticket == request.ticket)
         };
         match request.op {
+            DbOp::DueHint(now, reply) => {
+                let result = if valid() && fence.lock().is_ok_and(|f| !f.blocked) {
+                    w.due_hint(now)
+                } else { Err(locked()) };
+                let _ = reply.send(if valid() { result } else { Err(locked()) });
+            }
             DbOp::Message(identity, op, reply) => {
                 let result = if valid() && fence.lock().is_ok_and(|f| !f.blocked) {
                     w.message(identity, op)
@@ -867,6 +882,183 @@ mod tests {
         );
         assert_eq!(store.counts().await, (0, 0, 0, 0));
     }
+    #[tokio::test]
+    async fn idle_scheduler_does_not_request_message_authority() {
+        let store = OwnedStore::open().await;
+        let stored = crate::account::storage::migration_fixtures::migration_states()
+            .pop()
+            .unwrap()
+            .unwrap();
+        let AccountState::Active(local) = AccountState::decode(&stored).unwrap() else {
+            unreachable!()
+        };
+        let repo = messages::MessageRepo::new(store.handle.clone(), &local);
+        let mut scheduler = crate::message::scheduler::Scheduler::new(
+            repo,
+            Arc::new(crate::account::clock::FakeClock::new(1, 0)),
+        );
+        // No actual message operation is needed to discover an empty queue.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), scheduler.poll_due(0))
+                .await
+                .unwrap()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(store.counts().await, (0, 0, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn positive_due_hint_still_requires_actual_sql_identity() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let store = OwnedStore::open().await;
+            let stored = crate::account::storage::migration_fixtures::migration_states()
+                .pop()
+                .unwrap()
+                .unwrap();
+            let AccountState::Active(mut local) = AccountState::decode(&stored).unwrap() else {
+                unreachable!()
+            };
+            let identity = Identity {
+                peer: local.keys.peer_id(),
+                installation: local.device.installation_id(),
+            };
+            store.handle.commit_account(stored).await.unwrap();
+            store
+                .handle
+                .message(
+                    identity,
+                    MessageDbOp::Enqueue(PeerId([2; 32]), MessageId([1; 16]), "fixture".into(), 0),
+                )
+                .await
+                .unwrap();
+            assert!(store.handle.due_hint(0).await.unwrap());
+            local.keys = derive_account(&Secret32::from([91; 32])).unwrap();
+            let repo = messages::MessageRepo::new(store.handle.clone(), &local);
+            let mut scheduler = crate::message::scheduler::Scheduler::new(
+                repo,
+                Arc::new(crate::account::clock::FakeClock::new(1, 0)),
+            );
+            let before = store.counts().await;
+            assert_eq!(
+                scheduler.poll_due(0).await.err().unwrap().code,
+                ErrorCode::AccountRestricted
+            );
+            assert_eq!(store.counts().await, before);
+        })
+        .await
+        .unwrap();
+    }
+    #[tokio::test]
+    async fn due_hint_preserves_uncertain_owner_until_actual_operation() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let store = OwnedStore::open().await;
+            let stored = crate::account::storage::migration_fixtures::migration_states()
+                .pop()
+                .unwrap()
+                .unwrap();
+            let AccountState::Active(local) = AccountState::decode(&stored).unwrap() else {
+                unreachable!()
+            };
+            let identity = Identity {
+                peer: local.keys.peer_id(),
+                installation: local.device.installation_id(),
+            };
+            store.handle.commit_account(stored).await.unwrap();
+            let (tx, rx) = oneshot::channel();
+            store
+                .handle
+                .test(TestOp::MessageFault(CommitFault::BeforeCommit, tx))
+                .await;
+            rx.await.unwrap();
+            assert_eq!(
+                store
+                    .handle
+                    .message(
+                        identity,
+                        MessageDbOp::Enqueue(
+                            PeerId([2; 32]),
+                            MessageId([1; 16]),
+                            "fixture".into(),
+                            0
+                        )
+                    )
+                    .await
+                    .err()
+                    .unwrap()
+                    .code,
+                ErrorCode::StorageUncertain
+            );
+            assert!(store.handle.due_hint(0).await.unwrap());
+            assert_eq!(store.counts().await, (0, 0, 0, 0));
+            assert!(store.handle.due_hint(0).await.unwrap());
+            let wrong = Identity {
+                peer: PeerId([9; 32]),
+                ..identity
+            };
+            assert_eq!(
+                store
+                    .handle
+                    .message(wrong, MessageDbOp::Due(0, vec![], [None, None]))
+                    .await
+                    .err()
+                    .unwrap()
+                    .code,
+                ErrorCode::AccountRestricted
+            );
+            assert!(store.handle.due_hint(0).await.unwrap());
+            store
+                .handle
+                .message(identity, MessageDbOp::Due(0, vec![], [None, None]))
+                .await
+                .unwrap();
+            assert!(!store.handle.due_hint(0).await.unwrap());
+            assert_eq!(store.counts().await, (0, 0, 0, 0));
+        })
+        .await
+        .unwrap();
+    }
+    #[tokio::test]
+    async fn due_hint_fences_queued_and_already_sent_results() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let store = OwnedStore::open().await;
+            let (entered, wait) = oneshot::channel();
+            let (release, hold) = std::sync::mpsc::channel();
+            store.handle.test(TestOp::Pause(entered, hold)).await;
+            wait.await.unwrap();
+            let queued = store
+                .handle
+                .send(|reply| DbOp::DueHint(0, reply), false)
+                .unwrap();
+            store.handle.invalidate(1);
+            release.send(()).unwrap();
+            assert_eq!(
+                store.handle.receive(queued).await.err().unwrap().code,
+                ErrorCode::StorageLocked
+            );
+            assert_eq!(
+                store.handle.due_hint(0).await.err().unwrap().code,
+                ErrorCode::StorageLocked
+            );
+            store.handle.resume().await.unwrap();
+            let sent = store
+                .handle
+                .send(|reply| DbOp::DueHint(0, reply), false)
+                .unwrap();
+            // This FIFO barrier completes only after the hint reply was sent.
+            let (tx, rx) = oneshot::channel();
+            store.handle.test(TestOp::Rows(tx)).await;
+            rx.await.unwrap().unwrap();
+            store.handle.invalidate(2);
+            assert_eq!(
+                store.handle.receive(sent).await.err().unwrap().code,
+                ErrorCode::StorageLocked
+            );
+        })
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn message_identity_unconfigured_sql_rejects_without_mutation() {
         check_restricted_binding(SqlBinding::Unconfigured).await;

@@ -118,6 +118,8 @@ impl From<chat_core::NetworkInfo> for NetworkInfo {
 impl From<chat_core::CoreEvent> for ChatEvent {
     fn from(event: chat_core::CoreEvent) -> Self {
         match event {
+            chat_core::CoreEvent::MessagesChanged { revision, conversation } => Self::MessagesChanged { revision, conversation: conversation.0.to_vec() },
+            chat_core::CoreEvent::MessageStateChanged { revision, key, state, cancel_requested } => Self::MessageStateChanged { revision, key: key.into(), state: state.into(), cancel_requested },
             chat_core::CoreEvent::AccountChanged { revision, view } => Self::AccountChanged { revision, view: Box::new((*view).into()) },
             chat_core::CoreEvent::AccountAuthChanged {peer_id,installation_id,ready} => Self::AccountAuthChanged {peer_id,installation_id,ready},
             chat_core::CoreEvent::AccountCacheUsed {peer_id} => Self::AccountCacheUsed {peer_id},
@@ -538,6 +540,33 @@ mod tests {
                 }),
                 ChatEvent::Error { code: ffi, detail: "safe detail".into() }
             );
+        }
+    }
+}
+
+impl From<chat_core::MessageKey> for crate::api::chat::MessageKey {
+    fn from(k: chat_core::MessageKey) -> Self {
+        Self { conversation: k.conversation.0.to_vec(), sender: k.sender.0.to_vec(), installation: k.installation.0.to_vec(), id: k.id.0.to_vec() }
+    }
+}
+impl From<chat_core::DeliveryState> for crate::api::chat::DeliveryState {
+    fn from(s: chat_core::DeliveryState) -> Self {
+        use chat_core::DeliveryState as C;
+        match s { C::Queued => Self::Queued, C::SentDirect => Self::SentDirect, C::Delivered => Self::Delivered, C::Read => Self::Read, C::Blocked => Self::Blocked, C::Failed => Self::Failed, C::Cancelled => Self::Cancelled }
+    }
+}
+
+#[cfg(test)]
+mod message_event_tests {
+    use super::*;
+    #[test]
+    fn message_events_preserve_exact_ids_revision_and_all_states() {
+        let key = chat_core::MessageKey { conversation: chat_core::ConversationId([1; 32]), sender: chat_core::account::PeerId([2; 32]), installation: chat_core::account::InstallationId([3; 32]), id: chat_core::MessageId([4; 16]) };
+        assert_eq!(ChatEvent::from(chat_core::CoreEvent::MessagesChanged { revision: u64::MAX, conversation: key.conversation }), ChatEvent::MessagesChanged { revision: u64::MAX, conversation: vec![1; 32] });
+        use chat_core::DeliveryState as C;
+        use crate::api::chat::DeliveryState as D;
+        for (from, to) in [(C::Queued,D::Queued),(C::SentDirect,D::SentDirect),(C::Delivered,D::Delivered),(C::Read,D::Read),(C::Blocked,D::Blocked),(C::Failed,D::Failed),(C::Cancelled,D::Cancelled)] {
+            assert_eq!(ChatEvent::from(chat_core::CoreEvent::MessageStateChanged { revision: u64::MAX, key, state: from, cancel_requested: true }), ChatEvent::MessageStateChanged { revision: u64::MAX, key: crate::api::chat::MessageKey { conversation: vec![1; 32], sender: vec![2; 32], installation: vec![3; 32], id: vec![4; 16] }, state: to, cancel_requested: true });
         }
     }
 }

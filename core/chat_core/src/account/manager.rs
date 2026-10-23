@@ -63,6 +63,7 @@ pub struct CandidateInfo {
     pub endpoint_id: String,
 }
 enum Command {
+    Message(crate::message::service::MessageRequest, oneshot::Sender<Result<crate::message::service::MessageReply, CoreError>>),
     #[cfg(all(feature="test-hooks",debug_assertions))]
     MessageProofWriteStarts(oneshot::Sender<Result<usize,CoreError>>),
     #[cfg(all(feature = "test-hooks", debug_assertions))]
@@ -124,6 +125,7 @@ struct Queued {
 impl Command {
     fn reject(self, error: CoreError) {
         match self {
+            Self::Message(_, reply) => { let _ = reply.send(Err(error)); }
             #[cfg(all(feature="test-hooks",debug_assertions))]
             Self::MessageProofWriteStarts(reply)=>{let _=reply.send(Err(error));}
             #[cfg(all(feature = "test-hooks", debug_assertions))]
@@ -203,6 +205,15 @@ fn unavailable(code: ErrorCode) -> CoreError {
 }
 
 impl AccountHandle {
+    pub(crate) async fn message(&self, request: crate::message::service::MessageRequest) -> Result<crate::message::service::MessageReply, CoreError> {
+        let ticket = self.shared.requests.borrow().ticket;
+        let value = self.send(|reply| Command::Message(request, reply)).await?;
+        // A storage failure can lock this same request after its SQL reply was sent.
+        if self.shared.status.load(Ordering::Acquire) != (ticket << 2) | 1 {
+            return Err(unavailable(ErrorCode::StorageLocked));
+        }
+        Ok(value)
+    }
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     pub fn storage_test_fixture(&self) -> crate::storage_fixture::Fixture {
         crate::storage_fixture::Fixture::from_handle(self.shared.store.clone())
@@ -1150,7 +1161,8 @@ impl Manager {
                     self.complete(request, result);
                     self.auto_refresh().await;
                 }
-                _ = expiry.tick() => { self.restrict_grants(); self.expire_pair(); self.poll_messages().await; }
+                // Coalesce overdue maintenance: a slow SQL turn must leave commands a ready window.
+                _ = expiry.tick() => { self.restrict_grants(); self.expire_pair(); self.poll_messages().await; expiry.reset(); }
                 _ = message_wake.notified() => { self.restrict_grants(); self.poll_messages().await; }
                 _ = import_poll.tick(), if self.pair.current.is_some() && matches!(self.state,Some(AccountState::PendingImport(_))) => {let _=self.refresh_import().await;}
                 Some(input)=self.pair.input.recv()=>{self.pair_input(input).await;}
@@ -1163,6 +1175,7 @@ impl Manager {
                         continue;
                     }
                     match queued.command {
+                        Command::Message(operation, reply) => { let result = self.message_request(operation).await; let _ = reply.send(result); }
                         #[cfg(all(feature="test-hooks",debug_assertions))]
                         Command::MessageProofWriteStarts(reply)=>{let _=reply.send(Ok(self.message_proof_write_starts()));}
                         #[cfg(all(feature = "test-hooks", debug_assertions))]

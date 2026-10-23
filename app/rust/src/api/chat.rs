@@ -104,8 +104,19 @@ pub struct CoreError {
     pub detail: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryState { Queued, SentDirect, Delivered, Read, Blocked, Failed, Cancelled }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageKey {
+    pub conversation: Vec<u8>,
+    pub sender: Vec<u8>,
+    pub installation: Vec<u8>,
+    pub id: Vec<u8>,
+}
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChatEvent {
+    MessagesChanged { revision: u64, conversation: Vec<u8> },
+    MessageStateChanged { revision: u64, key: MessageKey, state: DeliveryState, cancel_requested: bool },
     AccountChanged { revision: u64, view: Box<super::account::AccountView> },
     AccountAuthChanged { peer_id: String, installation_id: String, ready: bool },
     AccountCacheUsed { peer_id: String },

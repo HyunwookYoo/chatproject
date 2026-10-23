@@ -5,7 +5,7 @@ pub mod account;
 pub mod error;
 pub mod event;
 pub mod runtime;
-mod message;
+pub mod message;
 mod storage;
 pub mod transport;
 
@@ -24,3 +24,8 @@ pub use account::{AccountHandle, CandidateInfo};
 #[cfg(all(feature = "test-hooks", debug_assertions))]
 #[path = "storage/fixture.rs"]
 pub mod storage_fixture;
+
+pub use message::{
+    BlockReason, ConversationCursor, ConversationId, ConversationPage, ConversationView,
+    DeliveryState, MessageCursor, MessageHandle, MessageId, MessageKey, MessagePage, MessageView,
+};

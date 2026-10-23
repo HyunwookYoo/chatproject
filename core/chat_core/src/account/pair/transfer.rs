@@ -35,8 +35,12 @@ impl Payload {
         base: [u8; 32],
         contacts: &[Contact],
     ) -> Zeroizing<Vec<u8>> {
-        // Reserve the bounded maximum once so seed-containing allocations never grow.
-        let mut bytes = Zeroizing::new(Vec::with_capacity(LIMIT));
+        // Reserve before writing seeds: fixed fields (including the <=256-byte cert)
+        // fit in 512 bytes. Each contact needs at most 79 bytes plus its UTF-8 alias:
+        // array(1), peer(34), string header(9), flag(1), optional digest(34).
+        // A proportional bound avoids wiping an unused LIMIT-sized allocation.
+        let capacity = 512 + contacts.iter().map(|c| 80 + c.alias.len()).sum::<usize>();
+        let mut bytes = Zeroizing::new(Vec::with_capacity(capacity));
         let mut e = Encoder::new(&mut *bytes);
         e.array(7)
             .unwrap()
@@ -396,6 +400,82 @@ mod tests {
         bad.splice(0..1, [0x98, 7]);
         assert!(Payload::decode(&bad).is_err());
     }
+    #[test]
+    fn small_payload_reservation_is_proportional() {
+        let (_, bytes) = payload();
+        assert_eq!(bytes.len(), 355);
+        assert!(
+            bytes.capacity() < 1024,
+            "small payload must not reserve the 4 MiB wire limit"
+        );
+    }
+
+    #[test]
+    fn payload_reservation_covers_cbor_boundaries_without_growth() {
+        let keys = derive_account(&Secret32::from([3; 32])).unwrap();
+        let device = derive_device(Secret32::from([4; 32])).unwrap();
+        let cert = sign_cert(&keys, &device, DeviceKind::Mobile, u64::MAX).unwrap();
+        // Literal reserve bounds cover CBOR count and UTF-8 byte-length transitions.
+        // Final capacity equals the initial reserve only if encoding never grows it.
+        for (count, alias, reserve) in [
+            (0, String::new(), 512),
+            (1, String::new(), 592),
+            (1, "a".repeat(23), 615),
+            (1, "a".repeat(24), 616),
+            (1, "a".repeat(64), 656),
+            (1, "한".repeat(21) + "a", 656),
+            (23, "a".repeat(64), 3824),
+            (24, "a".repeat(64), 3968),
+            (255, "a".repeat(64), 37232),
+            (256, "a".repeat(64), 37376),
+            (1000, "한".repeat(21) + "a", 144512),
+        ] {
+            for verified in [false, true] {
+                let contacts: Vec<_> = (0..count as u64)
+                    .map(|i| {
+                        let mut peer = [0; 32];
+                        peer[24..].copy_from_slice(&i.to_be_bytes());
+                        let peer = PeerId(peer);
+                        Contact {
+                            peer,
+                            alias: alias.clone(),
+                            verified_digest: verified
+                                .then(|| crate::account::safety_digest(keys.peer_id(), peer)),
+                            known_installation: None,
+                            new_device: false,
+                        }
+                    })
+                    .collect();
+                let bytes = Payload::encode_parts(
+                    TxId([1; 16]),
+                    &keys,
+                    &cert,
+                    Generation([2; 16]),
+                    [8; 32],
+                    &contacts,
+                );
+                assert!(bytes.len() <= reserve);
+                assert_eq!(
+                    bytes.capacity(),
+                    reserve,
+                    "secret-containing encoding must not grow its reservation"
+                );
+                let decoded = Payload::decode(&bytes).unwrap();
+                assert_eq!(decoded.contacts.len(), count);
+                assert!(decoded.matches_device(&device));
+                assert!(
+                    decoded
+                        .contacts
+                        .iter()
+                        .zip(&contacts)
+                        .all(|(a, b)| a.peer == b.peer
+                            && a.alias == b.alias
+                            && a.verified_digest == b.verified_digest)
+                );
+            }
+        }
+    }
+
     #[test]
     fn ordered_chunks_reject_skip_duplicate_excess_hash_and_trailing() {
         let (_, bytes) = payload();

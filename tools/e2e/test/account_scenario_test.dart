@@ -13,6 +13,8 @@ void main() {
   for (final kind in [
     'account_auth_changed',
     'account_cache_used',
+    'messages_changed',
+    'message_state_changed',
     'unknown_account_event',
   ]) {
     test(

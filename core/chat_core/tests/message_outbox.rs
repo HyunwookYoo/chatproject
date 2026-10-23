@@ -367,6 +367,7 @@ async fn reopen(f: Fixture, backend: Arc<Backend>, now: u64) -> Fixture {
         _sql: sql_store::Store::from_fixture(account.storage_test_fixture()),
         _dir,
         slot,
+        bus,
         account,
         peer,
         clock,

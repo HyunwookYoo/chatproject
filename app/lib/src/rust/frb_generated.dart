@@ -1415,6 +1415,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  MessageKey dco_decode_box_autoadd_message_key(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return dco_decode_message_key(raw);
+  }
+
+  @protected
   NetworkInfo dco_decode_box_autoadd_network_info(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return dco_decode_network_info(raw);
@@ -1461,39 +1467,51 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     switch (raw[0]) {
       case 0:
+        return ChatEvent_MessagesChanged(
+          revision: dco_decode_u_64(raw[1]),
+          conversation: dco_decode_list_prim_u_8_strict(raw[2]),
+        );
+      case 1:
+        return ChatEvent_MessageStateChanged(
+          revision: dco_decode_u_64(raw[1]),
+          key: dco_decode_box_autoadd_message_key(raw[2]),
+          state: dco_decode_delivery_state(raw[3]),
+          cancelRequested: dco_decode_bool(raw[4]),
+        );
+      case 2:
         return ChatEvent_AccountChanged(
           revision: dco_decode_u_64(raw[1]),
           view: dco_decode_box_account_view(raw[2]),
         );
-      case 1:
+      case 3:
         return ChatEvent_AccountAuthChanged(
           peerId: dco_decode_String(raw[1]),
           installationId: dco_decode_String(raw[2]),
           ready: dco_decode_bool(raw[3]),
         );
-      case 2:
+      case 4:
         return ChatEvent_AccountCacheUsed(peerId: dco_decode_String(raw[1]));
-      case 3:
+      case 5:
         return ChatEvent_ConnectionState(
           directPeers: dco_decode_u_32(raw[1]),
           mailboxOk: dco_decode_bool(raw[2]),
           queueOk: dco_decode_opt_box_autoadd_bool(raw[3]),
         );
-      case 4:
+      case 6:
         return ChatEvent_Error(
           code: dco_decode_error_code(raw[1]),
           detail: dco_decode_String(raw[2]),
         );
-      case 5:
+      case 7:
         return ChatEvent_NetworkChanged(
           info: dco_decode_box_autoadd_network_info(raw[1]),
         );
-      case 6:
+      case 8:
         return ChatEvent_PeerChanged(
           revision: dco_decode_u_64(raw[1]),
           peer: dco_decode_box_autoadd_peer_info(raw[2]),
         );
-      case 7:
+      case 9:
         return ChatEvent_ProbeTextReceived(
           peerId: dco_decode_String(raw[1]),
           text: dco_decode_String(raw[2]),
@@ -1540,6 +1558,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       version: dco_decode_String(arr[0]),
       instanceId: dco_decode_String(arr[1]),
     );
+  }
+
+  @protected
+  DeliveryState dco_decode_delivery_state(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return DeliveryState.values[raw as int];
   }
 
   @protected
@@ -1652,6 +1676,20 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   List<RevocationView> dco_decode_list_revocation_view(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return (raw as List<dynamic>).map(dco_decode_revocation_view).toList();
+  }
+
+  @protected
+  MessageKey dco_decode_message_key(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 4)
+      throw Exception('unexpected arr length: expect 4 but see ${arr.length}');
+    return MessageKey(
+      conversation: dco_decode_list_prim_u_8_strict(arr[0]),
+      sender: dco_decode_list_prim_u_8_strict(arr[1]),
+      installation: dco_decode_list_prim_u_8_strict(arr[2]),
+      id: dco_decode_list_prim_u_8_strict(arr[3]),
+    );
   }
 
   @protected
@@ -2041,6 +2079,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  MessageKey sse_decode_box_autoadd_message_key(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return (sse_decode_message_key(deserializer));
+  }
+
+  @protected
   NetworkInfo sse_decode_box_autoadd_network_info(
     SseDeserializer deserializer,
   ) {
@@ -2091,9 +2135,27 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     switch (tag_) {
       case 0:
         var var_revision = sse_decode_u_64(deserializer);
+        var var_conversation = sse_decode_list_prim_u_8_strict(deserializer);
+        return ChatEvent_MessagesChanged(
+          revision: var_revision,
+          conversation: var_conversation,
+        );
+      case 1:
+        var var_revision = sse_decode_u_64(deserializer);
+        var var_key = sse_decode_box_autoadd_message_key(deserializer);
+        var var_state = sse_decode_delivery_state(deserializer);
+        var var_cancelRequested = sse_decode_bool(deserializer);
+        return ChatEvent_MessageStateChanged(
+          revision: var_revision,
+          key: var_key,
+          state: var_state,
+          cancelRequested: var_cancelRequested,
+        );
+      case 2:
+        var var_revision = sse_decode_u_64(deserializer);
         var var_view = sse_decode_box_account_view(deserializer);
         return ChatEvent_AccountChanged(revision: var_revision, view: var_view);
-      case 1:
+      case 3:
         var var_peerId = sse_decode_String(deserializer);
         var var_installationId = sse_decode_String(deserializer);
         var var_ready = sse_decode_bool(deserializer);
@@ -2102,10 +2164,10 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           installationId: var_installationId,
           ready: var_ready,
         );
-      case 2:
+      case 4:
         var var_peerId = sse_decode_String(deserializer);
         return ChatEvent_AccountCacheUsed(peerId: var_peerId);
-      case 3:
+      case 5:
         var var_directPeers = sse_decode_u_32(deserializer);
         var var_mailboxOk = sse_decode_bool(deserializer);
         var var_queueOk = sse_decode_opt_box_autoadd_bool(deserializer);
@@ -2114,18 +2176,18 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           mailboxOk: var_mailboxOk,
           queueOk: var_queueOk,
         );
-      case 4:
+      case 6:
         var var_code = sse_decode_error_code(deserializer);
         var var_detail = sse_decode_String(deserializer);
         return ChatEvent_Error(code: var_code, detail: var_detail);
-      case 5:
+      case 7:
         var var_info = sse_decode_box_autoadd_network_info(deserializer);
         return ChatEvent_NetworkChanged(info: var_info);
-      case 6:
+      case 8:
         var var_revision = sse_decode_u_64(deserializer);
         var var_peer = sse_decode_box_autoadd_peer_info(deserializer);
         return ChatEvent_PeerChanged(revision: var_revision, peer: var_peer);
-      case 7:
+      case 9:
         var var_peerId = sse_decode_String(deserializer);
         var var_text = sse_decode_String(deserializer);
         return ChatEvent_ProbeTextReceived(peerId: var_peerId, text: var_text);
@@ -2165,6 +2227,13 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var var_version = sse_decode_String(deserializer);
     var var_instanceId = sse_decode_String(deserializer);
     return CoreInfo(version: var_version, instanceId: var_instanceId);
+  }
+
+  @protected
+  DeliveryState sse_decode_delivery_state(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var inner = sse_decode_i_32(deserializer);
+    return DeliveryState.values[inner];
   }
 
   @protected
@@ -2347,6 +2416,21 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       ans_.add(sse_decode_revocation_view(deserializer));
     }
     return ans_;
+  }
+
+  @protected
+  MessageKey sse_decode_message_key(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_conversation = sse_decode_list_prim_u_8_strict(deserializer);
+    var var_sender = sse_decode_list_prim_u_8_strict(deserializer);
+    var var_installation = sse_decode_list_prim_u_8_strict(deserializer);
+    var var_id = sse_decode_list_prim_u_8_strict(deserializer);
+    return MessageKey(
+      conversation: var_conversation,
+      sender: var_sender,
+      installation: var_installation,
+      id: var_id,
+    );
   }
 
   @protected
@@ -2806,6 +2890,15 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_box_autoadd_message_key(
+    MessageKey self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_message_key(self, serializer);
+  }
+
+  @protected
   void sse_encode_box_autoadd_network_info(
     NetworkInfo self,
     SseSerializer serializer,
@@ -2858,8 +2951,26 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   void sse_encode_chat_event(ChatEvent self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     switch (self) {
-      case ChatEvent_AccountChanged(revision: final revision, view: final view):
+      case ChatEvent_MessagesChanged(
+        revision: final revision,
+        conversation: final conversation,
+      ):
         sse_encode_i_32(0, serializer);
+        sse_encode_u_64(revision, serializer);
+        sse_encode_list_prim_u_8_strict(conversation, serializer);
+      case ChatEvent_MessageStateChanged(
+        revision: final revision,
+        key: final key,
+        state: final state,
+        cancelRequested: final cancelRequested,
+      ):
+        sse_encode_i_32(1, serializer);
+        sse_encode_u_64(revision, serializer);
+        sse_encode_box_autoadd_message_key(key, serializer);
+        sse_encode_delivery_state(state, serializer);
+        sse_encode_bool(cancelRequested, serializer);
+      case ChatEvent_AccountChanged(revision: final revision, view: final view):
+        sse_encode_i_32(2, serializer);
         sse_encode_u_64(revision, serializer);
         sse_encode_box_account_view(view, serializer);
       case ChatEvent_AccountAuthChanged(
@@ -2867,35 +2978,35 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
         installationId: final installationId,
         ready: final ready,
       ):
-        sse_encode_i_32(1, serializer);
+        sse_encode_i_32(3, serializer);
         sse_encode_String(peerId, serializer);
         sse_encode_String(installationId, serializer);
         sse_encode_bool(ready, serializer);
       case ChatEvent_AccountCacheUsed(peerId: final peerId):
-        sse_encode_i_32(2, serializer);
+        sse_encode_i_32(4, serializer);
         sse_encode_String(peerId, serializer);
       case ChatEvent_ConnectionState(
         directPeers: final directPeers,
         mailboxOk: final mailboxOk,
         queueOk: final queueOk,
       ):
-        sse_encode_i_32(3, serializer);
+        sse_encode_i_32(5, serializer);
         sse_encode_u_32(directPeers, serializer);
         sse_encode_bool(mailboxOk, serializer);
         sse_encode_opt_box_autoadd_bool(queueOk, serializer);
       case ChatEvent_Error(code: final code, detail: final detail):
-        sse_encode_i_32(4, serializer);
+        sse_encode_i_32(6, serializer);
         sse_encode_error_code(code, serializer);
         sse_encode_String(detail, serializer);
       case ChatEvent_NetworkChanged(info: final info):
-        sse_encode_i_32(5, serializer);
+        sse_encode_i_32(7, serializer);
         sse_encode_box_autoadd_network_info(info, serializer);
       case ChatEvent_PeerChanged(revision: final revision, peer: final peer):
-        sse_encode_i_32(6, serializer);
+        sse_encode_i_32(8, serializer);
         sse_encode_u_64(revision, serializer);
         sse_encode_box_autoadd_peer_info(peer, serializer);
       case ChatEvent_ProbeTextReceived(peerId: final peerId, text: final text):
-        sse_encode_i_32(7, serializer);
+        sse_encode_i_32(9, serializer);
         sse_encode_String(peerId, serializer);
         sse_encode_String(text, serializer);
     }
@@ -2923,6 +3034,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_String(self.version, serializer);
     sse_encode_String(self.instanceId, serializer);
+  }
+
+  @protected
+  void sse_encode_delivery_state(DeliveryState self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_i_32(self.index, serializer);
   }
 
   @protected
@@ -3086,6 +3203,15 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     for (final item in self) {
       sse_encode_revocation_view(item, serializer);
     }
+  }
+
+  @protected
+  void sse_encode_message_key(MessageKey self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_list_prim_u_8_strict(self.conversation, serializer);
+    sse_encode_list_prim_u_8_strict(self.sender, serializer);
+    sse_encode_list_prim_u_8_strict(self.installation, serializer);
+    sse_encode_list_prim_u_8_strict(self.id, serializer);
   }
 
   @protected

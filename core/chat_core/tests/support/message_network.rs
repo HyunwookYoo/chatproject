@@ -83,6 +83,8 @@ struct Fixture {
     _sql: sql_store::Store,
     _dir: tempfile::TempDir,
     slot: CoreSlot,
+    #[allow(dead_code)]
+    bus: EventBus,
     account: AccountHandle,
     peer: PeerId,
     clock: Arc<FakeClock>,
@@ -244,6 +246,7 @@ impl Fixture {
             _sql: sql_store::Store::from_fixture(account.storage_test_fixture()),
             _dir: dir,
             slot,
+            bus,
             account,
             peer,
             clock,

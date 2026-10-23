@@ -52,6 +52,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   ErrorCode dco_decode_box_autoadd_error_code(dynamic raw);
 
   @protected
+  MessageKey dco_decode_box_autoadd_message_key(dynamic raw);
+
+  @protected
   NetworkInfo dco_decode_box_autoadd_network_info(dynamic raw);
 
   @protected
@@ -80,6 +83,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   CoreInfo dco_decode_core_info(dynamic raw);
+
+  @protected
+  DeliveryState dco_decode_delivery_state(dynamic raw);
 
   @protected
   DeviceKind dco_decode_device_kind(dynamic raw);
@@ -128,6 +134,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   List<RevocationView> dco_decode_list_revocation_view(dynamic raw);
+
+  @protected
+  MessageKey dco_decode_message_key(dynamic raw);
 
   @protected
   NetworkInfo dco_decode_network_info(dynamic raw);
@@ -255,6 +264,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   ErrorCode sse_decode_box_autoadd_error_code(SseDeserializer deserializer);
 
   @protected
+  MessageKey sse_decode_box_autoadd_message_key(SseDeserializer deserializer);
+
+  @protected
   NetworkInfo sse_decode_box_autoadd_network_info(SseDeserializer deserializer);
 
   @protected
@@ -283,6 +295,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   CoreInfo sse_decode_core_info(SseDeserializer deserializer);
+
+  @protected
+  DeliveryState sse_decode_delivery_state(SseDeserializer deserializer);
 
   @protected
   DeviceKind sse_decode_device_kind(SseDeserializer deserializer);
@@ -341,6 +356,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   List<RevocationView> sse_decode_list_revocation_view(
     SseDeserializer deserializer,
   );
+
+  @protected
+  MessageKey sse_decode_message_key(SseDeserializer deserializer);
 
   @protected
   NetworkInfo sse_decode_network_info(SseDeserializer deserializer);
@@ -484,6 +502,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_box_autoadd_message_key(
+    MessageKey self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_box_autoadd_network_info(
     NetworkInfo self,
     SseSerializer serializer,
@@ -524,6 +548,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_core_info(CoreInfo self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_delivery_state(DeliveryState self, SseSerializer serializer);
 
   @protected
   void sse_encode_device_kind(DeviceKind self, SseSerializer serializer);
@@ -596,6 +623,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
     List<RevocationView> self,
     SseSerializer serializer,
   );
+
+  @protected
+  void sse_encode_message_key(MessageKey self, SseSerializer serializer);
 
   @protected
   void sse_encode_network_info(NetworkInfo self, SseSerializer serializer);

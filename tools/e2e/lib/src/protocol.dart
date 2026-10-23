@@ -125,6 +125,8 @@ sealed class WireRecord {
           'account_changed',
           'account_auth_changed',
           'account_cache_used',
+          'messages_changed',
+          'message_state_changed',
         }.contains(event['kind'])) {
           throw StateError('invalid protocol event kind');
         }

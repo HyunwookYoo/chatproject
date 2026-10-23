@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:typed_data';
 
 import 'package:chat_app/network/network_model.dart';
 import 'package:chat_app/src/rust/api/chat.dart' as rust;
@@ -54,11 +55,24 @@ void main() {
     const ready = rust.ChatEvent.accountAuthChanged(
       peerId: 'account-peer', installationId: 'installation', ready: true,
     );
+    final messages = rust.ChatEvent.messagesChanged(
+      revision: BigInt.from(100), conversation: Uint8List(32),
+    );
+    final state = rust.ChatEvent.messageStateChanged(
+      revision: BigInt.from(101),
+      key: rust.MessageKey(
+        conversation: Uint8List(32), sender: Uint8List(32),
+        installation: Uint8List(32), id: Uint8List(16),
+      ),
+      state: rust.DeliveryState.read, cancelRequested: true,
+    );
+    client.controller.add(messages);
+    client.controller.add(state);
     client.controller.add(cached);
     client.controller.add(ready);
     client.controller.add(changed);
     await Future<void>.delayed(Duration.zero);
-    expect(accountEvents, [cached, ready, changed]);
+    expect(accountEvents, [messages, state, cached, ready, changed]);
     expect(model.snapshot, same(before));
     expect(model.snapshot!.state, rust.NetworkState.online);
     expect(model.snapshot!.peers.single.connectMs, BigInt.from(123));

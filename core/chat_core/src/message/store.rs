@@ -21,6 +21,8 @@ pub(crate) struct MessageRepo {
     identity: Identity,
 }
 pub(crate) enum MessageDbOp {
+    Observed(Box<MessageDbOp>),
+    MarkRead(ConversationId, Vec<MessageKey>, u64),
     #[cfg(all(feature="test-hooks",debug_assertions))]
     RejectedPrepare(MessageKey, InstallationId, u64, PrepareTransition),
     Due(u64, Vec<PeerId>, [Option<DueCursor>; 2]),
@@ -253,6 +255,30 @@ pub(crate) fn execute(
             .map_err(sql_error)?;
     }
     match op {
+        MessageDbOp::Observed(op) => {
+            let before = revision(c)?;
+            let key = op.key(identity)?;
+            let prior = key.map(|k| find(c, k)).transpose()?.flatten().map(|m| (m.state, m.cancel_requested, m.block));
+            let cid = match &*op {
+                MessageDbOp::Open(local, peer) => Some(conversation_id(*local, *peer)?),
+                MessageDbOp::ReleasePeer(peer, _) => Some(conversation_id(identity.peer, *peer)?),
+                MessageDbOp::MarkRead(id, _, _) => Some(*id),
+                _ => key.map(|k| k.conversation),
+            };
+            let reply = execute(c, identity, *op, #[cfg(all(feature="test-hooks",debug_assertions))] fault)?;
+            let after = revision(c)?;
+            let mut events = Vec::new();
+            if after > before && let Some(conversation) = cid {
+                events.push(crate::CoreEvent::MessagesChanged { revision: after, conversation });
+                if let Some(key) = key && let Some(view) = find(c, key)? {
+                    if prior != Some((view.state, view.cancel_requested, view.block)) {
+                        events.push(crate::CoreEvent::MessageStateChanged { revision: after, key, state: view.state, cancel_requested: view.cancel_requested });
+                    }
+                }
+            }
+            Ok(MessageDbReply::Observed(Box::new(reply), events))
+        }
+        MessageDbOp::MarkRead(id, keys, now) => mark_read(c, identity, id, keys, now, #[cfg(all(feature="test-hooks",debug_assertions))] fault),
         #[cfg(all(feature="test-hooks",debug_assertions))]
         MessageDbOp::RejectedPrepare(key,receiver,now,transition) => {
             let state:Option<u64>=c.query_row("SELECT dispatch_state FROM outbox WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",params![key.conversation.0.as_slice(),key.sender.0.as_slice(),key.installation.0.as_slice(),key.id.0.as_slice()],|r|uint(r,0)).optional().map_err(sql_error)?;
@@ -813,6 +839,7 @@ fn fill(c: &mut Connection, key: MessageKey, count: u64, target: Option<u64>) ->
     tx.commit().map_err(sql_error)
 }
 pub(crate) enum MessageDbReply {
+    Observed(Box<MessageDbReply>, Vec<crate::CoreEvent>),
     Due(
         Vec<super::scheduler::Dispatch>,
         Vec<super::scheduler::Dispatch>,
@@ -836,6 +863,9 @@ impl MessageRepo {
                 installation: local.device.installation_id(),
             },
         }
+    }
+    pub(crate) async fn due_hint(&self, now: u64) -> R<bool> {
+        self.storage.due_hint(now).await
     }
     pub(crate) async fn retry_send(&self, key: MessageKey, now_ms: u64) -> R<MessageView> {
         match self.operation(MessageDbOp::Retry(key,now_ms)).await? {
@@ -910,6 +940,8 @@ impl MessageRepo {
 impl MessageDbOp {
     pub(crate) fn key(&self, identity: Identity) -> R<Option<MessageKey>> {
         Ok(match self {
+            Self::Observed(op) => return op.key(identity),
+            Self::MarkRead(_, keys, _) => keys.first().copied(),
             Self::Enqueue(peer, id, _, _) => Some(MessageKey {
                 conversation: conversation_id(identity.peer, *peer)?,
                 sender: identity.peer,
@@ -1276,6 +1308,7 @@ fn attempt_outcome(
 /// The worker checks the actual SQL account membership before recording a receiver.
 /// A caller's installation ID is never itself a membership grant.
 pub(crate) fn authorize(c: &Connection, local: &LocalAccount, op: &MessageDbOp) -> R<()> {
+    if let MessageDbOp::Observed(op) = op { return authorize(c, local, op); }
     let retry = match op {
         MessageDbOp::Retry(key, now) => Some((target(c,Identity { peer:local.keys.peer_id(),installation:local.device.installation_id() },*key,false)?,*now)),
         MessageDbOp::ReleasePeer(peer, now) => Some((*peer,*now)),
@@ -1395,6 +1428,7 @@ pub(crate) struct PendingMessage {
 }
 impl MessageDbOp {
     pub(crate) fn pending(&self, identity: Identity) -> R<Option<PendingMessage>> {
+        if let Self::Observed(op) = self { return op.pending(identity); }
         Ok(self.key(identity)?.map(|key| PendingMessage {
             key,
             prebyte_attempt: match self {
@@ -1515,6 +1549,13 @@ fn scan_due(c: &Connection, receipt: bool, now: u64, cursor: Option<DueCursor>) 
         }
     }
     Ok(selected)
+}
+// Advisory scheduling presence only: never returns keys, bodies or authority.
+pub(crate) fn due_hint(c: &Connection, now: u64) -> R<bool> {
+    c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM outbox INDEXED BY outbox_due WHERE dispatch_state=0 AND next_retry_at_ms<=?1 LIMIT 1) OR EXISTS(SELECT 1 FROM receipt_job INDEXED BY receipt_due WHERE next_retry_at_ms<=?1 LIMIT 1)",
+        params![integer(now)?], |r| r.get(0),
+    ).map_err(sql_error)
 }
 fn due(
     c: &Connection,
@@ -1716,6 +1757,58 @@ mod due_tests {
         (result.unwrap(), steps)
     }
     #[test]
+    fn due_hint_native_work_is_bounded_for_empty_future_blocked_and_due_rows() {
+        unsafe extern "C" fn count(p: *mut std::ffi::c_void) -> std::ffi::c_int {
+            unsafe {
+                *(p as *mut u64) += 1;
+            }
+            0
+        }
+        let c = backlog(8192);
+        let measure = |expected| {
+            let mut steps = 0u64;
+            unsafe {
+                rusqlite::ffi::sqlite3_progress_handler(
+                    c.handle(),
+                    1,
+                    Some(count),
+                    (&mut steps as *mut u64).cast(),
+                );
+            }
+            let result = due_hint(&c, 0);
+            unsafe {
+                rusqlite::ffi::sqlite3_progress_handler(c.handle(), 0, None, std::ptr::null_mut());
+            }
+            assert_eq!(result.unwrap(), expected);
+            eprintln!("due_hint expected={expected} native_VM_steps={steps}");
+            assert!(steps < 200, "presence hint must seek, never scan backlog");
+        };
+        measure(true);
+        c.execute("UPDATE outbox SET dispatch_state=2", []).unwrap();
+        c.execute("UPDATE receipt_job SET next_retry_at_ms=1", [])
+            .unwrap();
+        measure(false);
+        c.execute("UPDATE outbox SET dispatch_state=0,next_retry_at_ms=1", [])
+            .unwrap();
+        measure(false);
+        c.execute(
+            "UPDATE outbox SET next_retry_at_ms=0 WHERE rowid=(SELECT max(rowid) FROM outbox)",
+            [],
+        )
+        .unwrap();
+        measure(true);
+        c.execute("UPDATE outbox SET dispatch_state=1", []).unwrap();
+        measure(false);
+        c.execute("UPDATE receipt_job SET next_retry_at_ms=0 WHERE rowid=(SELECT max(rowid) FROM receipt_job)",[]).unwrap();
+        measure(true);
+        c.execute("DELETE FROM receipt_job", []).unwrap();
+        c.execute("DELETE FROM outbox", []).unwrap();
+        measure(false);
+        c.execute_batch("DROP INDEX receipt_due").unwrap();
+        assert!(due_hint(&c, 0).is_err(), "probe errors must propagate");
+    }
+
+    #[test]
     fn due_later_time_and_full_payload_batch_remain_bounded() {
         let c = backlog(8192);
         for table in ["outbox", "receipt_job"] {
@@ -1800,4 +1893,69 @@ mod due_tests {
         assert_eq!(receipts.len(), 1);
         assert_eq!(receipts[0].peer, PeerId([1; 32]));
     }
+}
+
+fn mark_read(
+    c: &mut Connection,
+    identity: Identity,
+    id: ConversationId,
+    keys: Vec<MessageKey>,
+    now: u64,
+    #[cfg(all(feature = "test-hooks", debug_assertions))] fault: Option<
+        crate::storage::worker::CommitFault,
+    >,
+) -> R<MessageDbReply> {
+    if keys.len() > 50 {
+        return Err(invalid());
+    }
+    let now = integer(now)?;
+    let tx = c.transaction().map_err(sql_error)?;
+    let current = conversation(&tx, id)?;
+    // Validate the whole supplied visible set before changing any fact or job.
+    for key in &keys {
+        if key.conversation != id {
+            return Err(invalid());
+        }
+        let view = find(&tx, *key)?.ok_or_else(missing)?;
+        if view.outgoing || key.sender == identity.peer || key.sender != current.peer {
+            return Err(invalid());
+        }
+    }
+    let mut changed = 0usize;
+    for key in keys {
+        let k = key;
+        let count = tx.execute("UPDATE message SET seen_local=1 WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4 AND seen_local=0", params![k.conversation.0.as_slice(), k.sender.0.as_slice(), k.installation.0.as_slice(), k.id.0.as_slice()]).map_err(sql_error)?;
+        if count == 0 {
+            continue;
+        }
+        changed += count;
+        // Read subsumes Delivered. Repeating mark_read never resets an existing obligation's backoff.
+        tx.execute("DELETE FROM receipt_job WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4 AND recipient_install=?5 AND kind=1", params![k.conversation.0.as_slice(), k.sender.0.as_slice(), k.installation.0.as_slice(), k.id.0.as_slice(), identity.installation.0.as_slice()]).map_err(sql_error)?;
+        tx.execute(
+            "INSERT OR IGNORE INTO receipt_job VALUES(?1,?2,?3,?4,?5,2,?6,0)",
+            params![
+                k.conversation.0.as_slice(),
+                k.sender.0.as_slice(),
+                k.installation.0.as_slice(),
+                k.id.0.as_slice(),
+                identity.installation.0.as_slice(),
+                now
+            ],
+        )
+        .map_err(sql_error)?;
+    }
+    if changed > 0 {
+        let rev = bump(&tx)?;
+        tx.execute(
+            "UPDATE conversation SET unread=unread-?2,change_revision=?3 WHERE id=?1",
+            params![id.0.as_slice(), changed as i64, integer(rev)?],
+        )
+        .map_err(sql_error)?;
+    }
+    commit(
+        tx,
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        fault,
+    )?;
+    Ok(MessageDbReply::Done)
 }

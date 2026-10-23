@@ -51,6 +51,11 @@ impl Scheduler {
             .min(i64::MAX as u64)
     }
     pub(crate) async fn poll_due(&mut self, now_ms: u64) -> Result<Vec<Dispatch>, CoreError> {
+        if !self.repo.due_hint(now_ms).await? {
+            self.cursors = [None, None];
+            return Ok(Vec::new());
+        }
+        // A positive hint confers no authority; every candidate still uses full validation.
         let MessageDbReply::Due(mut text, mut receipts, cursors) = self
             .repo
             .operation(MessageDbOp::Due(

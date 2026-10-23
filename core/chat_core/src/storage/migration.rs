@@ -533,12 +533,16 @@ pub(crate) fn checkpoint(root: &Path, stage: MigrationStage) {
 }
 
 pub(crate) fn binding(state: Option<&StoredPlaintext>) -> R<Vec<u8>> {
+    let decoded = state.map(AccountState::decode).transpose()?;
+    Ok(binding_decoded(state.zip(decoded.as_ref())))
+}
+fn binding_decoded(state: Option<(&StoredPlaintext, &AccountState)>) -> Vec<u8> {
     let mut e = minicbor::Encoder::new(Vec::new());
     match state {
         None => {
             e.array(2).unwrap().u8(1).unwrap().u8(0).unwrap();
         }
-        Some(stored) => match AccountState::decode(stored)? {
+        Some((stored, decoded)) => match decoded {
             AccountState::Active(a) => {
                 e.array(4)
                     .unwrap()
@@ -563,9 +567,17 @@ pub(crate) fn binding(state: Option<&StoredPlaintext>) -> R<Vec<u8>> {
             }
         },
     }
-    Ok(e.into_writer())
+    e.into_writer()
 }
 pub(crate) fn load(conn: &Connection, id: &[u8; 16]) -> R<Option<StoredPlaintext>> {
+    Ok(load_validated(conn, id)?.map(|(stored, _)| stored))
+}
+// Ownership is returned only for immediate reuse within the same worker operation.
+// Every call reads and fully validates the actual SQL snapshot and binding.
+pub(crate) fn load_validated(
+    conn: &Connection,
+    id: &[u8; 16],
+) -> R<Option<(StoredPlaintext, AccountState)>> {
     let (version, db, stored_binding): (i64, Vec<u8>, Vec<u8>) = conn
         .query_row(
             "SELECT schema_version,db_id,binding FROM storage_meta WHERE singleton=1",
@@ -596,8 +608,9 @@ pub(crate) fn load(conn: &Connection, id: &[u8; 16]) -> R<Option<StoredPlaintext
             })
         })
         .transpose()?;
-    if binding(state.as_ref())? != stored_binding {
+    let decoded = state.as_ref().map(AccountState::decode).transpose()?;
+    if binding_decoded(state.as_ref().zip(decoded.as_ref())) != stored_binding {
         return Err(corrupt());
     }
-    Ok(state)
+    Ok(state.zip(decoded))
 }
