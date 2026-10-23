@@ -184,15 +184,17 @@ pub async fn open_account() -> Result<(), CoreError> {
         code: super::chat::ErrorCode::CoreNotStarted,
         detail: "Core not started".into(),
     })?;
-    let protector = crate::platform_keys::provider(&info.data_dir).map_err(CoreError::from)?;
-    #[cfg(all(feature = "test-hooks", debug_assertions))]
-    if storage_fixture::enabled() {
-        return storage_fixture::open(protector);
-    }
-    crate::global::CORE
-        .open_account(protector)
-        .map(|_| ())
-        .map_err(Into::into)
+    tokio::task::spawn_blocking(move || {
+        let protector = crate::platform_keys::provider(&info.data_dir).map_err(CoreError::from)?;
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        if storage_fixture::enabled() {
+            return storage_fixture::open(protector);
+        }
+        crate::global::CORE.open_account(protector).map(|_| ()).map_err(Into::into)
+    }).await.map_err(|_| CoreError {
+        code: super::chat::ErrorCode::NotAvailable,
+        detail: "Account open unavailable".into(),
+    })?
 }
 pub async fn retry_open() -> Result<AccountView, CoreError> {
     open_account().await?;

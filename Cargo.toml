@@ -7,3 +7,9 @@ exclude = ["spikes/a-connectivity", "spikes/b-mls-memory", "spikes/c-push/apns-p
 [patch.crates-io]
 iroh-dns = { path = "vendor/iroh-dns" }
 netwatch = { path = "vendor/netwatch" }
+
+[profile.test.package.curve25519-dalek]
+opt-level = 3
+
+[profile.test.package.ed25519-dalek]
+opt-level = 3

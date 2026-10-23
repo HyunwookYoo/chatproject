@@ -309,7 +309,7 @@ mod actor {
         let (slot, a, backend) = open(dir.path()).await;
         setup(&a).await;
         let input = invite(Some("remote name"), NOW, NOW + 86400, None);
-        let before = std::fs::read(dir.path().join("account.bin")).unwrap();
+        let before = a.storage_test_fixture().handle.load_account().await.unwrap().unwrap().payload;
         let calls = backend.0.load(Ordering::SeqCst);
         assert!(parse_invite("https://bad/", NOW).is_err());
         assert!(
@@ -317,10 +317,7 @@ mod actor {
                 .await
                 .is_err()
         );
-        assert_eq!(
-            std::fs::read(dir.path().join("account.bin")).unwrap(),
-            before
-        );
+        assert!(a.storage_test_fixture().handle.load_account().await.unwrap().unwrap().payload == before);
         assert_eq!(backend.0.load(Ordering::SeqCst), calls);
         let contact = a
             .accept_invite(input.clone(), "local alias".into())
@@ -374,7 +371,7 @@ mod actor {
     }
     #[tokio::test]
     async fn contact_capacity_rejects_without_eviction_or_store_change() {
-        use chat_core::account::storage::Store;
+        use crate::sql_store::Store;
         let dir = tempfile::tempdir().unwrap();
         let (slot, a, _) = open(dir.path()).await;
         setup(&a).await;
@@ -436,7 +433,7 @@ mod actor {
         let (_slot, a, _) = open(dir.path()).await;
         assert_eq!(a.contacts().await.unwrap().len(), 1000);
         assert_eq!(a.snapshot().await.unwrap().contacts.len(), 1000);
-        let before = std::fs::read(dir.path().join("account.bin")).unwrap();
+        let before = a.storage_test_fixture().handle.load_account().await.unwrap().unwrap().payload;
         assert_eq!(
             a.accept_invite(invite(None, NOW, NOW + 86400, None), "new".into())
                 .await
@@ -445,9 +442,9 @@ mod actor {
             ErrorCode::StorageFull
         );
         assert_eq!(a.contacts().await.unwrap().len(), 1000);
-        assert_eq!(
-            std::fs::read(dir.path().join("account.bin")).unwrap(),
-            before
-        );
+        assert!(a.storage_test_fixture().handle.load_account().await.unwrap().unwrap().payload == before);
     }
 }
+
+#[path = "support/sql_account_store.rs"]
+mod sql_store;

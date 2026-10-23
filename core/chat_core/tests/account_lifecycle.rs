@@ -217,7 +217,7 @@ async fn active_folder_overwrite_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let (_slot, account) = open(dir.path()).await;
     account.recover(fixture(), true).await.unwrap();
-    let before = std::fs::read(dir.path().join("account.bin")).unwrap();
+    let before = account.storage_test_fixture().handle.load_account().await.unwrap().unwrap().payload;
     assert_eq!(
         account.begin_create().await.err().unwrap().code,
         ErrorCode::AccountExists
@@ -230,10 +230,7 @@ async fn active_folder_overwrite_rejected() {
         account.prepare_candidate().await.unwrap_err().code,
         ErrorCode::AccountExists
     );
-    assert_eq!(
-        std::fs::read(dir.path().join("account.bin")).unwrap(),
-        before
-    );
+    assert!(account.storage_test_fixture().handle.load_account().await.unwrap().unwrap().payload == before);
 }
 
 #[tokio::test]
@@ -394,10 +391,9 @@ async fn commit_error_gates_mutations_until_disk_is_reconciled() {
     let dir = tempfile::tempdir().unwrap();
     let (slot, account) = open(dir.path()).await;
     account.prepare_candidate().await.unwrap();
-    let before = std::fs::read(dir.path().join("account.bin")).unwrap();
-    // A real filesystem failure at the atomic-write boundary.
-    let obstruction = dir.path().join(".account.bin.tmp");
-    std::fs::create_dir(&obstruction).unwrap();
+    let before = account.storage_test_fixture().handle.load_account().await.unwrap().unwrap().payload;
+    // Actual SQL write failure rolls back the candidate to active transaction.
+    account.storage_test_fixture().fault(chat_core::storage_fixture::CommitFault::WriteDenied).await;
     assert!(account.recover(fixture(), true).await.is_err());
     assert_eq!(account.lifecycle_status(), 2);
     assert_eq!(
@@ -417,11 +413,8 @@ async fn commit_error_gates_mutations_until_disk_is_reconciled() {
             .code,
         ErrorCode::Busy
     );
-    assert_eq!(
-        std::fs::read(dir.path().join("account.bin")).unwrap(),
-        before
-    );
-    std::fs::remove_dir(obstruction).unwrap();
+    assert!(sql_store::snapshot_closed(dir.path(), support::protector(), &account.storage_test_fixture()).payload == before);
+
     assert_eq!(account.request_resume(), 2);
     account.request_suspend();
     settled(&account).await;
@@ -444,3 +437,6 @@ async fn public_cert(account: &AccountHandle) -> chat_core::account::Installatio
     let invite = account.create_invite(None).await.unwrap();
     chat_core::account::parse_invite(&invite, chat_core::account::clock::SystemClock::default().unix_seconds()).unwrap().issuing_cert
 }
+
+#[path = "support/sql_account_store.rs"]
+mod sql_store;

@@ -64,11 +64,20 @@ impl RecordBackend for Backend {
     }
 }
 struct Fixture {
+    _sql: sql_store::Store,
     _dir: tempfile::TempDir,
     slot: CoreSlot,
     account: AccountHandle,
     backend: Arc<Backend>,
     clock: Arc<FakeClock>,
+}
+#[tokio::test]
+async fn fixture_drop_closes_sql_before_owned_tempdir() {
+    let fixture = Fixture::new().await;
+    let path = fixture._dir.path().canonicalize().unwrap();
+    let storage = fixture.account.storage_test_fixture();
+    drop(fixture);
+    sql_store::assert_closed_and_removed(path, storage);
 }
 impl Fixture {
     async fn new() -> Self {
@@ -77,6 +86,7 @@ impl Fixture {
         let clock = Arc::new(FakeClock::new(1_800_000_000, 0));
         let (slot, account) = open(dir.path(), backend.clone(), clock.clone()).await;
         Self {
+            _sql: sql_store::Store::from_fixture(account.storage_test_fixture()),
             _dir: dir,
             slot,
             account,
@@ -192,6 +202,7 @@ async fn future_initial_recovery_waits_for_fresh_current_base_across_restart() {
         tokio::task::yield_now().await;
     }
     let Fixture {
+        _sql,
         _dir: dir,
         slot,
         account,
@@ -200,7 +211,9 @@ async fn future_initial_recovery_waits_for_fresh_current_base_across_restart() {
     } = f;
     drop(account);
     drop(slot);
+    drop(_sql);
     let (_slot, account) = open(dir.path(), backend.clone(), clock).await;
+    let _sql = sql_store::Store::from_fixture(account.storage_test_fixture());
     let restored = account.snapshot().await.unwrap();
     assert_eq!(restored.publication.state, PublicationState::LocalBlocked);
     assert_eq!(
@@ -362,6 +375,7 @@ async fn future_same_sequence_conflict_and_pending_hold_survive_restart() {
         tokio::task::yield_now().await;
     }
     let Fixture {
+        _sql,
         _dir: dir,
         slot,
         account,
@@ -370,9 +384,11 @@ async fn future_same_sequence_conflict_and_pending_hold_survive_restart() {
     } = f;
     drop(account);
     drop(slot);
+    drop(_sql);
     clock.set_unix_seconds(1_800_000_600);
     backend.answer(Answer::Absent);
     let (_slot, account) = open(dir.path(), backend.clone(), clock).await;
+    let _sql = sql_store::Store::from_fixture(account.storage_test_fixture());
     let restored = account.snapshot().await.unwrap();
     assert_eq!(backend.sent.lock().unwrap().len(), sent);
     assert_eq!(restored.publication.state, PublicationState::Conflict);
@@ -547,6 +563,7 @@ async fn durable_floor_survives_restart_and_clock_rollback() {
     .await
     .unwrap();
     let Fixture {
+        _sql,
         _dir: dir,
         slot,
         account,
@@ -555,9 +572,11 @@ async fn durable_floor_survives_restart_and_clock_rollback() {
     } = f;
     drop(account);
     drop(slot);
+    drop(_sql);
     clock.set_unix_seconds(1_700_000_000);
     backend.answer(Answer::Absent);
     let (_slot, account) = open(dir.path(), backend, clock).await;
+    let _sql = sql_store::Store::from_fixture(account.storage_test_fixture());
     let after = account.snapshot().await.unwrap();
     assert_ne!(after.phase, AccountPhase::Locked);
     assert_eq!(
@@ -737,6 +756,7 @@ async fn restart_retries_exact_durable_packet() {
         tokio::task::yield_now().await;
     }
     let Fixture {
+        _sql,
         _dir: dir,
         slot,
         account,
@@ -745,7 +765,9 @@ async fn restart_retries_exact_durable_packet() {
     } = f;
     drop(account);
     drop(slot);
+    drop(_sql);
     let (_slot, account) = open(dir.path(), backend.clone(), clock).await;
+    let _sql = sql_store::Store::from_fixture(account.storage_test_fixture());
     let view = account.snapshot().await.unwrap();
     assert_eq!(backend.last().as_bytes(), first.as_bytes());
     assert_eq!(view.publication.pending_count, 1);
@@ -761,6 +783,7 @@ async fn legacy_a5_snapshot_is_rejected_without_file_modification() {
         tokio::task::yield_now().await;
     }
     let Fixture {
+        _sql,
         _dir: dir,
         slot,
         account,
@@ -769,8 +792,9 @@ async fn legacy_a5_snapshot_is_rejected_without_file_modification() {
     } = f;
     drop(account);
     drop(slot);
+    drop(_sql);
     let mut store =
-        chat_core::account::storage::Store::open(dir.path(), support::protector()).unwrap();
+        sql_store::Store::open(dir.path(), support::protector()).unwrap();
     let mut stored = store.load().unwrap().unwrap();
     let mut decoder = minicbor::Decoder::new(&stored.payload);
     assert_eq!(decoder.array().unwrap(), Some(11));
@@ -780,8 +804,9 @@ async fn legacy_a5_snapshot_is_rejected_without_file_modification() {
     let end = decoder.position();
     stored.payload.truncate(end);
     stored.payload[0] = 0x87;
-    store.commit(&stored).unwrap();
     drop(store);
+    let dir = tempfile::tempdir().unwrap();
+    chat_core::account::storage::Store::open(dir.path(), support::protector()).unwrap().commit(&stored).unwrap();
     let before = std::fs::read(dir.path().join("account.bin")).unwrap();
     let slot = CoreSlot::new();
     slot.start(
@@ -835,7 +860,7 @@ async fn revoke_is_durable_before_notification_and_failed_notification_blocks_pu
     let backend = Arc::new(Backend::new());
     let clock = Arc::new(FakeClock::new(1_800_000_000, 0));
     let notifier = Arc::new(Notifier {
-        path: dir.path().join("account.bin"),
+        path: dir.path().join("db.sqlite3-wal"),
         clock: clock.clone(),
         fail: AtomicBool::new(true),
         calls: Mutex::new(vec![]),
@@ -846,6 +871,7 @@ async fn revoke_is_durable_before_notification_and_failed_notification_blocks_pu
     )
     .await;
     let f = Fixture {
+        _sql: sql_store::Store::from_fixture(account.storage_test_fixture()),
         _dir: dir,
         slot,
         account,
@@ -894,6 +920,7 @@ async fn revoke_is_durable_before_notification_and_failed_notification_blocks_pu
     }
     // Verify the real encrypted snapshot, not only an in-memory notification.
     let Fixture {
+        _sql,
         _dir: dir,
         slot,
         account,
@@ -902,8 +929,9 @@ async fn revoke_is_durable_before_notification_and_failed_notification_blocks_pu
     } = f;
     drop(account);
     drop(slot);
+    drop(_sql);
     let mut store =
-        chat_core::account::storage::Store::open(dir.path(), support::protector()).unwrap();
+        sql_store::Store::open(dir.path(), support::protector()).unwrap();
     let stored = store.load().unwrap().unwrap();
     let signed_intent = view.publication.tombstones[0].to_bytes();
     assert!(
@@ -919,6 +947,7 @@ async fn revoke_is_durable_before_notification_and_failed_notification_blocks_pu
         AccountServices::new(backend.clone(), clock.clone()).with_notifier(notifier.clone()),
     )
     .await;
+    let _sql = sql_store::Store::from_fixture(account.storage_test_fixture());
     let resumed = account.snapshot().await.unwrap();
     assert_eq!(resumed.publication.pending_notifications.len(), 0);
     assert!(notifier.calls.lock().unwrap().len() >= 2);
@@ -942,3 +971,6 @@ async fn revoke_is_durable_before_notification_and_failed_notification_blocks_pu
         PublicationState::Pending
     );
 }
+
+#[path = "support/sql_account_store.rs"]
+mod sql_store;

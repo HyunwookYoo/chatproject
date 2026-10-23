@@ -55,6 +55,18 @@ pub(crate) struct PairTransaction {
     pub publication: Option<[u8; 32]>,
 }
 impl PairTransaction {
+    fn copy_for_update(&self) -> Self {
+        Self {
+            tx: self.tx,
+            pin: self.pin,
+            payload: self.payload.clone(),
+            approved_flow: self.approved_flow,
+            approved_hash: self.approved_hash,
+            stage: self.stage,
+            receipt: self.receipt.clone(),
+            publication: self.publication,
+        }
+    }
     pub(crate) fn envelope(&self) -> Result<Envelope, CoreError> {
         Ok(Envelope {
             tx: self.tx,
@@ -216,6 +228,16 @@ pub(crate) struct PairState {
     pub origin: Option<Origin>,
 }
 impl PairState {
+    pub(crate) fn copy_for_update(&self) -> Self {
+        Self {
+            existing: self
+                .existing
+                .iter()
+                .map(PairTransaction::copy_for_update)
+                .collect(),
+            origin: self.origin.clone(),
+        }
+    }
     pub(crate) fn unfinished(&self) -> usize {
         self.existing.iter().filter(|t| t.stage != Stage::Observed).count()
     }

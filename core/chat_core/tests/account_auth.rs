@@ -30,7 +30,7 @@ const NOW: u64 = 1_800_000_000;
 struct Backend {
     packets: Mutex<BTreeMap<PeerId, SignedPacket>>,
     offline: AtomicBool,
-    capture: Mutex<Option<(Vec<std::path::PathBuf>, chat_core::account::InstallationId)>>,
+    capture: Mutex<Option<(Vec<chat_core::storage_fixture::Handle>, chat_core::account::InstallationId)>>,
     observed: Mutex<Vec<Vec<chat_core::account::RevokeIntent>>>,
     publish_error: Mutex<Option<ErrorCode>>,
     publishes: Mutex<Vec<SignedPacket>>,
@@ -60,12 +60,16 @@ impl RecordBackend for Backend {
             if let Some(code) = *self.publish_error.lock().unwrap() {
                 return Err(CoreError::new(code, "injected publish failure"));
             }
-            if let Some((paths, target)) = self.capture.lock().unwrap().as_ref() {
-                let observed: Vec<_> = paths.iter().map(|path| durable_tombstones(path)).collect();
+            let capture = self.capture.lock().unwrap().clone();
+            if let Some((handles, target)) = capture {
+                let mut observed = Vec::new();
+                for handle in handles {
+                    observed.push(durable_tombstones(&handle).await);
+                }
                 assert!(
                     observed.iter().all(|intents| intents
                         .iter()
-                        .any(|intent| intent.target_installation == *target)),
+                        .any(|intent| intent.target_installation == target)),
                     "public mutation preceded durable receipt"
                 );
                 *self.observed.lock().unwrap() = observed;
@@ -85,6 +89,8 @@ impl EventSink for Events {
     }
 }
 struct Fixture {
+    // Rust drops fields in declaration order; join SQL stop before TempDir cleanup.
+    _sql: sql_store::Store,
     _dir: tempfile::TempDir,
     slot: CoreSlot,
     account: AccountHandle,
@@ -246,6 +252,7 @@ impl Fixture {
         .await
         .unwrap();
         Self {
+            _sql: sql_store::Store::from_fixture(account.storage_test_fixture()),
             _dir: dir,
             slot,
             account,
@@ -301,6 +308,30 @@ async fn pair() -> (Fixture, Fixture, Arc<Backend>) {
     (a, b, backend)
 }
 #[tokio::test]
+async fn fixture_drop_closes_sql_before_owned_tempdir_with_capture_handles() {
+    let signed = packet(4, &[31], 4, NOW, NOW + 600, NOW * 1_000_000);
+    let backend = Arc::new(Backend::default());
+    let fixture = Fixture::new(4, 31, &signed, backend.clone()).await;
+    let path = fixture._dir.path().canonicalize().unwrap();
+    let storage = fixture.account.storage_test_fixture();
+    let installation = fixture.view().await.installation.unwrap();
+    *backend.capture.lock().unwrap() = Some((
+        vec![storage.handle.clone()],
+        installation,
+    ));
+    drop(fixture);
+    let observed = (storage.live_connections(), path.exists());
+    if observed.1 {
+        // RED cleanup owns only this exact TempDir; never scan/delete other roots.
+        storage.close().await;
+        let resolved = path.canonicalize().unwrap();
+        let temp_root = std::env::temp_dir().canonicalize().unwrap();
+        assert!(resolved == path && resolved.starts_with(&temp_root) && resolved != temp_root);
+        std::fs::remove_dir_all(resolved).unwrap();
+    }
+    assert_eq!(observed, (0, false), "fixture SQL/root outlived its owner");
+}
+#[tokio::test]
 async fn valid_cert_actual_endpoint_installation_proof_required() {
     let (a, b, _) = pair().await;
     a.account.connect_account(b.peer).await.unwrap();
@@ -328,8 +359,7 @@ async fn handshake_changed_signed_record_restricts_live_grant_durably() {
         target.packets.lock().unwrap().insert(ap, own.clone());
         target.packets.lock().unwrap().insert(bp, remote.clone());
     }
-    let protector = Arc::new(FailingProtector(AtomicBool::new(false)));
-    let a = Fixture::with_protector(1, 11, &own, backend.clone(), protector.clone()).await;
+    let a = Fixture::new(1, 11, &own, backend.clone()).await;
     let b = Fixture::new(2, 12, &old, backend.clone()).await;
     let c = Fixture::new(2, 13, &changed, newer).await;
     a.route(&b).await;
@@ -337,7 +367,7 @@ async fn handshake_changed_signed_record_restricts_live_grant_durably() {
     c.route(&a).await;
     a.account.connect_account(bp).await.unwrap();
     backend.offline.store(true, Ordering::SeqCst);
-    protector.0.store(fail_store, Ordering::SeqCst);
+    if fail_store { a.account.storage_test_fixture().fault(chat_core::storage_fixture::CommitFault::BeforeCommit).await; }
     assert!(c.account.connect_account(ap).await.is_err());
     a.account.snapshot().await.unwrap();
     assert!(a.events.0.lock().unwrap().iter().any(|e| matches!(e, CoreEvent::AccountAuthChanged { ready: false, .. })), "signed handshake evidence did not restrict old grant");
@@ -437,18 +467,13 @@ async fn own_removal_stops_account_activity() {
     assert!(a.account.connect_account(b.peer).await.is_err());
 }
 
-fn durable_snapshot(root: &std::path::Path) -> StoredPlaintext {
-    // Copy the committed encrypted snapshot into an isolated read-only fixture.
-    // Never open a second Store on a live actor's folder.
-    let mirror = tempfile::tempdir().unwrap();
-    for name in ["store.id", "key.wrap", "account.bin"] {
-        std::fs::copy(root.join(name), mirror.path().join(name)).unwrap();
-    }
-    let mut store = Store::open(mirror.path(), support::protector()).unwrap();
-    store.load().unwrap().unwrap()
+async fn durable_snapshot(handle: &chat_core::storage_fixture::Handle) -> StoredPlaintext {
+    handle.load_account().await.unwrap().unwrap()
 }
-fn durable_tombstones(root: &std::path::Path) -> Vec<chat_core::account::RevokeIntent> {
-    let state = durable_snapshot(root);
+async fn durable_tombstones(handle: &chat_core::storage_fixture::Handle) -> Vec<chat_core::account::RevokeIntent> {
+    tombstones(durable_snapshot(handle).await)
+}
+fn tombstones(state: StoredPlaintext) -> Vec<chat_core::account::RevokeIntent> {
     let mut d = minicbor::Decoder::new(&state.payload);
     assert_eq!(d.array().unwrap(), Some(11));
     for _ in 0..7 {
@@ -464,31 +489,6 @@ fn durable_tombstones(root: &std::path::Path) -> Vec<chat_core::account::RevokeI
         .map(|_| chat_core::account::RevokeIntent::from_bytes(records.bytes().unwrap()).unwrap())
         .collect()
 }
-#[derive(Default)]
-struct ReceiptOrderProtector {
-    owner: Mutex<Option<(Arc<Events>, chat_core::account::InstallationId)>>,
-    checked: AtomicBool,
-}
-impl KeyProtector for ReceiptOrderProtector {
-    fn protect(&self, id: StoreId, key: &Secret32) -> Result<Vec<u8>, CoreError> {
-        support::protector().protect(id, key)
-    }
-    fn unprotect(&self, id: StoreId, blob: &[u8]) -> Result<Secret32, CoreError> {
-        if let Some((events, target)) = self.owner.lock().unwrap().as_ref() {
-            assert!(
-                events.0.lock().unwrap().iter().any(|event| matches!(event,
-                CoreEvent::AccountAuthChanged { installation_id, ready: false, .. }
-                if installation_id == &target.to_string())),
-                "receiver persistence started before sender closed the target"
-            );
-            self.checked.store(true, Ordering::SeqCst);
-        }
-        support::protector().unprotect(id, blob)
-    }
-    fn delete(&self, id: StoreId) -> Result<(), CoreError> {
-        support::protector().delete(id)
-    }
-}
 #[tokio::test]
 async fn real_revoke_closes_target_then_confirms_remaining_peer_before_public_mutation() {
     let signed = packet(3, &[21, 22, 23], 3, NOW, NOW + 600, NOW * 1_000_000);
@@ -501,8 +501,7 @@ async fn real_revoke_closes_target_then_confirms_remaining_peer_before_public_mu
         ..Default::default()
     });
     let a = Fixture::new(3, 21, &signed, backend.clone()).await;
-    let order = Arc::new(ReceiptOrderProtector::default());
-    let b = Fixture::with_protector(3, 22, &signed, backend.clone(), order.clone()).await;
+    let b = Fixture::new(3, 22, &signed, backend.clone()).await;
     let c = Fixture::new(3, 23, &signed, backend.clone()).await;
     b.route(&a).await;
     b.route(&c).await;
@@ -516,14 +515,25 @@ async fn real_revoke_closes_target_then_confirms_remaining_peer_before_public_mu
     a.account.connect_account(peer).await.unwrap();
     let target = c.view().await.installation.unwrap();
     *backend.capture.lock().unwrap() =
-        Some((vec![a._dir.path().into(), b._dir.path().into()], target));
-    *order.owner.lock().unwrap() = Some((a.events.clone(), target));
-    a.account.revoke_device(target).await.unwrap();
-    assert!(order.checked.load(Ordering::SeqCst));
+        Some((vec![a.account.storage_test_fixture().handle, b.account.storage_test_fixture().handle], target));
+    let sql = b.account.storage_test_fixture();
+    let pause = sql.pause().await;
+    pause.wait_entered().await;
+    let owner = a.account.clone();
+    let revoke = tokio::spawn(async move { owner.revoke_device(target).await });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while sql.remaining_capacity() == 32 { tokio::task::yield_now().await; }
+    }).await.unwrap();
+    assert!(a.events.0.lock().unwrap().iter().any(|event| matches!(event,
+        CoreEvent::AccountAuthChanged { installation_id, ready: false, .. }
+        if installation_id == &target.to_string())), "receiver persistence started before sender closed the target");
+    assert!(!revoke.is_finished());
+    pause.release();
+    revoke.await.unwrap().unwrap();
     assert_eq!(backend.observed.lock().unwrap().len(), 2);
     assert_eq!(a.view().await.publication.pending_notifications.len(), 0);
     assert_eq!(
-        durable_tombstones(b._dir.path())[0].target_installation,
+        durable_tombstones(&b.account.storage_test_fixture().handle).await[0].target_installation,
         target
     );
     assert!(a.events.0.lock().unwrap().iter().any(|event|matches!(event,CoreEvent::AccountAuthChanged{installation_id,ready:false,..} if installation_id==&target.to_string())));
@@ -868,7 +878,8 @@ async fn previous_array8_9_and10_snapshots_are_rejected_without_file_mutation() 
         let path = a._dir.path().to_path_buf();
         drop(a.account);
         drop(a.slot);
-        let mut store = Store::open(&path, support::protector()).unwrap();
+        drop(a._sql);
+        let mut store = sql_store::Store::open(&path, support::protector()).unwrap();
         let mut state = store.load().unwrap().unwrap();
         let mut d = minicbor::Decoder::new(&state.payload);
         d.array().unwrap();
@@ -878,8 +889,10 @@ async fn previous_array8_9_and10_snapshots_are_rejected_without_file_mutation() 
         let end = d.position();
         state.payload.truncate(end);
         state.payload[0] = 0x80 + field_count;
-        store.commit(&state).unwrap();
         drop(store);
+        let legacy = tempfile::tempdir().unwrap();
+        let path = legacy.path().to_owned();
+        Store::open(&path, support::protector()).unwrap().commit(&state).unwrap();
         let before = std::fs::read(path.join("account.bin")).unwrap();
         let slot = CoreSlot::new();
         slot.start(
@@ -945,6 +958,16 @@ async fn expired_session_accepts_public_record_sync_without_mutation_or_grant() 
     a.route(&b).await;
     b.route(&a).await;
     a.account.connect_account(peer).await.unwrap();
+    // Expire an established session: local connect completion does not prove
+    // the remote proof, grant installation and reader have completed.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for fixture in [&a, &b] {
+            while !fixture.events.0.lock().unwrap().iter().any(|event| matches!(event,
+                CoreEvent::AccountAuthChanged { ready: true, .. })) {
+                tokio::task::yield_now().await;
+            }
+        }
+    }).await.unwrap();
     a.clock.set_unix_seconds(NOW + 600);
     b.clock.set_unix_seconds(NOW + 600);
     backend.packets.lock().unwrap().remove(&peer);
@@ -976,25 +999,6 @@ async fn expired_session_accepts_public_record_sync_without_mutation_or_grant() 
     a.account.connect_account(peer).await.unwrap();
 }
 
-struct FailingProtector(AtomicBool);
-impl KeyProtector for FailingProtector {
-    fn protect(&self, id: StoreId, key: &Secret32) -> Result<Vec<u8>, CoreError> {
-        support::protector().protect(id, key)
-    }
-    fn unprotect(&self, id: StoreId, blob: &[u8]) -> Result<Secret32, CoreError> {
-        if self.0.load(Ordering::SeqCst) {
-            Err(CoreError::new(
-                ErrorCode::StorageLocked,
-                "receiver fixture unavailable",
-            ))
-        } else {
-            support::protector().unprotect(id, blob)
-        }
-    }
-    fn delete(&self, id: StoreId) -> Result<(), CoreError> {
-        support::protector().delete(id)
-    }
-}
 #[tokio::test]
 async fn receiver_store_failure_keeps_real_notification_pending_and_never_publishes() {
     let signed = packet(5, &[41, 42, 43], 5, NOW, NOW + 600, NOW * 1_000_000);
@@ -1006,7 +1010,6 @@ async fn receiver_store_failure_keeps_real_notification_pending_and_never_publis
         observed: Mutex::new(vec![]),
         ..Default::default()
     });
-    let protector = Arc::new(FailingProtector(AtomicBool::new(false)));
     let mut seeds = [41, 42, 43];
     seeds.sort_by_key(|seed| {
         derive_device(Secret32::from([*seed; 32]))
@@ -1014,7 +1017,7 @@ async fn receiver_store_failure_keeps_real_notification_pending_and_never_publis
             .installation_id()
     });
     let a = Fixture::new(5, seeds[0], &signed, backend.clone()).await;
-    let b = Fixture::with_protector(5, seeds[1], &signed, backend.clone(), protector.clone()).await;
+    let b = Fixture::new(5, seeds[1], &signed, backend.clone()).await;
     let c = Fixture::new(5, seeds[2], &signed, backend.clone()).await;
     a.route(&b).await;
     a.route(&c).await;
@@ -1025,7 +1028,7 @@ async fn receiver_store_failure_keeps_real_notification_pending_and_never_publis
     b.account.connect_account(peer).await.unwrap();
     c.account.connect_account(peer).await.unwrap();
     a.account.connect_account(peer).await.unwrap();
-    protector.0.store(true, Ordering::SeqCst);
+    b.account.storage_test_fixture().fault(chat_core::storage_fixture::CommitFault::BeforeCommit).await;
     let target = c.view().await.installation.unwrap();
     assert!(a.account.revoke_device(target).await.is_err());
     assert_eq!(a.view().await.publication.pending_notifications.len(), 1);
@@ -1033,8 +1036,9 @@ async fn receiver_store_failure_keeps_real_notification_pending_and_never_publis
         backend.packets.lock().unwrap()[&peer].as_bytes(),
         signed.as_bytes()
     );
-    assert_eq!(durable_tombstones(a._dir.path()).len(), 1);
-    assert_eq!(durable_tombstones(b._dir.path()).len(), 0);
+    assert_eq!(durable_tombstones(&a.account.storage_test_fixture().handle).await.len(), 1);
+    assert_eq!(b.account.lifecycle_status(), 2);
+    assert_eq!(tombstones(sql_store::snapshot_closed(b._dir.path(), support::protector(), &b.account.storage_test_fixture())).len(), 0);
     // A receiver that could not commit closes. Retrying must not silently
     // replace the original expected recipient with today's empty registry.
     assert!(a.account.refresh_record(peer).await.is_err());
@@ -1285,7 +1289,7 @@ async fn received_revoke_with_pending(removes_receiver: bool) {
     } else {
         assert_eq!(read_control(&mut recv).await, frame[4..]);
     }
-    assert_eq!(durable_tombstones(receiver._dir.path()), vec![intent]);
+    assert_eq!(durable_tombstones(&receiver.account.storage_test_fixture().handle).await, vec![intent]);
     backend.publishes.lock().unwrap().clear();
     *backend.publish_error.lock().unwrap() = None;
     for absent in [false, true] {
@@ -1381,8 +1385,8 @@ async fn publish_conflict_without_signed_evidence_closes_and_denies_account_gran
     a.account.connect_account(b.peer).await.unwrap();
 }
 
-fn durable_remote(root: &std::path::Path, peer: PeerId) -> Option<(Vec<u8>, u64)> {
-    let state = durable_snapshot(root);
+async fn durable_remote(receiver: &Fixture, peer: PeerId) -> Option<(Vec<u8>, u64)> {
+    let state = durable_snapshot(&receiver.account.storage_test_fixture().handle).await;
     let mut d = minicbor::Decoder::new(&state.payload);
     assert_eq!(d.array().unwrap(), Some(11));
     for _ in 0..8 {
@@ -1427,7 +1431,7 @@ async fn different_accounts_exchange_expired_public_records_durably_before_fresh
     let renewed_a = backend.packets.lock().unwrap()[&a.peer].clone();
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
-            if durable_remote(b._dir.path(), a.peer)
+            if durable_remote(&b, a.peer).await
                 .is_some_and(|(bytes, _)| bytes.as_slice() == renewed_a.as_bytes().as_ref())
             {
                 break;
@@ -1442,7 +1446,7 @@ async fn different_accounts_exchange_expired_public_records_durably_before_fresh
     let renewed_b = backend.packets.lock().unwrap()[&b.peer].clone();
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
-            if durable_remote(a._dir.path(), b.peer)
+            if durable_remote(&a, b.peer).await
                 .is_some_and(|(bytes, _)| bytes.as_slice() == renewed_b.as_bytes().as_ref())
             {
                 break;
@@ -1453,7 +1457,7 @@ async fn different_accounts_exchange_expired_public_records_durably_before_fresh
     .await
     .expect("reverse public renewal never reached durable remote cache");
     for (receiver, peer, packet) in [(&a, b.peer, &renewed_b), (&b, a.peer, &renewed_a)] {
-        let (bytes, floor) = durable_remote(receiver._dir.path(), peer).unwrap();
+        let (bytes, floor) = durable_remote(receiver, peer).await.unwrap();
         assert_eq!(bytes.as_slice(), packet.as_bytes().as_ref());
         assert_eq!(
             floor,
@@ -1508,7 +1512,7 @@ async fn cross_account_public_controls_bind_peer_and_preserve_observation_floor(
         tokio::time::timeout(Duration::from_secs(5), conn.closed())
             .await
             .unwrap();
-        let (accepted, floor) = durable_remote(a._dir.path(), b_peer).unwrap();
+        let (accepted, floor) = durable_remote(&a, b_peer).await.unwrap();
         assert_eq!(accepted.as_slice(), renewal.as_bytes().as_ref());
         let expected_floor = if mode == "future" {
             (NOW + 600) * 1_000_000
@@ -1519,7 +1523,7 @@ async fn cross_account_public_controls_bind_peer_and_preserve_observation_floor(
             floor, expected_floor,
             "public control lost {mode} observation policy"
         );
-        assert!(durable_remote(a._dir.path(), a_peer).is_none());
+        assert!(durable_remote(&a, a_peer).await.is_none());
         raw.close().await;
     }
 }
@@ -1602,3 +1606,6 @@ async fn invited_current_installation_proof_does_not_report_new_device() {
     a.clock.set_unix_seconds(NOW + 601);
     assert!(a.account.contacts().await.unwrap()[0].device_unverified);
 }
+
+#[path = "support/sql_account_store.rs"]
+mod sql_store;

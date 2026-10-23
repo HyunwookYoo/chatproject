@@ -4,8 +4,6 @@ use crate::{CoreError, ErrorCode};
 use std::{fs, path::Path, sync::Arc};
 use zeroize::Zeroizing;
 pub(crate) mod atomic;
-#[cfg(all(test, feature = "test-hooks", debug_assertions))]
-pub(crate) use atomic::with_after_replace_failure;
 pub(crate) mod ownership;
 pub(crate) mod schema;
 #[cfg(all(feature = "test-hooks", debug_assertions))]
@@ -42,6 +40,14 @@ const ARTIFACTS: &[&str] = &[
 fn exists(path: &Path) -> Result<bool, CoreError> {
     path.try_exists()
         .map_err(|_| CoreError::new(ErrorCode::StorageMissing, "Cannot inspect account storage"))
+}
+fn reject_sql(root: &Path) -> Result<(), CoreError> {
+    for name in ["storage.mode", "db.sqlite3", "db.keys", "db.keys.pending", "migration.prep"] {
+        if exists(&root.join(name))? {
+            return Err(CoreError::new(ErrorCode::StorageLocked, "sql_storage_authoritative"));
+        }
+    }
+    Ok(())
 }
 
 fn store_id(root: &Path) -> Result<StoreId, CoreError> {
@@ -84,19 +90,22 @@ pub(crate) fn load_for_migration(
 
 impl Store {
     pub fn open(root: &Path, protector: Arc<dyn KeyProtector>) -> Result<Self, CoreError> {
+        let mut ownership = ownership::Ownership::open(root)?;
+        ownership.with_lock(reject_sql)?;
         Ok(Self {
-            ownership: ownership::Ownership::open(root)?,
+            ownership,
             protector,
         })
     }
 
     pub fn load(&mut self) -> Result<Option<StoredPlaintext>, CoreError> {
         self.ownership
-            .with_lock(|root| Ok(load_locked(root, &*self.protector)?.map(|(_, _, state)| state)))
+            .with_lock(|root| { reject_sql(root)?; Ok(load_locked(root, &*self.protector)?.map(|(_, _, state)| state)) })
     }
 
     pub fn commit(&mut self, state: &StoredPlaintext) -> Result<(), CoreError> {
         self.ownership.with_lock(|root| {
+            reject_sql(root)?;
             if state.payload.len() > schema::FILE_LIMIT - 87 {
                 return Err(CoreError::new(
                     ErrorCode::StorageFull,
@@ -149,6 +158,7 @@ impl Store {
     #[allow(dead_code)] // Called by the later AccountManager/B6 integration.
     pub(crate) fn discard_pending(&mut self) -> Result<(), CoreError> {
         self.ownership.with_lock(|root| {
+            reject_sql(root)?;
             if exists(&root.join("store.id"))? {
                 self.protector.delete(store_id(root)?)?;
             } else {

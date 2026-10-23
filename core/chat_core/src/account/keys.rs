@@ -19,6 +19,12 @@ pub struct AccountKeys {
 }
 
 impl AccountKeys {
+    pub(crate) fn copy_for_update(&self) -> Self {
+        Self {
+            identity: Secret32::from(*self.identity.as_bytes()),
+            peer: self.peer,
+        }
+    }
     /// Reconstitute a stored signing seed, without applying the recovery KDF again.
     pub(crate) fn from_identity(identity: Secret32) -> Self {
         let peer = PeerId(public_key(&identity));
@@ -43,6 +49,14 @@ pub struct DeviceKeys {
 }
 
 impl DeviceKeys {
+    pub(crate) fn copy_for_update(&self) -> Self {
+        Self {
+            seed: Secret32::from(*self.seed.as_bytes()),
+            transport: Secret32::from(*self.transport.as_bytes()),
+            installation: Secret32::from(*self.installation.as_bytes()),
+            installation_id: self.installation_id,
+        }
+    }
     pub fn installation_id(&self) -> InstallationId {
         self.installation_id
     }

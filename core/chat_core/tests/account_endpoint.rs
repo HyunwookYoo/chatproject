@@ -145,14 +145,11 @@ async fn transition_busy_and_bind_failure_keeps_saved_key() {
         account.prepare_candidate().await.unwrap_err().code,
         ErrorCode::TransportFailed
     );
-    let bytes = std::fs::read(dir.path().join("account.bin")).unwrap();
+    let bytes = account.storage_test_fixture().handle.load_account().await.unwrap().unwrap().payload;
     let saved_id = info(&net).await.endpoint_id;
     let candidate = account.prepare_candidate().await.unwrap();
     assert_eq!(saved_id, Some(candidate.endpoint_id));
-    assert_eq!(
-        std::fs::read(dir.path().join("account.bin")).unwrap(),
-        bytes
-    );
+    assert!(account.storage_test_fixture().handle.load_account().await.unwrap().unwrap().payload == bytes);
     net.execute(NetworkOp::Stop).await.unwrap();
 }
 
@@ -184,7 +181,7 @@ async fn suspend_blocks_immediately_and_failed_resume_keeps_ownership() {
             .code,
         ErrorCode::WriterBusy
     );
-    std::fs::write(dir.path().join("account.bin"), b"corrupt").unwrap();
+    std::fs::write(dir.path().join("storage.mode"), b"corrupt").unwrap();
     assert_eq!(account.request_resume(), 1);
     tokio::time::timeout(Duration::from_secs(10), async {
         while account.lifecycle_status() == 1 {
@@ -492,3 +489,6 @@ async fn suspend_inside_token_replacement_settles_without_releasing_bind() {
     // Do not notify held_bind: cancellation must resolve activation and suspend.
     drop(held_bind);
 }
+
+#[path = "support/sql_account_store.rs"]
+mod sql_store;

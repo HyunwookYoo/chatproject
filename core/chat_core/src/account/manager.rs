@@ -6,9 +6,9 @@ use super::{
     derive_device,
     publication::{Action, PacketStatus, RecordState},
     random_secret, recovery,
-    storage::{KeyProtector, Store, schema::AccountState},
+    storage::{KeyProtector, schema::AccountState},
 };
-use crate::{CoreError, ErrorCode, NetworkHandle};
+use crate::{CoreError, ErrorCode, NetworkHandle, storage::worker::StorageHandle};
 use std::{
     path::Path,
     sync::{
@@ -62,7 +62,7 @@ pub struct CandidateInfo {
     pub endpoint_id: String,
 }
 enum Command {
-    Retry(oneshot::Sender<Result<(), CoreError>>),
+    Retry(oneshot::Sender<Result<u64, CoreError>>),
     #[cfg(all(feature="test-hooks",debug_assertions))]
     PairTestStop(super::PairTestStop,oneshot::Sender<Result<(),CoreError>>),
     #[cfg(all(feature="test-hooks",debug_assertions))]
@@ -170,6 +170,7 @@ struct Request {
 }
 struct Shared {
     network: NetworkHandle,
+    store: StorageHandle,
     requests: watch::Sender<Request>,
     // ticket << 2 | 0 pending / 1 complete / 2 failed. Monotonic revisions
     // prevent an obsolete completion from reporting success for a newer request.
@@ -185,6 +186,10 @@ fn unavailable(code: ErrorCode) -> CoreError {
 }
 
 impl AccountHandle {
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    pub fn storage_test_fixture(&self) -> crate::storage_fixture::Fixture {
+        crate::storage_fixture::Fixture::from_handle(self.shared.store.clone())
+    }
     #[cfg(all(feature="test-hooks",debug_assertions))]
     pub async fn pair_test_stop(&self,stop:super::PairTestStop)->Result<(),CoreError>{self.send(|reply|Command::PairTestStop(stop,reply)).await}
     #[cfg(all(feature="test-hooks",debug_assertions))]
@@ -200,9 +205,10 @@ impl AccountHandle {
         bus: crate::EventBus,
     ) -> Result<Self, CoreError> {
         network.begin_account();
-        let mut store = Store::open(root, protector)?;
-        let state = store
-            .load()?
+        let ticket = network.block();
+        let (store, initial) = StorageHandle::open_blocking(root.to_owned(), protector)?;
+        store.invalidate(ticket);
+        let state = initial
             .as_ref()
             .map(AccountState::decode)
             .transpose()?;
@@ -213,12 +219,12 @@ impl AccountHandle {
             Some(AccountState::PendingImport(p)) => p.revision,
             None => 0,
         };
-        let ticket = network.block();
         let (requests, received) = watch::channel(Request {
             ticket,
             suspend: network.desired_suspend(),
         });
         let shared = Arc::new(Shared {
+            store: store.clone(),
             network,
             requests,
             status: AtomicU64::new(ticket << 2),
@@ -270,15 +276,21 @@ impl AccountHandle {
     ) -> Result<T, CoreError> {
         let (reply, result) = oneshot::channel();
         let ticket = self.shared.requests.borrow().ticket;
+        let command = command(reply);
+        let snapshot = matches!(command, Command::Snapshot(_));
         self.commands
             .try_send(Queued {
                 ticket,
-                command: command(reply),
+                command,
             })
             .map_err(|_| unavailable(ErrorCode::Busy))?;
-        result
+        let value = result
             .await
-            .map_err(|_| unavailable(ErrorCode::NotAvailable))?
+            .map_err(|_| unavailable(ErrorCode::NotAvailable))??;
+        if self.shared.requests.borrow().ticket != ticket || (!snapshot && self.shared.network.desired_suspend()) {
+            return Err(unavailable(ErrorCode::StorageLocked));
+        }
+        Ok(value)
     }
     pub async fn begin_create(&self) -> Result<RecoveryDisplay, CoreError> {
         self.send(Command::Begin).await
@@ -300,7 +312,22 @@ impl AccountHandle {
         self.send(|reply| Command::Recover(words, confirm_replacement, reply))
             .await
     }
-    pub async fn retry_open(&self) -> Result<(), CoreError> { self.send(Command::Retry).await }
+    pub async fn retry_open(&self) -> Result<(), CoreError> {
+        let (reply, result) = oneshot::channel();
+        self.commands
+            .try_send(Queued {
+                ticket: self.shared.requests.borrow().ticket,
+                command: Command::Retry(reply),
+            })
+            .map_err(|_| unavailable(ErrorCode::Busy))?;
+        // Retry may advance the lifecycle ticket itself. Fence its acknowledgement
+        // against that exact accepted ticket, including invalidation after send.
+        let accepted = result.await.map_err(|_| unavailable(ErrorCode::NotAvailable))??;
+        if self.shared.requests.borrow().ticket != accepted || self.shared.network.desired_suspend() {
+            return Err(unavailable(ErrorCode::StorageLocked));
+        }
+        Ok(())
+    }
     pub async fn snapshot(&self) -> Result<AccountView, CoreError> {
         self.send(Command::Snapshot).await
     }
@@ -358,6 +385,7 @@ impl AccountHandle {
             return self.lifecycle_status();
         }
         let ticket = self.shared.network.block();
+        self.shared.store.invalidate(ticket);
         self.shared.status.fetch_max(ticket << 2, Ordering::AcqRel);
         // Bounded latest-request mailbox; concurrent/rapid scene callbacks cannot
         // overwrite a newer request with an older one or fill an IO work queue.
@@ -375,7 +403,7 @@ struct Manager {
     pair:super::pair::session::Runtime,
     auth: super::connection::Runtime,
     bus: crate::EventBus,
-    store: Store,
+    store: StorageHandle,
     state: Option<AccountState>,
     creation: Option<Creation>,
     cleanup_pending: bool,
@@ -387,6 +415,9 @@ struct Manager {
     services: AccountServices,
 }
 impl Manager {
+    fn copy_state(&self) -> Option<AccountState> {
+        self.state.as_ref().map(AccountState::copy_for_update)
+    }
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     fn pair_checkpoint(&mut self, at: super::PairTestStop) -> Result<(), CoreError> {
         if self.pair.stop == Some(at) {
@@ -447,14 +478,14 @@ impl Manager {
         }
         Ok(())
     }
-    fn commit_pair_state(
+    async fn commit_pair_state(
         &mut self,
         state: AccountState,
         request: Request,
     ) -> Result<(), CoreError> {
-        let result = self.persist(&state, request);
-        self.state = Some(state);
+        let result = self.persist(&state, request).await;
         if result.is_ok() {
+            self.state = Some(state);
             self.revision += 1;
         }
         result
@@ -485,8 +516,11 @@ impl Manager {
         if !self.current(request) || self.shared.network.desired_suspend() {
             return Err(unavailable(ErrorCode::StorageLocked));
         }
-        self.store.discard_pending()?;
-        // Successful cleanup includes OS resource, wrapping blob and all snapshots.
+        self.store.discard_pending().await?;
+        if !self.current(request) || self.shared.network.desired_suspend() {
+            return Err(unavailable(ErrorCode::StorageLocked));
+        }
+        // SQL clears only the never-active state/binding; DB identity and keys remain.
         self.state = None;
         self.cleanup_pending = false;
         self.revision += 1;
@@ -567,7 +601,7 @@ impl Manager {
                 ),
             )
         };
-        let mut state = self.state.take().ok_or_else(super::wire::invalid)?;
+        let mut state = self.copy_state().ok_or_else(super::wire::invalid)?;
         let AccountState::Active(local) = &mut state else {
             unreachable!()
         };
@@ -597,7 +631,7 @@ impl Manager {
         }
         local.revision = self.revision + 1;
         // Any ambiguous Store error closes the actor; no permit or first frame exists yet.
-        self.commit_pair_state(state, request)?;
+        self.commit_pair_state(state, request).await?;
         #[cfg(all(feature = "test-hooks", debug_assertions))]
         self.pair_checkpoint(super::PairTestStop::EAfterDisclosure)?;
         if !self.local_authorized() {
@@ -705,7 +739,7 @@ impl Manager {
                 return Err(super::wire::invalid());
             }
             if matches!(self.state, Some(AccountState::Candidate(_))) {
-                let Some(AccountState::Candidate(device)) = self.state.take() else {
+                let Some(AccountState::Candidate(device)) = self.copy_state() else {
                     unreachable!()
                 };
                 self.commit_pair_state(
@@ -716,7 +750,7 @@ impl Manager {
                         envelope,
                     })),
                     request,
-                )?;
+                ).await?;
             }
             let s = self
                 .pair
@@ -792,7 +826,7 @@ impl Manager {
         }
         #[cfg(all(feature = "test-hooks", debug_assertions))]
         self.pair_checkpoint(super::PairTestStop::NBeforeImport)?;
-        let state = self.state.take().ok_or_else(super::wire::invalid)?;
+        let state = self.copy_state().ok_or_else(super::wire::invalid)?;
         let state = match state {
             AccountState::CandidatePinned(p) => {
                 let records = RecordState {
@@ -827,7 +861,7 @@ impl Manager {
             _ => return Err(super::wire::invalid()),
         };
         // The exact import and newly channel-bound receipt become durable together.
-        self.commit_pair_state(state, request)?;
+        self.commit_pair_state(state, request).await?;
         #[cfg(all(feature = "test-hooks", debug_assertions))]
         self.pair_checkpoint(super::PairTestStop::NAfterImport)?;
         let clock = self.services.clock.clone();
@@ -885,7 +919,7 @@ impl Manager {
                     .is_ok_and(|e| e.tx == r.tx && e.hash == r.payload_hash)
             })
             .ok_or_else(super::wire::invalid)?;
-        let mut state = self.state.take().ok_or_else(super::wire::invalid)?;
+        let mut state = self.copy_state().ok_or_else(super::wire::invalid)?;
         let AccountState::Active(l) = &mut state else {
             unreachable!()
         };
@@ -895,7 +929,7 @@ impl Manager {
             t.stage = Stage::ReceiptVerified;
         }
         l.revision = self.revision + 1;
-        self.commit_pair_state(state, request)?;
+        self.commit_pair_state(state, request).await?;
         #[cfg(all(feature = "test-hooks", debug_assertions))]
         self.pair_checkpoint(super::PairTestStop::EAfterReceipt)?;
         if let Some(s) = &mut self.pair.current {
@@ -938,7 +972,7 @@ impl Manager {
                 self.services.clock.unix_seconds(),
             )?
         };
-        let mut state = self.state.take().ok_or_else(super::wire::invalid)?;
+        let mut state = self.copy_state().ok_or_else(super::wire::invalid)?;
         let AccountState::Active(l) = &mut state else {
             unreachable!()
         };
@@ -950,7 +984,7 @@ impl Manager {
             Stage::PublishPending
         };
         l.revision = self.revision + 1;
-        self.commit_pair_state(state, request)?;
+        self.commit_pair_state(state, request).await?;
         #[cfg(all(feature = "test-hooks", debug_assertions))]
         self.pair_checkpoint(super::PairTestStop::EBeforePublish)?;
         if !included {
@@ -966,13 +1000,13 @@ impl Manager {
             .as_ref()
             .is_some_and(|a| a.hash == packet);
         if observed {
-            let mut state = self.state.take().ok_or_else(super::wire::invalid)?;
+            let mut state = self.copy_state().ok_or_else(super::wire::invalid)?;
             let AccountState::Active(l) = &mut state else {
                 unreachable!()
             };
             l.pairs.existing[index].stage = Stage::Observed;
             l.revision = self.revision + 1;
-            self.commit_pair_state(state, request)?;
+            self.commit_pair_state(state, request).await?;
         }
         if let Some(s) = &mut self.pair.current {
             s.phase = Some(if observed {
@@ -1017,7 +1051,7 @@ impl Manager {
         let existing = found.record.devices.iter().any(|d| {
             d.installation_id == pin.installation && d.transport_public_key == pin.transport
         });
-        let Some(AccountState::PendingImport(mut p)) = self.state.take() else {
+        let Some(AccountState::PendingImport(mut p)) = self.copy_state() else {
             unreachable!()
         };
         p.records.observed_seq = p.records.observed_seq.max(found.seq);
@@ -1025,13 +1059,13 @@ impl Manager {
         if conflicting {
             p.records.conflict = Some(found);
             p.records.state = PublicationState::Conflict;
-            self.commit_pair_state(AccountState::PendingImport(p), request)?;
+            self.commit_pair_state(AccountState::PendingImport(p), request).await?;
             return Err(unavailable(ErrorCode::RecordConflict));
         }
         p.records.accepted = Some(found);
         p.records.state = PublicationState::LocalBlocked;
         if !current || !included || !existing {
-            self.commit_pair_state(AccountState::PendingImport(p), request)?;
+            self.commit_pair_state(AccountState::PendingImport(p), request).await?;
             if let Some(s) = &mut self.pair.current {
                 s.phase = Some(super::PairPhase::PublishPending);
             }
@@ -1057,8 +1091,8 @@ impl Manager {
                 origin: Some(origin),
             },
         };
-        self.commit_pair_state(AccountState::Active(Box::new(local)), request)?;
-        // Store callbacks can change time while persistence is synchronous.
+        self.commit_pair_state(AccountState::Active(Box::new(local)), request).await?;
+        // Authority can expire while the SQL worker commits.
         // The committed Active snapshot is established/non-discardable, but
         // cannot be exposed as successful activation on stale authority.
         if !self.local_authorized() {
@@ -1128,9 +1162,9 @@ impl Manager {
                         Command::PairFixtureReceived(flow,reply)=>{let result=self.pair_session(flow).map(|s|s.received.to_vec());let _=reply.send(result);}
 
                         Command::CreateInvite(name,reply) => {let result=self.create_invite(name);let _=reply.send(result);}
-                        Command::AcceptInvite(input,alias,reply) => {let result=self.accept_invite(&input,alias);let _=reply.send(result);}
+                        Command::AcceptInvite(input,alias,reply) => {let result=self.accept_invite(&input,alias).await;let _=reply.send(result);}
                         Command::Contacts(reply) => {let result=self.contact_views();let _=reply.send(result);}
-                        Command::ConfirmSafety(peer,digest,reply) => {let result=self.confirm_safety(peer,digest);let _=reply.send(result);}
+                        Command::ConfirmSafety(peer,digest,reply) => {let result=self.confirm_safety(peer,digest).await;let _=reply.send(result);}
                         Command::Connect(peer,reply) => {let result=self.connect(peer).await;let _=reply.send(result);}
                         Command::Prepare(reply) => { let result = self.prepare().await; let _ = reply.send(result); }
                         Command::Begin(reply) => { let result = self.begin(); let _ = reply.send(result); }
@@ -1157,7 +1191,7 @@ impl Manager {
         self.pair.current=None;
         self.auth.cancel.cancel();
         self.close_auth();
-        let _ = self.store.suspend();
+        let _ = self.store.suspend().await;
     }
     fn current(&self, request: Request) -> bool {
         self.shared.requests.borrow().ticket == request.ticket
@@ -1202,7 +1236,9 @@ impl Manager {
         // time; pending/failure stays closed. Store locks never cross an await.
         let stopped =
             tokio::time::timeout(Duration::from_secs(2), self.shared.network.quiesce()).await;
-        self.store.suspend()?;
+        if !self.current(request) { return Err(unavailable(ErrorCode::StorageLocked)); }
+        self.store.suspend().await?;
+        if !self.current(request) { return Err(unavailable(ErrorCode::StorageLocked)); }
         if request.suspend {
             return stopped.map_err(|_| unavailable(ErrorCode::NetworkTimeout))?;
         }
@@ -1210,29 +1246,33 @@ impl Manager {
         if !self.current(request) {
             return Err(unavailable(ErrorCode::Busy));
         }
-        self.store.resume()?;
+        self.store.resume().await?;
+        if !self.current(request) { return Err(unavailable(ErrorCode::StorageLocked)); }
         if self.cleanup_pending{return Err(unavailable(ErrorCode::StorageLocked));}
         let loaded = self
             .store
-            .load()
+            .load_account().await
             .and_then(|state| state.as_ref().map(AccountState::decode).transpose());
         match loaded {
             Ok(state) => {
+                if !self.current(request) { return Err(unavailable(ErrorCode::StorageLocked)); }
                 if let Some(AccountState::Active(local)) = &state {
                     self.revision = self.revision.max(local.revision);
                 }
                 self.state = state;
             }
             Err(error) => {
-                self.store.suspend()?;
+                if self.current(request) { self.store.suspend().await?; }
                 return Err(error);
             }
         }
         let result = self.restore(request).await;
-        if result.is_err() {
-            self.store.suspend()?;
+        if result.is_err() && self.current(request) {
+            self.store.suspend().await?;
         }
-        result
+        result?;
+        if !self.current(request) { return Err(unavailable(ErrorCode::StorageLocked)); }
+        Ok(())
     }
     async fn prepare(&mut self) -> Result<CandidateInfo, CoreError> {
         let request = self.ready()?;
@@ -1243,7 +1283,7 @@ impl Manager {
         if self.state.is_none() {
             let state = AccountState::Candidate(derive_device(random_secret()?)?);
             self.ensure_ready(request)?;
-            self.persist(&state, request)?;
+            self.persist(&state, request).await?;
             self.state = Some(state);
             self.revision += 1;
         }
@@ -1336,7 +1376,7 @@ impl Manager {
     ) -> Result<(), CoreError> {
         self.ensure_ready(request)?;
         let state = AccountState::Active(Box::new(local));
-        self.persist(&state, request)?;
+        self.persist(&state, request).await?;
         let AccountState::Active(local) = &state else {
             unreachable!()
         };
@@ -1353,20 +1393,22 @@ impl Manager {
         self.auto_refresh().await;
         Ok(())
     }
-    fn persist(&mut self, state: &AccountState, request: Request) -> Result<(), CoreError> {
+    async fn persist(&mut self, state: &AccountState, request: Request) -> Result<(), CoreError> {
         self.ensure_ready(request)?;
-        if let Err(error) = self.store.commit(&state.encode()) {
+        if let Err(error) = self.store.commit_account(state.encode()).await {
             // An error can follow atomic replacement. Do not trust the old
             // in-memory state or permit another setup to overwrite the new one.
             // A new suspend/resume cycle must reload and validate the actual disk.
             self.close_auth();
-            self.shared.network.block();
-            self.shared
-                .status
-                .fetch_max((request.ticket << 2) | 2, Ordering::AcqRel);
+            if self.current(request) {
+                let ticket = self.shared.network.block();
+                self.store.invalidate(ticket);
+                self.lock_error = Some(error.code);
+                self.shared.status.fetch_max((request.ticket << 2) | 2, Ordering::AcqRel);
+            }
             return Err(error);
         }
-        Ok(())
+        self.ensure_ready(request)
     }
     fn local(&self) -> Result<&super::storage::schema::LocalAccount, CoreError> {
         match &self.state {
@@ -1394,7 +1436,7 @@ impl Manager {
             }
         }
     }
-    fn commit_records(&mut self, records: RecordState, request: Request) -> Result<(), CoreError> {
+    async fn commit_records(&mut self, records: RecordState, request: Request) -> Result<(), CoreError> {
         self.ensure_ready(request)?;
         let old_accepted = self.local()?.records.accepted.as_ref().map(|r| r.hash);
         if self.local()?.records.encode() == records.encode() {
@@ -1404,7 +1446,7 @@ impl Manager {
             .revision
             .checked_add(1)
             .ok_or_else(|| unavailable(ErrorCode::StorageFull))?;
-        let mut state = self.state.take().unwrap();
+        let mut state = self.copy_state().unwrap();
         let AccountState::Active(local) = &mut state else {
             unreachable!()
         };
@@ -1415,9 +1457,9 @@ impl Manager {
             {t.stage=super::pair::transaction::Stage::Observed;}
         }
         local.revision = revision;
-        let result = self.persist(&state, request);
-        self.state = Some(state);
+        let result = self.persist(&state, request).await;
         if result.is_ok() {
+            self.state = Some(state);
             self.revision = revision;
         }
         self.restrict_grants();
@@ -1433,7 +1475,7 @@ impl Manager {
         }
         result
     }
-    fn ensure_packet_time(
+    async fn ensure_packet_time(
         &mut self,
         signed: &super::publication::SignedRecord,
         request: Request,
@@ -1447,7 +1489,7 @@ impl Manager {
         if !signed.current(now) || signed.record.is_expired(now) {
             let mut records = self.local()?.records.clone();
             records.state = PublicationState::LocalBlocked;
-            self.commit_records(records, request)?;
+            self.commit_records(records, request).await?;
             return Err(unavailable(ErrorCode::AccountRestricted));
         }
         Ok(())
@@ -1508,7 +1550,7 @@ impl Manager {
             }
         }
         // Includes observed floors and conflicting signed evidence on Err.
-        self.commit_records(records, request)?;
+        self.commit_records(records, request).await?;
         result?;
         let pending = self.local()?.records.pending.clone();
         for intent in pending {
@@ -1519,7 +1561,7 @@ impl Manager {
                 let Some(notifier) = self.services.notifier.clone() else {
                     continue;
                 };
-                self.ensure_packet_time(&intent.signed, request)?;
+                self.ensure_packet_time(&intent.signed, request).await?;
                 let revoke = self
                     .local()?
                     .records
@@ -1546,11 +1588,11 @@ impl Manager {
                     .find(|p| p.signed.hash == intent.signed.hash)
                     .unwrap()
                     .status = PacketStatus::Ready;
-                self.commit_records(records, request)?;
+                self.commit_records(records, request).await?;
                 self.auth.registry.1.lock().unwrap().remove(&revoke.nonce);
             }
             // Only the exact committed packet can be retried at its sequence.
-            self.ensure_packet_time(&intent.signed, request)?;
+            self.ensure_packet_time(&intent.signed, request).await?;
             if let Err(error) = self
                 .service(request, backend.publish(&intent.signed.packet))
                 .await
@@ -1561,7 +1603,7 @@ impl Manager {
                         pending.status = PacketStatus::Held;
                     }
                     records.state = PublicationState::Conflict;
-                    self.commit_records(records, request)?;
+                    self.commit_records(records, request).await?;
                 }
                 return Err(error);
             }
@@ -1569,20 +1611,21 @@ impl Manager {
         // A publish ACK is deliberately not an observation or completion.
         Ok(())
     }
-    fn retry_open(&mut self) -> Result<(), CoreError> {
+    fn retry_open(&mut self) -> Result<u64, CoreError> {
         let previous = *self.shared.requests.borrow();
         if self.cleanup_pending || previous.suspend || self.shared.network.desired_suspend() {
             return Err(unavailable(ErrorCode::StorageLocked));
         }
-        if self.ready().is_ok() { return Ok(()); }
+        if self.ready().is_ok() { return Ok(previous.ticket); }
         let ticket = self.shared.network.block();
         let accepted = self.shared.requests.send_if_modified(|request| {
             if request.ticket != previous.ticket || request.suspend || self.shared.network.desired_suspend() { return false; }
+            self.store.invalidate(ticket);
             *request = Request { ticket, suspend: false };
             self.shared.status.fetch_max(ticket << 2, Ordering::AcqRel);
             true
         });
-        if accepted { Ok(()) } else { Err(unavailable(ErrorCode::StorageLocked)) }
+        if accepted { Ok(ticket) } else { Err(unavailable(ErrorCode::StorageLocked)) }
     }
     fn snapshot_view(&mut self) -> AccountView {
         self.expire_pair();
@@ -1748,8 +1791,25 @@ mod tests {
         assert!(matches!(rejected.await.unwrap(), Err(CoreError { code: ErrorCode::StorageLocked, .. })));
         assert_eq!(account.snapshot().await.unwrap().lock_error, Some(ErrorCode::StorageCorrupt));
         protector.0.store(0, Ordering::SeqCst);
-        account.retry_open().await.unwrap();
+        let retry = account.retry_open();
+        tokio::pin!(retry);
+        assert!(std::future::poll_fn(|cx| std::task::Poll::Ready(
+            std::future::Future::poll(retry.as_mut(), cx).is_pending()
+        )).await);
+        // The actor barrier proves Retry's accepted-ticket reply was already sent.
+        // Queue directly: a public Snapshot queued before Retry accepts its new
+        // ticket is correctly rejected by its own response-consumption fence.
+        let (barrier, completed) = oneshot::channel();
+        account.commands.try_send(Queued {
+            ticket: account.shared.requests.borrow().ticket,
+            command: Command::Snapshot(barrier),
+        }).ok().unwrap();
+        assert_eq!(completed.await.unwrap().unwrap().phase, AccountPhase::Candidate);
+        account.request_suspend();
+        account.request_resume();
+        assert_eq!(retry.await.unwrap_err().code, ErrorCode::StorageLocked);
         assert_eq!(account.snapshot().await.unwrap().phase, AccountPhase::Candidate);
+        account.retry_open().await.unwrap(); // Already-ready acknowledgement keeps the same ticket.
         // Native intent can change before its lifecycle mailbox notification arrives.
         account.shared.network.lifecycle_gate(true);
         assert_eq!(account.retry_open().await.unwrap_err().code, ErrorCode::StorageLocked);
@@ -1788,7 +1848,11 @@ mod tests {
         network.configure_local(None).await.unwrap();
         let ticket = network.begin_account();
         let (requests, _) = watch::channel(Request { ticket, suspend: false });
+        let root = dir.path().to_owned();
+        let (store, _) = tokio::task::spawn_blocking(move || StorageHandle::open_blocking(root, Arc::new(Protector))).await.unwrap().unwrap();
+        store.invalidate(ticket);
         let shared = Arc::new(Shared {
+            store: store.clone(),
             network: network.clone(),
             requests,
             status: AtomicU64::new((ticket << 2) | 1),
@@ -1803,7 +1867,7 @@ mod tests {
             pair: super::super::pair::session::Runtime::default(),
             auth: super::super::connection::Runtime::default(),
             bus,
-            store: Store::open(dir.path(), Arc::new(Protector)).unwrap(),
+            store: store.clone(),
             state: None,
             creation: None,
             cleanup_pending: false,
@@ -1915,7 +1979,11 @@ mod tests {
             suspend: false,
         };
         let (requests, _) = watch::channel(request);
+        let root = dir.path().to_owned();
+        let (store, _) = tokio::task::spawn_blocking(move || StorageHandle::open_blocking(root, Arc::new(Protector))).await.unwrap().unwrap();
+        store.invalidate(ticket);
         let shared = Arc::new(Shared {
+            store: store.clone(),
             network: network.clone(),
             requests,
             status: AtomicU64::new(ticket << 2),
@@ -1928,7 +1996,7 @@ mod tests {
             pair: super::super::pair::session::Runtime::default(),
             auth: super::super::connection::Runtime::default(),
             bus: EventBus::new(),
-            store: Store::open(dir.path(), Arc::new(Protector)).unwrap(),
+            store: store.clone(),
             state: None,
             creation: None,
                 cleanup_pending: false,
@@ -1949,15 +2017,14 @@ mod tests {
             .await
             .unwrap();
         backend.absent.store(true, Ordering::SeqCst);
-        use futures_util::FutureExt;
-        let result = super::super::storage::with_after_replace_failure(|| {
-            manager.publication(Action::Refresh).now_or_never().unwrap()
-        });
-        assert_eq!(result.unwrap_err().code, ErrorCode::StorageFull);
+        crate::storage_fixture::Fixture::from_handle(manager.store.clone()).fault(crate::storage_fixture::CommitFault::AfterCommit).await;
+        let result = manager.publication(Action::Refresh).await;
+        assert_eq!(result.unwrap_err().code, ErrorCode::StorageUncertain);
         assert_eq!(manager.view().phase, AccountPhase::Locked);
         assert!(backend.sent.lock().unwrap().is_empty());
+        manager.store.resume().await.unwrap();
         let AccountState::Active(saved) =
-            AccountState::decode(&manager.store.load().unwrap().unwrap()).unwrap()
+            AccountState::decode(&manager.store.load_account().await.unwrap().unwrap()).unwrap()
         else {
             panic!()
         };
@@ -1971,6 +2038,7 @@ mod tests {
         for suspend in [true, false] {
             let ticket = network.block();
             let request = Request { ticket, suspend };
+            manager.store.invalidate(ticket);
             manager.shared.requests.send_replace(request);
             manager.shared.status.store(ticket << 2, Ordering::Release);
             let result = manager.lifecycle(request).await;
@@ -2008,11 +2076,14 @@ mod tests {
                 suspend: false,
             };
             let (requests, _) = watch::channel(request);
+        let root = dir.path().to_owned();
+        let (store, _) = tokio::task::spawn_blocking(move || StorageHandle::open_blocking(root, Arc::new(Protector))).await.unwrap().unwrap();
+        store.invalidate(ticket);
             let mut manager = Manager {
                 pair: Default::default(),
                 auth: Default::default(),
                 bus: EventBus::new(),
-                store: Store::open(dir.path(), Arc::new(Protector)).unwrap(),
+                store: store.clone(),
                 state: None,
                 creation: None,
                 cleanup_pending: false,
@@ -2021,6 +2092,7 @@ mod tests {
             last_public_view: None,
             lock_error: None,
                 shared: Arc::new(Shared {
+            store: store.clone(),
                     network: network.clone(),
                     requests,
                     status: AtomicU64::new(ticket << 2),
@@ -2082,13 +2154,9 @@ mod tests {
                     records: local.records.clone(),
                 }))
             };
-            // The thread-local failpoint surrounds exactly this synchronous
-            // Store commit, including real atomic replacement, on this thread.
-            let error = super::super::storage::with_after_replace_failure(|| {
-                manager.commit_pair_state(state, request)
-            })
-            .unwrap_err();
-            assert_eq!(error.code, ErrorCode::StorageFull);
+            crate::storage_fixture::Fixture::from_handle(manager.store.clone()).fault(crate::storage_fixture::CommitFault::AfterCommit).await;
+            let error = manager.commit_pair_state(state, request).await.unwrap_err();
+            assert_eq!(error.code, ErrorCode::StorageUncertain);
             assert_eq!(manager.view().phase, AccountPhase::Locked);
             assert_eq!(manager.pair.bytes, (0, 0));
             assert_eq!(
@@ -2100,7 +2168,8 @@ mod tests {
                 ErrorCode::StorageLocked
             );
             assert!(manager.begin().is_err());
-            let stored = manager.store.load().unwrap().unwrap();
+            manager.store.resume().await.unwrap();
+            let stored = manager.store.load_account().await.unwrap().unwrap();
             let saved = AccountState::decode(&stored).unwrap();
             match saved {
                 AccountState::Active(l) => {
@@ -2118,7 +2187,8 @@ mod tests {
             for suspend in [true, false] {
                 let ticket = network.block();
                 let request = Request { ticket, suspend };
-                manager.shared.requests.send_replace(request);
+                manager.store.invalidate(ticket);
+            manager.shared.requests.send_replace(request);
                 manager.shared.status.store(ticket << 2, Ordering::Release);
                 let result = manager.lifecycle(request).await;
                 manager.complete(request, result);
@@ -2149,7 +2219,11 @@ mod tests {
             suspend: false,
         };
         let (requests, _) = watch::channel(request);
+        let root = dir.path().to_owned();
+        let (store, _) = tokio::task::spawn_blocking(move || StorageHandle::open_blocking(root, Arc::new(Protector))).await.unwrap().unwrap();
+        store.invalidate(ticket);
         let shared = Arc::new(Shared {
+            store: store.clone(),
             network: network.clone(),
             requests,
             status: AtomicU64::new(ticket << 2),
@@ -2158,7 +2232,7 @@ mod tests {
             pair: super::super::pair::session::Runtime::default(),
             auth: super::super::connection::Runtime::default(),
             bus: EventBus::new(),
-            store: Store::open(dir.path(), Arc::new(Protector)).unwrap(),
+            store: store.clone(),
             state: None,
             creation: None,
                 cleanup_pending: false,
@@ -2179,9 +2253,9 @@ mod tests {
         .unwrap();
         let peer = local.keys.peer_id();
         let state = AccountState::Active(Box::new(local));
-        let result =
-            super::super::storage::with_after_replace_failure(|| manager.persist(&state, request));
-        assert_eq!(result.unwrap_err().code, ErrorCode::StorageFull);
+        crate::storage_fixture::Fixture::from_handle(manager.store.clone()).fault(crate::storage_fixture::CommitFault::AfterCommit).await;
+        let result = manager.persist(&state, request).await;
+        assert_eq!(result.unwrap_err().code, ErrorCode::StorageUncertain);
         assert_eq!(manager.view().phase, AccountPhase::Locked);
         assert_eq!(
             manager.begin().err().unwrap().code,
@@ -2191,10 +2265,12 @@ mod tests {
             manager.recover("invalid", true).await.unwrap_err().code,
             ErrorCode::StorageLocked
         );
-        let bytes = std::fs::read(dir.path().join("account.bin")).unwrap();
+        manager.store.resume().await.unwrap();
+        let bytes = manager.store.load_account().await.unwrap().unwrap().payload;
         // The call returned Err, but atomic replacement really committed Active.
+        manager.store.resume().await.unwrap();
         let AccountState::Active(saved) =
-            AccountState::decode(&manager.store.load().unwrap().unwrap()).unwrap()
+            AccountState::decode(&manager.store.load_account().await.unwrap().unwrap()).unwrap()
         else {
             panic!()
         };
@@ -2202,6 +2278,7 @@ mod tests {
         for suspend in [true, false] {
             let ticket = network.block();
             let request = Request { ticket, suspend };
+            manager.store.invalidate(ticket);
             manager.shared.requests.send_replace(request);
             manager.shared.status.store(ticket << 2, Ordering::Release);
             let result = manager.lifecycle(request).await;
@@ -2215,10 +2292,7 @@ mod tests {
             manager.recover("invalid", true).await.unwrap_err().code,
             ErrorCode::AccountExists
         );
-        assert_eq!(
-            std::fs::read(dir.path().join("account.bin")).unwrap(),
-            bytes
-        );
+        assert!(manager.store.load_account().await.unwrap().unwrap().payload == bytes);
         assert_eq!(manager.view().public_peer_id, Some(peer));
         network.execute(NetworkOp::Stop).await.unwrap();
     }
@@ -2242,7 +2316,11 @@ mod tests {
             suspend: false,
         };
         let (requests, _) = watch::channel(request);
+        let root = dir.path().to_owned();
+        let (store, _) = tokio::task::spawn_blocking(move || StorageHandle::open_blocking(root, Arc::new(Protector))).await.unwrap().unwrap();
+        store.invalidate(ticket);
         let shared = Arc::new(Shared {
+            store: store.clone(),
             network: network.clone(),
             requests,
             status: AtomicU64::new(ticket << 2),
@@ -2251,7 +2329,7 @@ mod tests {
             pair: super::super::pair::session::Runtime::default(),
             auth: super::super::connection::Runtime::default(),
             bus: EventBus::new(),
-            store: Store::open(dir.path(), Arc::new(Protector)).unwrap(),
+            store: store.clone(),
             state: None,
             creation: None,
                 cleanup_pending: false,
@@ -2265,7 +2343,7 @@ mod tests {
         let restored = manager.lifecycle(request).await;
         manager.complete(request, restored);
         let first = manager.prepare().await.unwrap();
-        let persisted = manager.store.load().unwrap().unwrap();
+        let persisted = manager.store.load_account().await.unwrap().unwrap();
         assert_eq!(
             AccountState::decode(&persisted)
                 .unwrap()
@@ -2306,13 +2384,13 @@ mod tests {
         // decision. A5 must test actual recovery policy and fresh DeviceSeed.
         // Use the same real Store/handler/network; no second writer or public reset.
         let replacement = AccountState::Candidate(derive_device(random_secret().unwrap()).unwrap());
-        manager.store.commit(&replacement.encode()).unwrap();
+        manager.store.commit_account(replacement.encode()).await.unwrap();
         manager.state = Some(replacement);
         let second = manager.prepare().await.unwrap();
         assert_ne!(second.endpoint_id, first.endpoint_id);
         assert_ne!(second.installation_id, first.installation_id);
         assert_eq!(slot.info().unwrap().instance_id, instance);
-        let persisted = manager.store.load().unwrap().unwrap();
+        let persisted = manager.store.load_account().await.unwrap().unwrap();
         assert_eq!(
             AccountState::decode(&persisted)
                 .unwrap()
@@ -2455,7 +2533,7 @@ impl Manager {
             });
         }
     }
-    fn commit_remote(
+    async fn commit_remote(
         &mut self,
         remote: Vec<super::connection::RemoteRecord>,
         request: Request,
@@ -2470,21 +2548,21 @@ impl Manager {
             .revision
             .checked_add(1)
             .ok_or_else(|| unavailable(ErrorCode::StorageFull))?;
-        let mut state = self.state.take().unwrap();
+        let mut state = self.copy_state().unwrap();
         let AccountState::Active(local) = &mut state else {
             unreachable!()
         };
         local.remote = remote;
         local.revision = revision;
-        let result = self.persist(&state, request);
-        self.state = Some(state);
+        let result = self.persist(&state, request).await;
         if result.is_ok() {
+            self.state = Some(state);
             self.revision = revision;
         }
         self.restrict_grants();
         result
     }
-    fn observe_remote(
+    async fn observe_remote(
         &mut self,
         peer: PeerId,
         signed: super::publication::SignedRecord,
@@ -2511,7 +2589,7 @@ impl Manager {
             remote.sort_by_key(|r| r.peer);
             Ok(())
         };
-        self.commit_remote(remote, request)?;
+        self.commit_remote(remote, request).await?;
         result
     }
     async fn confirm_remote(&mut self, peer: PeerId, hash: [u8; 32]) -> Result<(), CoreError> {
@@ -2529,7 +2607,7 @@ impl Manager {
         };
         let signed = super::publication::SignedRecord::new(packet, peer)?;
         // Retain newly observed evidence even when consent is stale.
-        let observed = self.observe_remote(peer, signed.clone(), request);
+        let observed = self.observe_remote(peer, signed.clone(), request).await;
         if let Err(error) = observed && error.code != ErrorCode::RecordConflict {
             return Err(error);
         }
@@ -2544,7 +2622,7 @@ impl Manager {
         entry.accepted = signed;
         entry.conflict = None;
         self.restrict_peer_grants(peer, true);
-        self.commit_remote(remote, request)
+        self.commit_remote(remote, request).await
     }
     fn restrict_peer_grants(&self, peer: PeerId, close: bool) {
         for grant in self.auth.registry.apply(|grant| (grant.peer != peer, close && grant.peer == peer)) {
@@ -2572,7 +2650,7 @@ impl Manager {
         match lookup {
             Ok(super::Lookup::Found(packet)) => {
                 let signed = super::publication::SignedRecord::new(packet, peer)?;
-                self.observe_remote(peer, signed, request)?;
+                self.observe_remote(peer, signed, request).await?;
             }
             Ok(super::Lookup::CompletedAbsent) | Err(_) => {
                 cached = true;
@@ -2677,12 +2755,12 @@ impl Manager {
                 )
                 .await;
             if let Some(signed) = evidence
-                && let Err(error) = self.observe_auth_record(peer, signed, request) {
+                && let Err(error) = self.observe_auth_record(peer, signed, request).await {
                 conn.close(0u32.into(), b"account record changed");
                 return Err(error);
             }
             match result {
-                Ok(grant) => return self.install_grant(conn, grant),
+                Ok(grant) => return self.install_grant(conn, grant).await,
                 Err(error) => {
                     conn.close(0u32.into(), b"account authentication failed");
                     last = error;
@@ -2691,7 +2769,7 @@ impl Manager {
         }
         Err(last)
     }
-    fn install_grant(
+    async fn install_grant(
         &mut self,
         conn: iroh::endpoint::Connection,
         grant: super::auth::AuthGrant,
@@ -2700,9 +2778,13 @@ impl Manager {
             conn.close(0u32.into(), b"account restricted");
             return Err(unavailable(ErrorCode::AccountRestricted));
         }
-        if let Err(error) = self.observe_contact_device(grant.peer, grant.installation) {
+        if let Err(error) = self.observe_contact_device(grant.peer, grant.installation).await {
             conn.close(0u32.into(), b"contact persistence failed");
             return Err(error);
+        }
+        if !self.grant_authorized(&grant) {
+            conn.close(0u32.into(), b"account restricted");
+            return Err(unavailable(ErrorCode::AccountRestricted));
         }
         let mut sessions = self.auth.registry.0.lock().unwrap();
         sessions.retain(|s| {
@@ -2762,9 +2844,9 @@ impl Manager {
                         )
                         .await;
                     if let Some(signed) = evidence {
-                        self.observe_auth_record(peer, signed, request)?;
+                        self.observe_auth_record(peer, signed, request).await?;
                     }
-                    self.install_grant(conn.clone(), result?)
+                    self.install_grant(conn.clone(), result?).await
                 }
                 .await;
                 if result.is_err() {
@@ -2776,7 +2858,7 @@ impl Manager {
                 body,
                 reply,
             } => {
-                let result = self.receive_control(&connection, &body);
+                let result = self.receive_control(&connection, &body).await;
                 let _ = reply.send(result);
             }
             Input::Closed(id) => {
@@ -2796,19 +2878,19 @@ impl Manager {
             }
         }
     }
-    fn observe_auth_record(
+    async fn observe_auth_record(
         &mut self,
         peer: PeerId,
         signed: super::publication::SignedRecord,
         request: Request,
     ) -> Result<(), CoreError> {
         if peer == self.local()?.keys.peer_id() {
-            self.apply_record_change(&signed, request)
+            self.apply_record_change(&signed, request).await
         } else {
-            self.observe_remote(peer, signed, request)
+            self.observe_remote(peer, signed, request).await
         }
     }
-    fn apply_record_change(
+    async fn apply_record_change(
         &mut self,
         signed: &super::publication::SignedRecord,
         request: Request,
@@ -2867,10 +2949,10 @@ impl Manager {
             }
             Err(unavailable(ErrorCode::RecordConflict))
         };
-        self.commit_records(records, request)?;
+        self.commit_records(records, request).await?;
         result
     }
-    fn receive_control(
+    async fn receive_control(
         &mut self,
         conn: &iroh::endpoint::Connection,
         body: &[u8],
@@ -2898,11 +2980,11 @@ impl Manager {
             );
             if grant.peer == self.local()?.keys.peer_id() {
                 current?;
-                self.apply_record_change(&signed, request)?;
+                self.apply_record_change(&signed, request).await?;
             } else {
                 // Verified future/rollback evidence must retain the same durable
                 // floor/conflict policy as lookup, even when unusable right now.
-                self.observe_remote(grant.peer, signed, request)?;
+                self.observe_remote(grant.peer, signed, request).await?;
                 current?;
             }
             return Ok(super::auth::envelope(
@@ -2962,7 +3044,7 @@ impl Manager {
             // Preserve exact signed packets and receipt obligations, but never
             // retry a queued membership that the new tombstone invalidates.
             records.restrict_pending(local);
-            self.commit_records(records, request)?;
+            self.commit_records(records, request).await?;
         }
         self.restrict_grants();
         if !self.grant_authorized(&grant) || conn.close_reason().is_some() {
@@ -3001,7 +3083,7 @@ impl Manager {
             .map(|c| self.contact_view(c))
             .collect())
     }
-    fn commit_contacts(
+    async fn commit_contacts(
         &mut self,
         contacts: Vec<super::contacts::Contact>,
         request: Request,
@@ -3011,20 +3093,20 @@ impl Manager {
             .revision
             .checked_add(1)
             .ok_or_else(|| unavailable(ErrorCode::StorageFull))?;
-        let mut state = self.state.take().unwrap();
+        let mut state = self.copy_state().unwrap();
         let AccountState::Active(local) = &mut state else {
             unreachable!()
         };
         local.contacts = contacts;
         local.revision = revision;
-        let result = self.persist(&state, request);
-        self.state = Some(state);
+        let result = self.persist(&state, request).await;
         if result.is_ok() {
+            self.state = Some(state);
             self.revision = revision;
         }
         result
     }
-    fn accept_invite(
+    async fn accept_invite(
         &mut self,
         input: &str,
         alias: String,
@@ -3052,10 +3134,10 @@ impl Manager {
         };
         contacts.push(contact.clone());
         contacts.sort_by_key(|c| c.peer);
-        self.commit_contacts(contacts, request)?;
+        self.commit_contacts(contacts, request).await?;
         Ok(self.contact_view(&contact))
     }
-    fn confirm_safety(&mut self, peer: PeerId, digest: [u8; 32]) -> Result<(), CoreError> {
+    async fn confirm_safety(&mut self, peer: PeerId, digest: [u8; 32]) -> Result<(), CoreError> {
         let request = self.ready()?;
         let local = self.local()?;
         if super::safety_digest(local.keys.peer_id(), peer) != digest {
@@ -3070,9 +3152,9 @@ impl Manager {
             return Ok(());
         }
         contact.verified_digest = Some(digest);
-        self.commit_contacts(contacts, request)
+        self.commit_contacts(contacts, request).await
     }
-    fn observe_contact_device(
+    async fn observe_contact_device(
         &mut self,
         peer: PeerId,
         installation: InstallationId,
@@ -3089,7 +3171,7 @@ impl Manager {
         // authorized B3 proof, and the notice remains sticky across later proofs.
         c.new_device |= c.known_installation.is_some();
         c.known_installation = Some(installation);
-        self.commit_contacts(contacts, request)
+        self.commit_contacts(contacts, request).await
     }
 }
 

@@ -56,11 +56,29 @@ struct Worker {
     state: State,
     counts: Arc<Counts>,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
-    fault: Option<CommitFault>,
+    hook: Option<(usize, CommitAction)>,
 }
 impl Worker {
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    fn next_commit_action(&mut self) -> Option<CommitAction> {
+        match self.hook.as_mut() {
+            Some((remaining, _)) if *remaining > 1 => {
+                *remaining -= 1;
+                None
+            }
+            Some(_) => self.hook.take().map(|(_, action)| action),
+            None => None,
+        }
+    }
     fn discard_pending(&mut self) -> R<()> {
         let id = self.id;
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        let action = self.next_commit_action();
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        let fault = match &action {
+            Some(CommitAction::Fault(fault)) => Some(*fault),
+            _ => None,
+        };
         let result = self.operation(|conn| {
             if let Some(stored) = load(conn, &id)? {
                 if matches!(AccountState::decode(&stored)?, AccountState::Active(_)) {
@@ -70,6 +88,11 @@ impl Worker {
                     ));
                 }
             }
+            #[cfg(all(feature = "test-hooks", debug_assertions))]
+            if fault == Some(CommitFault::WriteDenied) {
+                conn.pragma_update(None, "query_only", true)
+                    .map_err(|_| uncertain())?;
+            }
             let tx = conn.transaction().map_err(|_| uncertain())?;
             tx.execute("DELETE FROM account_state WHERE singleton=1", [])
                 .map_err(|_| uncertain())?;
@@ -78,8 +101,23 @@ impl Worker {
                 params![binding(None)?],
             )
             .map_err(|_| uncertain())?;
-            tx.commit().map_err(|_| uncertain())
+            #[cfg(all(feature = "test-hooks", debug_assertions))]
+            if fault == Some(CommitFault::BeforeCommit) {
+                return Err(uncertain());
+            }
+            tx.commit().map_err(|_| uncertain())?;
+            #[cfg(all(feature = "test-hooks", debug_assertions))]
+            if fault == Some(CommitFault::AfterCommit) {
+                return Err(uncertain());
+            }
+            Ok(())
         });
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        if result.is_ok()
+            && let Some(CommitAction::Clock(clock, seconds)) = action
+        {
+            clock.set_unix_seconds(seconds);
+        }
         if result
             .as_ref()
             .is_err_and(|e| e.code == ErrorCode::StorageUncertain)
@@ -140,12 +178,24 @@ impl Worker {
         }
         let new_binding = binding(Some(&state))?;
         #[cfg(all(feature = "test-hooks", debug_assertions))]
-        let fault = self.fault.take();
+        let action = self.next_commit_action();
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        let fault = match &action {
+            Some(CommitAction::Fault(fault)) => Some(*fault),
+            _ => None,
+        };
         let id = self.id;
         let result = self.operation(|conn| {
-            let old = load(conn, &id)?;
-            if let Some(old) = old {
-                let previous = binding(Some(&old))?;
+            if load(conn, &id)?.is_some() {
+                // load just validated this binding against the full old snapshot.
+                // Same owned connection: no await or intervening write/other writer.
+                let previous: Vec<u8> = conn
+                    .query_row(
+                        "SELECT binding FROM storage_meta WHERE singleton=1",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(|_| CoreError::new(ErrorCode::StorageCorrupt, "db_binding_invalid"))?;
                 // Active identity/installation cannot be replaced with Candidate or another account.
                 if previous.get(2) == Some(&2) && previous != new_binding {
                     return Err(CoreError::new(
@@ -182,6 +232,12 @@ impl Worker {
             }
             Ok(())
         });
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        if result.is_ok()
+            && let Some(CommitAction::Clock(clock, seconds)) = action
+        {
+            clock.set_unix_seconds(seconds);
+        }
         if result
             .as_ref()
             .is_err_and(|e| e.code == ErrorCode::StorageUncertain)
@@ -215,7 +271,7 @@ enum DbOp {
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     Test(TestOp),
 }
-// Interim until T4 wires the private capability into the account actor.
+// Private persistence capability shared by the account actor and its lifecycle gate.
 #[allow(dead_code)]
 #[derive(Clone)]
 pub(crate) struct StorageHandle {
@@ -248,7 +304,7 @@ impl StorageHandle {
             state: conn.map(State::Open).unwrap_or(State::Closed),
             counts: counts.clone(),
             #[cfg(all(feature = "test-hooks", debug_assertions))]
-            fault: None,
+            hook: None,
         };
         let (sender, receiver) = mpsc::channel(32);
         let fence = Arc::new(Mutex::new(Fence {
@@ -419,7 +475,12 @@ fn run(mut w: Worker, mut rx: mpsc::Receiver<Request>, fence: Arc<Mutex<Fence>>)
                     let _ = release.recv();
                 }
                 TestOp::Fault(fault, reply) => {
-                    w.fault = Some(fault);
+                    w.hook = Some((1, CommitAction::Fault(fault)));
+                    let _ = reply.send(());
+                }
+                TestOp::CommitAction(after, action, reply) => {
+                    assert!(after > 0);
+                    w.hook = Some((after, action));
                     let _ = reply.send(());
                 }
                 TestOp::Rows(reply) => {
@@ -450,9 +511,15 @@ pub enum CommitFault {
     AfterCommit,
 }
 #[cfg(all(feature = "test-hooks", debug_assertions))]
+pub(crate) enum CommitAction {
+    Fault(CommitFault),
+    Clock(Arc<crate::account::clock::FakeClock>, u64),
+}
+#[cfg(all(feature = "test-hooks", debug_assertions))]
 pub(crate) enum TestOp {
     Pause(oneshot::Sender<()>, std::sync::mpsc::Receiver<()>),
     Fault(CommitFault, oneshot::Sender<()>),
+    CommitAction(usize, CommitAction, oneshot::Sender<()>),
     Rows(oneshot::Sender<R<usize>>),
     Stop(oneshot::Sender<()>),
 }

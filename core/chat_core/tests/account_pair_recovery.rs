@@ -13,10 +13,6 @@ use std::{
 const NOW: u64 = 1_800_000_000;
 #[derive(Default)]
 struct Protector {
-    shift_clock: Mutex<Option<(usize, Arc<FakeClock>, u64)>>,
-    reads: std::sync::atomic::AtomicUsize,
-    fail_read: std::sync::atomic::AtomicUsize,
-    fail_delete: std::sync::atomic::AtomicBool,
     deleted: std::sync::atomic::AtomicUsize,
 }
 impl KeyProtector for Protector {
@@ -24,27 +20,9 @@ impl KeyProtector for Protector {
         Ok(s.as_bytes().to_vec())
     }
     fn unprotect(&self, _: StoreId, b: &[u8]) -> Result<Secret32, CoreError> {
-        let read = self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-        if let Some((at, clock, time)) = &*self.shift_clock.lock().unwrap()
-            && *at == read
-        {
-            clock.set_unix_seconds(*time);
-        }
-        if self.fail_read.load(std::sync::atomic::Ordering::SeqCst) == read {
-            return Err(CoreError::new(
-                chat_core::ErrorCode::StorageLocked,
-                "real Store unprotect failure",
-            ));
-        }
         Ok(Secret32::from(<[u8; 32]>::try_from(b).unwrap()))
     }
     fn delete(&self, _: StoreId) -> Result<(), CoreError> {
-        if self.fail_delete.load(std::sync::atomic::Ordering::SeqCst) {
-            return Err(CoreError::new(
-                chat_core::ErrorCode::StorageLocked,
-                "OS resource deletion failed",
-            ));
-        }
         self.deleted
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(())
@@ -103,6 +81,7 @@ impl RecordBackend for Backend {
     }
 }
 struct Fixture {
+    _sql: sql_store::Store,
     _dir: tempfile::TempDir,
     slot: CoreSlot,
     a: AccountHandle,
@@ -110,15 +89,27 @@ struct Fixture {
     protector: Arc<Protector>,
     backend: Arc<dyn RecordBackend>,
 }
+#[tokio::test]
+async fn fixture_drop_closes_sql_before_owned_tempdir() {
+    let fixture = Fixture::new(false, Arc::new(Backend::default())).await;
+    let path = fixture._dir.path().canonicalize().unwrap();
+    let old_storage = fixture.a.storage_test_fixture();
+    let fixture = fixture.restart().await;
+    assert_eq!(old_storage.live_connections(), 0);
+    let storage = fixture.a.storage_test_fixture();
+    drop(fixture);
+    sql_store::assert_closed_and_removed(path, storage);
+}
 impl Fixture {
     async fn restart(self) -> Self {
         self.restart_edit(|_| {}).await
     }
     async fn restart_edit(
         self,
-        edit: impl FnOnce(&mut chat_core::account::storage::Store),
+        edit: impl FnOnce(&mut sql_store::Store),
     ) -> Self {
         let Self {
+            _sql,
             _dir,
             slot,
             a,
@@ -128,9 +119,10 @@ impl Fixture {
         } = self;
         drop(a);
         drop(slot);
+        drop(_sql);
         let mut store = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                match chat_core::account::storage::Store::open(_dir.path(), protector.clone()) {
+                match sql_store::Store::open(_dir.path(), protector.clone()) {
                     Ok(s) => break s,
                     Err(e) if e.code == chat_core::ErrorCode::WriterBusy => {
                         tokio::time::sleep(Duration::from_millis(10)).await
@@ -170,6 +162,7 @@ impl Fixture {
         .unwrap();
         settled(&a).await;
         Self {
+            _sql: sql_store::Store::from_fixture(a.storage_test_fixture()),
             _dir,
             slot,
             a,
@@ -217,6 +210,7 @@ impl Fixture {
             a.confirm_create(d.flow, answers).await.unwrap();
         }
         Self {
+            _sql: sql_store::Store::from_fixture(a.storage_test_fixture()),
             _dir: dir,
             slot,
             a,
@@ -392,11 +386,15 @@ async fn completed_history_releases_pending_quota_and_retains_exact_resume() {
     e.a.pair_cancel(flow).await.unwrap();
     first.a.pair_cancel(flow).await.unwrap();
     for cycle in 1..33 {
+        eprintln!("retained_history_cycle={cycle}");
         let n = Fixture::new(false, backend.clone()).await;
         let flow = fresh(&e, &n, None).await;
         confirm_wait(&e, &n, flow).await;
+        let started = std::time::Instant::now();
         e.a.pair_approve(flow).await.unwrap_or_else(|error| panic!("cycle {cycle}: {error}"));
+        eprintln!("retained_history_cycle={cycle} stage=approved elapsed_ms={}", started.elapsed().as_millis());
         active(&n).await;
+        eprintln!("retained_history_cycle={cycle} stage=active elapsed_ms={}", started.elapsed().as_millis());
         let target = n.a.snapshot().await.unwrap().installation.unwrap();
         e.a.pair_cancel(flow).await.unwrap();
         n.a.pair_cancel(flow).await.unwrap();
@@ -415,12 +413,9 @@ async fn completed_history_releases_pending_quota_and_retains_exact_resume() {
 
 #[tokio::test]
 async fn failed_disclosure_commit_sends_zero() {
-    use std::sync::atomic::Ordering::SeqCst;
     let (e, n, f, _) = connected(PairDirection::NewDisplays).await;
     confirm_wait(&e, &n, f).await;
-    e.protector
-        .fail_read
-        .store(e.protector.reads.load(SeqCst) + 1, SeqCst);
+    e.a.storage_test_fixture().fault(chat_core::storage_fixture::CommitFault::BeforeCommit).await;
     assert!(e.a.pair_approve(f).await.is_err());
     assert_eq!(e.a.pair_test_bytes().await.unwrap().0, 0);
     assert_eq!(n.a.pair_test_bytes().await.unwrap().1, 0);
@@ -432,13 +427,10 @@ async fn failed_disclosure_commit_sends_zero() {
 
 #[tokio::test]
 async fn ack_only_after_durable_import() {
-    use std::sync::atomic::Ordering::SeqCst;
     let (e, n, f, _) = connected(PairDirection::NewDisplays).await;
     confirm_wait(&e, &n, f).await;
-    // Pin commit succeeds; the second actual Store::commit fails while loading its wrapping key.
-    n.protector
-        .fail_read
-        .store(n.protector.reads.load(SeqCst) + 2, SeqCst);
+    // Pin commits; real import commits but its acknowledgement is uncertain.
+    n.a.storage_test_fixture().fault_after_commits(2, chat_core::storage_fixture::CommitFault::AfterCommit).await;
     e.a.pair_approve(f).await.unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         while n.a.snapshot().await.unwrap().phase != AccountPhase::Locked {
@@ -540,19 +532,24 @@ async fn discard_pending_then_phrase_recovery() {
     pending(&n).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
     let old = n.a.snapshot().await.unwrap().installation.unwrap();
-    n.protector.fail_delete.store(true, SeqCst);
+    let guard = std::fs::read(n._dir.path().join("store.id")).unwrap();
+    let keys = std::fs::read(n._dir.path().join("db.keys")).unwrap();
+    n.a.storage_test_fixture().fault(chat_core::storage_fixture::CommitFault::WriteDenied).await;
     assert!(n.a.discard_pending_import().await.is_err());
     assert_eq!(n.a.retry_open().await.unwrap_err().code, chat_core::ErrorCode::StorageLocked);
     assert_eq!(n.a.snapshot().await.unwrap().phase, AccountPhase::Locked);
     assert!(n.a.begin_create().await.is_err());
-    n.protector.fail_delete.store(false, SeqCst);
+    // Reconcile the SQL failure before explicitly retrying the never-active discard.
+    n.a.storage_test_fixture().handle.resume().await.unwrap();
     n.a.discard_pending_import().await.unwrap();
     assert_eq!(
         n.a.snapshot().await.unwrap().phase,
         AccountPhase::Unconfigured
     );
-    assert_eq!(n.protector.deleted.load(SeqCst), 1);
-    for path in ["store.id", "key.wrap", "account.bin"] {
+    assert_eq!(n.protector.deleted.load(SeqCst), 0);
+    assert_eq!(std::fs::read(n._dir.path().join("store.id")).unwrap(), guard);
+    assert_eq!(std::fs::read(n._dir.path().join("db.keys")).unwrap(), keys);
+    for path in ["key.wrap", "account.bin"] {
         assert!(!n._dir.path().join(path).exists());
     }
     assert!(
@@ -633,7 +630,7 @@ struct DiskBoundary {
     publication: Option<[u8; 32]>,
 }
 impl DiskBoundary {
-    fn read(store: &mut chat_core::account::storage::Store) -> Self {
+    fn read(store: &mut sql_store::Store) -> Self {
         use sha2::{Digest, Sha256};
         let stored = store.load().unwrap().unwrap();
         let raw = &stored.payload;
@@ -1208,8 +1205,7 @@ async fn thousand_contacts_cross_multiple_real_noise_chunks_without_device_trust
 async fn authority_rechecked_after_disclosure_store_commit_before_first_byte() {
     let (e, n, f, _) = connected(PairDirection::NewDisplays).await;
     confirm_wait(&e, &n, f).await;
-    let next = e.protector.reads.load(std::sync::atomic::Ordering::SeqCst) + 1;
-    *e.protector.shift_clock.lock().unwrap() = Some((next, e.clock.clone(), NOW - 301));
+    e.a.storage_test_fixture().clock_after_commits(1, e.clock.clone(), NOW - 301).await;
     assert!(e.a.pair_approve(f).await.is_err());
     assert_eq!(e.a.pair_test_bytes().await.unwrap().0, 0);
     assert!(e.a.snapshot().await.unwrap().disclosure_possible);
@@ -1277,8 +1273,7 @@ async fn activation_commit_clock_change_is_error_and_reload_never_claims_active(
     b.hold_publish.store(false, SeqCst);
     e.a.refresh_record(peer).await.unwrap();
     e.a.refresh_record(peer).await.unwrap();
-    let next = n.protector.reads.load(SeqCst) + 1;
-    *n.protector.shift_clock.lock().unwrap() = Some((next, n.clock.clone(), NOW - 301));
+    n.a.storage_test_fixture().clock_after_commits(1, n.clock.clone(), NOW - 301).await;
     assert!(
         n.a.refresh_record(peer).await.is_err(),
         "time-invalid activation commit must not report success"
@@ -1388,3 +1383,6 @@ async fn resume_key_transition_cancellation_returns_no_display_or_session() {
     settled(&n.a).await;
     assert!(n.a.pair_view().await.unwrap().is_none());
 }
+
+#[path = "support/sql_account_store.rs"]
+mod sql_store;

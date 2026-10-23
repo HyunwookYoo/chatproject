@@ -744,10 +744,7 @@ async fn all_legacy_states_round_trip() {
         f.close().await;
         assert!(!dir.path().join("account.bin").exists());
         assert!(!dir.path().join("key.wrap").exists());
-        let mut old = Store::open(dir.path(), p.clone()).unwrap();
-        assert!(old.load().is_err());
-        assert!(old.commit(&state(18)).is_err());
-        drop(old);
+        assert!(Store::open(dir.path(), p.clone()).is_err());
         let f = Fixture::open(dir.path(), p).await.unwrap();
         let loaded = f.handle.load_account().await.unwrap();
         if let Some(expected) = &expected {
@@ -768,7 +765,5 @@ async fn old_binary_guard_survives_cleanup() {
     assert_eq!(fs::read(dir.path().join("store.id")).unwrap().len(), 16);
     assert!(dir.path().join("storage.mode").exists());
     f.close().await;
-    let mut old = Store::open(dir.path(), resources(dir.path())).unwrap();
-    assert!(old.load().is_err());
-    assert!(old.commit(&state(18)).is_err());
+    assert!(Store::open(dir.path(), resources(dir.path())).is_err());
 }

@@ -60,6 +60,11 @@ impl Drop for Pause {
     }
 }
 impl Fixture {
+    pub(crate) fn from_handle(handle: StorageHandle) -> Self {
+        Self {
+            handle: Handle(handle),
+        }
+    }
     /// Narrow corruption fixture, never an arbitrary SQL/key interface.
     pub fn set_unknown_schema(root: &Path, p: Arc<dyn KeyProtector>) -> Result<(), CoreError> {
         let mut opened = crate::storage::migration::open_or_migrate(root, &*p)?;
@@ -111,6 +116,35 @@ impl Fixture {
     pub async fn fault(&self, fault: CommitFault) {
         let (tx, rx) = oneshot::channel();
         self.handle.0.test(TestOp::Fault(fault, tx)).await;
+        rx.await.unwrap();
+    }
+    pub async fn fault_after_commits(&self, after: usize, fault: CommitFault) {
+        let (tx, rx) = oneshot::channel();
+        self.handle
+            .0
+            .test(TestOp::CommitAction(
+                after,
+                crate::storage::worker::CommitAction::Fault(fault),
+                tx,
+            ))
+            .await;
+        rx.await.unwrap();
+    }
+    pub async fn clock_after_commits(
+        &self,
+        after: usize,
+        clock: Arc<crate::account::clock::FakeClock>,
+        seconds: u64,
+    ) {
+        let (tx, rx) = oneshot::channel();
+        self.handle
+            .0
+            .test(TestOp::CommitAction(
+                after,
+                crate::storage::worker::CommitAction::Clock(clock, seconds),
+                tx,
+            ))
+            .await;
         rx.await.unwrap();
     }
     pub async fn account_rows(&self) -> usize {
