@@ -2807,7 +2807,7 @@ impl Manager {
                 return Err(error);
             }
             match result {
-                Ok(grant) => return self.install_grant(conn, grant).await,
+                Ok(grant) => return self.install_grant(conn, grant, None).await,
                 Err(error) => {
                     conn.close(0u32.into(), b"account authentication failed");
                     last = error;
@@ -2820,13 +2820,22 @@ impl Manager {
         &mut self,
         conn: iroh::endpoint::Connection,
         grant: super::auth::AuthGrant,
+        proof_owner: Option<(crate::message::types::MessageKey, u64, InstallationId)>,
     ) -> Result<(), CoreError> {
+        if let Err(error) = self.check_message_proof(proof_owner) {
+            conn.close(0u32.into(), b"stale message proof");
+            return Err(error);
+        }
         if !self.grant_authorized(&grant) {
             conn.close(0u32.into(), b"account restricted");
             return Err(unavailable(ErrorCode::AccountRestricted));
         }
         if let Err(error) = self.observe_contact_device(grant.peer, grant.installation).await {
             conn.close(0u32.into(), b"contact persistence failed");
+            return Err(error);
+        }
+        if let Err(error) = self.check_message_proof(proof_owner) {
+            conn.close(0u32.into(), b"stale message proof");
             return Err(error);
         }
         if !self.grant_authorized(&grant) {
@@ -2836,6 +2845,10 @@ impl Manager {
         // Release only current authorized Blocked work before announcing a ready session.
         if let Err(error) = self.release_message_peer(grant.peer).await {
             conn.close(0u32.into(), b"message release failed");
+            return Err(error);
+        }
+        if let Err(error) = self.check_message_proof(proof_owner) {
+            conn.close(0u32.into(), b"stale message proof");
             return Err(error);
         }
         if !self.grant_authorized(&grant) {
@@ -2905,7 +2918,7 @@ impl Manager {
                     if let Some(signed) = evidence {
                         self.observe_auth_record(peer, signed, request).await?;
                     }
-                    self.install_grant(conn.clone(), result?).await
+                    self.install_grant(conn.clone(), result?, None).await
                 }
                 .await;
                 if result.is_err() {

@@ -1,5 +1,5 @@
 //! Scheduling candidates confer no authority: the account actor prepares and launches.
-use super::store::{MessageDbOp, MessageDbReply, MessageRepo};
+use super::store::{DueCursor, MessageDbOp, MessageDbReply, MessageRepo};
 use super::types::MessageKey;
 use crate::account::{PeerId, clock::Clock};
 use zeroize::Zeroizing;
@@ -29,6 +29,7 @@ pub(crate) struct Scheduler {
     pub excluded: Vec<PeerId>,
     pub ticket: u64,
     streak: u8,
+    cursors: [Option<DueCursor>; 2],
 }
 impl Scheduler {
     pub(crate) fn new(repo: MessageRepo, clock: Arc<dyn Clock>) -> Self {
@@ -40,6 +41,7 @@ impl Scheduler {
             excluded: Vec::new(),
             ticket: 0,
             streak: 0,
+            cursors: [None, None],
         }
     }
     // A wall jump never changes live due times; security still uses unix_seconds.
@@ -49,13 +51,18 @@ impl Scheduler {
             .min(i64::MAX as u64)
     }
     pub(crate) async fn poll_due(&mut self, now_ms: u64) -> Result<Vec<Dispatch>, CoreError> {
-        let MessageDbReply::Due(mut text, mut receipts) = self
+        let MessageDbReply::Due(mut text, mut receipts, cursors) = self
             .repo
-            .operation(MessageDbOp::Due(now_ms, self.excluded.clone()))
+            .operation(MessageDbOp::Due(
+                now_ms,
+                self.excluded.clone(),
+                self.cursors,
+            ))
             .await?
         else {
             unreachable!()
         };
+        self.cursors = cursors;
         let mut jobs = Vec::new();
         let mut streak = self.streak;
         while jobs.len() < 32 && (!text.is_empty() || !receipts.is_empty()) {

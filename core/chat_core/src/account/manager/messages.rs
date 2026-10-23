@@ -56,6 +56,8 @@ pub(super) struct Runtime {
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     signature_pause: Option<TestPause>,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
+    proof_result_pause: Option<ProofPause>,
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
     proof_writes: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     reply_pause: Option<TestPause>,
@@ -75,12 +77,33 @@ impl TestPause {
     }
 }
 #[cfg(all(feature = "test-hooks", debug_assertions))]
+struct ProofPause {
+    pause: TestPause,
+    queued: oneshot::Sender<()>,
+    connection: oneshot::Sender<iroh::endpoint::Connection>,
+}
+#[cfg(all(feature = "test-hooks", debug_assertions))]
 pub struct MessagePause {
     entered: Option<oneshot::Receiver<()>>,
     release: Option<oneshot::Sender<()>>,
+    queued: Option<oneshot::Receiver<()>>,
+    connection: Option<oneshot::Receiver<iroh::endpoint::Connection>>,
 }
 #[cfg(all(feature = "test-hooks", debug_assertions))]
 impl MessagePause {
+    pub async fn release_and_wait_queued(&mut self) {
+        let _ = self.release.take().unwrap().send(());
+        self.queued.take().unwrap().await.unwrap();
+    }
+    pub async fn wait_connection_closed(&mut self) {
+        self.connection
+            .take()
+            .unwrap()
+            .await
+            .unwrap()
+            .closed()
+            .await;
+    }
     pub async fn wait_entered(&mut self) {
         self.entered.take().unwrap().await.unwrap();
     }
@@ -97,6 +120,7 @@ pub enum MessagePoint {
     Prelaunch,
     Proof,
     Signature,
+    ProofResult,
 }
 #[cfg(all(feature = "test-hooks", debug_assertions))]
 #[derive(Clone, Copy, Default)]
@@ -330,6 +354,8 @@ impl Manager {
     pub(super) fn message_pause(&mut self, response: MessagePoint) -> MessagePause {
         let (entered, rx) = oneshot::channel();
         let (release, tx) = oneshot::channel();
+        let (queued, queued_rx) = oneshot::channel();
+        let (connection, connection_rx) = oneshot::channel();
         let pause = Some(TestPause {
             entered,
             release: tx,
@@ -340,10 +366,19 @@ impl Manager {
             MessagePoint::Prelaunch => self.messages.prelaunch_pause = pause,
             MessagePoint::Proof => self.messages.proof_pause = pause,
             MessagePoint::Signature => self.messages.signature_pause = pause,
+            MessagePoint::ProofResult => {
+                self.messages.proof_result_pause = Some(ProofPause {
+                    pause: pause.unwrap(),
+                    queued,
+                    connection,
+                })
+            }
         }
         MessagePause {
             entered: Some(rx),
             release: Some(release),
+            queued: matches!(response, MessagePoint::ProofResult).then_some(queued_rx),
+            connection: matches!(response, MessagePoint::ProofResult).then_some(connection_rx),
         }
     }
     pub(super) async fn reset_unlaunched(&mut self, request: Request) -> Result<(), CoreError> {
@@ -959,19 +994,12 @@ impl Manager {
             a.cancel.cancel();
         }
     }
-    pub(super) fn restrict_message_acquisitions(&self, local: Option<&LocalAccount>) {
+    fn acquisition_snapshot_current(&self, a: &Acquisition, local: &LocalAccount) -> bool {
         let now = self.services.clock.unix_seconds();
-        for a in self.messages.acquiring.values() {
-            let valid = local.is_some_and(|local| {
-                if !acquisition_current(&self.shared, a.ticket)
-                    || !Self::local_authorized_at(local, now)
-                    || !local.contacts.iter().any(|c| c.peer == a.peer)
-                {
-                    return false;
-                }
-                let Some(snapshot) = &a.snapshot else {
-                    return true;
-                };
+        acquisition_current(&self.shared, a.ticket)
+            && Self::local_authorized_at(local, now)
+            && local.contacts.iter().any(|c| c.peer == a.peer)
+            && a.snapshot.as_ref().is_none_or(|snapshot| {
                 local
                     .records
                     .accepted
@@ -992,11 +1020,62 @@ impl Manager {
                                         && d.transport_public_key == snapshot.transport
                                 })
                         })
-            });
-            if !valid {
+            })
+    }
+    pub(super) fn restrict_message_acquisitions(&self, local: Option<&LocalAccount>) {
+        for a in self.messages.acquiring.values() {
+            if !local.is_some_and(|local| self.acquisition_snapshot_current(a, local)) {
                 a.cancel.cancel();
             }
         }
+    }
+    // A completed task still owns its exact reservation until the actor consumes it.
+    // A valid newer record requires a fresh proof, not an indefinitely blocked job.
+    pub(super) fn check_message_proof(
+        &self,
+        owner: Option<(MessageKey, u64, InstallationId)>,
+    ) -> Result<(), CoreError> {
+        let Some((key, ticket, installation)) = owner else {
+            return Ok(());
+        };
+        let a = self
+            .messages
+            .acquiring
+            .get(&key)
+            .ok_or_else(|| unavailable(ErrorCode::TransportFailed))?;
+        if a.ticket != ticket
+            || a.phase != AcquisitionPhase::Proof(installation)
+            || !acquisition_current(&self.shared, ticket)
+        {
+            return Err(unavailable(ErrorCode::StorageLocked));
+        }
+        let local = self.local()?;
+        let now = self.services.clock.unix_seconds();
+        let current = Self::local_authorized_at(local, now)
+            && local.contacts.iter().any(|c| c.peer == a.peer)
+            && local
+                .remote
+                .iter()
+                .find(|r| r.peer == a.peer)
+                .is_some_and(|r| {
+                    r.conflict.is_none()
+                        && r.accepted.seq >= r.floor
+                        && r.accepted.current(now)
+                        && !r.accepted.record.is_expired(now)
+                        && a.snapshot.as_ref().is_some_and(|snapshot| {
+                            r.accepted.record.devices.iter().any(|d| {
+                                d.installation_id == snapshot.installation
+                                    && d.transport_public_key == snapshot.transport
+                            })
+                        })
+                });
+        if !current {
+            return Err(unavailable(ErrorCode::AccountRestricted));
+        }
+        if a.cancel.is_cancelled() || !self.acquisition_snapshot_current(a, local) {
+            return Err(unavailable(ErrorCode::TransportFailed));
+        }
+        Ok(())
     }
     pub(super) async fn restore_message_scheduler(
         &mut self,
@@ -1310,6 +1389,8 @@ impl Manager {
         let cancel = a.cancel.clone();
         #[cfg(all(feature = "test-hooks", debug_assertions))]
         let pause = self.messages.proof_pause.take();
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        let result_pause = self.messages.proof_result_pause.take();
         let mut gate = ProofGate {
             shared: shared.clone(),
             ticket: request.ticket,
@@ -1366,6 +1447,16 @@ impl Manager {
             {
                 conn.close(0u32.into(), b"message proof failed");
             }
+            #[cfg(all(feature = "test-hooks", debug_assertions))]
+            let queued = if result.is_ok()
+                && let Some(pause) = result_pause
+            {
+                let _ = pause.connection.send(conn.as_ref().unwrap().clone());
+                pause.pause.wait().await;
+                Some(pause.queued)
+            } else {
+                None
+            };
             let message = ProofResult {
                 key,
                 ticket: request.ticket,
@@ -1375,9 +1466,16 @@ impl Manager {
                 result,
             };
             // Drop closes an obtained connection on cancellation, stale/missing owner or failed mailbox.
-            let _ = mailbox
+            let sent = mailbox
                 .send(crate::account::connection::Input::MessageProof(message))
-                .await;
+                .await
+                .is_ok();
+            #[cfg(all(feature = "test-hooks", debug_assertions))]
+            if sent && let Some(queued) = queued {
+                let _ = queued.send(());
+            }
+            #[cfg(not(all(feature = "test-hooks", debug_assertions)))]
+            let _ = sent;
         });
         Ok(())
     }
@@ -1389,6 +1487,7 @@ impl Manager {
             return;
         }
         let (peer, receipt) = (a.peer, a.receipt);
+        let owner = Some((proof.key, proof.ticket, proof.installation));
         let result = async {
             let request = self.ready()?;
             if request.ticket != proof.ticket {
@@ -1398,11 +1497,13 @@ impl Manager {
                 self.observe_auth_record(peer, evidence, request).await?;
             }
             self.ensure_ready(request)?;
+            self.check_message_proof(owner)?;
             match &proof.result {
                 Ok(grant) => {
                     let conn = proof.conn.as_ref().unwrap().clone();
-                    self.install_grant(conn, grant.clone()).await?;
+                    self.install_grant(conn, grant.clone(), owner).await?;
                     self.ensure_ready(request)?;
+                    self.check_message_proof(owner)?;
                     proof.conn.take();
                     self.messages.acquiring.remove(&proof.key);
                     let (reply, _) = oneshot::channel();

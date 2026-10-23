@@ -1150,3 +1150,262 @@ async fn changed_own_record_cancels_before_signature_write() {
     );
     assert_eq!(a.account.message_test_write_starts().await.unwrap().0, 0);
 }
+
+#[tokio::test]
+async fn auth_transport_close_retries_automatically_after_peer_returns() {
+    let (a, b, _) = pair().await;
+    contacts(&a, &b).await;
+    contacts(&b, &a).await;
+    let mut pause = a
+        .account
+        .message_test_pause(chat_core::account::MessagePoint::Signature)
+        .await
+        .unwrap();
+    let m = enqueue(&a, &b).await;
+    tokio::time::timeout(Duration::from_secs(5), pause.wait_entered())
+        .await
+        .unwrap();
+    b.slot
+        .network()
+        .unwrap()
+        .execute(NetworkOp::Stop)
+        .await
+        .unwrap();
+    pause.release();
+    let facts = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let facts = a
+                .account
+                .storage_test_fixture()
+                .message_facts(m.key)
+                .await
+                .unwrap();
+            if facts.dispatch_state == Some(2) || facts.retry.is_some_and(|r| r.0 > 0) {
+                break facts;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        facts.dispatch_state,
+        Some(0),
+        "auth transport interruption must remain due, not require external Retry"
+    );
+    assert_eq!(facts.retry.unwrap().0, 1);
+    assert_eq!(a.account.message_test_write_starts().await.unwrap().0, 0);
+    network_start(&b).await;
+    a.route(&b).await;
+    b.route(&a).await;
+    a.clock.advance_monotonic_ms(1000);
+    wait_state(&a, m.key, DeliveryState::Delivered).await;
+}
+
+fn proof_control(kind: u8, payload: &[u8]) -> Vec<u8> {
+    let mut e = minicbor::Encoder::new(Vec::new());
+    e.array(3).unwrap().u8(1).unwrap().u8(kind).unwrap();
+    if kind == 0 {
+        let mut bytes = e.into_writer();
+        bytes.extend(payload);
+        bytes
+    } else {
+        e.bytes(payload).unwrap();
+        e.into_writer()
+    }
+}
+async fn proof_write(send: &mut iroh::endpoint::SendStream, body: &[u8]) {
+    send.write_all(&(body.len() as u32).to_be_bytes())
+        .await
+        .unwrap();
+    send.write_all(body).await.unwrap();
+}
+async fn proof_read(recv: &mut iroh::endpoint::RecvStream) -> Vec<u8> {
+    let mut len = [0; 4];
+    recv.read_exact(&mut len).await.unwrap();
+    let len = u32::from_be_bytes(len) as usize;
+    assert!(len <= 65536);
+    let mut bytes = vec![0; len];
+    recv.read_exact(&mut bytes).await.unwrap();
+    bytes
+}
+#[tokio::test]
+async fn invalid_remote_signature_blocks_automatic_acquisition() {
+    let (a, b, _) = pair().await;
+    contacts(&a, &b).await;
+    b.slot
+        .network()
+        .unwrap()
+        .execute(NetworkOp::Stop)
+        .await
+        .unwrap();
+    let mut seed = [0; 32];
+    Hkdf::<Sha256>::new(Some(b"ChatProject/device-keys/v1"), &[12; 32])
+        .expand(b"transport-ed25519", &mut seed)
+        .unwrap();
+    let raw = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .secret_key(iroh::SecretKey::from_bytes(&seed))
+        .relay_mode(iroh::RelayMode::Disabled)
+        .alpns(vec![b"chatproject/account/1".to_vec()])
+        .bind()
+        .await
+        .unwrap();
+    let addresses = raw.bound_sockets().into_iter().map(|mut socket| {
+        if socket.ip().is_unspecified() {
+            socket.set_ip(if socket.is_ipv4() {
+                std::net::Ipv4Addr::LOCALHOST.into()
+            } else {
+                std::net::Ipv6Addr::LOCALHOST.into()
+            });
+        }
+        iroh::TransportAddr::Ip(socket)
+    });
+    let ticket = iroh_tickets::endpoint::EndpointTicket::new(iroh::EndpointAddr::from_parts(
+        raw.id(),
+        addresses,
+    ))
+    .to_string();
+    a.slot
+        .network()
+        .unwrap()
+        .account_target_for_test(ticket)
+        .await
+        .unwrap();
+    let endpoint = raw.clone();
+    let server = tokio::spawn(async move {
+        let conn = endpoint.accept().await.unwrap().await.unwrap();
+        let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+        proof_read(&mut recv).await;
+        let keys = derive_account(&Secret32::from([2; 32])).unwrap();
+        let device = derive_device(Secret32::from([12; 32])).unwrap();
+        let cert = sign_cert(&keys, &device, DeviceKind::Desktop, NOW).unwrap();
+        let mut e = minicbor::Encoder::new(Vec::new());
+        e.array(5)
+            .unwrap()
+            .u8(1)
+            .unwrap()
+            .bytes(&keys.peer_id().0)
+            .unwrap()
+            .bytes(&[2; 16])
+            .unwrap();
+        let mut hello = e.into_writer();
+        hello.extend(cert.to_bytes());
+        minicbor::Encoder::new(&mut hello).bytes(&[44; 32]).unwrap();
+        proof_write(&mut send, &proof_control(0, &hello)).await;
+        proof_read(&mut recv).await;
+        proof_write(
+            &mut send,
+            &proof_control(
+                2,
+                packet(2, &[12], 2, NOW, NOW + 600, NOW * 1_000_000).as_bytes(),
+            ),
+        )
+        .await;
+        proof_read(&mut recv).await;
+        proof_write(&mut send, &proof_control(1, &[0; 64])).await;
+        tokio::time::timeout(Duration::from_secs(5), conn.closed())
+            .await
+            .unwrap();
+    });
+    let m = enqueue(&a, &b).await;
+    wait_state(&a, m.key, DeliveryState::Blocked).await;
+    assert_eq!(a.account.message_test_write_starts().await.unwrap().0, 0);
+    let rows = a
+        .account
+        .storage_test_fixture()
+        .messages()
+        .await
+        .unwrap()
+        .load_messages(m.key.conversation, None, 50)
+        .await
+        .unwrap();
+    assert_eq!(rows.items[0].block, Some(BlockReason::Account));
+    assert_eq!(
+        a.account
+            .storage_test_fixture()
+            .message_facts(m.key)
+            .await
+            .unwrap()
+            .jobs,
+        1
+    );
+    server.await.unwrap();
+    raw.close().await;
+}
+
+#[tokio::test]
+async fn completed_proof_queued_behind_new_local_record_closes_before_payload() {
+    let (a, b, backend) = pair().await;
+    contacts(&a, &b).await;
+    contacts(&b, &a).await;
+    // Stage a normal renewal after completed absence, but keep the accepted
+    // packet visible until the completed old proof has reached its handoff.
+    let old = backend.packets.lock().unwrap().remove(&a.peer).unwrap();
+    a.account.refresh_record(a.peer).await.unwrap();
+    let renewed = backend.packets.lock().unwrap().insert(a.peer, old).unwrap();
+    let mut pause = a
+        .account
+        .message_test_pause(chat_core::account::MessagePoint::ProofResult)
+        .await
+        .unwrap();
+    let m = enqueue(&a, &b).await;
+    tokio::time::timeout(Duration::from_secs(5), pause.wait_entered())
+        .await
+        .unwrap();
+    assert_eq!(
+        a.account.message_test_proof_write_starts().await.unwrap(),
+        1
+    );
+    let hold = Arc::new(tokio::sync::Notify::new());
+    backend
+        .lookup_holds
+        .lock()
+        .unwrap()
+        .insert(a.peer, hold.clone());
+    backend.packets.lock().unwrap().insert(a.peer, renewed);
+    backend
+        .lookup_starts
+        .lock()
+        .unwrap()
+        .retain(|p| *p != a.peer);
+    let account = a.account.clone();
+    let peer = a.peer;
+    let refresh = tokio::spawn(async move { account.refresh_record(peer).await });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !backend.lookup_starts.lock().unwrap().contains(&a.peer) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), pause.release_and_wait_queued())
+        .await
+        .unwrap();
+    backend.lookup_holds.lock().unwrap().remove(&a.peer);
+    hold.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), refresh)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), pause.wait_connection_closed())
+        .await
+        .expect("completed old proof must close after exact snapshot cancellation");
+    assert_eq!(a.account.message_test_write_starts().await.unwrap().0, 0);
+    assert_eq!(
+        b.account
+            .storage_test_fixture()
+            .message_counts()
+            .await
+            .unwrap()
+            .0,
+        0
+    );
+    a.clock.advance_monotonic_ms(1000);
+    wait_state(&a, m.key, DeliveryState::Delivered).await;
+    assert_eq!(
+        a.account.message_test_proof_write_starts().await.unwrap(),
+        2
+    );
+    assert_eq!(a.account.message_test_write_starts().await.unwrap().0, 1);
+}

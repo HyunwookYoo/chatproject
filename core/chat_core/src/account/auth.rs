@@ -144,10 +144,27 @@ pub(crate) fn payload(input: &[u8], kind: u8) -> Result<Vec<u8>, CoreError> {
     Ok(value)
 }
 pub(crate) async fn read_frame(recv: &mut RecvStream, limit: usize) -> Result<Vec<u8>, CoreError> {
+    read_auth_frame(recv, limit, false).await
+}
+fn io_error(acquisition: bool) -> CoreError {
+    if acquisition {
+        CoreError::new(
+            crate::ErrorCode::TransportFailed,
+            "account_transport_failed",
+        )
+    } else {
+        wire::invalid()
+    }
+}
+async fn read_auth_frame(
+    recv: &mut RecvStream,
+    limit: usize,
+    acquisition: bool,
+) -> Result<Vec<u8>, CoreError> {
     let mut length = [0; 4];
     recv.read_exact(&mut length)
         .await
-        .map_err(|_| wire::invalid())?;
+        .map_err(|_| io_error(acquisition))?;
     let length = u32::from_be_bytes(length) as usize;
     if length > limit || length > 65536 {
         return Err(wire::invalid());
@@ -155,7 +172,7 @@ pub(crate) async fn read_frame(recv: &mut RecvStream, limit: usize) -> Result<Ve
     let mut bytes = vec![0; length];
     recv.read_exact(&mut bytes)
         .await
-        .map_err(|_| wire::invalid())?;
+        .map_err(|_| io_error(acquisition))?;
     Ok(bytes)
 }
 pub(crate) async fn write_frame(send: &mut SendStream, bytes: &[u8]) -> Result<(), CoreError> {
@@ -237,10 +254,13 @@ pub(crate) async fn authenticate(
     let own = hello(local)?;
     conn.set_max_concurrent_uni_streams(0u32.into());
     conn.set_max_concurrent_bi_streams(4u32.into());
-    let (mut send, mut recv) = conn.open_bi().await.map_err(|_| wire::invalid())?;
+    let (mut send, mut recv) = conn.open_bi().await.map_err(|_| io_error(gate.is_some()))?;
     check_gate(gate.as_deref())?;
     write_auth_frame(&mut send, &envelope(0, &own.encode()), gate.as_deref()).await?;
-    let remote = AuthHello::decode(&payload(&read_frame(&mut recv, 16384).await?, 0)?)?;
+    let remote = AuthHello::decode(&payload(
+        &read_auth_frame(&mut recv, 16384, gate.is_some()).await?,
+        0,
+    )?)?;
     check_gate(gate.as_deref())?;
     finish(
         &conn,
@@ -313,7 +333,7 @@ async fn finish(
         gate.as_deref(),
     )
     .await?;
-    let packet = payload(&read_frame(&mut recv, 1100).await?, 2)?;
+    let packet = payload(&read_auth_frame(&mut recv, 1100, gate.is_some()).await?, 2)?;
     check_gate(gate.as_deref())?;
     let exchanged = SignedRecord::decode(&packet, expected)?;
     // Identity-signature/canonical evidence survives a denied installation proof.
@@ -358,7 +378,7 @@ async fn finish(
         gate.signature_write();
     }
     write_auth_frame(&mut send, &envelope(1, &sig), gate.as_deref()).await?;
-    let sig: [u8; 64] = payload(&read_frame(&mut recv, 80).await?, 1)?
+    let sig: [u8; 64] = payload(&read_auth_frame(&mut recv, 80, gate.is_some()).await?, 1)?
         .try_into()
         .map_err(|_| wire::invalid())?;
     check_gate(gate.as_deref())?;
@@ -369,7 +389,7 @@ async fn finish(
     if !grant.valid(record, &[], clock.unix_seconds()) {
         return Err(wire::invalid());
     }
-    send.finish().map_err(|_| wire::invalid())?;
+    send.finish().map_err(|_| io_error(gate.is_some()))?;
     Ok(grant)
 }
 
@@ -395,8 +415,8 @@ async fn write_auth_frame(
     gate.check()?;
     send.write_all(&(bytes.len() as u32).to_be_bytes())
         .await
-        .map_err(|_| wire::invalid())?;
+        .map_err(|_| io_error(true))?;
     gate.check()?;
-    send.write_all(bytes).await.map_err(|_| wire::invalid())?;
+    send.write_all(bytes).await.map_err(|_| io_error(true))?;
     gate.check()
 }

@@ -23,7 +23,7 @@ pub(crate) struct MessageRepo {
 pub(crate) enum MessageDbOp {
     #[cfg(all(feature="test-hooks",debug_assertions))]
     RejectedPrepare(MessageKey, InstallationId, u64, PrepareTransition),
-    Due(u64, Vec<PeerId>),
+    Due(u64, Vec<PeerId>, [Option<DueCursor>; 2]),
     RecoverScheduler(u64),
     SettleCompleted(MessageKey),
     Defer(MessageKey, bool, u64),
@@ -282,7 +282,7 @@ pub(crate) fn execute(
             commit(tx,#[cfg(all(feature="test-hooks",debug_assertions))] fault)?;
             Ok(MessageDbReply::Message(view))
         },
-        MessageDbOp::Due(now, excluded) => due(c, identity, now, excluded),
+        MessageDbOp::Due(now, excluded, cursors) => due(c, identity, now, excluded, cursors),
         MessageDbOp::RecoverScheduler(now) => {
             let tx = c.transaction().map_err(sql_error)?;
             let now = integer(now)?;
@@ -813,7 +813,11 @@ fn fill(c: &mut Connection, key: MessageKey, count: u64, target: Option<u64>) ->
     tx.commit().map_err(sql_error)
 }
 pub(crate) enum MessageDbReply {
-    Due(Vec<super::scheduler::Dispatch>, Vec<super::scheduler::Dispatch>),
+    Due(
+        Vec<super::scheduler::Dispatch>,
+        Vec<super::scheduler::Dispatch>,
+        [Option<DueCursor>; 2],
+    ),
     Receipt(ReceiptFrame),
     Prepared(Zeroizing<Vec<u8>>, Option<ReceiptFrame>),
     Peer(PeerId),
@@ -1417,23 +1421,124 @@ fn schedule_retry(tx: &Transaction<'_>, k: MessageKey, receipt: bool, now: u64) 
         params![k.conversation.0.as_slice(),k.sender.0.as_slice(),k.installation.0.as_slice(),k.id.0.as_slice(),integer(count)?,next]).map_err(sql_error)?;
     Ok(())
 }
-fn due(c: &Connection, identity: Identity, now: u64, excluded: Vec<PeerId>) -> R<MessageDbReply> {
+#[derive(Clone, Copy)]
+pub(crate) struct DueCursor {
+    at: i64,
+    conversation: ConversationId,
+    rowid: i64,
+}
+#[derive(Clone, Copy, Debug)]
+enum DueSeek {
+    Start,
+    Row,
+    Conversation,
+    Time,
+}
+fn due_sql(receipt: bool, seek: DueSeek) -> String {
+    let (table, index, state) = if receipt {
+        ("receipt_job", "receipt_due", "")
+    } else {
+        ("outbox", "outbox_due", "AND j.dispatch_state=0")
+    };
+    let after = match seek {
+        DueSeek::Start => "",
+        DueSeek::Row => "AND j.next_retry_at_ms=?2 AND j.conversation=?3 AND j.rowid>?4",
+        DueSeek::Conversation => "AND j.next_retry_at_ms=?2 AND j.conversation>?3",
+        DueSeek::Time => "AND j.next_retry_at_ms>?2",
+    };
+    format!(
+        "SELECT j.conversation,j.sender_peer,j.sender_install,j.msg_id,c.peer,j.next_retry_at_ms,j.rowid FROM {table} j INDEXED BY {index} JOIN conversation c ON c.id=j.conversation WHERE j.next_retry_at_ms<=?1 {state} {after} ORDER BY j.next_retry_at_ms,j.conversation,j.rowid LIMIT ?5"
+    )
+}
+struct DueKeys {
+    rows: Vec<(MessageKey, PeerId, DueCursor)>,
+    #[cfg(test)]
+    steps: i32,
+}
+fn scan_due(c: &Connection, receipt: bool, now: u64, cursor: Option<DueCursor>) -> R<DueKeys> {
+    let seeks: &[DueSeek] = if cursor.is_some() {
+        &[DueSeek::Row, DueSeek::Conversation, DueSeek::Time]
+    } else {
+        &[DueSeek::Start]
+    };
+    let cursor = cursor.unwrap_or(DueCursor {
+        at: 0,
+        conversation: ConversationId([0; 32]),
+        rowid: 0,
+    });
+    let mut selected = DueKeys {
+        rows: Vec::new(),
+        #[cfg(test)]
+        steps: 0,
+    };
+    for seek in seeks {
+        // Separate equality prefixes let SQLite seek the implicit index rowid.
+        // A row-value comparison only seeks its explicit (time,conversation)
+        // prefix and would rescan every prior row tied at that prefix.
+        let mut stmt = c.prepare(&due_sql(receipt, *seek)).map_err(sql_error)?;
+        let rows = stmt
+            .query_map(
+                params![
+                    integer(now)?,
+                    cursor.at,
+                    cursor.conversation.0.as_slice(),
+                    cursor.rowid,
+                    16 - selected.rows.len() as i64
+                ],
+                |r| {
+                    Ok((
+                        MessageKey {
+                            conversation: ConversationId(bytes(r, 0)?),
+                            sender: PeerId(bytes(r, 1)?),
+                            installation: InstallationId(bytes(r, 2)?),
+                            id: MessageId(bytes(r, 3)?),
+                        },
+                        PeerId(bytes(r, 4)?),
+                        DueCursor {
+                            at: r.get(5)?,
+                            conversation: ConversationId(bytes(r, 0)?),
+                            rowid: r.get(6)?,
+                        },
+                    ))
+                },
+            )
+            .map_err(sql_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(sql_error)?;
+        selected.rows.extend(rows);
+        #[cfg(test)]
+        {
+            selected.steps += stmt.get_status(rusqlite::StatementStatus::VmStep);
+        }
+        if selected.rows.len() == 16 {
+            break;
+        }
+    }
+    Ok(selected)
+}
+fn due(
+    c: &Connection,
+    identity: Identity,
+    now: u64,
+    excluded: Vec<PeerId>,
+    mut cursors: [Option<DueCursor>; 2],
+) -> R<MessageDbReply> {
     use super::scheduler::Dispatch;
     let mut batches = Vec::new();
-    for receipt in [false, true] {
-        let table = if receipt { "receipt_job" } else { "outbox" };
-        let state = if receipt { "" } else { "AND dispatch_state=0" };
-        // Index bounds the due set; group keys before reading payloads, one per peer.
-        let sql = format!("SELECT j.conversation,j.sender_peer,j.sender_install,j.msg_id,c.peer FROM {table} j JOIN conversation c ON c.id=j.conversation WHERE j.rowid IN (SELECT min(rowid) FROM {table} WHERE next_retry_at_ms<=?1 {state} GROUP BY conversation) ORDER BY j.next_retry_at_ms,j.conversation LIMIT 20");
-        let mut stmt = c.prepare(&sql).map_err(sql_error)?;
-        let rows = stmt.query_map(params![integer(now)?], |r| Ok((MessageKey {
-            conversation:ConversationId(bytes(r,0)?), sender:PeerId(bytes(r,1)?),
-            installation:InstallationId(bytes(r,2)?), id:MessageId(bytes(r,3)?),
-        },PeerId(bytes(r,4)?)))).map_err(sql_error)?;
-        let mut jobs = Vec::new();
-        for row in rows {
-            let (key,peer) = row.map_err(sql_error)?;
-            if excluded.contains(&peer) { continue; }
+    for (kind, receipt) in [false, true].into_iter().enumerate() {
+        // Bound indexed key work before reading payloads. Advance over exclusions
+        // and duplicate peers too; a full backlog cannot pin selection at its head.
+        let rows = scan_due(c, receipt, now, cursors[kind])?.rows;
+        cursors[kind] = if rows.len() == 16 {
+            rows.last().map(|r| r.2)
+        } else {
+            None
+        };
+        let mut jobs: Vec<Dispatch> = Vec::new();
+        for (key, peer, _) in rows {
+            if excluded.contains(&peer) || jobs.iter().any(|j| j.peer == peer) {
+                continue;
+            }
             let wire = if receipt {
                 let kind:u64=c.query_row("SELECT max(kind) FROM receipt_job WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",params![key.conversation.0.as_slice(),key.sender.0.as_slice(),key.installation.0.as_slice(),key.id.0.as_slice()],|r|uint(r,0)).map_err(sql_error)?;
                 Frame::Receipt(receipt_for(c,key,identity.installation,if kind==2 {ReceiptKind::Read} else {ReceiptKind::Delivered})?).envelope()
@@ -1441,12 +1546,15 @@ fn due(c: &Connection, identity: Identity, now: u64, excluded: Vec<PeerId>) -> R
                 Zeroizing::new(c.query_row("SELECT wire FROM outbox WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",params![key.conversation.0.as_slice(),key.sender.0.as_slice(),key.installation.0.as_slice(),key.id.0.as_slice()],|r|r.get(0)).map_err(sql_error)?)
             };
             jobs.push(Dispatch {key,peer,wire,ticket:0});
-            if jobs.len()==16 { break; }
         }
         batches.push(jobs);
     }
     let receipts = batches.pop().unwrap();
-    Ok(MessageDbReply::Due(batches.pop().unwrap(),receipts))
+    Ok(MessageDbReply::Due(
+        batches.pop().unwrap(),
+        receipts,
+        cursors,
+    ))
 }
 
 fn release_blocked(c:&mut Connection,peer:PeerId,key:Option<MessageKey>,
@@ -1464,4 +1572,232 @@ fn release_blocked(c:&mut Connection,peer:PeerId,key:Option<MessageKey>,
         tx.execute("UPDATE conversation SET change_revision=?2 WHERE peer=?1",params![peer.0.as_slice(),integer(rev)?]).map_err(sql_error)?;
     }
     commit(tx,#[cfg(all(feature="test-hooks",debug_assertions))] fault)
+}
+
+#[cfg(test)]
+mod due_tests {
+    use super::*;
+    fn backlog(count: u64) -> Connection {
+        let mut c = Connection::open_in_memory().unwrap();
+        c.execute_batch(include_str!("../storage/schema.sql"))
+            .unwrap();
+        c.execute_batch("PRAGMA foreign_keys=ON").unwrap();
+        let tx = c.transaction().unwrap();
+        for peer in [1u8, 2] {
+            tx.execute(
+                "INSERT INTO conversation VALUES(?1,?1,0,?1,0,0)",
+                params![[peer; 32].as_slice()],
+            )
+            .unwrap();
+        }
+        for n in 0..=count {
+            let peer = if n < count { 1u8 } else { 2 };
+            let id = (n as u128).to_be_bytes();
+            tx.execute("INSERT INTO message VALUES(?1,?1,?1,?2,?3,?1,?1,0,0,'body',0,0,NULL,NULL,0,0,NULL,NULL,X'')",params![[peer;32].as_slice(),id.as_slice(),n as i64]).unwrap();
+            tx.execute(
+                "INSERT INTO receipt_job VALUES(?1,?1,?1,?2,?1,1,0,0)",
+                params![[peer; 32].as_slice(), id.as_slice()],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO outbox VALUES(?1,?1,?1,?2,1,X'01',0,0,0,0)",
+                params![[peer; 32].as_slice(), id.as_slice()],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+        c
+    }
+    #[test]
+    fn indexed_due_selection_work_is_bounded_before_payload_reads() {
+        let c = backlog(8192);
+        for receipt in [true, false] {
+            for cursor in [
+                None,
+                Some(DueCursor {
+                    at: 0,
+                    conversation: ConversationId([1; 32]),
+                    rowid: 8000,
+                }),
+                Some(DueCursor {
+                    at: 0,
+                    conversation: ConversationId([1; 32]),
+                    rowid: 8192,
+                }),
+                Some(DueCursor {
+                    at: 0,
+                    conversation: ConversationId([2; 32]),
+                    rowid: 8193,
+                }),
+            ] {
+                let selected = scan_due(&c, receipt, 0, cursor).unwrap();
+                eprintln!(
+                    "native sqlite {} receipt={receipt} cursor_row={:?} rows={} VMsteps={}",
+                    rusqlite::version(),
+                    cursor.map(|c| c.rowid),
+                    selected.rows.len(),
+                    selected.steps
+                );
+                assert!(
+                    selected.steps < 2000,
+                    "selection must bound native VM work before payload reads: {}",
+                    selected.steps
+                );
+                assert!(selected.rows.len() <= 16);
+                let (_, steps) = measured_due(&c, 0, vec![], [cursor, cursor]);
+                eprintln!("whole due including payload native progress steps={steps}");
+                assert!(steps < 3000);
+
+                for seek in [
+                    DueSeek::Start,
+                    DueSeek::Row,
+                    DueSeek::Conversation,
+                    DueSeek::Time,
+                ] {
+                    let sql = due_sql(receipt, seek);
+                    let mut plan = c.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+                    let plan: Vec<String> = plan
+                        .query_map(params![0, 0, [1u8; 32].as_slice(), 8000, 16], |r| r.get(3))
+                        .unwrap()
+                        .collect::<Result<_, _>>()
+                        .unwrap();
+                    eprintln!("receipt={receipt} seek={seek:?} plan={plan:?}");
+                    assert!(
+                        plan.iter()
+                            .all(|p| !p.contains("TEMP B-TREE") && !p.starts_with("SCAN"))
+                    );
+                    assert!(plan.iter().any(|p| p.contains(if receipt {
+                        "receipt_due"
+                    } else {
+                        "outbox_due"
+                    })));
+                }
+            }
+        }
+    }
+    // Read-only native VM observation of the actual due operation including
+    // payload lookups. The callback always continues; no feature/schema change.
+    fn measured_due(
+        c: &Connection,
+        now: u64,
+        excluded: Vec<PeerId>,
+        cursors: [Option<DueCursor>; 2],
+    ) -> (MessageDbReply, u64) {
+        unsafe extern "C" fn count(p: *mut std::ffi::c_void) -> std::ffi::c_int {
+            unsafe {
+                *(p as *mut u64) += 1;
+            }
+            0
+        }
+        let mut steps = 0u64;
+        // The synchronous connection cannot outlive this stack counter; remove
+        // the observer before inspecting/unwrap of the operation result.
+        unsafe {
+            rusqlite::ffi::sqlite3_progress_handler(
+                c.handle(),
+                1,
+                Some(count),
+                (&mut steps as *mut u64).cast(),
+            );
+        }
+        let result = due(
+            c,
+            Identity {
+                peer: PeerId([3; 32]),
+                installation: InstallationId([3; 32]),
+            },
+            now,
+            excluded,
+            cursors,
+        );
+        unsafe {
+            rusqlite::ffi::sqlite3_progress_handler(c.handle(), 0, None, std::ptr::null_mut());
+        }
+        (result.unwrap(), steps)
+    }
+    #[test]
+    fn due_later_time_and_full_payload_batch_remain_bounded() {
+        let c = backlog(8192);
+        for table in ["outbox", "receipt_job"] {
+            c.execute(
+                &format!("UPDATE {table} SET next_retry_at_ms=5 WHERE conversation=?1"),
+                params![[2u8; 32].as_slice()],
+            )
+            .unwrap();
+        }
+        let cursor = Some(DueCursor {
+            at: 0,
+            conversation: ConversationId([1; 32]),
+            rowid: 8192,
+        });
+        for receipt in [false, true] {
+            assert!(scan_due(&c, receipt, 4, cursor).unwrap().rows.is_empty());
+            let selected = scan_due(&c, receipt, 5, cursor).unwrap();
+            assert_eq!(selected.rows.len(), 1);
+            assert_eq!(selected.rows[0].1, PeerId([2; 32]));
+            assert!(selected.steps < 2000);
+            eprintln!(
+                "later-time receipt={receipt} native VMsteps={}",
+                selected.steps
+            );
+        }
+        for peer in 3u8..=18 {
+            c.execute(
+                "INSERT INTO conversation VALUES(?1,?1,0,?1,0,0)",
+                params![[peer; 32].as_slice()],
+            )
+            .unwrap();
+            c.execute("INSERT INTO message VALUES(?1,?1,?1,?2,0,?1,?1,0,0,'body',0,0,NULL,NULL,0,0,NULL,NULL,X'')",params![[peer;32].as_slice(),[peer;16].as_slice()]).unwrap();
+            c.execute(
+                "INSERT INTO receipt_job VALUES(?1,?1,?1,?2,?1,1,0,0)",
+                params![[peer; 32].as_slice(), [peer; 16].as_slice()],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO outbox VALUES(?1,?1,?1,?2,1,X'01',0,0,0,0)",
+                params![[peer; 32].as_slice(), [peer; 16].as_slice()],
+            )
+            .unwrap();
+        }
+        let (MessageDbReply::Due(text, receipts, _), steps) =
+            measured_due(&c, 5, vec![], [cursor, cursor])
+        else {
+            unreachable!()
+        };
+        assert_eq!(text.len(), 16);
+        assert_eq!(receipts.len(), 16);
+        eprintln!("32 payload candidates native progress steps={steps}");
+        assert!(steps < 5000);
+    }
+    #[test]
+    fn excluded_backlog_continues_to_other_peer_and_wraps() {
+        let c = backlog(8192);
+        let mut cursors = [None, None];
+        for page in 0..=512 {
+            let (MessageDbReply::Due(text, receipts, next), steps) =
+                measured_due(&c, 0, vec![PeerId([1; 32])], cursors)
+            else {
+                unreachable!()
+            };
+            assert!(steps < 3000);
+            assert!(text.len() + receipts.len() <= 32);
+            if page < 512 {
+                assert!(text.is_empty() && receipts.is_empty());
+            } else {
+                assert_eq!(text.len(), 1);
+                assert_eq!(receipts.len(), 1);
+                assert_eq!(receipts[0].peer, PeerId([2; 32]));
+            }
+            cursors = next;
+        }
+        assert!(cursors.iter().all(Option::is_none));
+        let (MessageDbReply::Due(text, receipts, _), steps) = measured_due(&c, 0, vec![], cursors)
+        else {
+            unreachable!()
+        };
+        assert!(steps < 3000);
+        assert_eq!(text.len(), 1);
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].peer, PeerId([1; 32]));
+    }
 }
