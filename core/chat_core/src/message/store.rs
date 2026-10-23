@@ -7,6 +7,7 @@ use crate::{
 };
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 use sha2::{Digest, Sha256};
+use std::sync::{Arc, Mutex};
 use zeroize::Zeroizing;
 type R<T> = Result<T, CoreError>;
 #[derive(Clone, Copy)]
@@ -20,9 +21,9 @@ pub(crate) struct MessageRepo {
     identity: Identity,
 }
 pub(crate) enum MessageDbOp {
-    ResetUnlaunched(MessageKey),
+    ResetUnlaunched(MessageKey, PrepareToken),
     Receive(TextFrame, [u8; 32], u64),
-    Prepare(MessageKey, InstallationId, bool, u64),
+    Prepare(MessageKey, InstallationId, bool, u64, PrepareTransition),
     Target(MessageKey, bool),
     ApplyReceipt(ReceiptFrame, PeerId, u64),
     Applied(ReceiptFrame, PeerId),
@@ -31,6 +32,44 @@ pub(crate) enum MessageDbOp {
     Enqueue(PeerId, MessageId, String, u64),
     Messages(ConversationId, Option<MessageCursor>, u32),
     Conversations(Option<ConversationCursor>, u32),
+}
+
+// Provenance of one Prepare, not authority to send. Only its SQL execution can
+// become eligible; dropping a queued/rejected operation settles Pending too.
+#[derive(Clone)]
+pub(crate) struct PrepareToken(Arc<Mutex<PrepareState>>);
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PrepareState {
+    Pending,
+    RejectedWithoutMutation,
+    EligibleForTransition,
+}
+pub(crate) struct PrepareTransition(PrepareToken);
+impl PrepareToken {
+    pub(crate) fn new() -> (Self, PrepareTransition) {
+        let token = Self(Arc::new(Mutex::new(PrepareState::Pending)));
+        (token.clone(), PrepareTransition(token))
+    }
+    fn eligible(&self) -> R<bool> {
+        match *self.0.lock().unwrap() {
+            PrepareState::Pending => Err(CoreError::new(ErrorCode::Busy, "prepare_pending")),
+            PrepareState::RejectedWithoutMutation => Ok(false),
+            PrepareState::EligibleForTransition => Ok(true),
+        }
+    }
+}
+impl PrepareTransition {
+    fn eligible(&self) {
+        *self.0.0.lock().unwrap() = PrepareState::EligibleForTransition;
+    }
+}
+impl Drop for PrepareTransition {
+    fn drop(&mut self) {
+        let mut state = self.0.0.lock().unwrap();
+        if *state == PrepareState::Pending {
+            *state = PrepareState::RejectedWithoutMutation;
+        }
+    }
 }
 
 fn invalid() -> CoreError {
@@ -205,9 +244,13 @@ pub(crate) fn execute(
             .map_err(sql_error)?;
     }
     match op {
-        MessageDbOp::ResetUnlaunched(k) => {
+        MessageDbOp::ResetUnlaunched(k, provenance) => {
             if k.sender != identity.peer || k.installation != identity.installation {
                 return Err(invalid());
+            }
+            // The FIFO worker has settled the original operation before this read.
+            if !provenance.eligible()? {
+                return Ok(MessageDbReply::Done);
             }
             let tx = c.transaction().map_err(sql_error)?;
             tx.execute("UPDATE outbox SET dispatch_state=0 WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4 AND dispatch_state=1 AND EXISTS(SELECT 1 FROM message m WHERE m.conversation=?1 AND m.sender_peer=?2 AND m.sender_install=?3 AND m.msg_id=?4 AND m.cancel_requested=0 AND m.delivered_at_ms IS NULL)",params![k.conversation.0.as_slice(),k.sender.0.as_slice(),k.installation.0.as_slice(),k.id.0.as_slice()]).map_err(sql_error)?;
@@ -230,13 +273,14 @@ pub(crate) fn execute(
         MessageDbOp::Target(key, receipt) => {
             target(c, identity, key, receipt).map(MessageDbReply::Peer)
         }
-        MessageDbOp::Prepare(key, receiver, receipt, now) => prepare(
+        MessageDbOp::Prepare(key, receiver, receipt, now, transition) => prepare(
             c,
             identity,
             key,
             receiver,
             receipt,
             now,
+            transition,
             #[cfg(all(feature = "test-hooks", debug_assertions))]
             fault,
         ),
@@ -530,7 +574,13 @@ pub(crate) fn reconcile(c: &mut Connection, pending: PendingMessage) -> R<()> {
             ));
         }
     }
-    if pending.prebyte_attempt {
+    if pending
+        .prebyte_attempt
+        .as_ref()
+        .map(PrepareToken::eligible)
+        .transpose()?
+        .unwrap_or(false)
+    {
         c.execute("UPDATE outbox SET dispatch_state=0 WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4 AND dispatch_state=1 AND EXISTS(SELECT 1 FROM message m WHERE m.conversation=?1 AND m.sender_peer=?2 AND m.sender_install=?3 AND m.msg_id=?4 AND m.cancel_requested=0 AND m.delivered_at_ms IS NULL)",params![key.conversation.0.as_slice(),key.sender.0.as_slice(),key.installation.0.as_slice(),key.id.0.as_slice()]).map_err(sql_error)?;
     }
     Ok(())
@@ -781,8 +831,8 @@ impl MessageDbOp {
                 id: *id,
             }),
             Self::Receive(t, _, _) => Some(t.key),
-            Self::ResetUnlaunched(k)
-            | Self::Prepare(k, _, _, _)
+            Self::ResetUnlaunched(k, _)
+            | Self::Prepare(k, _, _, _, _)
             | Self::AttemptOutcome(k, _, _, _) => Some(*k),
             Self::ApplyReceipt(r, _, _) | Self::Applied(r, _) => Some(r.key),
             _ => None,
@@ -963,6 +1013,7 @@ fn prepare(
     receiver: InstallationId,
     receipt: bool,
     now: u64,
+    transition: PrepareTransition,
     #[cfg(all(feature = "test-hooks", debug_assertions))] fault: Option<
         crate::storage::worker::CommitFault,
     >,
@@ -1003,8 +1054,12 @@ fn prepare(
             allowed.sort();
         }
         let packed: Vec<_> = allowed.iter().flat_map(|i| i.0).collect();
+        let next_retry = integer(now)?;
+        // All definite no-mutation validation has passed. From here a storage
+        // error/fenced reply may hide this attempt's own transition.
+        transition.eligible();
         tx.execute("UPDATE message SET attempted_receivers=?5 WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",params![k.conversation.0.as_slice(),k.sender.0.as_slice(),k.installation.0.as_slice(),k.id.0.as_slice(),packed]).map_err(sql_error)?;
-        tx.execute("UPDATE outbox SET dispatch_state=1,attempts=min(attempts+1,4294967295),next_retry_at_ms=?5 WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",params![k.conversation.0.as_slice(),k.sender.0.as_slice(),k.installation.0.as_slice(),k.id.0.as_slice(),integer(now)?]).map_err(sql_error)?;
+        tx.execute("UPDATE outbox SET dispatch_state=1,attempts=min(attempts+1,4294967295),next_retry_at_ms=?5 WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",params![k.conversation.0.as_slice(),k.sender.0.as_slice(),k.installation.0.as_slice(),k.id.0.as_slice(),next_retry]).map_err(sql_error)?;
         MessageDbReply::Prepared(Zeroizing::new(wire), None)
     };
     commit(
@@ -1127,7 +1182,7 @@ fn attempt_outcome(
 /// The worker checks the actual SQL account membership before recording a receiver.
 /// A caller's installation ID is never itself a membership grant.
 pub(crate) fn authorize(c: &Connection, local: &LocalAccount, op: &MessageDbOp) -> R<()> {
-    if let MessageDbOp::Prepare(key, receiver, receipt, now) = op {
+    if let MessageDbOp::Prepare(key, receiver, receipt, now, _) = op {
         let identity = Identity {
             peer: local.keys.peer_id(),
             installation: local.device.installation_id(),
@@ -1163,6 +1218,41 @@ pub(crate) fn authorize(c: &Connection, local: &LocalAccount, op: &MessageDbOp) 
 mod receiver_tests {
     use super::*;
     #[test]
+    fn prepare_provenance_retains_exact_pending_token_until_operation_drop() {
+        let identity = Identity {
+            peer: PeerId([1; 32]),
+            installation: InstallationId([2; 32]),
+        };
+        let key = MessageKey {
+            conversation: ConversationId([3; 32]),
+            sender: identity.peer,
+            installation: identity.installation,
+            id: MessageId([4; 16]),
+        };
+        let (token, transition) = PrepareToken::new();
+        let op = MessageDbOp::Prepare(key, InstallationId([5; 32]), false, 1, transition);
+        let pending = op.pending(identity).unwrap().unwrap();
+        let retained = pending.clone();
+        assert!(token.eligible().is_err());
+        assert!(
+            retained
+                .prebyte_attempt
+                .as_ref()
+                .unwrap()
+                .eligible()
+                .is_err()
+        );
+        drop(op); // includes queue rejection, cancelled request and worker validation failure
+        assert!(!token.eligible().unwrap());
+        assert!(!retained.prebyte_attempt.unwrap().eligible().unwrap());
+        assert!(retained.key == key);
+        let (eligible, transition) = PrepareToken::new();
+        transition.eligible();
+        drop(transition);
+        assert!(eligible.eligible().unwrap());
+        assert!(!token.eligible().unwrap()); // one operation cannot confer another's ownership
+    }
+    #[test]
     fn packed_receivers_require_sorted_distinct_bounded_fixed_width_ids() {
         assert!(receivers(&[]).unwrap().is_empty());
         assert_eq!(receivers(&[1; 32]).unwrap(), vec![InstallationId([1; 32])]);
@@ -1180,16 +1270,20 @@ mod receiver_tests {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct PendingMessage {
     pub key: MessageKey,
-    pub prebyte_attempt: bool,
+    pub prebyte_attempt: Option<PrepareToken>,
 }
 impl MessageDbOp {
     pub(crate) fn pending(&self, identity: Identity) -> R<Option<PendingMessage>> {
         Ok(self.key(identity)?.map(|key| PendingMessage {
             key,
-            prebyte_attempt: matches!(self, Self::Prepare(_, _, false, _)),
+            prebyte_attempt: match self {
+                Self::Prepare(_, _, false, _, transition) => Some(transition.0.clone()),
+                Self::ResetUnlaunched(_, token) => Some(token.clone()),
+                _ => None,
+            },
         }))
     }
 }

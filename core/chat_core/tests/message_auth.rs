@@ -1191,3 +1191,86 @@ async fn sender_contact_requirement_keeps_explicit_blocked_job() {
     assert_eq!(facts.jobs, 1);
     assert!(facts.attempted_receivers.is_empty());
 }
+
+async fn rejected_prepare_preserves_launched_job(fence_rejection: bool) {
+    let (a, b, _) = pair().await;
+    contacts(&a, &b).await;
+    contacts(&b, &a).await;
+    a.account.connect_account(b.peer).await.unwrap();
+    let m = enqueue(&a, &b).await;
+    let mut response = b
+        .account
+        .message_test_pause(chat_core::account::MessagePoint::Response)
+        .await
+        .unwrap();
+    let account = a.account.clone();
+    let launched = tokio::spawn(async move {
+        account
+            .message_test_attempt(m.key, false, MessageMutation::None)
+            .await
+    });
+    response.wait_entered().await;
+    // The peer committed this normal attempt; fence its completion, not its launch.
+    a.account.request_suspend();
+    assert!(launched.await.unwrap().is_err());
+    response.release();
+    restart(&a).await;
+    a.route(&b).await;
+    b.route(&a).await;
+    assert_eq!(a.account.message_test_write_starts().await.unwrap().0, 1);
+    let original = a
+        .account
+        .storage_test_fixture()
+        .message_facts(m.key)
+        .await
+        .unwrap();
+    assert_eq!(original.dispatch_state, Some(1));
+    assert_eq!(original.attempted_receivers.len(), 1);
+    a.account.connect_account(b.peer).await.unwrap();
+    let pause = if fence_rejection {
+        Some(a.account.storage_test_fixture().pause_message_reply().await)
+    } else {
+        None
+    };
+    let account = a.account.clone();
+    let rejected = tokio::spawn(async move {
+        account
+            .message_test_attempt(m.key, false, MessageMutation::None)
+            .await
+    });
+    if let Some(pause) = pause {
+        pause.wait_entered().await;
+        a.account.request_suspend();
+        pause.release();
+        assert!(rejected.await.unwrap().is_err());
+        restart(&a).await;
+    } else {
+        assert!(matches!(rejected.await.unwrap(), Err(e) if e.code == ErrorCode::Busy));
+    }
+    // Restore changes neither these cumulative write counters nor M4 facts.
+    assert_eq!(a.account.message_test_write_starts().await.unwrap().0, 1);
+    let retained = a
+        .account
+        .storage_test_fixture()
+        .message_facts(m.key)
+        .await
+        .unwrap();
+    assert_eq!(retained.dispatch_state, original.dispatch_state);
+    assert_eq!(retained.messages, original.messages);
+    assert_eq!(retained.jobs, original.jobs);
+    assert_eq!(retained.quota_bytes, original.quota_bytes);
+    assert!(retained.wire == original.wire);
+    assert!(retained.hash == original.hash);
+    assert!(retained.prev_hash == original.prev_hash);
+    assert!(retained.attempted_receivers == original.attempted_receivers);
+    assert_eq!(retained.receipt_jobs, original.receipt_jobs);
+    assert_eq!(retained.processed, original.processed);
+}
+#[tokio::test]
+async fn rejected_prepare_cannot_reset_previously_launched_job() {
+    rejected_prepare_preserves_launched_job(false).await;
+}
+#[tokio::test]
+async fn fenced_rejected_prepare_cannot_reset_previously_launched_job() {
+    rejected_prepare_preserves_launched_job(true).await;
+}

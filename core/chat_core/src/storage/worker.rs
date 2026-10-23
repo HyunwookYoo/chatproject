@@ -70,7 +70,7 @@ impl Worker {
     fn message(&mut self, identity: Identity, op: MessageDbOp) -> R<MessageDbReply> {
         let key = op.pending(identity)?;
         let db_id = self.id;
-        let pending = self.pending_message;
+        let pending = self.pending_message.clone();
         let mut reconciled = false;
         #[cfg(all(feature = "test-hooks", debug_assertions))]
         let fault = if key.is_some() {
@@ -98,7 +98,7 @@ impl Worker {
                     "message_identity_mismatch",
                 ));
             }
-            if let Some(key) = pending {
+            if let Some(key) = pending.clone() {
                 messages::reconcile(c, key)?;
             }
             reconciled = true;
@@ -112,7 +112,7 @@ impl Worker {
             )
         });
         #[cfg(all(feature="test-hooks",debug_assertions))]
-        if key.is_some() && result.is_ok() && let Some((entered,release))=self.message_reply_pause.take() {let _=entered.send(());let _=release.recv();}
+        if key.is_some() && let Some((entered,release))=self.message_reply_pause.take() {let _=entered.send(());let _=release.recv();}
         #[cfg(all(feature="test-hooks",debug_assertions))]
         if result.is_ok() && let Some((clock,seconds))=clock {clock.set_unix_seconds(seconds);}
         if result
@@ -776,6 +776,96 @@ mod tests {
             after, before,
             "restricted worker changed conversation/message/outbox/revision"
         );
+    }
+    #[tokio::test]
+    async fn rejected_prepare_settles_provenance_across_worker_and_queue_fences() {
+        let store = OwnedStore::open().await;
+        let stored = crate::account::storage::migration_fixtures::migration_states()
+            .pop()
+            .unwrap()
+            .unwrap();
+        let AccountState::Active(local) = AccountState::decode(&stored).unwrap() else {
+            unreachable!()
+        };
+        let identity = Identity {
+            peer: local.keys.peer_id(),
+            installation: local.device.installation_id(),
+        };
+        let key = crate::message::types::MessageKey {
+            conversation: crate::message::types::ConversationId([3; 32]),
+            sender: identity.peer,
+            installation: identity.installation,
+            id: MessageId([4; 16]),
+        };
+        let (token, transition) = messages::PrepareToken::new();
+        let result = store
+            .handle
+            .message(
+                identity,
+                MessageDbOp::Prepare(key, identity.installation, false, 1, transition),
+            )
+            .await;
+        assert_eq!(result.err().unwrap().code, ErrorCode::AccountRestricted);
+        store.handle.commit_account(stored).await.unwrap();
+        // FIFO reset sees settled rejection, even though execute never received Prepare.
+        assert!(
+            store
+                .handle
+                .message(identity, MessageDbOp::ResetUnlaunched(key, token))
+                .await
+                .is_ok()
+        );
+        let (token, transition) = messages::PrepareToken::new();
+        store.handle.invalidate(1);
+        let result = store
+            .handle
+            .message(
+                identity,
+                MessageDbOp::Prepare(key, identity.installation, false, 1, transition),
+            )
+            .await;
+        assert_eq!(result.err().unwrap().code, ErrorCode::StorageLocked);
+        store.handle.resume().await.unwrap();
+        assert!(
+            store
+                .handle
+                .message(identity, MessageDbOp::ResetUnlaunched(key, token))
+                .await
+                .is_ok()
+        );
+        let (entered, waiting) = oneshot::channel();
+        let (release, hold) = std::sync::mpsc::channel();
+        store.handle.test(TestOp::Pause(entered, hold)).await;
+        waiting.await.unwrap();
+        let (token, transition) = messages::PrepareToken::new();
+        let queued = store
+            .handle
+            .send(
+                |reply| {
+                    DbOp::Message(
+                        identity,
+                        MessageDbOp::Prepare(key, identity.installation, false, 1, transition),
+                        reply,
+                    )
+                },
+                false,
+            )
+            .unwrap();
+        store.handle.invalidate(2);
+        release.send(()).unwrap();
+        assert_eq!(
+            store.handle.receive(queued).await.err().unwrap().code,
+            ErrorCode::StorageLocked
+        );
+        store.handle.resume().await.unwrap();
+        assert!(
+            store
+                .handle
+                .message(identity, MessageDbOp::ResetUnlaunched(key, token))
+                .await
+                .is_ok()
+        );
+        assert_eq!(store.counts().await, (0, 0, 0, 0));
     }
     #[tokio::test]
     async fn message_identity_unconfigured_sql_rejects_without_mutation() {

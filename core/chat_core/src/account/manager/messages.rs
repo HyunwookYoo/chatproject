@@ -5,7 +5,7 @@ use crate::account::{
     connection::{Registry, Session},
 };
 use crate::message::{
-    store::{MessageDbOp, MessageDbReply, MessageRepo, conversation_id},
+    store::{MessageDbOp, MessageDbReply, MessageRepo, PrepareToken, conversation_id},
     types::{BlockReason, MessageKey},
     wire::{self, Frame, ReceiptFrame, RejectReason},
 };
@@ -45,7 +45,7 @@ struct Pending {
 #[derive(Default)]
 pub(super) struct Runtime {
     pending: BTreeMap<MessageKey, Pending>,
-    unlaunched: BTreeMap<MessageKey, u64>,
+    unlaunched: BTreeMap<MessageKey, (u64, PrepareToken)>,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     writes: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
@@ -324,13 +324,18 @@ impl Manager {
         }
     }
     pub(super) async fn reset_unlaunched(&mut self, request: Request) -> Result<(), CoreError> {
-        let keys: Vec<_> = self.messages.unlaunched.keys().copied().collect();
-        for key in keys {
+        let keys: Vec<_> = self
+            .messages
+            .unlaunched
+            .iter()
+            .map(|(k, (_, token))| (*k, token.clone()))
+            .collect();
+        for (key, token) in keys {
             if !self.current(request) {
                 return Err(unavailable(ErrorCode::StorageLocked));
             }
             self.message_repo()?
-                .operation(MessageDbOp::ResetUnlaunched(key))
+                .operation(MessageDbOp::ResetUnlaunched(key, token))
                 .await?;
             if !self.current(request) {
                 return Err(unavailable(ErrorCode::StorageLocked));
@@ -577,8 +582,11 @@ impl Manager {
                 })
                 .cloned()
                 .ok_or_else(|| unavailable(ErrorCode::AccountRestricted))?;
+            let (token, transition) = PrepareToken::new();
             if !receipt {
-                self.messages.unlaunched.insert(key, request.ticket);
+                self.messages
+                    .unlaunched
+                    .insert(key, (request.ticket, token));
             }
             let MessageDbReply::Prepared(wire, receipt) = self
                 .message_db(
@@ -587,6 +595,7 @@ impl Manager {
                         session.grant.installation,
                         receipt,
                         self.services.clock.unix_seconds().saturating_mul(1000),
+                        transition,
                     ),
                     request,
                 )
@@ -628,10 +637,12 @@ impl Manager {
         match result {
             Err(e) => {
                 if let Ok(request) = self.ready()
-                    && self.messages.unlaunched.get(&key) == Some(&request.ticket)
+                    && let Some((ticket, token)) = self.messages.unlaunched.get(&key)
+                    && *ticket == request.ticket
                 {
+                    let token = token.clone();
                     if self
-                        .message_db(MessageDbOp::ResetUnlaunched(key), request)
+                        .message_db(MessageDbOp::ResetUnlaunched(key, token), request)
                         .await
                         .is_ok()
                     {
