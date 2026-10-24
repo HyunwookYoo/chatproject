@@ -6,6 +6,7 @@ import 'package:path_provider/path_provider.dart';
 import 'src/rust/api/chat.dart' as rust;
 import 'network/network_client.dart';
 import 'account/account_client.dart';
+import 'message/message_client.dart';
 
 const _accountStorage = MethodChannel('chat_app/account_storage');
 
@@ -62,6 +63,7 @@ class FrbCoreClient implements CoreClient, NetworkClient {
 
   final String? dataDir;
   late final AccountClient account = FrbAccountClient(this);
+  late final MessageClient messages = FrbMessageClient(this);
   Stream<rust.ChatEvent>? _events;
 
   @override
