@@ -265,6 +265,9 @@ class MessageModel extends ChangeNotifier {
         if (stale || !_current(generation)) continue;
         _conversations = conversations.values.take(150).toList();
         _messages = messages.values.take(150).toList();
+        for (final row in _messages.where((row) => row.cancelRequested)) {
+          _retirePendingSend(_key(row.key));
+        }
         _conversationNext = conversationCursor;
         _messageNext = messageCursor;
         if (selected != null) {
@@ -287,7 +290,7 @@ class MessageModel extends ChangeNotifier {
   }
 
   /// True authorizes the caller to clear its composer only after durable commit.
-  /// A failed/lost reply retains the same action token for the same body.
+  /// A failed/lost reply retains its token until matching cancellation is confirmed.
   Future<bool> send(String body) {
     if (!ready || _peer == null || currentConversation == null) {
       return Future.value(false);
@@ -341,7 +344,10 @@ class MessageModel extends ChangeNotifier {
     }
   }
 
-  Future<bool> _command(Future<Object?> Function() operation) async {
+  Future<bool> _command(
+    Future<Object?> Function() operation, {
+    void Function()? onSuccess,
+  }) async {
     if (!ready || _commandBusy) return false;
     final generation = _generation;
     _commandBusy = true;
@@ -350,6 +356,7 @@ class MessageModel extends ChangeNotifier {
     try {
       await operation();
       if (!_current(generation)) return false;
+      onSuccess?.call();
       unawaited(reload());
       return true;
     } catch (failure) {
@@ -363,8 +370,30 @@ class MessageModel extends ChangeNotifier {
     }
   }
 
-  Future<bool> cancel(MessageKey key) =>
-      _command(() => client.cancelSend(key: key));
+  Future<bool> cancel(MessageKey key) {
+    final owned = MessageKey(
+      conversation: Uint8List.fromList(key.conversation),
+      sender: Uint8List.fromList(key.sender),
+      installation: Uint8List.fromList(key.installation),
+      id: Uint8List.fromList(key.id),
+    );
+    final identity = _key(owned);
+    return _command(
+      () => client.cancelSend(key: owned),
+      onSuccess: () => _retirePendingSend(identity),
+    );
+  }
+
+  // Only current-generation cancellation facts end this exact send action.
+  // The next same-body send is then a new action with a new idempotency token.
+  void _retirePendingSend(String identity) {
+    final action = _pendingSend;
+    if (action == null) return;
+    final expected =
+        '${_bytes(currentConversation?.id ?? [])}/${_bytes(account.snapshot?.publicPeerId ?? [])}/${_bytes(account.snapshot?.installation ?? [])}/${_bytes(action.id)}';
+    if (identity == expected) _pendingSend = null;
+  }
+
   Future<bool> retry(MessageKey key) =>
       _command(() => client.retrySend(key: key));
 

@@ -43,6 +43,212 @@ void main() {
     await accountClient.controller.close();
   });
 
+  Future<DurableMessageClient> durableLostReply() async {
+    model.dispose();
+    await client.controller.close();
+    final durable = DurableMessageClient();
+    client = durable;
+    accounts.applySnapshot(
+      account.AccountView(
+        revision: BigInt.from(3),
+        phase: account.AccountPhase.localReady,
+        publicPeerId: bytes(2),
+        installation: bytes(3),
+        devices: [],
+        contacts: [],
+        remoteRecords: [],
+        publishIntents: [],
+        publication: accounts.snapshot!.publication,
+        disclosurePossible: false,
+        pendingPairTransactions: [],
+        pairResumes: [],
+        pendingImportRequiresRemoteRevoke: false,
+      ),
+    );
+    model = MessageModel(client, account: accounts);
+    await model.openConversation(bytes(4));
+    expect(await model.send('fixture'), isFalse);
+    await model.reload();
+    expect(model.messages.single.state, DeliveryState.queued);
+    expect(model.messages.single.key.id, durable.tokens.first);
+    return durable;
+  }
+
+  test('cancelled_lost_reply_action_resend_creates_new_durable_row', () async {
+    final durable = await durableLostReply();
+    final observed = model.messages.single.key;
+    final decoded = MessageKey(
+      conversation: bytes(observed.conversation.first),
+      sender: bytes(2),
+      installation: bytes(3),
+      id: observed.id.sublist(0),
+    );
+    expect(await model.cancel(decoded), isTrue);
+    await settle();
+    expect(model.messages.single.cancelRequested, isTrue);
+    expect(durable.queued, isEmpty);
+    expect(await model.send('fixture'), isTrue);
+    await model.reload();
+    expect(durable.tokens.last, hasLength(16));
+    expect(durable.tokens.last, isNot(durable.tokens.first));
+    expect(durable.rows, hasLength(2));
+    expect(
+      durable.rows.where((row) => row.state == DeliveryState.queued),
+      hasLength(1),
+    );
+    expect(durable.queued, hasLength(1));
+  });
+
+  test(
+    'successful_cancel_retires_action_before_held_page_and_owns_requested_key',
+    () async {
+      final durable = await durableLostReply();
+      final observed = model.messages.single.key;
+      final requested = MessageKey(
+        conversation: observed.conversation.sublist(0),
+        sender: observed.sender.sublist(0),
+        installation: observed.installation.sublist(0),
+        id: observed.id.sublist(0),
+      );
+      final held = Completer<MessagePage>();
+      final releaseCancel = Completer<void>();
+      durable.query = (_) => held.future;
+      durable.beforeCancel = releaseCancel.future;
+      final cancelling = model.cancel(requested);
+      requested.id[0] ^= 1;
+      releaseCancel.complete();
+      expect(await cancelling, isTrue);
+      await settle();
+      expect(model.messages.single.cancelRequested, isFalse); // page still held
+      expect(durable.rows.single.cancelRequested, isTrue);
+      expect(await model.send('fixture'), isTrue);
+      durable.query = null;
+      held.complete(
+        MessagePage(revision: durable.revision, items: List.of(durable.rows)),
+      );
+      await model.reload();
+      expect(durable.tokens.last, isNot(durable.tokens.first));
+      expect(durable.rows, hasLength(2));
+      expect(durable.queued, hasLength(1));
+    },
+  );
+
+  test(
+    'lost_reply_without_cancellation_retries_one_durable_obligation',
+    () async {
+      final durable = await durableLostReply();
+      expect(await model.send('fixture'), isTrue);
+      expect(durable.tokens.last, durable.tokens.first);
+      expect(durable.rows, hasLength(1));
+      expect(durable.queued, hasLength(1));
+    },
+  );
+
+  test('failed_cancel_does_not_retire_lost_reply_action', () async {
+    final durable = await durableLostReply();
+    durable.cancelError = const rust.CoreError(
+      code: rust.ErrorCode.storageFull,
+      detail: 'fixture',
+    );
+    expect(await model.cancel(model.messages.single.key), isFalse);
+    expect(await model.send('fixture'), isTrue);
+    expect(durable.tokens.last, durable.tokens.first);
+    expect(durable.rows, hasLength(1));
+    expect(durable.queued, hasLength(1));
+  });
+
+  test(
+    'unrelated_cancel_matches_every_identifier_before_retiring_action',
+    () async {
+      for (var field = 0; field < 4; field++) {
+        final durable = await durableLostReply();
+        final row = model.messages.single;
+        final fields = [
+          row.key.conversation.sublist(0),
+          row.key.sender.sublist(0),
+          row.key.installation.sublist(0),
+          row.key.id.sublist(0),
+        ];
+        fields[field][0] ^= 1;
+        final unrelated = MessageKey(
+          conversation: fields[0],
+          sender: fields[1],
+          installation: fields[2],
+          id: fields[3],
+        );
+        durable.rows.add(
+          MessageView(
+            key: unrelated,
+            lamport: BigInt.two,
+            sentAtMs: row.sentAtMs,
+            body: row.body,
+            outgoing: true,
+            state: DeliveryState.queued,
+            cancelRequested: false,
+          ),
+        );
+        expect(await model.cancel(unrelated), isTrue);
+        await settle();
+        expect(await model.send('fixture'), isTrue);
+        expect(
+          durable.tokens.last,
+          durable.tokens.first,
+          reason: 'identifier field $field',
+        );
+        expect(durable.queued, hasLength(1));
+      }
+    },
+  );
+
+  test(
+    'late_cancel_does_not_retire_newer_or_replacement_route_action',
+    () async {
+      for (final replaceRoute in [false, true]) {
+        final durable = await durableLostReply();
+        final oldKey = model.messages.single.key;
+        final releaseCancel = Completer<void>();
+        durable.beforeCancel = releaseCancel.future;
+        final cancelling = model.cancel(oldKey);
+        if (replaceRoute) await model.openConversation(bytes(4));
+        durable.loseSendReply = true;
+        expect(await model.send('new fixture'), isFalse);
+        final currentToken = List.of(durable.tokens.last);
+        releaseCancel.complete();
+        expect(await cancelling, !replaceRoute);
+        await model.reload();
+        expect(await model.send('new fixture'), isTrue);
+        expect(durable.tokens.last, currentToken);
+        expect(durable.rows, hasLength(2));
+        expect(durable.queued, hasLength(1));
+      }
+    },
+  );
+
+  test(
+    'accepted_cancel_fact_retires_action_after_lost_cancel_reply_even_with_read',
+    () async {
+      final durable = await durableLostReply();
+      durable.loseCancelReply = true;
+      expect(await model.cancel(model.messages.single.key), isFalse);
+      final cancelled = durable.rows.single;
+      durable.rows[0] = MessageView(
+        key: cancelled.key,
+        lamport: cancelled.lamport,
+        sentAtMs: cancelled.sentAtMs,
+        body: cancelled.body,
+        outgoing: true,
+        state: DeliveryState.read,
+        cancelRequested: true,
+      );
+      await model.reload();
+      expect(model.messages.single.state, DeliveryState.read);
+      expect(await model.send('fixture'), isTrue);
+      expect(durable.tokens.last, isNot(durable.tokens.first));
+      expect(durable.rows, hasLength(2));
+      expect(durable.queued, hasLength(1));
+    },
+  );
+
   test(
     'late_model_uses_current_offline_established_account_snapshot',
     () async {

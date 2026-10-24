@@ -176,3 +176,93 @@ class FakeMessageClient implements MessageClient {
     );
   }
 }
+
+/// Models the native token lookup before enqueue, including cancelled rows.
+class DurableMessageClient extends FakeMessageClient {
+  DurableMessageClient() {
+    rows = [];
+    conversations = [conversation(3)];
+  }
+  bool loseSendReply = true;
+  bool loseCancelReply = false;
+  Object? cancelError;
+  Future<void>? beforeCancel;
+  final queued = <String>{};
+
+  @override
+  Future<MessageView> sendText({
+    required List<int> peer,
+    required List<int> id,
+    required String body,
+  }) async {
+    tokens.add(List.of(id));
+    final key = MessageKey(
+      conversation: bytes(peer.first - 1),
+      sender: bytes(2),
+      installation: bytes(3),
+      id: Uint8List.fromList(id),
+    );
+    for (final row in rows) {
+      if (_identity(row.key) == _identity(key)) {
+        if (row.body != body) {
+          throw const rust.CoreError(
+            code: rust.ErrorCode.messageConflict,
+            detail: 'fixture',
+          );
+        }
+        return row;
+      }
+    }
+    final row = MessageView(
+      key: key,
+      lamport: BigInt.from(rows.length + 1),
+      sentAtMs: BigInt.one,
+      body: body,
+      outgoing: true,
+      state: DeliveryState.queued,
+      cancelRequested: false,
+    );
+    rows.add(row);
+    queued.add(_identity(key));
+    revision += BigInt.one;
+    if (loseSendReply) {
+      loseSendReply = false;
+      throw StateError('fixture response lost after commit');
+    }
+    return row;
+  }
+
+  @override
+  Future<MessageView> cancelSend({required MessageKey key}) async {
+    cancellations.add(key);
+    await beforeCancel;
+    if (cancelError != null) throw cancelError!;
+    final index = rows.indexWhere(
+      (row) => _identity(row.key) == _identity(key),
+    );
+    if (index < 0) {
+      throw const rust.CoreError(
+        code: rust.ErrorCode.messageNotFound,
+        detail: 'fixture',
+      );
+    }
+    final row = rows[index];
+    final cancelled = MessageView(
+      key: row.key,
+      lamport: row.lamport,
+      sentAtMs: row.sentAtMs,
+      body: row.body,
+      outgoing: row.outgoing,
+      state: DeliveryState.cancelled,
+      cancelRequested: true,
+    );
+    rows[index] = cancelled;
+    queued.remove(_identity(key));
+    revision += BigInt.one;
+    if (loseCancelReply) throw StateError('fixture cancellation reply lost');
+    return cancelled;
+  }
+}
+
+String _identity(MessageKey key) =>
+    '${key.conversation.join(',')}/${key.sender.join(',')}/${key.installation.join(',')}/${key.id.join(',')}';
