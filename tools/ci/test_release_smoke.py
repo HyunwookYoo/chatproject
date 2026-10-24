@@ -48,6 +48,8 @@ class Fake implements ProcessRunner {
   Future<OwnedProcess> start(String exe, List<String> args, {required Directory logDir, String? workingDirectory, String? stdin, bool retainOutput = false}) async {
     final child = Child(next++, Completer<int>(), this);
     var output = '';
+    var errorOutput = '';
+    var commandExit = 0;
     if (mode.startsWith('android-')) {
       if (args.contains('pidof')) {
         if (finalStopPending) {
@@ -59,6 +61,17 @@ class Fake implements ProcessRunner {
           output = mode == 'android-cancel-foreign' && identityReads > 1 ? '999' : '${320 + launches}';
           if (mode == 'android-cancel-identity' || mode == 'android-cancel-foreign') cancel.cancel();
           if (finalStopPending && mode == 'android-contract2-stop-replacement') output = '999';
+        }
+        commandExit = output.isEmpty ? 1 : 0;
+        if (finalStopPending && mode.contains('-query-')) {
+          output = '';
+          commandExit = 1;
+          if (mode.endsWith('-stderr')) errorOutput = 'public-pid-query-error';
+          if (mode.endsWith('-exit2')) commandExit = 2;
+          if (mode.endsWith('-empty0')) commandExit = 0;
+          if (mode.endsWith('-failed-pid')) output = '323';
+          if (mode.endsWith('-malformed')) { commandExit = 0; output = 'invalid'; }
+          if (mode.endsWith('-zero')) { commandExit = 0; output = '0'; }
         }
       }
       if (args.contains('package')) output = 'android.permission.INTERNET android.permission.ACCESS_NETWORK_STATE${mode == 'android-backup' ? ' ALLOW_BACKUP' : ''}';
@@ -89,7 +102,7 @@ class Fake implements ProcessRunner {
             'binding': base64Encode(List.filled(20, 7)), 'instance': 'android-$launches'});
         }
       }
-      child.code.complete(0);
+      child.code.complete(commandExit);
     } else if (exe.endsWith('chat_app.exe')) {
       appPid = child.pid;
       launches++;
@@ -133,7 +146,7 @@ class Fake implements ProcessRunner {
       child.code.complete(0);
     }
     File('${logDir.path}/${child.pid}.stdout.log').writeAsStringSync(output);
-    File('${logDir.path}/${child.pid}.stderr.log').writeAsStringSync('');
+    File('${logDir.path}/${child.pid}.stderr.log').writeAsStringSync(errorOutput);
     return child;
   }
   dynamic noSuchMethod(Invocation i) => throw StateError('unexpected runner API: $i');
@@ -153,9 +166,11 @@ Future<void> main(List<String> args) async {
   } catch (error) { result = 'FAIL: $error'; }
   final phaseLogs = fake.launches == 3 ? 'cleaned' : fake.launches == 2 ? 'reopened' : 'created';
   final ownershipFile = File(args[0].contains('contract') ? '${logs.path}/$phaseLogs/ownership.json' : '${logs.path}/ownership.json');
+  final cleanupFile = File('${logs.path}/$phaseLogs/cleanup.json');
   print(jsonEncode({'result': result, 'stops': fake.stops, 'forceStopped': fake.forceStopped,
     'finalStopReads': fake.finalStopReads, 'forceStopLaunches': fake.forceStopLaunches,
     'contractSuccess': File('${logs.path}/contract-success.json').existsSync(),
+    'cleanupFailure': cleanupFile.existsSync() ? cleanupFile.readAsStringSync() : '',
     'launches': fake.launches, 'rootRetained': fake.contractRoot != null && Directory(fake.contractRoot!).existsSync(),
     'ownership': jsonDecode(ownershipFile.readAsStringSync())}));
 }
@@ -258,6 +273,16 @@ class ReleaseSmokeTests(unittest.TestCase):
         self.assertEqual(data['finalStopReads'], 1)
         self.assertEqual(data['ownership']['activities'][0]['pid'], '323')
         self.assertEqual(data['forceStopLaunches'], [1, 2, 3])
+
+    def test_android_failed_final_pid_query_cannot_prove_absence(self):
+        for failure in ('stderr', 'exit2', 'empty0', 'failed-pid', 'malformed', 'zero'):
+            with self.subTest(failure=failure):
+                data = self.probe('android-contract2-stop-query-' + failure, False)
+                self.assertFalse(data['contractSuccess'])
+                self.assertEqual(data['ownership']['activities'][0]['pid'], '323')
+                self.assertEqual(data['forceStopLaunches'], [1, 2, 3])
+                self.assertIn('Android PID query failed', data['cleanupFailure'])
+                self.assertFalse('public-pid-query-error' in data['cleanupFailure'])
 
     def test_android_cancellation_drains_launch_and_identity_acquisition(self):
         for mode in ('android-cancel-launch', 'android-cancel-identity'):

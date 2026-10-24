@@ -222,14 +222,23 @@ Future<Map<String, dynamic>?> _runSmokeOnce({
         cleanup: cleanup,
         success: success,
       );
-      Future<String> appPid({bool cleanup = false}) async =>
-          ((await command(
-                    ['shell', 'pidof', _package],
-                    cleanup: cleanup,
-                    success: false,
-                  )).stdout
-                  as String)
-              .trim();
+      Future<String> appPid({bool cleanup = false}) async {
+        final result = await command(
+          ['shell', 'pidof', _package],
+          cleanup: cleanup,
+          success: false,
+        );
+        final value = (result.stdout as String).trim();
+        // pidof reports no matching process with exit 1 and no diagnostics.
+        final absent = result.exitCode == 1 && value.isEmpty;
+        final present =
+            result.exitCode == 0 && RegExp(r'^[1-9]\d*$').hasMatch(value);
+        if ((result.stderr as String).trim().isNotEmpty ||
+            (!absent && !present)) {
+          throw StateError('Android PID query failed');
+        }
+        return value;
+      }
       if ((await appPid()).isNotEmpty)
         throw StateError(
           'Existing app process preserved; use an idle test emulator',
