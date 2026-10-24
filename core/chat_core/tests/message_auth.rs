@@ -888,31 +888,30 @@ async fn rejected_prepare_preserves_launched_job(fence_rejection: bool) {
     let (a,b,_)=pair().await;
     contacts(&a,&b).await; contacts(&b,&a).await;
     a.account.connect_account(b.peer).await.unwrap();
-    let m=enqueue(&a,&b).await;
     let mut response=a.account.message_test_pause(chat_core::account::MessagePoint::FirstByte).await.unwrap();
-    let account=a.account.clone();
-    let launched=tokio::spawn(async move {account.message_test_attempt(m.key,false,MessageMutation::None).await});
-    response.wait_entered().await;
+    // Arm before eligibility and let only the automatic scheduler own this job.
+    let m=enqueue(&a,&b).await;
+    tokio::time::timeout(Duration::from_secs(5),response.wait_entered()).await.unwrap();
     let original=a.account.storage_test_fixture().message_facts(m.key).await.unwrap();
     assert_eq!(original.dispatch_state,Some(1));
     assert_eq!(original.attempted_receivers.len(),1);
     assert_eq!(a.account.message_test_write_starts().await.unwrap().0,0);
     // The normal actor path rejects concurrent work before SQL.
-    assert_eq!(a.account.message_test_attempt(m.key,false,MessageMutation::None).await.unwrap_err().code,ErrorCode::Busy);
+    assert_eq!(tokio::time::timeout(Duration::from_secs(5),a.account.message_test_attempt(m.key,false,MessageMutation::None)).await.unwrap().unwrap_err().code,ErrorCode::Busy);
     // Separately exercise actual SQL InFlight rejection and its exact R29 token.
     let repo=a.account.storage_test_fixture().messages().await.unwrap();
     let pause=if fence_rejection {Some(a.account.storage_test_fixture().pause_message_reply().await)} else {None};
     let receiver=original.attempted_receivers[0];
     let rejected=tokio::spawn(async move {repo.rejected_prepare(m.key,receiver,NOW*1000).await.unwrap()});
     let probe=if let Some(pause)=pause {
-        pause.wait_entered().await;
+        tokio::time::timeout(Duration::from_secs(5),pause.wait_entered()).await.unwrap();
         a.account.request_suspend(); pause.release();
-        let probe=rejected.await.unwrap();
+        let probe=tokio::time::timeout(Duration::from_secs(5),rejected).await.unwrap().unwrap();
         assert_eq!(probe.code,ErrorCode::StorageLocked);
         restart(&a).await;
         probe
     } else {
-        let probe=rejected.await.unwrap();
+        let probe=tokio::time::timeout(Duration::from_secs(5),rejected).await.unwrap().unwrap();
         assert_eq!(probe.code,ErrorCode::Busy);
         probe
     };
@@ -935,8 +934,18 @@ async fn rejected_prepare_preserves_launched_job(fence_rejection: bool) {
     assert_eq!(retained.receipt_jobs, original.receipt_jobs);
     assert_eq!(retained.processed, original.processed);
     response.release();
-    let result=launched.await.unwrap();
-    if fence_rejection {assert!(result.is_err());} else {result.unwrap();}
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while a.account.storage_test_fixture().message_facts(m.key).await.unwrap().dispatch_state == Some(1) {
+            tokio::task::yield_now().await;
+        }
+    }).await.unwrap();
+    if fence_rejection {
+        assert_eq!(a.account.message_test_write_starts().await.unwrap().0,0);
+        assert_eq!(a.account.storage_test_fixture().message_facts(m.key).await.unwrap().dispatch_state,Some(0));
+    } else {
+        assert_eq!(a.account.message_test_write_starts().await.unwrap().0,1);
+        assert_eq!(a.account.storage_test_fixture().messages().await.unwrap().load_messages(m.key.conversation,None,50).await.unwrap().items[0].state,DeliveryState::Delivered);
+    }
 }
 #[tokio::test]
 async fn rejected_prepare_cannot_reset_previously_launched_job() {

@@ -483,7 +483,6 @@ void main() {
     model.scrollAnchor = model.messages.last.key;
     await model.loadOlder();
     await model.loadOlder();
-    await model.loadOlder();
     expect(model.messages, hasLength(150));
     expect(client.limits.every((limit) => limit == 50), isTrue);
     client.rows.add(message(201));
@@ -494,6 +493,108 @@ void main() {
     expect(model.scrollAnchor!.id.first, 151);
     expect(client.maxQueries, 1);
   });
+
+  test(
+    'older_message_windows_reach_retained_tail_after_duplicate_events',
+    () async {
+      client.rows = List.generate(225, (i) => message(i + 1));
+      await model.openConversation(bytes(2));
+      final seen = <int>{};
+      for (var page = 0; page < 5; page++) {
+        expect(model.messages.length, lessThanOrEqualTo(150));
+        seen.addAll(model.messages.map((row) => row.key.id.first));
+        if (page == 3) {
+          model.scrollAnchor = model.messages.last.key;
+          client.rows.add(message(226));
+          client.changed(2);
+          client.changed(2);
+          await settle();
+          expect(model.messages.first.key.id.first, 175);
+          expect(model.scrollAnchor!.id.first, 26);
+        }
+        await model.loadOlder();
+      }
+      expect(model.messages.last.key.id.first, 1);
+      expect(seen, containsAll(List.generate(225, (i) => i + 1)));
+      expect(
+        model.messages.map((row) => row.key.id.first).toSet().length,
+        model.messages.length,
+      );
+      expect(model.hasOlder, false);
+      expect(client.maxQueries, 1);
+    },
+  );
+
+  test(
+    'older_conversation_windows_reach_retained_tail_after_duplicate_events',
+    () async {
+      client.conversations = List.generate(
+        225,
+        (i) => conversation(i + 1, revision: i + 1),
+      );
+      await model.reload();
+      final seen = <int>{};
+      for (var page = 0; page < 5; page++) {
+        expect(model.conversations.length, lessThanOrEqualTo(150));
+        seen.addAll(model.conversations.map((row) => row.id.first));
+        if (page == 3) {
+          client.conversations.add(conversation(226, revision: 226));
+          client.changed(2);
+          client.changed(2);
+          await settle();
+          expect(model.conversations.first.id.first, 175);
+        }
+        await model.loadOlder();
+      }
+      expect(model.conversations.last.id.first, 1);
+      expect(seen, containsAll(List.generate(225, (i) => i + 1)));
+      expect(
+        model.conversations.map((row) => row.id.first).toSet().length,
+        model.conversations.length,
+      );
+      expect(model.hasOlder, false);
+      expect(client.maxQueries, 1);
+    },
+  );
+
+  test(
+    'moved_older_window_start_returns_latest_then_reaches_every_conversation',
+    () async {
+      client.conversations = List.generate(
+        225,
+        (i) => conversation(i + 1, revision: i + 1),
+      );
+      await model.reload();
+      await model.loadOlder();
+      await model.loadOlder();
+      await model.loadOlder();
+      expect(model.conversations.first.id.first, 175);
+      client.conversations.removeWhere((row) => row.id.first == 176);
+      client.conversations.add(conversation(176, revision: 226));
+      client.listQuery = (before) async {
+        expect(before!.id.first, 176);
+        expect(before.changeRevision, BigInt.from(176));
+        client.listQuery = null;
+        throw const rust.CoreError(
+          code: rust.ErrorCode.invalidMessage,
+          detail: 'fixture',
+        );
+      };
+      client.changed(2);
+      client.changed(2);
+      await settle();
+      expect(model.conversations.first.id.first, 176);
+      expect(model.error, isNull);
+      final seen = <int>{};
+      for (var i = 0; i < 3; i++) {
+        expect(model.conversations.length, lessThanOrEqualTo(150));
+        seen.addAll(model.conversations.map((row) => row.id.first));
+        await model.loadOlder();
+      }
+      expect(model.conversations.last.id.first, 1);
+      expect(seen, containsAll(List.generate(225, (i) => i + 1)));
+    },
+  );
 
   test(
     'all_message_identifier_bytes_define_identity_bigints_stay_exact',
@@ -558,7 +659,6 @@ void main() {
         (i) => conversation(i + 1, revision: i + 1),
       );
       await model.reload();
-      await model.loadOlder();
       await model.loadOlder();
       await model.loadOlder();
       expect(model.conversations, hasLength(150));

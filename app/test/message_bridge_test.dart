@@ -1,15 +1,23 @@
 // Correspondence tests intentionally access generated codecs and the actual API.
 // ignore_for_file: invalid_use_of_internal_member, invalid_use_of_protected_member
 
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:isolate';
+import 'package:chat_app/account/account_model.dart';
+import 'package:chat_app/core_client.dart';
+import 'package:chat_app/message/message_model.dart';
+import 'package:chat_app/message/screens/conversation_list_screen.dart';
+import 'package:chat_app/message/screens/conversation_screen.dart';
+import 'package:chat_app/theme/app_theme.dart';
 import 'package:chat_app/src/rust/api/account.dart' as account;
 import 'package:chat_app/src/rust/api/chat.dart' as chat;
 import 'package:chat_app/message/message_bridge.dart' as message;
 import 'package:chat_app/src/rust/frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:flutter/material.dart';
 
 Uint8List bytes(int length, [int value = 255]) =>
     Uint8List.fromList(List.filled(length, value));
@@ -175,16 +183,23 @@ void main() {
   // app-only suites can run without native tooling; an invalid supplied path fails.
   final library = Platform.environment['CHAT_MESSAGE_BRIDGE_LIBRARY'];
   group('actual generated native bridge', skip: library == null, () {
+    var initialized = false;
     late Directory directory;
     late account.AccountView owner;
     late RustLibApiImpl api;
     final peer = bytes(32);
     setUpAll(() async {
       final fixturePath = Platform.environment['CHAT_MESSAGE_BRIDGE_DATA_DIR'];
-      directory = fixturePath == null
-          ? await Directory.systemTemp.createTemp('chat-message-bridge-')
-          : Directory(fixturePath);
+      if (fixturePath == null ||
+          fixturePath.trim().isEmpty ||
+          !Directory(fixturePath).isAbsolute) {
+        throw StateError(
+          'CHAT_MESSAGE_BRIDGE_DATA_DIR must be an explicit absolute runner-owned directory',
+        );
+      }
+      directory = Directory(fixturePath);
       await RustLib.init(externalLibrary: ExternalLibrary.open(library!));
+      initialized = true;
       api = RustLib.instance.api as RustLibApiImpl;
       await account.testStorageStart(dataDir: directory.path);
       await account.openAccount();
@@ -196,7 +211,7 @@ void main() {
       owner = await account.snapshot();
     });
     tearDownAll(() async {
-      RustLib.dispose();
+      if (initialized) RustLib.dispose();
       // Native owners hold the isolated database until process exit on Windows.
       // The runner removes its owned fixture after the test process exits.
     });
@@ -585,5 +600,160 @@ void main() {
         );
       },
     );
+
+    testWidgets(
+      'native bounded room and list controls reach retained history',
+      (t) async {
+        final core = FrbCoreClient(dataDir: directory.path);
+        final accounts = AccountModel(core.account);
+        final historyPeer = bytes(32, 200);
+        final expectedConversations = <String>{};
+        await t.runAsync(() async {
+          for (var id = 1; id <= 225; id++) {
+            final saved = await message.sendText(
+              peer: historyPeer,
+              id: bytes(16, id),
+              body: 'Native history $id',
+            );
+            await message.cancelSend(key: saved.key);
+          }
+          for (var id = 0; id < 225; id++) {
+            final opened = await message.openDm(peer: bytes(32, id));
+            expectedConversations.add(opened.id.join(','));
+          }
+          await accounts.open();
+        });
+        final room = MessageModel(core.messages, account: accounts);
+        final list = MessageModel(core.messages, account: accounts);
+        Future<void> settleNative(MessageModel model) async {
+          await t.pump();
+          final elapsed = Stopwatch()..start();
+          while (model.busy) {
+            if (elapsed.elapsed > const Duration(seconds: 10)) {
+              throw TimeoutException('native window did not settle');
+            }
+            await t.runAsync(
+              () => Future<void>.delayed(const Duration(milliseconds: 10)),
+            );
+            await t.pump();
+          }
+          await t.pumpAndSettle();
+          expect(model.errorCode, isNull);
+        }
+
+        Widget app(Widget child) =>
+            MaterialApp(theme: buildAppTheme(), home: child);
+        t.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+        try {
+          await t.pumpWidget(
+            app(ConversationScreen(model: room, peer: historyPeer)),
+          );
+          await settleNative(room);
+          final viewport = find.descendant(
+            of: find.byKey(const ValueKey('message-viewport')),
+            matching: find.byType(Scrollable),
+          );
+          final seenMessages = <int>{};
+          for (var page = 0; page < 5; page++) {
+            expect(room.messages.length, lessThanOrEqualTo(150));
+            seenMessages.addAll(room.messages.map((row) => row.key.id.first));
+            if (page == 3) {
+              await t.runAsync(() async {
+                final saved = await message.sendText(
+                  peer: historyPeer,
+                  id: bytes(16, 226),
+                  body: 'Native history 226',
+                );
+                await message.cancelSend(key: saved.key);
+              });
+              unawaited(room.reload());
+              await settleNative(room);
+              expect(room.messages.first.key.id.first, 175);
+            }
+            if (page < 4) {
+              expect(room.hasOlder, true);
+              await t.scrollUntilVisible(
+                find.text('이전 메시지 더 보기'),
+                1600,
+                scrollable: viewport,
+                maxScrolls: 100,
+              );
+              await t.tap(find.text('이전 메시지 더 보기'));
+              await settleNative(room);
+            }
+          }
+          expect(seenMessages, containsAll(List.generate(225, (i) => i + 1)));
+          await t.scrollUntilVisible(
+            find.text('Native history 1'),
+            1600,
+            scrollable: viewport,
+            maxScrolls: 100,
+          );
+          expect(find.text('Native history 1').hitTestable(), findsOneWidget);
+          await t.tap(find.text('최신 메시지로 이동'));
+          await settleNative(room);
+          expect(room.messages.length, 50);
+          expect(find.text('Native history 226').hitTestable(), findsOneWidget);
+          List<int>? openedPeer;
+          await t.pumpWidget(
+            app(
+              Scaffold(
+                body: ConversationListScreen(
+                  model: list,
+                  onOpen: (peer) => openedPeer = peer,
+                ),
+              ),
+            ),
+          );
+          await settleNative(list);
+          final seenConversations = <String>{};
+          for (var page = 0; page < 6; page++) {
+            expect(list.conversations.length, lessThanOrEqualTo(150));
+            seenConversations.addAll(
+              list.conversations.map((row) => row.id.join(',')),
+            );
+            if (!list.hasOlder) break;
+            await t.scrollUntilVisible(
+              find.text('이전 대화 더 보기'),
+              2000,
+              maxScrolls: 100,
+            );
+            await t.tap(find.text('이전 대화 더 보기'));
+            await settleNative(list);
+          }
+          expect(list.hasOlder, false);
+          expect(seenConversations, containsAll(expectedConversations));
+          final oldest = list.conversations.last;
+          final tile = find.byKey(ValueKey(oldest.id.join(',')));
+          await t.scrollUntilVisible(tile, 2000, maxScrolls: 100);
+          await t.tap(tile);
+          expect(openedPeer, oldest.peer);
+          await t.runAsync(() async {
+            await message.openDm(peer: bytes(32, 226));
+          });
+          unawaited(list.reload());
+          await settleNative(list);
+          await t.tap(find.text('최신 대화로 이동'));
+          await settleNative(list);
+          expect(list.conversations.length, 50);
+          expect(list.conversations.first.peer, bytes(32, 226));
+          final latest = find.byKey(
+            ValueKey(list.conversations.first.id.join(',')),
+          );
+          expect(latest.hitTestable(), findsOneWidget);
+          await t.tap(latest);
+          expect(openedPeer, bytes(32, 226));
+          expect(t.takeException(), isNull);
+        } finally {
+          await t.pumpWidget(const SizedBox());
+          room.dispose();
+          list.dispose();
+          accounts.dispose();
+        }
+      },
+      timeout: const Timeout(Duration(minutes: 2)),
+    );
+
+
   });
 }

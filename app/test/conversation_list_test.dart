@@ -19,6 +19,62 @@ void main() {
     f = ConversationFixture();
   });
   tearDown(() async => f.close());
+  testWidgets(
+    'list controls reach oldest of 225 conversations and return to latest after events',
+    (t) async {
+      await f.open();
+      f.client.conversations = List.generate(
+        225,
+        (i) => conversation(i + 1, revision: i + 1),
+      );
+      List<int>? opened;
+      await pumpConversation(
+        t,
+        Scaffold(
+          body: ConversationListScreen(
+            model: f.model,
+            onOpen: (peer) => opened = peer,
+          ),
+        ),
+      );
+      final seen = <int>{};
+      for (var page = 0; page < 5; page++) {
+        expect(f.model.conversations.length, lessThanOrEqualTo(150));
+        seen.addAll(f.model.conversations.map((row) => row.id.first));
+        if (page == 3) {
+          f.client.conversations.add(conversation(226, revision: 226));
+          f.client.changed(2);
+          f.client.changed(2);
+          await t.pumpAndSettle();
+          expect(f.model.conversations.first.id.first, 175);
+        }
+        if (page < 4) {
+          expect(f.model.hasOlder, true);
+          await t.scrollUntilVisible(
+            find.text('이전 대화 더 보기'),
+            2000,
+            maxScrolls: 100,
+          );
+          await t.tap(find.text('이전 대화 더 보기'));
+          await t.pumpAndSettle();
+        }
+      }
+      expect(seen, containsAll(List.generate(225, (i) => i + 1)));
+      final oldest = find.byKey(ValueKey(bytes(1).join(',')));
+      await t.scrollUntilVisible(oldest, 2000, maxScrolls: 100);
+      await t.tap(oldest);
+      expect(opened, bytes(2));
+      await t.tap(find.text('최신 대화로 이동'));
+      await t.pumpAndSettle();
+      expect(f.model.conversations.length, 50);
+      final newest = find.byKey(ValueKey(bytes(226).join(',')));
+      expect(newest.hitTestable(), findsOneWidget);
+      await t.tap(newest);
+      expect(opened, bytes(227));
+      expect(t.takeException(), isNull);
+    },
+  );
+
   testWidgets('replacing a borrowed list projection reloads the new owner', (
     t,
   ) async {

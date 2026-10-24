@@ -97,19 +97,16 @@ async fn cancel_then_late_receipt_keeps_both_facts() {
     contacts(&a, &b).await;
     contacts(&b, &a).await;
     a.account.connect_account(b.peer).await.unwrap();
-    let m = enqueue(&a, &b).await;
     let mut pause = a
         .account
         .message_test_pause(chat_core::account::MessagePoint::FirstByte)
         .await
         .unwrap();
-    let account = a.account.clone();
-    let attempt = tokio::spawn(async move {
-        account
-            .message_test_attempt(m.key, false, MessageMutation::None)
-            .await
-    });
-    pause.wait_entered().await;
+    // Install the checkpoint before eligibility; the scheduler is the sole owner.
+    let m = enqueue(&a, &b).await;
+    tokio::time::timeout(Duration::from_secs(5), pause.wait_entered())
+        .await
+        .expect("the intended attempt must enter the checkpoint");
     let cancelled = a
         .account
         .storage_test_fixture()
@@ -131,7 +128,7 @@ async fn cancel_then_late_receipt_keeps_both_facts() {
         0
     );
     pause.release();
-    attempt.await.unwrap().unwrap();
+    wait_state(&a, m.key, DeliveryState::Delivered).await;
     let page = a
         .account
         .storage_test_fixture()
@@ -381,25 +378,21 @@ async fn same_wire_after_lost_ack_and_crash() {
     contacts(&a, &b).await;
     contacts(&b, &a).await;
     a.account.connect_account(b.peer).await.unwrap();
+    let mut pause = b
+        .account
+        .message_test_pause(chat_core::account::MessagePoint::Response)
+        .await
+        .unwrap();
     let m = enqueue(&a, &b).await;
+    tokio::time::timeout(Duration::from_secs(5), pause.wait_entered())
+        .await
+        .unwrap();
     let before = a
         .account
         .storage_test_fixture()
         .message_facts(m.key)
         .await
         .unwrap();
-    let mut pause = b
-        .account
-        .message_test_pause(chat_core::account::MessagePoint::Response)
-        .await
-        .unwrap();
-    let account = a.account.clone();
-    let attempt = tokio::spawn(async move {
-        account
-            .message_test_attempt(m.key, false, MessageMutation::None)
-            .await
-    });
-    pause.wait_entered().await;
     assert_eq!(
         b.account
             .storage_test_fixture()
@@ -410,10 +403,10 @@ async fn same_wire_after_lost_ack_and_crash() {
         1
     );
     assert!(
-        b.account
-            .message_test_attempt(m.key, true, MessageMutation::ReceiptHash)
-            .await
-            .is_err()
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            b.account.message_test_attempt(m.key, true, MessageMutation::ReceiptHash),
+        ).await.unwrap().is_err()
     );
     let progress = b
         .account
@@ -423,8 +416,9 @@ async fn same_wire_after_lost_ack_and_crash() {
         .unwrap()
         .receipt_retry;
     assert_eq!(progress, Some((2, NOW * 1000 + 2000)));
-    let a = reopen(a, backend, NOW).await;
-    assert!(attempt.await.unwrap().is_err());
+    let a = tokio::time::timeout(Duration::from_secs(5), reopen(a, backend, NOW))
+        .await
+        .unwrap();
     let recovered = a
         .account
         .storage_test_fixture()
@@ -559,35 +553,42 @@ async fn read_before_delivered_never_regresses() {
     contacts(&a, &b).await;
     contacts(&b, &a).await;
     a.account.connect_account(b.peer).await.unwrap();
-    let m = enqueue(&a, &b).await;
     let mut pause = b
         .account
         .message_test_pause(chat_core::account::MessagePoint::Response)
         .await
         .unwrap();
-    let account = a.account.clone();
-    let attempt = tokio::spawn(async move {
-        account
-            .message_test_attempt(m.key, false, MessageMutation::None)
-            .await
-    });
-    pause.wait_entered().await;
+    let m = enqueue(&a, &b).await;
+    tokio::time::timeout(Duration::from_secs(5), pause.wait_entered())
+        .await
+        .unwrap();
     // A real persisted receipt travels on its authenticated RPC with the Read kind.
     // Its ACK does not match the original Delivered obligation, which must remain.
     assert!(
-        b.account
-            .message_test_attempt(m.key, true, MessageMutation::ReadReceipt)
-            .await
-            .is_err()
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            b.account.message_test_attempt(m.key, true, MessageMutation::ReadReceipt),
+        ).await.unwrap().is_err()
     );
     wait_state(&a, m.key, DeliveryState::Read).await;
-    b.account
-        .message_test_attempt(m.key, true, MessageMutation::None)
-        .await
-        .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        b.account.message_test_attempt(m.key, true, MessageMutation::None),
+    ).await.unwrap().unwrap();
     wait_state(&a, m.key, DeliveryState::Read).await;
     pause.release();
-    attempt.await.unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            // Read has already removed the outbox, so SQL alone cannot tell
+            // whether the paused network owner finished. Busy must clear first.
+            let code = a.account.message_test_attempt(m.key, false, MessageMutation::None).await.unwrap_err().code;
+            if code != ErrorCode::Busy {
+                assert_eq!(code, ErrorCode::MessageNotFound);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    }).await.unwrap();
     wait_state(&a, m.key, DeliveryState::Read).await;
 }
 #[tokio::test]

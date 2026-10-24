@@ -40,6 +40,10 @@ class MessageModel extends ChangeNotifier {
   int _conversationPages = 1;
   MessageCursor? _messageNext;
   ConversationCursor? _conversationNext;
+  MessageCursor? _messageStart;
+  MessageCursor? _messageFirstNext;
+  ConversationCursor? _conversationStart;
+  ConversationCursor? _conversationFirstNext;
   bool _opening = false;
   bool _commandBusy = false;
   List<MessageView> _messages = [];
@@ -54,8 +58,11 @@ class MessageModel extends ChangeNotifier {
   bool get ready => _ready && !_disposed;
   bool get busy => _opening || _refresh != null || saving || _commandBusy;
   bool get hasOlder => currentConversation == null
-      ? _conversationNext != null && _conversationPages < 3
-      : _messageNext != null && _messagePages < 3;
+      ? _conversationNext != null
+      : _messageNext != null;
+  bool get hasLatest => currentConversation == null
+      ? _conversationStart != null || _conversationPages > 1
+      : _messageStart != null || _messagePages > 1;
   rust.ErrorCode? errorCode;
   String? get error =>
       errorCode == null ? null : messageErrorMessage(errorCode!);
@@ -92,6 +99,8 @@ class MessageModel extends ChangeNotifier {
       _messagePages = _conversationPages = 1;
       _messageNext = null;
       _conversationNext = null;
+      _messageStart = _messageFirstNext = null;
+      _conversationStart = _conversationFirstNext = null;
       revision = null;
       _seenRevision = BigInt.zero;
       _dirty = false;
@@ -130,6 +139,7 @@ class MessageModel extends ChangeNotifier {
     scrollAnchor = null;
     _messagePages = 1;
     _messageNext = null;
+    _messageStart = _messageFirstNext = null;
     errorCode = null;
     notifyListeners();
     try {
@@ -155,17 +165,39 @@ class MessageModel extends ChangeNotifier {
   }
 
   Future<void> loadOlder() async {
-    if (!ready || !hasOlder) return;
+    if (!ready || busy || !hasOlder) return;
     if (currentConversation == null) {
-      ++_conversationPages;
+      if (_conversationPages < 3) {
+        ++_conversationPages;
+      } else {
+        _conversationStart = _conversationFirstNext;
+      }
     } else {
-      ++_messagePages;
+      if (_messagePages < 3) {
+        ++_messagePages;
+      } else {
+        _messageStart = _messageFirstNext;
+      }
     }
     await reload();
   }
 
-  /// One refresh in flight, one dirty bit. Each pass restarts cursors and reads
-  /// at most three pages per window. Pages are separate SQL requests: publish
+  Future<void> loadLatest() async {
+    if (!ready || busy) return;
+    if (currentConversation == null) {
+      _conversationStart = null;
+      _conversationPages = 1;
+    } else {
+      _messageStart = null;
+      _messagePages = 1;
+      scrollAnchor = null;
+    }
+    await reload();
+  }
+
+  /// One refresh in flight, one dirty bit. Each pass starts at the current
+  /// window boundary and reads at most three pages. Only two bounded cursor
+  /// boundaries survive paging; evicted bodies are not retained. Publish
   /// matching revisions, resnapshot after churn, and converge once events settle.
   Future<void> reload() {
     if (!ready) return Future.value();
@@ -194,8 +226,10 @@ class MessageModel extends ChangeNotifier {
         final conversations = <String, ConversationView>{};
         final messages = <String, MessageView>{};
         BigInt? passRevision;
-        ConversationCursor? conversationCursor;
-        MessageCursor? messageCursor;
+        var conversationCursor = _conversationStart;
+        var messageCursor = _messageStart;
+        ConversationCursor? conversationFirstNext;
+        MessageCursor? messageFirstNext;
         var stale = false;
         for (var i = 0; i < _conversationPages; i++) {
           final ConversationPage page;
@@ -206,11 +240,12 @@ class MessageModel extends ChangeNotifier {
             );
           } catch (failure) {
             if (!_current(generation)) continue refresh;
-            // The fixed cursor detects moved/missing anchors. Restart the
-            // loaded window; never reuse a cursor from the invalidated pass.
+            // A moved/missing anchor cannot locate this older window. Return
+            // to latest rather than retaining an invalid cursor or mixed rows.
             if (conversationCursor != null &&
                 failure is rust.CoreError &&
                 failure.code == rust.ErrorCode.invalidMessage) {
+              _conversationStart = null;
               _dirty = true;
               continue refresh;
             }
@@ -230,6 +265,7 @@ class MessageModel extends ChangeNotifier {
             conversations[_bytes(row.id)] = row;
           }
           conversationCursor = page.next;
+          if (i == 0) conversationFirstNext = page.next;
           if (conversationCursor == null) break;
         }
         if (stale) continue;
@@ -259,6 +295,7 @@ class MessageModel extends ChangeNotifier {
               messages[_key(row.key)] = row;
             }
             messageCursor = page.next;
+            if (i == 0) messageFirstNext = page.next;
             if (messageCursor == null) break;
           }
         }
@@ -270,6 +307,8 @@ class MessageModel extends ChangeNotifier {
         }
         _conversationNext = conversationCursor;
         _messageNext = messageCursor;
+        _conversationFirstNext = conversationFirstNext;
+        _messageFirstNext = messageFirstNext;
         if (selected != null) {
           currentConversation = conversations[_bytes(selected.id)] ?? selected;
         }

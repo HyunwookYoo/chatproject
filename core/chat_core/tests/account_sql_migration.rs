@@ -641,7 +641,16 @@ async fn canonical_and_symlink_aliases_share_writer_and_restart() {
     );
     f.handle.resume().await.unwrap();
     f.close().await;
-    fs::remove_dir(&alias).unwrap(); // Remove only the owned link, never recursively follow it.
+    let preserved = fs::read(root.join("db.sqlite3")).unwrap();
+    // Unlink only the exact owned alias, never recursively follow its target.
+    #[cfg(unix)]
+    fs::remove_file(&alias).unwrap();
+    #[cfg(windows)]
+    fs::remove_dir(&alias).unwrap();
+    assert!(fs::symlink_metadata(&alias).is_err());
+    assert!(target.is_dir());
+    assert!(root.is_dir());
+    assert_eq!(fs::read(root.join("db.sqlite3")).unwrap(), preserved);
 }
 
 #[tokio::test]

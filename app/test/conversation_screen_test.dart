@@ -141,6 +141,117 @@ void main() {
   );
 
   testWidgets(
+    'room controls reach oldest of 225 messages and return to latest after events',
+    (t) async {
+      await f.open();
+      f.client.rows = List.generate(
+        225,
+        (i) => row(i + 1, body: 'History ${i + 1}'),
+      );
+      await show(t);
+      final viewport = find.descendant(
+        of: find.byKey(const ValueKey('message-viewport')),
+        matching: find.byType(Scrollable),
+      );
+      final seen = <int>{};
+      for (var page = 0; page < 5; page++) {
+        expect(f.model.messages.length, lessThanOrEqualTo(150));
+        seen.addAll(f.model.messages.map((row) => row.key.id.first));
+        if (page == 3) {
+          final visible = find.textContaining('History ').hitTestable().first;
+          final before = t.getTopLeft(visible);
+          f.client.rows.add(row(226, body: 'History 226'));
+          f.client.changed(2);
+          f.client.changed(2);
+          await t.pumpAndSettle();
+          expect(f.model.messages.first.key.id.first, 175);
+          expect(t.getTopLeft(visible), before);
+        }
+        if (page < 4) {
+          expect(f.model.hasOlder, true);
+          await t.scrollUntilVisible(
+            find.text('이전 메시지 더 보기'),
+            1600,
+            scrollable: viewport,
+            maxScrolls: 100,
+          );
+          await t.tap(find.text('이전 메시지 더 보기'));
+          await t.pumpAndSettle();
+        }
+      }
+      expect(seen, containsAll(List.generate(225, (i) => i + 1)));
+      await t.scrollUntilVisible(
+        find.text('History 1'),
+        1600,
+        scrollable: viewport,
+        maxScrolls: 100,
+      );
+      expect(find.text('History 1').hitTestable(), findsOneWidget);
+      await t.tap(find.text('최신 메시지로 이동'));
+      await t.pumpAndSettle();
+      expect(f.model.messages.length, 50);
+      expect(find.text('History 226').hitTestable(), findsOneWidget);
+      expect(t.takeException(), isNull);
+    },
+  );
+
+  for (final covered in [false, true]) {
+    testWidgets(
+      'stale room read completion rearms reused state covered=$covered',
+      (t) async {
+        await f.open();
+        final held = Completer<void>();
+        f.client.readWait = held.future;
+        f.client.rows = [row(1, outgoing: false)];
+        final peer = ValueNotifier<List<int>>(bytes(2));
+        addTearDown(peer.dispose);
+        await pumpConversation(
+          t,
+          ValueListenableBuilder<List<int>>(
+            valueListenable: peer,
+            builder: (_, value, _) =>
+                ConversationScreen(model: f.model, peer: value),
+          ),
+        );
+        expect(f.client.reads.length, 1);
+        final roomState = t.state(find.byType(ConversationScreen));
+        f.client.rows = [message(2, conversation: 2, outgoing: false)];
+        peer.value = bytes(3);
+        await t.pumpAndSettle();
+        expect(
+          identical(roomState, t.state(find.byType(ConversationScreen))),
+          true,
+        );
+        expect(f.client.reads.length, 1);
+        final navigator = Navigator.of(
+          t.element(find.byType(ConversationScreen)),
+        );
+        if (covered) {
+          unawaited(
+            navigator.push(
+              MaterialPageRoute<void>(
+                builder: (_) => const Scaffold(body: Text('Public cover')),
+              ),
+            ),
+          );
+          await t.pumpAndSettle();
+        }
+        f.client.readWait = null;
+        held.complete();
+        await t.pumpAndSettle();
+        expect(f.client.reads.length, covered ? 1 : 2);
+        expect(find.text('읽음 반영 다시 시도'), findsNothing);
+        if (covered) {
+          navigator.pop();
+          await t.pumpAndSettle();
+          expect(f.client.reads.length, 2);
+        }
+        expect(f.client.reads.last.single.conversation, bytes(2));
+      },
+    );
+  }
+
+  testWidgets(
     'visibility is rechecked between read batches when a large viewport loses foreground',
     (t) async {
       await f.open();

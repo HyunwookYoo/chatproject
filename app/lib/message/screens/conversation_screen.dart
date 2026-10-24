@@ -164,7 +164,11 @@ class _ConversationScreenState extends State<ConversationScreen>
     _reading = true;
     final completed = await model.markVisibleRead(visible);
     _reading = false;
-    if (!mounted || generation != _generation) return;
+    if (!mounted) return;
+    if (generation != _generation) {
+      _scheduleRead();
+      return;
+    }
     if (!completed) setState(() => _readFailed = true);
     _scheduleRead();
   }
@@ -179,6 +183,14 @@ class _ConversationScreenState extends State<ConversationScreen>
       _read.clear();
       _readFailed = false;
     });
+    _scheduleRead();
+  }
+
+  Future<void> _latest() async {
+    final generation = _generation;
+    await model.loadLatest();
+    if (!mounted || generation != _generation) return;
+    if (_scroll.hasClients) _scroll.jumpTo(0);
     _scheduleRead();
   }
 
@@ -325,6 +337,11 @@ class _ConversationScreenState extends State<ConversationScreen>
                 ? const Text('계정을 열면 대화를 볼 수 있어요.')
                 : Column(
                     children: [
+                      if (model.hasLatest)
+                        TextButton(
+                          onPressed: model.busy ? null : _latest,
+                          child: const Text('최신 메시지로 이동'),
+                        ),
                       Expanded(
                         child: SizedBox(
                           key: _viewport,
