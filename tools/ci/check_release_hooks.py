@@ -5,7 +5,7 @@ import sys
 import zipfile
 
 MARKER = b"chat-test-hooks:v1"
-MARKERS = (MARKER, b"account_local_", b"Local record fixture unavailable")
+MARKERS = (MARKER, b"account_local_", b"message_local_", b"Local record fixture unavailable")
 MACHO = {bytes.fromhex(value) for value in (
     "feedface", "cefaedfe", "feedfacf", "cffaedfe", "cafebabe", "bebafeca", "cafebabf", "bfbafeca"
 )}

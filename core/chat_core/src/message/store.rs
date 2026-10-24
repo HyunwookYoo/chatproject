@@ -270,10 +270,9 @@ pub(crate) fn execute(
             let mut events = Vec::new();
             if after > before && let Some(conversation) = cid {
                 events.push(crate::CoreEvent::MessagesChanged { revision: after, conversation });
-                if let Some(key) = key && let Some(view) = find(c, key)? {
-                    if prior != Some((view.state, view.cancel_requested, view.block)) {
-                        events.push(crate::CoreEvent::MessageStateChanged { revision: after, key, state: view.state, cancel_requested: view.cancel_requested });
-                    }
+                if let Some(key) = key && let Some(view) = find(c, key)?
+                    && prior != Some((view.state, view.cancel_requested, view.block)) {
+                    events.push(crate::CoreEvent::MessageStateChanged { revision: after, key, state: view.state, cancel_requested: view.cancel_requested });
                 }
             }
             Ok(MessageDbReply::Observed(Box::new(reply), events))
@@ -1119,7 +1118,7 @@ fn target(c: &Connection, identity: Identity, key: MessageKey, receipt: bool) ->
     }
 }
 pub(crate) fn receivers(raw: &[u8]) -> R<Vec<InstallationId>> {
-    if raw.len() > 160 || raw.len() % 32 != 0 {
+    if raw.len() > 160 || !raw.len().is_multiple_of(32) {
         return Err(invalid());
     }
     let ids: Vec<_> = raw
@@ -1131,6 +1130,7 @@ pub(crate) fn receivers(raw: &[u8]) -> R<Vec<InstallationId>> {
     }
     Ok(ids)
 }
+#[cfg_attr(all(feature = "test-hooks", debug_assertions), expect(clippy::too_many_arguments, reason = "Test-only fault argument keeps production persistence signature unchanged"))]
 fn prepare(
     c: &mut Connection,
     identity: Identity,

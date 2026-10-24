@@ -173,8 +173,7 @@ mod tests {
             };
             assert_eq!(
                 chat_core::MessageCursor::try_from(cursor)
-                    .err()
-                    .expect("oversized cursor accepted")
+                    .expect_err("oversized cursor accepted")
                     .code,
                 ErrorCode::InvalidMessage
             );
@@ -184,8 +183,7 @@ mod tests {
             };
             assert_eq!(
                 chat_core::ConversationCursor::try_from(cursor)
-                    .err()
-                    .expect("oversized revision accepted")
+                    .expect_err("oversized revision accepted")
                     .code,
                 ErrorCode::InvalidMessage
             );

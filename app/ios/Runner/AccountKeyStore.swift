@@ -115,7 +115,11 @@ enum AccountStorage {
     let manager = FileManager.default
     guard let group = manager.containerURL(forSecurityApplicationGroupIdentifier: "group.dev.chatproject.chatapp")
       else { throw NSError(domain: "AccountStorage", code: 4) }
-    let artifacts = ["store.id", "key.wrap", "account.bin", ".store.id.tmp", ".key.wrap.tmp", ".account.bin.tmp"]
+    // Preserve the path; Rust alone validates incomplete SQL material.
+    let artifacts = ["store.id", "key.wrap", "account.bin", ".store.id.tmp", ".key.wrap.tmp", ".account.bin.tmp",
+      "db.sqlite3", "db.sqlite3-wal", "db.sqlite3-shm", "db.keys", "db.keys.pending",
+      ".db.keys.tmp", ".db.keys.pending.tmp", "storage.mode", ".storage.mode.tmp",
+      "migration.prep", ".migration.prep.tmp", "migration.checkpoint", ".migration.checkpoint.tmp"]
     var root = group.appendingPathComponent("account", isDirectory: true)
     if let existing {
       let old = URL(fileURLWithPath: existing, isDirectory: true)

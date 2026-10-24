@@ -381,20 +381,20 @@ impl Manager {
         let (release, tx) = oneshot::channel();
         let (queued, queued_rx) = oneshot::channel();
         let (connection, connection_rx) = oneshot::channel();
-        let pause = Some(TestPause {
+        let pause = TestPause {
             key: None,
             entered,
             release: tx,
-        });
+        };
         match response {
-            MessagePoint::Response => self.messages.reply_pause = pause,
-            MessagePoint::FirstByte => self.messages.write_pause = pause,
-            MessagePoint::Prelaunch => self.messages.prelaunch_pause = pause,
-            MessagePoint::Proof => self.messages.proof_pause = pause,
-            MessagePoint::Signature => self.messages.signature_pause = pause,
+            MessagePoint::Response => self.messages.reply_pause = Some(pause),
+            MessagePoint::FirstByte => self.messages.write_pause = Some(pause),
+            MessagePoint::Prelaunch => self.messages.prelaunch_pause = Some(pause),
+            MessagePoint::Proof => self.messages.proof_pause = Some(pause),
+            MessagePoint::Signature => self.messages.signature_pause = Some(pause),
             MessagePoint::ProofResult => {
                 self.messages.proof_result_pause = Some(ProofPause {
-                    pause: pause.unwrap(),
+                    pause,
                     queued,
                     connection,
                 })

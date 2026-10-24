@@ -152,13 +152,12 @@ impl Worker {
             _ => None,
         };
         let result = self.operation(|conn| {
-            if let Some(stored) = load(conn, &id)? {
-                if matches!(AccountState::decode(&stored)?, AccountState::Active(_)) {
-                    return Err(CoreError::new(
-                        ErrorCode::AccountExists,
-                        "active_binding_immutable",
-                    ));
-                }
+            if let Some(stored) = load(conn, &id)?
+                && matches!(AccountState::decode(&stored)?, AccountState::Active(_)) {
+                return Err(CoreError::new(
+                    ErrorCode::AccountExists,
+                    "active_binding_immutable",
+                ));
             }
             #[cfg(all(feature = "test-hooks", debug_assertions))]
             if fault == Some(CommitFault::WriteDenied) {
@@ -334,6 +333,7 @@ struct Pending<T> {
     ticket: u64,
     cancellation: CancellationToken,
 }
+#[cfg_attr(not(all(feature = "test-hooks", debug_assertions)), expect(clippy::large_enum_variant, reason = "Bounded 32-slot worker queue keeps message operations inline without per-request allocation"))]
 enum DbOp {
     DueHint(u64, oneshot::Sender<R<bool>>),
     Message(Identity, MessageDbOp, oneshot::Sender<R<MessageDbReply>>),

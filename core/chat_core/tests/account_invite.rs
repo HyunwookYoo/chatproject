@@ -446,5 +446,6 @@ mod actor {
     }
 }
 
+#[cfg(all(feature = "test-hooks", debug_assertions))]
 #[path = "support/sql_account_store.rs"]
 mod sql_store;

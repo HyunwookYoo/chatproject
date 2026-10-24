@@ -862,7 +862,7 @@ async fn revoke_is_durable_before_notification_and_failed_notification_blocks_pu
             };
             let start = records.position();
             records.skip().unwrap();
-            let empty_recipients = &records.input()[start..records.position()] == [0x80];
+            let empty_recipients = records.input()[start..records.position()] == [0x80];
             notification |= operation == 3
                 && status == 1
                 && nonce == Some(intent.nonce.as_slice())

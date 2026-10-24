@@ -5,6 +5,7 @@ import tempfile
 import unittest
 
 from check_workflows import check, main
+import check_workflows
 
 PINNED = "apple-actions/upload-testflight-build@14df18fee5a4ff3b76971dd382f033494a0194e9"
 
@@ -32,7 +33,8 @@ def ci(**overrides):
     doc = {
         "on": {"push": {"branches": ["main"]}, "pull_request": None},
         "permissions": {"contents": "read"},
-        "jobs": {"ios-release": {"steps": [
+        "env": {"RUST_TOOLCHAIN": "1.92.0", "FLUTTER_VERSION": "3.44.6"},
+        "jobs": {"windows": {"steps": [{"run": "cargo test --locked -p chat_core"}]}, "ios-release": {"steps": [
             {"name": "Build the app for a device, unsigned", "run": "flutter pub get\nflutter build ios --release --no-codesign"},
             {"name": "Check the app and its extension", "run": "bash tools/ci/check_ios_app.sh app/build/ios/iphoneos/Runner.app"},
         ]}},
@@ -43,6 +45,33 @@ def ci(**overrides):
 
 class CheckTest(unittest.TestCase):
     path = pathlib.Path("testflight.yml")
+
+    def test_android_cannot_omit_native_worker_and_restart_processes(self):
+        doc = ci()
+        doc['jobs']['android'] = {'steps': [{'run': 'perl -v\nmake --version\ncc --version'}]}
+        self.assertTrue(any('native worker' in p for p in check(pathlib.Path('ci.yml'), doc)))
+
+    def test_instrumentation_rejects_exit_zero_without_selected_success(self):
+        for output in ('', 'OK (1 test)\n', 'INSTRUMENTATION_FAILED: crashed\nOK (1 test)',
+                       'INSTRUMENTATION_STATUS: test=restartPersistence\nINSTRUMENTATION_STATUS_CODE: -4\nOK (1 test)\nINSTRUMENTATION_CODE: -1\n'):
+            with self.subTest(output=output):
+                self.assertTrue(check_workflows.check_android_instrumentation(output, 'read'))
+
+    def test_instrumentation_requires_started_and_completed_expected_method(self):
+        output = ''.join(f'INSTRUMENTATION_STATUS: class=dev.chatproject.chat_app.AccountKeyStoreTest\nINSTRUMENTATION_STATUS: test=restartPersistence\nINSTRUMENTATION_STATUS_CODE: {code}\n' for code in (1, 0)) + 'OK (1 test)\nINSTRUMENTATION_CODE: -1\n'
+        self.assertEqual(check_workflows.check_android_instrumentation(output, 'read'), [])
+        for bad in (output.replace('restartPersistence', 'otherMethod'), output.replace('CODE: 0', 'CODE: -2'), output.replace('CODE: 1', 'CODE: 0'), output.replace('OK (1 test)', 'OK (0 tests)'), output.replace('INSTRUMENTATION_CODE: -1', 'INSTRUMENTATION_CODE: 0')):
+            self.assertTrue(check_workflows.check_android_instrumentation(bad, 'read'))
+
+    def test_full_instrumentation_requires_worker_and_only_expected_assumption(self):
+        methods = ('ownedTestPathAcceptsOnlyAbsoluteChildren', 'ownedTestPathRejectsChildSymlinkEscape',
+                   'ownedTestPathRejectsRootSymlinkEscape', 'nativeWorkerUsesCachedHelperAndThreadLocalEnvironment',
+                   'roundTripScopeTamperAndDelete', 'noBackupRootPreservesLegacyIncompleteState',
+                   'invalidInputsAndCapacityDoNotCreateKeys', 'restartPersistence')
+        output = ''.join(f'INSTRUMENTATION_STATUS: class=dev.chatproject.chat_app.AccountKeyStoreTest\nINSTRUMENTATION_STATUS: test={method}\nINSTRUMENTATION_STATUS_CODE: {code}\n' for method in methods for code in (1, -4 if method == 'restartPersistence' else 0)) + 'OK (8 tests)\nINSTRUMENTATION_CODE: -1\n'
+        self.assertEqual(check_workflows.check_android_instrumentation(output, 'full'), [])
+        self.assertTrue(check_workflows.check_android_instrumentation(output.replace('nativeWorkerUsesCachedHelperAndThreadLocalEnvironment', 'notWorker'), 'full'))
+        self.assertTrue(check_workflows.check_android_instrumentation(output.replace('CODE: 0', 'CODE: -4'), 'full'))
 
     def test_a_good_testflight_workflow_passes(self):
         self.assertEqual(check(self.path, testflight()), [])
@@ -151,6 +180,36 @@ class CiTest(unittest.TestCase):
     def test_a_good_ci_workflow_passes(self):
         self.assertEqual(check(self.path, ci()), [])
 
+    def test_windows_requires_explicit_core_tests(self):
+        doc = ci()
+        doc['jobs']['windows'] = {'runs-on': 'windows-latest', 'steps': []}
+        self.assertTrue(any('Windows cargo test -p chat_core' in p for p in check(self.path, doc)))
+        doc['jobs']['windows']['steps'].append({'run': 'cargo test --locked -p chat_core'})
+        self.assertFalse(any('Windows cargo test -p chat_core' in p for p in check(self.path, doc)))
+
+    def test_ci_pins_rust_and_flutter_versions(self):
+        for key, value in (('RUST_TOOLCHAIN', 'stable'), ('FLUTTER_VERSION', 'stable')):
+            doc = ci()
+            doc['env'] = {'RUST_TOOLCHAIN': '1.92.0', 'FLUTTER_VERSION': '3.44.6'}
+            doc['env'][key] = value
+            self.assertTrue(any(key in p for p in check(self.path, doc)))
+
+    def test_native_sql_prerequisites_are_job_scoped(self):
+        doc = ci()
+        doc['jobs']['rust'] = {'runs-on': 'ubuntu-latest', 'steps': [{'run': 'cargo test --workspace'}]}
+        self.assertTrue(any('SQL build prerequisites' in p for p in check(self.path, doc)))
+        doc['jobs']['rust']['steps'].insert(0, {'run': 'perl -v\nmake --version\ncc --version'})
+        self.assertFalse(any('SQL build prerequisites' in p for p in check(self.path, doc)))
+        doc['jobs']['workflows'] = {'runs-on': 'ubuntu-latest', 'steps': []}
+        self.assertFalse(any('SQL build prerequisites' in p for p in check(self.path, doc)))
+
+    def test_bindings_job_cannot_accept_generated_drift(self):
+        doc = ci()
+        doc['jobs']['bindings'] = {'steps': [{'run': 'perl -v\nmake --version\ncc --version\nbash tools/gen_bindings.sh\nbash tools/gen_bindings.sh'}]}
+        self.assertTrue(any('generated drift' in p for p in check(self.path, doc)))
+        doc['jobs']['bindings']['steps'].append({'run': 'git status --porcelain\nexit 1'})
+        self.assertFalse(any('generated drift' in p for p in check(self.path, doc)))
+
     def test_missing_ios_release_job_is_rejected(self):
         doc = ci()
         del doc["jobs"]["ios-release"]
@@ -181,7 +240,7 @@ class CiTest(unittest.TestCase):
 
 class PolicyTest(unittest.TestCase):
     def workflow(self, **overrides):
-        doc = {"on": "push", "permissions": {"contents": "read"}, "jobs": {"test": {"steps": []}}}
+        doc = {"on": "push", "permissions": {"contents": "read"}, "env": {"RUST_TOOLCHAIN": "1.92.0", "FLUTTER_VERSION": "3.44.6"}, "jobs": {"test": {"steps": []}}}
         doc.update(overrides)
         return doc
 

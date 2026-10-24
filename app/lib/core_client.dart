@@ -27,6 +27,20 @@ Future<String> accountStorageRoot(String existing) async {
       '.store.id.tmp',
       '.key.wrap.tmp',
       '.account.bin.tmp',
+      // Preserve the path; Rust alone validates incomplete SQL material.
+      'db.sqlite3',
+      'db.sqlite3-wal',
+      'db.sqlite3-shm',
+      'db.keys',
+      'db.keys.pending',
+      '.db.keys.tmp',
+      '.db.keys.pending.tmp',
+      'storage.mode',
+      '.storage.mode.tmp',
+      'migration.prep',
+      '.migration.prep.tmp',
+      'migration.checkpoint',
+      '.migration.checkpoint.tmp',
     ]) {
       if (await FileSystemEntity.type(
             '$existing${Platform.pathSeparator}$name',

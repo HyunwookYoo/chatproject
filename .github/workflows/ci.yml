@@ -43,6 +43,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
+      - name: SQL build prerequisites
+        if: runner.os == 'Linux'
+        run: |
+          perl -v
+          make --version
+          cc --version
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -51,7 +57,7 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - run: cargo test --workspace
+      - run: cargo test --workspace --locked
       - name: Verify pinned SQLCipher native source
         run: |
           sqlcipher_source=( "${CARGO_HOME:-$HOME/.cargo}"/registry/src/*/libsqlite3-sys-0.38.2/sqlcipher/sqlite3.c )
@@ -64,6 +70,8 @@ jobs:
       - run: cargo test --locked -p chat_ffi --features test-hooks
       - run: cargo test --locked -p chat_node --features harness
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy -p chat_core --features test-hooks --all-targets -- -D warnings
+      - run: cargo clippy -p chat_ffi --features test-hooks --all-targets -- -D warnings
 
   bindings:
     strategy:
@@ -72,6 +80,12 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
+      - name: SQL build prerequisites
+        if: runner.os == 'Linux'
+        run: |
+          perl -v
+          make --version
+          cc --version
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -90,6 +104,7 @@ jobs:
       - name: Regenerate
         run: |
           (cd app && flutter pub get)
+          bash tools/gen_bindings.sh
           bash tools/gen_bindings.sh
       - name: Generated files match the commit
         run: |
@@ -116,13 +131,13 @@ jobs:
         working-directory: app
         run: |
           flutter pub get
-          flutter analyze
+          flutter analyze --fatal-infos
           flutter test
       - name: Device tool tests
         working-directory: tools/e2e
         run: |
           dart pub get
-          dart analyze
+          dart analyze --fatal-infos
           dart test
       - name: Python runtime fixtures with Dart present
         run: |
@@ -148,13 +163,16 @@ jobs:
           flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: stable
       - run: flutter pub get
+      - name: Windows core storage regressions
+        working-directory: .
+        run: cargo test --locked -p chat_core
       - name: Host node for desktop integration
         working-directory: .
         run: cargo build --locked -p chat_node --features harness
       - name: Every Windows integration file in a fresh Flutter process
         run: |
           # Flutter 3.44.6 closes DesktopDevice's log reader after the first file.
-          foreach ($test in Get-ChildItem integration_test -Filter '*_test.dart' | Where-Object Name -ne 'account_storage_test.dart' | Sort-Object Name) {
+          foreach ($test in Get-ChildItem integration_test -Filter '*_test.dart' | Where-Object { $_.Name -notin @('account_storage_test.dart', 'message_test.dart') } | Sort-Object Name) {
             flutter test $test.FullName -d windows
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
@@ -163,6 +181,13 @@ jobs:
           $root = Join-Path $env:RUNNER_TEMP ('account-' + [Guid]::NewGuid().ToString('N'))
           foreach ($phase in @('write', 'read', 'locked', 'missing', 'read')) {
             flutter test integration_test/account_storage_test.dart -d windows "--dart-define=ACCOUNT_STORAGE_PHASE=$phase" "--dart-define=ACCOUNT_STORAGE_ROOT=$root"
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+      - name: Native message storage across Windows processes
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP ('message-' + [Guid]::NewGuid().ToString('N'))
+          foreach ($phase in @('write', 'read')) {
+            flutter test integration_test/message_test.dart -d windows "--dart-define=MESSAGE_TEST_PHASE=$phase" "--dart-define=MESSAGE_TEST_ROOT=$root"
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
       - name: Ordinary Release build and pinned native toolchain
@@ -200,6 +225,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
+      - name: SQL build prerequisites
+        if: runner.os == 'Linux'
+        run: |
+          perl -v
+          make --version
+          cc --version
       - name: Set job-owned Gradle home
         run: echo "GRADLE_USER_HOME=$RUNNER_TEMP/chatproject-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$GITHUB_JOB" >> "$GITHUB_ENV"
       - name: Free disk space
@@ -303,13 +334,27 @@ jobs:
           emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           disable-animations: true
           script: |
-            set -e
+            set -eo pipefail
+            (cd app && flutter build apk --debug --target-platform android-x64 --target lib/main.dart && ./android/gradlew -p android :app:assembleDebugAndroidTest -Ptarget-platform=android-x64 -Ptarget="$PWD/lib/main.dart")
+            sha256sum app/build/app/outputs/flutter-apk/app-debug.apk app/build/app/outputs/apk/androidTest/debug/app-debug-androidTest.apk
+            unzip -p app/build/app/outputs/flutter-apk/app-debug.apk lib/x86_64/libchat_ffi.so | sha256sum
+            adb -s emulator-5554 install -r app/build/app/outputs/flutter-apk/app-debug.apk
+            adb -s emulator-5554 install -r app/build/app/outputs/apk/androidTest/debug/app-debug-androidTest.apk
+            adb -s emulator-5554 shell am instrument -w -r -e class dev.chatproject.chat_app.AccountKeyStoreTest dev.chatproject.chat_app.test/androidx.test.runner.AndroidJUnitRunner | tee "$RUNNER_TEMP/native-worker.log"
+            python3 tools/ci/check_workflows.py --android-instrumentation "$RUNNER_TEMP/native-worker.log" full
+            for phase in write read; do
+              adb -s emulator-5554 shell am instrument -w -r -e class dev.chatproject.chat_app.AccountKeyStoreTest#restartPersistence -e accountPhase "$phase" dev.chatproject.chat_app.test/androidx.test.runner.AndroidJUnitRunner | tee "$RUNNER_TEMP/native-restart-$phase.log"
+              python3 tools/ci/check_workflows.py --android-instrumentation "$RUNNER_TEMP/native-restart-$phase.log" "$phase"
+            done
             for test in app/integration_test/*_test.dart; do
-              case "$test" in *account_storage_test.dart) continue ;; esac
+              case "$test" in *account_storage_test.dart|*message_test.dart) continue ;; esac
               (cd app && flutter test "${test#app/}" -d emulator-5554)
             done
             for phase in write read locked missing read; do
               (cd app && flutter test integration_test/account_storage_test.dart -d emulator-5554 --no-uninstall --dart-define=ACCOUNT_STORAGE_PHASE="$phase" --dart-define=ACCOUNT_STORAGE_ROOT=/data/user/0/dev.chatproject.chat_app/files/ci-account-storage)
+            done
+            for phase in write read; do
+              (cd app && flutter test integration_test/message_test.dart -d emulator-5554 --no-uninstall --dart-define=MESSAGE_TEST_PHASE="$phase" --dart-define=MESSAGE_TEST_ROOT=/data/user/0/dev.chatproject.chat_app/no_backup/ci-message-storage)
             done
             dart --packages=tools/e2e/.dart_tool/package_config.json tools/ci/release_smoke.dart --platform android --artifact "$RUNNER_TEMP/ordinary-release.apk" --serial emulator-5554
             dart --packages=tools/e2e/.dart_tool/package_config.json tools/ci/release_smoke.dart --platform android --artifact "$RUNNER_TEMP/contract-release.apk" --serial emulator-5554 --contract-nonce "$RELEASE_CONTRACT_NONCE"
@@ -415,8 +460,15 @@ jobs:
           flutter test integration_test/account_test.dart -d "${{ steps.sim.outputs.udid }}" --no-uninstall
           flutter test integration_test/account_privacy_test.dart -d "${{ steps.sim.outputs.udid }}" --no-uninstall
           container="$(xcrun simctl get_app_container '${{ steps.sim.outputs.udid }}' dev.chatproject.chatapp data)"
-          for phase in write read locked missing read; do
+          for phase in write read locked missing read lifecycle; do
             flutter test integration_test/account_storage_test.dart -d "${{ steps.sim.outputs.udid }}" --no-uninstall --dart-define=ACCOUNT_STORAGE_PHASE="$phase" --dart-define=ACCOUNT_STORAGE_ROOT="$container/Library/Application Support/ci-account-storage"
+          done
+      - name: Native message storage across simulator processes
+        working-directory: app
+        run: |
+          container="$(xcrun simctl get_app_container '${{ steps.sim.outputs.udid }}' dev.chatproject.chatapp data)"
+          for phase in write read; do
+            flutter test integration_test/message_test.dart -d "${{ steps.sim.outputs.udid }}" --no-uninstall --dart-define=MESSAGE_TEST_PHASE="$phase" --dart-define=MESSAGE_TEST_ROOT="$container/Library/Application Support/ci-message-storage"
           done
       - name: Check the app and its extension (test build)
         run: bash tools/ci/check_ios_app.sh app/build/ios/iphonesimulator/Runner.app

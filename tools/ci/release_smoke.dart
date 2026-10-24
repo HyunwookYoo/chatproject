@@ -84,6 +84,87 @@ Future<void> runSmoke({
   Duration settleTime = const Duration(seconds: 3),
   Duration pollInterval = const Duration(milliseconds: 300),
 }) async {
+  if (contractNonce == null) {
+    await _runSmokeOnce(
+      platform: platform,
+      artifact: artifact,
+      logs: logs,
+      serial: serial,
+      runner: runner,
+      cancellation: cancellation,
+      readyTimeout: readyTimeout,
+      settleTime: settleTime,
+      pollInterval: pollInterval,
+    );
+    return;
+  }
+  if (!RegExp(r'^[a-zA-Z0-9_-]+$').hasMatch(contractNonce)) {
+    throw const FormatException('Invalid contract nonce');
+  }
+  final dataDir = p.absolute(p.join(logs.path, 'core'));
+  Map<String, dynamic>? created;
+  for (final phase in [
+    'created',
+    'reopened',
+    if (platform == 'android') 'cleaned',
+  ]) {
+    final proof = await _runSmokeOnce(
+      platform: platform,
+      artifact: artifact,
+      logs: Directory(p.join(logs.path, phase)),
+      serial: serial,
+      contractNonce: contractNonce,
+      contractPhase: phase,
+      dataDir: dataDir,
+      runner: runner,
+      cancellation: cancellation,
+      readyTimeout: readyTimeout,
+      settleTime: settleTime,
+      pollInterval: pollInterval,
+    );
+    if (phase == 'created') {
+      created = proof;
+    } else if (proof!['binding'] != created!['binding'] ||
+        proof['instance'] == created['instance']) {
+      throw StateError('Release SQL reopen identity mismatch');
+    }
+  }
+  // Each acquisition has finished its owned-process cleanup before we get here.
+  // This is process-close evidence, not a graceful suspend Completed claim.
+  if (platform == 'windows') {
+    final root = Directory(p.join(dataDir, 'release-contract-$contractNonce'));
+    await _cleanContractRoot(
+      root,
+      contractNonce,
+      created!['binding'] as String,
+    );
+  }
+  await File(p.join(logs.path, 'contract-success.json')).writeAsString(
+    jsonEncode({
+      'nonce': contractNonce,
+      'sql': 'binding-reopened',
+      'cleanup': 'owned-files-removed',
+      'closure': 'process-exit',
+    }),
+    flush: true,
+  );
+}
+
+Future<Map<String, dynamic>?> _runSmokeOnce({
+  required String platform,
+  required String artifact,
+  required Directory logs,
+  String? serial,
+  String? contractNonce,
+  String? contractPhase,
+  String? dataDir,
+  required ProcessRunner runner,
+  RunCancellation? cancellation,
+  required Duration readyTimeout,
+  required Duration settleTime,
+  required Duration pollInterval,
+}) async {
+  Map<String, dynamic>? proof;
   final run = _Smoke(runner, logs, cancellation ?? RunCancellation());
   await logs.create(recursive: true);
   Object? primary;
@@ -101,7 +182,7 @@ Future<void> runSmoke({
         throw StateError('Missing full Windows Release artifact');
       final child = await run.start(executable, [
         '--data-dir',
-        p.absolute(p.join(logs.path, 'core')),
+        dataDir ?? p.absolute(p.join(logs.path, 'core')),
       ], cwd: artifact);
       unawaited(
         child.exitCode.then<void>(
@@ -158,6 +239,7 @@ Future<void> runSmoke({
           (await command(['shell', 'dumpsys', 'package', _package])).stdout
               as String;
       if (packageInfo.contains('DEBUGGABLE') ||
+          packageInfo.contains('ALLOW_BACKUP') ||
           !packageInfo.contains('android.permission.INTERNET') ||
           !packageInfo.contains('android.permission.ACCESS_NETWORK_STATE')) {
         throw StateError(
@@ -188,7 +270,14 @@ Future<void> runSmoke({
       // Launch and PID registration are one admitted acquisition. Reuse the
       // bounded, self-reclaiming cleanup commands to drain it despite Ctrl+C;
       // checking cancellation in between would strand the launched app.
-      await command(['shell', 'am', 'start', '-W', '-n', _activity], cleanup: true);
+      await command([
+        'shell',
+        'am',
+        'start',
+        '-W',
+        '-n',
+        _activity,
+      ], cleanup: true);
       ownedPid = await appPid(cleanup: true);
       if (!RegExp(r'^\d+$').hasMatch(ownedPid))
         throw StateError('Owned Android app failed to start');
@@ -261,7 +350,12 @@ Future<void> runSmoke({
                     state.text.contains('새 계정 만들기') &&
                     state.text.contains('복구 문구로 복구') &&
                     state.text.contains('다른 기기로 연결')
-              : _contractProof(state.output, contractNonce));
+              : (proof = _contractProof(
+                      state.output,
+                      contractNonce,
+                      contractPhase!,
+                    )) !=
+                    null);
       if (ready) {
         readyAt ??= timer.elapsed;
         if (timer.elapsed - readyAt >= settleTime) break;
@@ -291,9 +385,14 @@ Future<void> runSmoke({
         throw StateError('Release cleanup failed; see ownership record');
     }
   }
+  return proof;
 }
 
-bool _contractProof(String output, String nonce) {
+Map<String, dynamic>? _contractProof(
+  String output,
+  String nonce,
+  String phase,
+) {
   final records = <Map<String, dynamic>>[];
   for (final line in const LineSplitter().convert(output)) {
     final start = line.indexOf('{"type":"release_contract"');
@@ -304,20 +403,91 @@ bool _contractProof(String output, String nonce) {
       throw StateError('Malformed Release contract proof');
     }
   }
-  if (records.isEmpty) return false;
+  if (records.isEmpty) return null;
   if (records.length != 1) throw StateError('Duplicate Release contract proof');
   final record = records.single;
-  if (record.length != 7 ||
-      record['version'] != 1 ||
+  if (record.length != 10 ||
+      record['version'] != 2 ||
+      record['phase'] != phase ||
+      record['binding'] is! String ||
+      !RegExp(
+        r'^[A-Za-z0-9+/]{24,172}={0,2}$',
+      ).hasMatch(record['binding'] as String) ||
+      record['instance'] is! String ||
+      (record['instance'] as String).isEmpty ||
       record['mode'] != 'release' ||
       record['nonce'] != nonce ||
-      record['hooks'] != 'notAvailable' ||
+      record['hooks'] != (phase == 'cleaned' ? 'notRun' : 'notAvailable') ||
       record['network'] != 'stopped' ||
       !record.containsKey('endpoint') ||
       record['endpoint'] != null) {
     throw StateError('Invalid Release contract proof');
   }
-  return true;
+  return record;
+}
+
+Future<void> _cleanContractRoot(
+  Directory root,
+  String nonce,
+  String binding,
+) async {
+  if (await FileSystemEntity.type(root.path, followLinks: false) !=
+          FileSystemEntityType.directory ||
+      p.normalize(await root.resolveSymbolicLinks()) !=
+          p.normalize(root.absolute.path)) {
+    throw StateError('Unsafe Release fixture root');
+  }
+  const names = {
+    'owner.json',
+    '.account.lock',
+    'db.keys',
+    'db.sqlite3',
+    'db.sqlite3-wal',
+    'db.sqlite3-shm',
+    'migration.prep',
+    'storage.mode',
+    'store.id',
+  };
+  final files = await root.list(followLinks: false).toList();
+  for (final file in files) {
+    if (!names.contains(p.basename(file.path)) ||
+        await FileSystemEntity.type(file.path, followLinks: false) !=
+            FileSystemEntityType.file) {
+      throw StateError('Unexpected Release fixture entry; preserved');
+    }
+  }
+  for (final name in [
+    'owner.json',
+    'db.keys',
+    'db.sqlite3',
+    'storage.mode',
+    'store.id',
+  ]) {
+    if (!files.any((file) => p.basename(file.path) == name)) {
+      throw StateError('Release SQL reopen material missing; preserved');
+    }
+  }
+  final Object? owner;
+  try {
+    owner = jsonDecode(await File(p.join(root.path, 'owner.json')).readAsString());
+  } on FormatException {
+    throw StateError('Malformed Release fixture ownership; preserved');
+  }
+  if (owner is! Map ||
+      owner['nonce'] != nonce ||
+      owner['phase'] != 'reopened' ||
+      owner['binding'] != binding ||
+      base64Encode(
+            await File(p.join(root.path, 'storage.mode')).readAsBytes(),
+          ) !=
+          binding) {
+    throw StateError('Release fixture ownership mismatch; preserved');
+  }
+  for (final file in files.where((f) => p.basename(f.path) != 'owner.json')) {
+    await file.delete();
+  }
+  await File(p.join(root.path, 'owner.json')).delete();
+  await root.delete();
 }
 
 class _Smoke {

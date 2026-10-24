@@ -80,6 +80,22 @@ final class AccountKeyStoreTests: XCTestCase {
     XCTAssertEqual(cpKeyDelete(nil), 3)
   }
 
+  func testRootPreservesIncompleteLegacyOrSqlState() throws {
+    let manager = FileManager.default
+    let owned = manager.temporaryDirectory.appendingPathComponent("account-path-\(UUID().uuidString)", isDirectory: true)
+    try manager.createDirectory(at: owned, withIntermediateDirectories: false)
+    defer { try? manager.removeItem(at: owned) }
+    for name in ["store.id", "key.wrap", "account.bin", ".store.id.tmp", ".key.wrap.tmp", ".account.bin.tmp",
+      "db.sqlite3", "db.sqlite3-wal", "db.sqlite3-shm", "db.keys", "db.keys.pending",
+      ".db.keys.tmp", ".db.keys.pending.tmp", "storage.mode", ".storage.mode.tmp",
+      "migration.prep", ".migration.prep.tmp", "migration.checkpoint", ".migration.checkpoint.tmp"] {
+      let artifact = owned.appendingPathComponent(name)
+      try Data([1]).write(to: artifact)
+      defer { try? manager.removeItem(at: artifact) }
+      XCTAssertEqual(try AccountStorage.root(existing: owned.path), owned.path, "Preserve existing path for \(name)")
+    }
+  }
+
   func testOwnedKeyBufferErasesRetainedAliasOnSuccessAndFailure() throws {
     for status in [Int32(0), 1, 2, 3, 4] {
       var retainedQuery: [String: Any] = [:]

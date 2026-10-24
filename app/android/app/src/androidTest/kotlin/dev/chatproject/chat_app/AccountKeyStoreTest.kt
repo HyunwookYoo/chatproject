@@ -102,11 +102,15 @@ class AccountKeyStoreTest {
         assertTrue(legacy.mkdir())
         try {
             assertEquals(java.io.File(context.noBackupFilesDir, "account").canonicalPath, store.storageRoot(legacy.path))
-            for (name in listOf("store.id", "key.wrap", "account.bin", ".store.id.tmp", ".key.wrap.tmp", ".account.bin.tmp")) {
+            for (name in listOf("store.id", "key.wrap", "account.bin", ".store.id.tmp", ".key.wrap.tmp", ".account.bin.tmp",
+                "db.sqlite3", "db.sqlite3-wal", "db.sqlite3-shm", "db.keys", "db.keys.pending",
+                ".db.keys.tmp", ".db.keys.pending.tmp", "storage.mode", ".storage.mode.tmp",
+                "migration.prep", ".migration.prep.tmp", "migration.checkpoint", ".migration.checkpoint.tmp")) {
                 val artifact = java.io.File(legacy, name)
                 artifact.writeBytes(byteArrayOf(1))
-                assertEquals(legacy.canonicalPath, store.storageRoot(legacy.path))
-                assertTrue(artifact.delete())
+                try {
+                    assertEquals("Preserve existing path for $name", legacy.canonicalPath, store.storageRoot(legacy.path))
+                } finally { assertTrue(artifact.delete()) }
             }
         } finally { assertTrue(legacy.delete()) }
     }

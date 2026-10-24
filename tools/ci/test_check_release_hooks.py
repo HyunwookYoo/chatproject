@@ -37,6 +37,17 @@ class ReleaseHooksTests(unittest.TestCase):
     def test_release_rejects_account_test_commands(self):
         self.check(self.apk({"lib/x86_64/libchat_ffi.so": b"account_local_pair_approve"}), False)
 
+    def test_release_rejects_message_test_commands_in_each_native_container(self):
+        marker = b"message_local_send_text"
+        self.check(self.apk({"lib/x86_64/libchat_ffi.so": marker}), False)
+        (self.root / "chat_app.exe").write_bytes(b"MZ clean")
+        (self.root / "chat_ffi.dll").write_bytes(marker)
+        self.check(self.root, False)
+        app = self.root / "Runner.app"
+        app.mkdir()
+        (app / "chat_ffi").write_bytes(MACHO + marker)
+        self.check(app, False)
+
     def test_no_native_apk_fails(self):
         self.check(self.apk({"assets/readme": b"clean"}), False)
 

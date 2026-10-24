@@ -23,6 +23,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
+      - name: SQL build prerequisites
+        if: runner.os == 'Linux'
+        run: |
+          perl -v
+          make --version
+          cc --version
       - name: Set job-owned Gradle home
         # The runner validates this exact namespace before building. Its --stop
         # can only see this job's daemon registry, never a user's shared Gradle home.
@@ -141,7 +147,7 @@ jobs:
           path: ${{ runner.temp }}/e2e-summary.json
           if-no-files-found: error
           retention-days: 14
-      - name: M3 local account lifecycle
+      - name: M3 account/auth and M4 message regressions
         id: account_scenario
         if: steps.scenario.outcome == 'success'
         working-directory: tools/e2e
@@ -149,8 +155,12 @@ jobs:
           E2E_DIAGNOSTIC_FILE: ${{ runner.temp }}/m3-diagnostic.json
         run: |
           set +e
-          dart run bin/run.dart --profile android --scenario m3 --repo-root "$GITHUB_WORKSPACE" > "$RUNNER_TEMP/m3-private.log" 2>&1
-          code=$?
+          code=0
+          for scenario in m3 m3-auth m4; do
+            dart run bin/run.dart --profile android --scenario "$scenario" --repo-root "$GITHUB_WORKSPACE" > "$RUNNER_TEMP/$scenario-private.log" 2>&1
+            code=$?
+            if [ "$code" -ne 0 ]; then break; fi
+          done
           echo "exit_code=$code" >> "$GITHUB_OUTPUT"
           exit "$code"
       - name: M3 sanitized account summary
@@ -228,15 +238,19 @@ jobs:
           path: ${{ runner.temp }}/e2e-summary.json
           if-no-files-found: error
           retention-days: 14
-      - name: M3 local account lifecycle
+      - name: M3 account/auth and M4 message regressions
         id: account_scenario
         if: steps.scenario.outcome == 'success'
         working-directory: tools/e2e
         env:
           E2E_DIAGNOSTIC_FILE: ${{ runner.temp }}/m3-diagnostic.json
         run: |
-          dart run bin/run.dart --profile windows --scenario m3 --repo-root "$env:GITHUB_WORKSPACE" *> "$env:RUNNER_TEMP/m3-private.log"
-          $code = $LASTEXITCODE
+          $code = 0
+          foreach ($scenario in @('m3', 'm3-auth', 'm4')) {
+            dart run bin/run.dart --profile windows --scenario $scenario --repo-root "$env:GITHUB_WORKSPACE" *> "$env:RUNNER_TEMP/$scenario-private.log"
+            $code = $LASTEXITCODE
+            if ($code -ne 0) { break }
+          }
           "exit_code=$code" >> $env:GITHUB_OUTPUT
           exit $code
       - name: M3 sanitized account summary

@@ -117,7 +117,11 @@ class AccountKeyStore(private val context: Context) {
     }
 
     fun storageRoot(existing: String?): String {
-        val artifacts = listOf("store.id", "key.wrap", "account.bin", ".store.id.tmp", ".key.wrap.tmp", ".account.bin.tmp")
+        // Preserve the path; Rust alone validates incomplete SQL material.
+        val artifacts = listOf("store.id", "key.wrap", "account.bin", ".store.id.tmp", ".key.wrap.tmp", ".account.bin.tmp",
+            "db.sqlite3", "db.sqlite3-wal", "db.sqlite3-shm", "db.keys", "db.keys.pending",
+            ".db.keys.tmp", ".db.keys.pending.tmp", "storage.mode", ".storage.mode.tmp",
+            "migration.prep", ".migration.prep.tmp", "migration.checkpoint", ".migration.checkpoint.tmp")
         val old = existing?.let(::File)
         val root = if (old != null && artifacts.any { File(old, it).exists() }) old else File(context.noBackupFilesDir, "account")
         check(root.isDirectory || root.mkdirs())

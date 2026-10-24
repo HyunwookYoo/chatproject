@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:ffi';
 import 'package:chat_app/account/account_model.dart';
 import 'package:chat_app/bootstrap.dart';
 import 'package:chat_app/core_client.dart';
@@ -20,7 +21,7 @@ void main() {
     'native protected storage phase (explicit process boundary)',
     (tester) async {
       expect(
-        ['write', 'read', 'locked', 'missing'].contains(phase),
+        ['write', 'read', 'locked', 'missing', 'lifecycle'].contains(phase),
         isTrue,
         reason: 'An explicit valid storage phase is required',
       );
@@ -29,6 +30,7 @@ void main() {
         isTrue,
         reason: 'An explicit owned absolute root is required',
       );
+      if (phase == 'lifecycle') expect(Platform.isIOS, isTrue);
       await RustLib.init();
       final injected = switch (phase) {
         'locked' => rust.ErrorCode.storageLocked,
@@ -140,8 +142,38 @@ void main() {
         expect(event.revision, event.view.revision);
         expect(event.revision <= latest.revision, isTrue);
       }
-      expect(await File('$root/key.wrap').exists(), isTrue);
-      expect(await File('$root/account.bin').exists(), isTrue);
+      // SQL authority retires the legacy envelope and keeps its guard. Opening
+      // above already validated the runtime cipher/provider and SQL binding.
+      for (final name in ['db.keys', 'db.sqlite3', 'storage.mode', 'store.id']) {
+        expect(await File('$root/$name').exists(), isTrue, reason: name);
+      }
+      expect(await File('$root/db.sqlite3').length(), greaterThan(0));
+      expect(await File('$root/store.id').length(), 16);
+      expect(await File('$root/key.wrap').exists(), isFalse);
+      expect(await File('$root/account.bin').exists(), isFalse);
+      if (phase == 'lifecycle') {
+        // Existing iOS ABI + real OS provider. Completed/status and readback are
+        // observed here; actual native SQL handle/lock closure remains a separate
+        // Apple-runner gate, since iOS ownership/connection lifetime is transient.
+        final library = DynamicLibrary.process();
+        final suspend = library.lookupFunction<Int32 Function(), int Function()>('cp_account_suspend');
+        final resume = library.lookupFunction<Int32 Function(), int Function()>('cp_account_resume');
+        Future<void> completed(int Function() operation) async {
+          final deadline = DateTime.now().add(const Duration(seconds: 10));
+          var status = operation();
+          while (status == 1 && DateTime.now().isBefore(deadline)) {
+            await Future<void>.delayed(const Duration(milliseconds: 10));
+            status = operation();
+          }
+          expect(status, 0, reason: 'Pending/failed lifecycle is not Completed');
+        }
+        await completed(suspend);
+        await completed(resume);
+        final reopened = await core.account.snapshot();
+        expect(reopened.phase, latest.phase);
+        expect(reopened.publicPeerId, latest.publicPeerId);
+        expect(reopened.installation, latest.installation);
+      }
       await model.close();
       await subscription.cancel();
     },

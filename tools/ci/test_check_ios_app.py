@@ -26,6 +26,7 @@ elif tool == "otool":
     print(" /usr/lib/libSystem.B.dylib (compatibility version 1.0.0)")
     if args[-1].endswith("chat_ffi"):
         if os.environ.get("FAIL_TOOL") == "otool": sys.exit(7)
+        if os.environ.get("SQLITE_LINK"): print(" /usr/lib/libsqlite3.dylib (compatibility version 1.0.0)")
         if os.environ["NETWORK"]:
             print(" /" + os.environ["NETWORK"] + " (compatibility version 1.0.0)")
 '''
@@ -33,7 +34,7 @@ elif tool == "otool":
 
 @unittest.skipUnless(BASH and pathlib.Path(BASH).is_file(), "requires native bash")
 class IosSymbolsTest(unittest.TestCase):
-    def run_check(self, imports="_getaddrinfo\n_nw_path_get_status", network=None, fail_tool=""):
+    def run_check(self, imports="_getaddrinfo\n_nw_path_get_status\n_CCHmac", network=None, fail_tool="", sqlite_link=""):
         with tempfile.TemporaryDirectory(prefix="ios symbols fixture ") as folder:
             root = pathlib.Path(folder)
             app = root / "Runner.app"
@@ -53,7 +54,7 @@ class IosSymbolsTest(unittest.TestCase):
                 wrapper.write_text('#!/usr/bin/env bash\nexec "' + pathlib.Path(sys.executable).as_posix() +
                                    '" "' + fake.as_posix() + '" ' + tool + ' "$@"\n', encoding="utf-8")
                 wrapper.chmod(0o755)
-            env = dict(os.environ, IMPORTS=imports, FAIL_TOOL=fail_tool,
+            env = dict(os.environ, IMPORTS=imports, FAIL_TOOL=fail_tool, SQLITE_LINK=sqlite_link,
                        NETWORK="System/Library/Frameworks/Network.framework/Network" if network is None else network.lstrip("/"),
                        PLISTBUDDY=(fake_bin / "plist").as_posix(), CHECK_RELEASE_HOOKS="0",
                        NSE_ID="dev.chatproject.chatapp.NotificationService",
@@ -64,8 +65,18 @@ class IosSymbolsTest(unittest.TestCase):
             return subprocess.run([BASH, "-c", command], env=env, capture_output=True, text=True)
 
     def test_clean_public_imports_pass(self):
-        result = self.run_check(imports="_getaddrinfo\n_nw_path_get_status\n_SCNetworkReachabilityCreateWithName")
+        result = self.run_check(imports="_getaddrinfo\n_nw_path_get_status\n_SCNetworkReachabilityCreateWithName\n_CCHmac")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_missing_commoncrypto_provider_is_rejected(self):
+        result = self.run_check(imports="_getaddrinfo\n_nw_path_get_status")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("CommonCrypto", result.stdout)
+
+    def test_dynamic_ordinary_sqlite_is_rejected(self):
+        result = self.run_check(sqlite_link="1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("ordinary SQLite", result.stdout)
 
     def test_each_private_configuration_family_is_rejected(self):
         for symbol in ("_SCDynamicStoreCreate", "_SCPreferencesCreate", "_SCNetworkInterfaceCopyAll",
