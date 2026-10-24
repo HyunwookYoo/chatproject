@@ -14,6 +14,8 @@ pub enum Incoming {
         relay: Option<String>,
         #[serde(default)]
         records: Option<String>,
+        #[serde(default)]
+        controlled_time: bool,
     },
     Cmd {
         id: u64,

@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:mirrors';
 
@@ -30,7 +31,135 @@ void main() {
   ClassMirror type(String name) =>
       library.declarations[MirrorSystem.getSymbol(name, library)]
           as ClassMirror;
+  test('partial Android launch records PID before failing status', () async {
+    final activity = <String, Object?>{'serial': 'owned-test'};
+    var saved = false;
+    final result =
+        library.invoke(
+              MirrorSystem.getSymbol('_captureAndroidLaunch', library),
+              [
+                ProcessResult(1, 7, '', ''),
+                () async => ProcessResult(2, 0, '31415\n', ''),
+                activity,
+                () {
+                  saved = true;
+                  expect(activity['pid'], '31415');
+                },
+              ],
+            ).reflectee
+            as Future;
+    await expectLater(result, throwsA(isA<StateError>()));
+    expect(saved, isTrue);
+  });
   late Directory logs;
+  test(
+    'Android build environment selection validates and composes only child overrides',
+    () {
+      final method = MirrorSystem.getSymbol(
+        '_androidBuildEnvironment',
+        library,
+      );
+      Map<String, String>? select(Map<String, String> inputs) =>
+          library.invoke(method, [inputs]).reflectee as Map<String, String>?;
+      expect(select({}), isNull);
+      final perl = File('${logs.path}/perl.exe')..writeAsStringSync('fixture');
+      final make = File('${logs.path}/make.exe')..writeAsStringSync('fixture');
+      final inputs = {
+        'E2E_ANDROID_OPENSSL_PERL': perl.path,
+        'E2E_ANDROID_MAKE': make.path,
+        'E2E_ANDROID_PERL_LIB': logs.path,
+        'PATH': 'inherited-path',
+        'MSYS2_ENV_CONV_EXCL': 'KEEP',
+      };
+      for (final missing in ['E2E_ANDROID_MAKE', 'E2E_ANDROID_PERL_LIB']) {
+        expect(
+          () => select({...inputs}..remove(missing)),
+          throwsA(isA<StateError>()),
+        );
+      }
+      expect(
+        () => select({...inputs, 'E2E_ANDROID_MAKE': '${logs.path}/absent'}),
+        throwsA(isA<StateError>()),
+      );
+      if (!Platform.isWindows) {
+        expect(() => select(inputs), throwsA(isA<StateError>()));
+        return;
+      }
+      final selected = select(inputs)!;
+      expect(selected['OPENSSL_SRC_PERL'], perl.path.replaceAll('\\', '/'));
+      final unix =
+          '/${logs.path[0].toLowerCase()}${logs.path.substring(2).replaceAll('\\', '/')}';
+      expect(selected['PERL5LIB'], unix);
+      expect(selected['MSYS2_ENV_CONV_EXCL'], 'KEEP;PERL5LIB');
+      expect(
+        select(
+          {...inputs}..remove('MSYS2_ENV_CONV_EXCL'),
+        )!['MSYS2_ENV_CONV_EXCL'],
+        'PERL5LIB',
+      );
+      expect(
+        select({
+          ...inputs,
+          'MSYS2_ENV_CONV_EXCL': 'KEEP;PERL5LIB',
+        })!['MSYS2_ENV_CONV_EXCL'],
+        'KEEP;PERL5LIB',
+      );
+      expect(selected['PATH'], '${logs.path};${logs.path};inherited-path');
+      expect(inputs.containsKey('OPENSSL_SRC_PERL'), isFalse);
+      expect(
+        () => select({...inputs, 'E2E_ANDROID_PERL_LIB': r'\\server\share'}),
+        throwsA(isA<StateError>()),
+      );
+    },
+  );
+  test(
+    'recovery audit scans direct text files and fails with fixed detail',
+    () {
+      const marker = 'PUBLIC_SYNTHETIC_RECOVERY_PHRASE';
+      final text = File('${logs.path}/wire.jsonl')
+        ..writeAsStringSync('redacted');
+      Directory('${logs.path}/store').createSync();
+      File('${logs.path}/store/private.log').writeAsStringSync(marker);
+      File('${logs.path}/binary.db').writeAsStringSync(marker);
+      final method = MirrorSystem.getSymbol('_auditRecoveryLogs', library);
+      expect(
+        library.invoke(method, [
+          logs,
+          [marker],
+        ]).reflectee,
+        1,
+      );
+      text.writeAsStringSync(marker);
+      expect(
+        () => library.invoke(method, [
+          logs,
+          [marker],
+        ]),
+        throwsA(
+          isA<StateError>().having(
+            (e) => e.message == 'Recovery privacy audit failed',
+            'fixed detail',
+            true,
+          ),
+        ),
+      );
+      final serialized = jsonEncode([marker]);
+      text.writeAsStringSync(jsonEncode({'wire': serialized}));
+      expect(
+        () => library.invoke(method, [
+          logs,
+          [serialized],
+        ]),
+        throwsA(
+          isA<StateError>().having(
+            (e) => e.message == 'Recovery privacy audit failed',
+            'fixed detail',
+            true,
+          ),
+        ),
+      );
+    },
+  );
   late InstanceMirror run;
   void phase(String name) {
     final values =
@@ -54,6 +183,35 @@ void main() {
     await runner.owned.close();
     await logs.delete(recursive: true);
   });
+
+  test(
+    'owned Android build command override does not reach neighboring host command',
+    () async {
+      final runner = run.reflectee as dynamic;
+      const key = 'E2E_PUBLIC_BUILD_ENV_PROBE';
+      final inherited = Platform.environment[key];
+      final source = File('${logs.path}/child.dart')
+        ..writeAsStringSync(
+          "import 'dart:io'; void main() { stdout.write(Platform.environment['$key'] ?? 'absent'); }",
+        );
+      phase('build_android');
+      final selected =
+          await runner.command(
+                Platform.resolvedExecutable,
+                [source.path],
+                environment: <String, String>{key: 'android-only'},
+              )
+              as ProcessResult;
+      expect(selected.stdout, 'android-only');
+      phase('build_node');
+      final neighbor =
+          await runner.command(Platform.resolvedExecutable, [source.path])
+              as ProcessResult;
+      expect(neighbor.stdout, inherited ?? 'absent');
+      expect(Platform.environment[key], inherited);
+      expect(runner.processes, isEmpty);
+    },
+  );
 
   for (final registered in [false, true]) {
     test(
@@ -90,65 +248,94 @@ void main() {
   }
 
   for (final origin in ['android_pid_monitor', 'scenario']) {
-    test('$origin deadline keeps immutable origin during node restart phase', () async {
-      final runner = run.reflectee as dynamic;
-      phase('node_participant');
-      const deadline = Duration(milliseconds: 20);
-      final method = origin == 'scenario' ? #wait : #command;
-      final arguments = <Symbol, dynamic>{
-        #timeout: deadline,
-        #failurePhase: origin,
-      };
-      final release = Completer<void>();
-      final source = File('${logs.path}/waiting.dart')
-        ..writeAsStringSync("import 'dart:async'; void main() { Timer.periodic(Duration(seconds: 1), (_) {}); }");
-      final lifecycle = runner.token.cancelled.then<void>((_) {
-        phase('cleanup');
-        runner.fail(const FileSystemException('PRIVATE_TOKEN'), StackTrace.current);
-      });
-      final work = run.invoke(method, origin == 'scenario'
-          ? [release.future] : [Platform.resolvedExecutable, [source.path]], arguments).reflectee as Future;
-      try {
-        await expectLater(work, throwsA(isA<TimeoutException>()));
-        await lifecycle;
-        runner.recordFailure(const FileSystemException('PRIVATE_TOKEN'));
-        expect(projection(), {
-          'phase': origin, 'failure_kind': 'timeout', 'command_exit_code': null,
+    test(
+      '$origin deadline keeps immutable origin during node restart phase',
+      () async {
+        final runner = run.reflectee as dynamic;
+        phase('node_participant');
+        const deadline = Duration(milliseconds: 20);
+        final method = origin == 'scenario' ? #wait : #command;
+        final arguments = <Symbol, dynamic>{
+          #timeout: deadline,
+          #failurePhase: origin,
+        };
+        final release = Completer<void>();
+        final source = File('${logs.path}/waiting.dart')
+          ..writeAsStringSync(
+            "import 'dart:async'; void main() { Timer.periodic(Duration(seconds: 1), (_) {}); }",
+          );
+        final lifecycle = runner.token.cancelled.then<void>((_) {
+          phase('cleanup');
+          runner.fail(
+            const FileSystemException('PRIVATE_TOKEN'),
+            StackTrace.current,
+          );
         });
-      } finally {
-        release.complete();
-      }
-    });
+        final work =
+            run
+                    .invoke(
+                      method,
+                      origin == 'scenario'
+                          ? [release.future]
+                          : [
+                              Platform.resolvedExecutable,
+                              [source.path],
+                            ],
+                      arguments,
+                    )
+                    .reflectee
+                as Future;
+        try {
+          await expectLater(work, throwsA(isA<TimeoutException>()));
+          await lifecycle;
+          runner.recordFailure(const FileSystemException('PRIVATE_TOKEN'));
+          expect(projection(), {
+            'phase': origin,
+            'failure_kind': 'timeout',
+            'command_exit_code': null,
+          });
+        } finally {
+          release.complete();
+        }
+      },
+    );
   }
 
-  test('AVD throw metadata projects before cleanup and keeps original stack', () async {
-    final runner = run.reflectee as dynamic;
-    phase('avd_create');
-    final emulatorRunner = fixtures.FakeRunner(
-      (_, _) => ProcessResult(0, -9, '', 'PRIVATE_TOKEN'),
-    );
-    Object? original;
-    StackTrace? originalStack;
-    final work = fixtures.emulatorsWith(emulatorRunner).ensure(testEmulators.first)
-        .catchError((Object error, StackTrace stack) {
-      original = error;
-      originalStack = stack;
-      Error.throwWithStackTrace(error, stack);
-    });
-    try {
-      await runner.wait(work);
-      fail('ensure should fail');
-    } catch (error, stack) {
-      expect(error, same(original));
-      expect(stack.toString(), originalStack.toString());
-      expect(error, isA<StateError>());
-    }
-    phase('cleanup');
-    runner.recordFailure(const FileSystemException('PRIVATE_TOKEN'));
-    expect(projection(), {
-      'phase': 'avd_create', 'failure_kind': 'avd_list_exit', 'command_exit_code': -9,
-    });
-  });
+  test(
+    'AVD throw metadata projects before cleanup and keeps original stack',
+    () async {
+      final runner = run.reflectee as dynamic;
+      phase('avd_create');
+      final emulatorRunner = fixtures.FakeRunner(
+        (_, _) => ProcessResult(0, -9, '', 'PRIVATE_TOKEN'),
+      );
+      Object? original;
+      StackTrace? originalStack;
+      final work = fixtures
+          .emulatorsWith(emulatorRunner)
+          .ensure(testEmulators.first)
+          .catchError((Object error, StackTrace stack) {
+            original = error;
+            originalStack = stack;
+            Error.throwWithStackTrace(error, stack);
+          });
+      try {
+        await runner.wait(work);
+        fail('ensure should fail');
+      } catch (error, stack) {
+        expect(error, same(original));
+        expect(stack.toString(), originalStack.toString());
+        expect(error, isA<StateError>());
+      }
+      phase('cleanup');
+      runner.recordFailure(const FileSystemException('PRIVATE_TOKEN'));
+      expect(projection(), {
+        'phase': 'avd_create',
+        'failure_kind': 'avd_list_exit',
+        'command_exit_code': -9,
+      });
+    },
+  );
 
   for (final entry in <(String, List<String>, String, int)>[
     ('chat_node', ['relay', 'PRIVATE_TOKEN'], 'owned_relay_exit', 1),
@@ -158,37 +345,69 @@ void main() {
     ('chat_relay', ['PRIVATE_TOKEN'], 'owned_child_exit', 1),
     ('dart', [], 'owned_child_exit', 0),
   ]) {
-    test('unexpected persistent ${entry.$3}/${entry.$4} uses only fixed metadata', () async {
-      final runner = run.reflectee as dynamic;
-      phase('avd_create');
-      // Tiny native fixtures exercise the real asynchronous exit callback.
-      final source = Platform.isWindows
-          ? '${Platform.environment['SystemRoot']}/System32/where.exe' : '/bin/false';
-      final executable = entry.$4 == 0 ? File(Platform.resolvedExecutable) : await File(source).copy(
-        '${logs.path}/${entry.$1}${Platform.isWindows ? '.exe' : ''}',
-      );
-      if (!Platform.isWindows && entry.$4 != 0) {
-        expect((await Process.run('chmod', ['+x', executable.path])).exitCode, 0);
-      }
-      final args = entry.$4 == 0
-          ? [(File('${logs.path}/PRIVATE_TOKEN.dart')..writeAsStringSync('void main() {}')).path]
-          : entry.$2;
-      final failure = expectLater(runner.fatal.future, throwsA(isA<StateError>()
-          .having((e) => e.message, 'private message', 'Owned child exited (${entry.$4})')
-          .having((e) => e.toString(), 'toString', StateError('Owned child exited (${entry.$4})').toString())));
-      final process = await runner.acquire(executable.path, args, persistent: true);
-      await failure;
-      expect(await process.exitCode, entry.$4);
-      phase('cleanup');
-      runner.recordFailure(const FileSystemException('PRIVATE_TOKEN'));
-      expect(projection(), {
-        'phase': 'avd_create', 'failure_kind': entry.$3, 'command_exit_code': entry.$4,
-      });
-      expect(projection().toString(), isNot(contains('PRIVATE_TOKEN')));
-      await runner.stop(process);
-      expect(runner.active, isEmpty);
-      expect(runner.processes, isEmpty);
-    });
+    test(
+      'unexpected persistent ${entry.$3}/${entry.$4} uses only fixed metadata',
+      () async {
+        final runner = run.reflectee as dynamic;
+        phase('avd_create');
+        // Tiny native fixtures exercise the real asynchronous exit callback.
+        final source = Platform.isWindows
+            ? '${Platform.environment['SystemRoot']}/System32/where.exe'
+            : '/bin/false';
+        final executable = entry.$4 == 0
+            ? File(Platform.resolvedExecutable)
+            : await File(source).copy(
+                '${logs.path}/${entry.$1}${Platform.isWindows ? '.exe' : ''}',
+              );
+        if (!Platform.isWindows && entry.$4 != 0) {
+          expect(
+            (await Process.run('chmod', ['+x', executable.path])).exitCode,
+            0,
+          );
+        }
+        final args = entry.$4 == 0
+            ? [
+                (File(
+                  '${logs.path}/PRIVATE_TOKEN.dart',
+                )..writeAsStringSync('void main() {}')).path,
+              ]
+            : entry.$2;
+        final failure = expectLater(
+          runner.fatal.future,
+          throwsA(
+            isA<StateError>()
+                .having(
+                  (e) => e.message,
+                  'private message',
+                  'Owned child exited (${entry.$4})',
+                )
+                .having(
+                  (e) => e.toString(),
+                  'toString',
+                  StateError('Owned child exited (${entry.$4})').toString(),
+                ),
+          ),
+        );
+        final process = await runner.acquire(
+          executable.path,
+          args,
+          persistent: true,
+        );
+        await failure;
+        expect(await process.exitCode, entry.$4);
+        phase('cleanup');
+        runner.recordFailure(const FileSystemException('PRIVATE_TOKEN'));
+        expect(projection(), {
+          'phase': 'avd_create',
+          'failure_kind': entry.$3,
+          'command_exit_code': entry.$4,
+        });
+        expect(projection().toString(), isNot(contains('PRIVATE_TOKEN')));
+        await runner.stop(process);
+        expect(runner.active, isEmpty);
+        expect(runner.processes, isEmpty);
+      },
+    );
   }
 
   test(

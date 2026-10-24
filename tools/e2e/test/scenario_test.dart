@@ -352,8 +352,10 @@ void main() {
           );
       try {
         if (entry.$3 == 'windows') {
-          await fixture.stopping.future;
-          // Cleanup is still awaiting its distinct timeout: origin must exist now.
+          await awaited;
+          // An RPC timeout poisons the controller; cleanup owns process stops
+          // and must not resume this protocol to issue network_stop commands.
+          expect(fixture.stopping.isCompleted, isFalse);
           expect(run.getField(#safeFailure).reflectee, {
             'phase': entry.$4,
             'failure_kind': entry.$5,

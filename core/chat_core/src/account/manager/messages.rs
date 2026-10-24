@@ -66,6 +66,7 @@ pub(super) struct Runtime {
 }
 #[cfg(all(feature = "test-hooks", debug_assertions))]
 struct TestPause {
+    key: Option<MessageKey>,
     entered: oneshot::Sender<()>,
     release: oneshot::Receiver<()>,
 }
@@ -91,6 +92,11 @@ pub struct MessagePause {
 }
 #[cfg(all(feature = "test-hooks", debug_assertions))]
 impl MessagePause {
+    pub(crate) async fn wait_entered_checked(&mut self) -> Result<(), CoreError> {
+        self.entered.take().ok_or_else(|| unavailable(ErrorCode::NotAvailable))?
+            .await.map_err(|_| unavailable(ErrorCode::NotAvailable))
+    }
+
     pub async fn release_and_wait_queued(&mut self) {
         let _ = self.release.take().unwrap().send(());
         self.queued.take().unwrap().await.unwrap();
@@ -146,6 +152,11 @@ impl AccountHandle {
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     pub async fn message_test_write_starts(&self) -> Result<(usize, usize), CoreError> {
         self.send(Command::MessageWriteStarts).await
+    }
+
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    pub(crate) async fn message_ack_pause(&self, key: MessageKey) -> Result<(MessagePause, MessagePause), CoreError> {
+        self.send(|reply| Command::MessageAckPause(key, reply)).await
     }
 
     #[cfg(all(feature = "test-hooks", debug_assertions))]
@@ -351,12 +362,27 @@ impl Manager {
     }
 
     #[cfg(all(feature = "test-hooks", debug_assertions))]
+    pub(super) fn message_ack_pause(&mut self, key: MessageKey) -> Result<(MessagePause, MessagePause), CoreError> {
+        self.ready()?;
+        self.local()?;
+        if self.messages.reply_pause.is_some() || self.messages.write_pause.is_some() {
+            return Err(unavailable(ErrorCode::Busy));
+        }
+        let response = self.message_pause(MessagePoint::Response);
+        self.messages.reply_pause.as_mut().unwrap().key = Some(key);
+        let receipt = self.message_pause(MessagePoint::FirstByte);
+        self.messages.write_pause.as_mut().unwrap().key = Some(key);
+        Ok((response, receipt))
+    }
+
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
     pub(super) fn message_pause(&mut self, response: MessagePoint) -> MessagePause {
         let (entered, rx) = oneshot::channel();
         let (release, tx) = oneshot::channel();
         let (queued, queued_rx) = oneshot::channel();
         let (connection, connection_rx) = oneshot::channel();
         let pause = Some(TestPause {
+            key: None,
             entered,
             release: tx,
         });
@@ -500,6 +526,7 @@ impl Manager {
     pub(super) fn message_response_gate(
         &mut self,
         conn: &iroh::endpoint::Connection,
+        #[cfg(all(feature = "test-hooks", debug_assertions))] response: &[u8],
     ) -> Result<ResponseGate, CoreError> {
         let request = self.ready()?;
         let session = self.message_session(conn, request)?;
@@ -508,13 +535,25 @@ impl Manager {
             session,
             ticket: request.ticket,
         };
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        let pause = {
+            // Only successful Text replies are Receipt; rejects and ReceiptApplied
+            // can never consume the keyed durable-ack checkpoint.
+            let key = auth::payload(response, 16).ok().and_then(|inner| match wire::decode(&inner).ok()? {
+                Frame::Receipt(receipt) => Some(receipt.key),
+                _ => None,
+            });
+            if self.messages.reply_pause.as_ref().is_some_and(|pause| pause.key.is_none() || pause.key == key) {
+                self.messages.reply_pause.take()
+            } else { None }
+        };
         Ok(ResponseGate {
             #[cfg(all(feature = "test-hooks", debug_assertions))]
             writes: self.messages.replies.clone(),
             authority,
             lease,
             #[cfg(all(feature = "test-hooks", debug_assertions))]
-            pause: self.messages.reply_pause.take(),
+            pause,
         })
     }
     fn message_storage_failure(&mut self, code: ErrorCode, request: Request) {
@@ -745,7 +784,10 @@ impl Manager {
                 writes: self.messages.writes.clone(),
                 authority: self.message_authority()?,
                 #[cfg(all(feature = "test-hooks", debug_assertions))]
-                pause: self.messages.write_pause.take(),
+                pause: if self.messages.write_pause.as_ref().is_some_and(|pause|
+                    pause.key.is_none() || (pause.key == Some(key) && receipt.is_some())) {
+                    self.messages.write_pause.take()
+                } else { None },
                 #[cfg(all(feature = "test-hooks", debug_assertions))]
                 mutation,
             };

@@ -156,6 +156,7 @@ class RustBuilder {
         _toolchain,
         'cargo',
         'build',
+        '--locked',
         ...extraArgs,
         '--manifest-path',
         manifestPath,

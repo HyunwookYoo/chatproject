@@ -54,6 +54,28 @@ void main() {
     await logs.delete(recursive: true);
   });
 
+  for (final retained in [false, true]) {
+    test('child environment stays isolated with retained output=$retained', () async {
+      const key = 'E2E_PUBLIC_ENV_PROBE';
+      final inherited = Platform.environment[key];
+      final source = File('${logs.path}/environment_child.dart')..writeAsStringSync(
+        "import 'dart:io'; void main() { stdout.write(Platform.environment['$key'] ?? 'absent'); }");
+      final selected = await const IoProcessRunner().start(Platform.resolvedExecutable,
+        [source.path], logDir: logs, retainOutput: retained, environment: {key: 'selected'});
+      try {
+        expect(await selected.exitCode.timeout(const Duration(seconds: 10)), 0);
+        expect(File('${logs.path}/${selected.pid}.stdout.log').readAsStringSync(), 'selected');
+      } finally { await selected.stop(); }
+      final neighbor = await const IoProcessRunner().start(Platform.resolvedExecutable,
+        [source.path], logDir: logs, retainOutput: retained);
+      try {
+        expect(await neighbor.exitCode.timeout(const Duration(seconds: 10)), 0);
+        expect(File('${logs.path}/${neighbor.pid}.stdout.log').readAsStringSync(), inherited ?? 'absent');
+      } finally { await neighbor.stop(); }
+      expect(Platform.environment[key], inherited);
+    });
+  }
+
   for (final writeFailure in [false, true]) {
     for (final diagnosticCollision in [false, true]) {
       test('failed stdin ${writeFailure ? 'write' : 'close'} and reclaim retain child${diagnosticCollision ? ' despite diagnostic collision' : ''}', () async {

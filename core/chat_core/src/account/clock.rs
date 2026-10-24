@@ -48,32 +48,48 @@ pub use fake::FakeClock;
 
 #[cfg(any(test, all(feature = "test-hooks", debug_assertions)))]
 mod fake {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
 
     use super::Clock;
 
     pub struct FakeClock {
-        unix_seconds: AtomicU64,
-        monotonic_ms: AtomicU64,
+        time: Mutex<(u64, u64)>,
         wake: std::sync::Arc<tokio::sync::Notify>,
     }
 
     impl FakeClock {
         pub fn new(unix_seconds: u64, monotonic_ms: u64) -> Self {
             Self {
-                unix_seconds: AtomicU64::new(unix_seconds),
-                monotonic_ms: AtomicU64::new(monotonic_ms),
+                time: Mutex::new((unix_seconds, monotonic_ms)),
                 wake: Default::default(),
             }
         }
 
+        /// Commits both clocks together; failed arithmetic neither mutates nor wakes.
+        pub fn advance_seconds(&self, seconds: u64) -> Option<(u64, u64)> {
+            if seconds > 31_536_000 {
+                return None;
+            }
+            let elapsed = seconds.checked_mul(1000)?;
+            let mut time = self.time.lock().expect("clock lock poisoned");
+            let wall = time.0.checked_add(seconds)?;
+            wall.checked_mul(1000)?;
+            let mono = time.1.checked_add(elapsed)?;
+            *time = (wall, mono);
+            drop(time);
+            self.wake.notify_one();
+            Some((wall, mono))
+        }
+
         pub fn set_unix_seconds(&self, value: u64) {
-            self.unix_seconds.store(value, Ordering::SeqCst);
+            self.time.lock().expect("clock lock poisoned").0 = value;
             self.wake.notify_one();
         }
 
         pub fn advance_monotonic_ms(&self, elapsed: u64) {
-            self.monotonic_ms.fetch_add(elapsed, Ordering::SeqCst);
+            let mut time = self.time.lock().expect("clock lock poisoned");
+            time.1 = time.1.wrapping_add(elapsed);
+            drop(time);
             self.wake.notify_one();
         }
     }
@@ -83,11 +99,11 @@ mod fake {
             Some(self.wake.clone())
         }
         fn unix_seconds(&self) -> u64 {
-            self.unix_seconds.load(Ordering::SeqCst)
+            self.time.lock().expect("clock lock poisoned").0
         }
 
         fn monotonic_ms(&self) -> u64 {
-            self.monotonic_ms.load(Ordering::SeqCst)
+            self.time.lock().expect("clock lock poisoned").1
         }
     }
 }

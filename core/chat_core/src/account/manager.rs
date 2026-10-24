@@ -71,6 +71,8 @@ enum Command {
     #[cfg(all(feature="test-hooks",debug_assertions))]
     MessagePause(messages::MessagePoint,oneshot::Sender<Result<messages::MessagePause,CoreError>>),
     #[cfg(all(feature="test-hooks",debug_assertions))]
+    MessageAckPause(crate::MessageKey,oneshot::Sender<Result<(messages::MessagePause,messages::MessagePause),CoreError>>),
+    #[cfg(all(feature="test-hooks",debug_assertions))]
     MessageAttempt(crate::message::types::MessageKey,bool,MessageMutation,oneshot::Sender<Result<(),CoreError>>),
     Retry(oneshot::Sender<Result<u64, CoreError>>),
     #[cfg(all(feature="test-hooks",debug_assertions))]
@@ -132,6 +134,8 @@ impl Command {
             Self::MessageWriteStarts(reply)=>{let _=reply.send(Err(error));}
             #[cfg(all(feature="test-hooks",debug_assertions))]
             Self::MessagePause(_,reply)=>{let _=reply.send(Err(error));}
+            #[cfg(all(feature="test-hooks",debug_assertions))]
+            Self::MessageAckPause(_,reply)=>{let _=reply.send(Err(error));}
             #[cfg(all(feature="test-hooks",debug_assertions))]
             Self::MessageAttempt(_,_,_,reply)=>{let _=reply.send(Err(error));}
             Self::Retry(reply) => { let _ = reply.send(Err(error)); }
@@ -1163,7 +1167,7 @@ impl Manager {
                 }
                 // Coalesce overdue maintenance: a slow SQL turn must leave commands a ready window.
                 _ = expiry.tick() => { self.restrict_grants(); self.expire_pair(); self.poll_messages().await; expiry.reset(); }
-                _ = message_wake.notified() => { self.restrict_grants(); self.poll_messages().await; }
+                _ = message_wake.notified() => { self.restrict_grants(); self.expire_pair(); self.poll_messages().await; }
                 _ = import_poll.tick(), if self.pair.current.is_some() && matches!(self.state,Some(AccountState::PendingImport(_))) => {let _=self.refresh_import().await;}
                 Some(input)=self.pair.input.recv()=>{self.pair_input(input).await;}
                 Some(input) = self.auth.input.recv() => { self.auth_input(input).await; }
@@ -1182,6 +1186,8 @@ impl Manager {
                         Command::MessageWriteStarts(reply)=>{let _=reply.send(Ok(self.message_write_starts()));}
                         #[cfg(all(feature="test-hooks",debug_assertions))]
                         Command::MessagePause(response,reply)=>{let _=reply.send(Ok(self.message_pause(response)));}
+                        #[cfg(all(feature="test-hooks",debug_assertions))]
+                        Command::MessageAckPause(key,reply)=>{let _=reply.send(self.message_ack_pause(key));}
                         #[cfg(all(feature="test-hooks",debug_assertions))]
                         Command::MessageAttempt(key,receipt,mutation,reply)=>{self.message_attempt(key,receipt,mutation,reply).await;}
                         Command::Retry(reply) => { let result = self.retry_open(); let _ = reply.send(result); }
@@ -2945,7 +2951,7 @@ impl Manager {
             } => {
                 let result = self.receive_control(&connection, &body).await;
                 let result=result.and_then(|body| {
-                    let gate=if super::auth::payload(&body,16).is_ok() {Some(self.message_response_gate(&connection)?)} else {None};
+                    let gate=if super::auth::payload(&body,16).is_ok() {Some(self.message_response_gate(&connection, #[cfg(all(feature="test-hooks",debug_assertions))] &body)?)} else {None};
                     Ok(super::connection::Response {body,gate})
                 });
                 let _ = reply.send(result);

@@ -6,11 +6,64 @@ import 'package:args/args.dart';
 import 'package:chat_e2e/src/android_sdk.dart';
 import 'package:chat_e2e/src/controller.dart';
 import 'package:chat_e2e/src/account_scenario.dart';
+import 'package:chat_e2e/src/message_scenario.dart';
 import 'package:chat_e2e/src/emulators.dart';
 import 'package:chat_e2e/src/owned_resources.dart';
 import 'package:chat_e2e/src/process_runner.dart';
 import 'package:chat_e2e/src/scenario.dart';
 import 'package:path/path.dart' as p;
+
+Map<String, String>? _androidBuildEnvironment(Map<String, String> inputs) {
+  final perl = inputs['E2E_ANDROID_OPENSSL_PERL'];
+  final make = inputs['E2E_ANDROID_MAKE'];
+  final overlay = inputs['E2E_ANDROID_PERL_LIB'];
+  if (perl == null && make == null && overlay == null) return null;
+  if (!Platform.isWindows ||
+      perl == null ||
+      make == null ||
+      overlay == null ||
+      !p.isAbsolute(perl) ||
+      !p.isAbsolute(make) ||
+      !RegExp(r'^[a-zA-Z]:[\\/]').hasMatch(overlay) ||
+      !File(perl).existsSync() ||
+      !File(make).existsSync() ||
+      !Directory(overlay).existsSync()) {
+    throw StateError('Invalid Android build tool selection');
+  }
+  final nativeOverlay = p.normalize(overlay).replaceAll('\\', '/');
+  final exclusions = (inputs['MSYS2_ENV_CONV_EXCL'] ?? '')
+      .split(';')
+      .where((value) => value.isNotEmpty)
+      .toList();
+  if (!exclusions.contains('PERL5LIB')) exclusions.add('PERL5LIB');
+  return {
+    'OPENSSL_SRC_PERL': p.normalize(perl).replaceAll('\\', '/'),
+    'PERL5LIB':
+        '/${nativeOverlay[0].toLowerCase()}${nativeOverlay.substring(2)}',
+    'PATH': '${p.dirname(make)};${p.dirname(perl)};${inputs['PATH'] ?? ''}',
+    'MSYS2_ENV_CONV_EXCL': exclusions.join(';'),
+  };
+}
+
+int _auditRecoveryLogs(Directory logs, List<String> patterns) {
+  var files = 0;
+  for (final entry in logs.listSync(followLinks: false)) {
+    if (entry is! File ||
+        !const ['.log', '.json', '.jsonl'].contains(p.extension(entry.path))) {
+      continue;
+    }
+    final text = utf8.decode(entry.readAsBytesSync(), allowMalformed: true);
+    for (final pattern in patterns) {
+      final quoted = jsonEncode(pattern);
+      if (text.contains(pattern) ||
+          text.contains(quoted.substring(1, quoted.length - 1))) {
+        throw StateError('Recovery privacy audit failed');
+      }
+    }
+    files++;
+  }
+  return files;
+}
 
 Future<void> main(List<String> arguments) async {
   final parser = ArgParser()
@@ -19,7 +72,11 @@ Future<void> main(List<String> arguments) async {
       defaultsTo: Platform.isWindows ? 'mixed' : 'android',
       allowed: ['mixed', 'android', 'windows'],
     )
-    ..addOption('scenario', defaultsTo: 'm2', allowed: ['m2', 'm3', 'm3-auth'])
+    ..addOption(
+      'scenario',
+      defaultsTo: 'm2',
+      allowed: ['m2', 'm3', 'm3-auth', 'm4'],
+    )
     ..addOption('repo-root', mandatory: true);
   late ArgResults options;
   try {
@@ -33,7 +90,7 @@ Future<void> main(List<String> arguments) async {
     }
   } on FormatException {
     stderr.writeln(
-      'Usage: dart run bin/run.dart --profile mixed|android|windows --scenario m2|m3|m3-auth --repo-root <absolute>',
+      'Usage: dart run bin/run.dart --profile mixed|android|windows --scenario m2|m3|m3-auth|m4 --repo-root <absolute>',
     );
     exitCode = 64;
     return;
@@ -41,6 +98,7 @@ Future<void> main(List<String> arguments) async {
   final root = p.normalize(options['repo-root'] as String);
   final profile = options['profile'] as String;
   final authOnly = options['scenario'] == 'm3-auth';
+  final messageScenario = options['scenario'] == 'm4';
   final accountScenario = options['scenario'] != 'm2';
   final logs = await Directory(
     p.join(
@@ -135,6 +193,7 @@ Future<void> main(List<String> arguments) async {
       await run.command(
         flutter,
         ['build', 'apk', '--debug', '--target-platform', 'android-x64'],
+        environment: _androidBuildEnvironment(Platform.environment),
         cwd: p.join(root, 'app'),
         timeout: const Duration(minutes: 30),
       );
@@ -168,6 +227,7 @@ Future<void> main(List<String> arguments) async {
     controller = await Controller.start(
       logDir: logs,
       accountRecords: accountScenario,
+      controlledTime: messageScenario,
     );
     run.owned.add('controller', controller.close);
     final control = controller;
@@ -331,7 +391,7 @@ Future<void> main(List<String> arguments) async {
             }
             if (freshStore) store++;
             run.phase = _Phase.androidLaunch;
-            await run.command(sdk.adb, [
+            final launched = await run.command(sdk.adb, [
               ...adb,
               'shell',
               'am',
@@ -350,7 +410,18 @@ Future<void> main(List<String> arguments) async {
                 'chat_data_dir',
                 '/data/user/0/$package/files/e2e/${p.basename(logs.parent.path)}/$name/store-$store',
               ],
-            ]);
+            ], requireSuccess: false);
+            await _captureAndroidLaunch(
+              launched,
+              () => run.command(sdk.adb, [
+                ...adb,
+                'shell',
+                'pidof',
+                package,
+              ], requireSuccess: false),
+              activity,
+              run.save,
+            );
             run.phase = _Phase.androidPid;
             await run.until(() async {
               final result = await run.command(sdk.adb, [
@@ -493,7 +564,28 @@ Future<void> main(List<String> arguments) async {
     if (!accountScenario) participants.add(await launchNode());
     run.phase = _Phase.scenario;
     await run.wait(
-      accountScenario
+      messageScenario
+          ? runMessageScenario(
+              control,
+              participants,
+              auditRecovery: (patterns) => _auditRecoveryLogs(logs, patterns),
+              restart: (old, {bool freshStore = false}) {
+                final action = appRestarts[old.name];
+                if (action == null) {
+                  throw StateError('Restart participant is not owned');
+                }
+                return action(old, freshStore: freshStore);
+              },
+              evidence: (stage, data) =>
+                  File(
+                    p.join(logs.path, 'message-public-evidence.jsonl'),
+                  ).writeAsStringSync(
+                    '${jsonEncode({'stage': stage, ...data})}\n',
+                    mode: FileMode.append,
+                    flush: true,
+                  ),
+            )
+          : accountScenario
           ? runAccountScenario(
               control,
               participants,
@@ -575,7 +667,9 @@ Future<void> main(List<String> arguments) async {
     if (userInterrupted && code == 0) code = 130;
     if (code == 0) {
       stdout.writeln(
-        accountScenario
+        messageScenario
+            ? '$profile M4 PASS: native retained message restart, durable ack and read.'
+            : accountScenario
             ? authOnly
                   ? '$profile M3 auth PASS: fresh/cache proof, failed proof, disconnect and restart.'
                   : '$profile M3 PASS: local signed records, native stores, pairing, restart, revoke and recovery.'
@@ -855,6 +949,8 @@ class _Run extends IoProcessRunner {
     String? stdin,
     bool persistent = false,
     bool cleanup = false,
+    bool retainOutput = false,
+    Map<String, String>? environment,
   }) {
     if (!cleanup) {
       token.check();
@@ -867,6 +963,8 @@ class _Run extends IoProcessRunner {
       stdin: stdin,
       persistent: persistent,
       cleanup: cleanup,
+      retainOutput: retainOutput,
+      environment: environment,
     );
     acquisitions.add(acquisition);
     unawaited(
@@ -889,6 +987,8 @@ class _Run extends IoProcessRunner {
     String? stdin,
     required bool persistent,
     required bool cleanup,
+    bool retainOutput = false,
+    Map<String, String>? environment,
   }) async {
     File(p.join(logs.path, 'commands.jsonl')).writeAsStringSync(
       '${jsonEncode({'at': DateTime.now().toUtc().toIso8601String(), 'executable': executable, 'args': args, 'cwd': cwd})}\n',
@@ -903,6 +1003,8 @@ class _Run extends IoProcessRunner {
         logDir: logs,
         workingDirectory: cwd,
         stdin: stdin,
+        retainOutput: retainOutput,
+        environment: environment,
       );
     } on OwnedProcessStartFailure catch (failure) {
       retainStartFailure(failure, executable, cwd, cleanup);
@@ -972,6 +1074,7 @@ class _Run extends IoProcessRunner {
     String? workingDirectory,
     String? stdin,
     bool retainOutput = false,
+    Map<String, String>? environment,
   }) async => _Managed(
     await acquire(
       executable,
@@ -979,6 +1082,8 @@ class _Run extends IoProcessRunner {
       cwd: workingDirectory,
       stdin: stdin,
       persistent: true,
+      retainOutput: retainOutput,
+      environment: environment,
     ),
     this,
   );
@@ -1031,6 +1136,7 @@ class _Run extends IoProcessRunner {
     bool requireSuccess = true,
     bool cleanup = false,
     String? failurePhase,
+    Map<String, String>? environment,
   }) async {
     final process = await acquire(
       executable,
@@ -1038,6 +1144,7 @@ class _Run extends IoProcessRunner {
       cwd: cwd,
       stdin: stdin,
       cleanup: cleanup,
+      environment: environment,
     );
     Object? primary;
     try {
@@ -1137,4 +1244,19 @@ class _Managed implements OwnedProcess {
   Future<int> get exitCode => process.exitCode;
   @override
   Future<void> stop() => _stopping ??= run.stop(process);
+}
+
+Future<void> _captureAndroidLaunch(
+  ProcessResult launch,
+  Future<ProcessResult> Function() samplePid,
+  Map<String, Object?> activity,
+  void Function() save,
+) async {
+  final current = await samplePid();
+  final pid = (current.stdout as String).trim();
+  if (current.exitCode == 0 && RegExp(r'^\d+$').hasMatch(pid)) {
+    activity['pid'] = pid;
+    save();
+  }
+  if (launch.exitCode != 0) throw _CommandFailure(launch.exitCode, 'adb');
 }

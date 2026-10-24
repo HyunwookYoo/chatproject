@@ -137,24 +137,24 @@ class IoProcessRunner implements ProcessRunner {
   const IoProcessRunner();
 
   @override
-  Future<OwnedProcess> start(String executable, List<String> arguments, {required Directory logDir, String? workingDirectory, String? stdin, bool retainOutput = false}) async {
+  Future<OwnedProcess> start(String executable, List<String> arguments, {required Directory logDir, String? workingDirectory, String? stdin, bool retainOutput = false, Map<String, String>? environment}) async {
     if (retainOutput && stdin != null) throw ArgumentError('Retained output does not support stdin');
     await logDir.create(recursive: true);
     final batch = Platform.isWindows && (executable.endsWith('.bat') || executable.endsWith('.cmd'));
     if (retainOutput && batch) throw ArgumentError('Retained output requires a native executable');
     final process = retainOutput
-        ? await _startFileBacked(executable, arguments, logDir, workingDirectory)
-        : await Process.start(executable, arguments, workingDirectory: workingDirectory, runInShell: batch);
+        ? await _startFileBacked(executable, arguments, logDir, workingDirectory, environment)
+        : await Process.start(executable, arguments, workingDirectory: workingDirectory, runInShell: batch, environment: environment);
     final owned = _IoOwnedProcess(process, logDir, fileBacked: retainOutput);
     await owned._captureWindowsIdentity();
     return _finishManagedStart(process, owned, stdin, logDir, executable);
   }
 
-  Future<Process> _startFileBacked(String executable, List<String> arguments, Directory logDir, String? workingDirectory) {
+  Future<Process> _startFileBacked(String executable, List<String> arguments, Directory logDir, String? workingDirectory, Map<String, String>? environment) {
     if (!Platform.isWindows) {
       return Process.start('/bin/sh', ['-c',
         r'logdir=$1; shift; exec "$@" >"$logdir/$$.stdout.log" 2>"$logdir/$$.stderr.log"',
-        'e2e', logDir.absolute.path, executable, ...arguments], workingDirectory: workingDirectory);
+        'e2e', logDir.absolute.path, executable, ...arguments], workingDirectory: workingDirectory, environment: environment);
     }
     // Base64 is a transport for data, not shell quoting. The native argument
     // string separately follows Windows' backslash/double-quote rules.
@@ -195,7 +195,7 @@ try {
   if (\$null -ne \$native) { \$native.Dispose() }
 }
 exit \$code
-'''], workingDirectory: workingDirectory);
+'''], workingDirectory: workingDirectory, environment: environment);
   }
 
   static String _windowsArgument(String argument) {

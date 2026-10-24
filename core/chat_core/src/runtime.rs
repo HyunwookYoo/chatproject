@@ -52,6 +52,8 @@ pub(crate) struct AccountSlot {
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     pub records: Option<String>,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
+    pub controlled_clock: Option<Arc<crate::account::clock::FakeClock>>,
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
     pub configuring: bool,
 }
 
@@ -134,7 +136,7 @@ impl CoreSlot {
         if let Some(account) = account.handle.as_ref() { return Ok(account.clone()); }
         #[cfg(all(feature = "test-hooks", debug_assertions))]
         let services = match &account.records {
-            Some(url) => crate::puppet::records::services(url.clone())?,
+            Some(url) => crate::puppet::records::services(url.clone(), account.controlled_clock.clone().map(|clock| clock as Arc<dyn crate::account::clock::Clock>))?,
             None => services,
         };
         let handle = AccountHandle::open(core.runtime.as_ref().unwrap().handle(), &core.info.data_dir, protector, core.network.clone(), services, core.bus.clone())?;

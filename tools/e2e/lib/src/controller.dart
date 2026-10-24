@@ -11,6 +11,7 @@ class Controller {
     this._log,
     this._relay, [
     this._accountRecords = false,
+    this._controlledTime = false,
   ]) {
     _listener = _server.listen((request) {
       final handling = _accept(request);
@@ -24,9 +25,13 @@ class Controller {
     required Directory logDir,
     String? relay = localRelay,
     bool accountRecords = false,
+    bool controlledTime = false,
   }) async {
     if (relay != null && relay != localRelay) {
       throw ArgumentError.value(relay, 'relay');
+    }
+    if (controlledTime && !accountRecords) {
+      throw ArgumentError("Controlled time requires local records");
     }
     final server = await HttpServer.bind(
       InternetAddress.loopbackIPv4,
@@ -38,7 +43,7 @@ class Controller {
       final log = File(
         '${logDir.path}/wire.jsonl',
       ).openSync(mode: FileMode.append);
-      return Controller._(server, log, relay, accountRecords);
+      return Controller._(server, log, relay, accountRecords, controlledTime);
     } catch (_) {
       await server.close(force: true);
       rethrow;
@@ -49,6 +54,7 @@ class Controller {
   final RandomAccessFile _log;
   final String? _relay;
   final bool _accountRecords;
+  final bool _controlledTime;
   final _records = <String, List<int>>{};
   final _recordSockets = <WebSocket>{};
   bool recordPublicationsPaused = false;
@@ -204,6 +210,7 @@ class Controller {
             'type': 'config',
             'relay': _relay,
             if (_accountRecords) 'records': 'ws://127.0.0.1:47000/records',
+            if (_controlledTime) 'controlled_time': true,
           });
         }
         if (value case {
@@ -228,7 +235,9 @@ class Controller {
       switch (safe['type']) {
         case 'result':
           final op = connection.participant?._operations[safe['id']];
-          if (op == null || op.startsWith('account_local_')) {
+          if (op == null ||
+              op.startsWith('account_local_') ||
+              op.startsWith('message_local_')) {
             return jsonEncode({
               'type': 'result',
               'id': safe['id'],
@@ -402,6 +411,7 @@ class Controller {
           'type': 'config',
           'relay': _relay,
           if (_accountRecords) 'records': 'ws://127.0.0.1:47000/records',
+          if (_controlledTime) 'controlled_time': true,
         });
         connection.helloTimeout?.cancel();
         final next = Participant._(
@@ -428,10 +438,13 @@ class Controller {
           }
           if (record.error != null) {
             pending.completeError(
-              participant._operations[record.id]?.startsWith(
-                        'account_local_',
-                      ) ==
-                      true
+              const ['account_local_', 'message_local_'].any(
+                    (prefix) =>
+                        participant._operations[record.id]?.startsWith(
+                          prefix,
+                        ) ==
+                        true,
+                  )
                   ? RpcError(record.error!.code, '[redacted]')
                   : record.error!,
             );
@@ -592,6 +605,9 @@ class Participant {
         _controller._fail(error);
       }
       return await result;
+    } on TimeoutException catch (error) {
+      _controller._fail(error);
+      rethrow;
     } finally {
       _pending.remove(id);
       _operations.remove(id);

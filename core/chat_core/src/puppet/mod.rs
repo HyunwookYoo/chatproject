@@ -1,4 +1,5 @@
 mod account;
+mod message;
 pub(crate) mod records;
 pub mod protocol;
 
@@ -52,7 +53,14 @@ fn failed() -> CoreError {
     CoreError::new(ErrorCode::TransportFailed, "control connection failed")
 }
 async fn send(socket: &mut Socket, record: Outgoing<'_>) -> Result<(), CoreError> {
-    let text = zeroize::Zeroizing::new(serde_json::to_string(&record).map_err(|_| failed())?);
+    let mut text = zeroize::Zeroizing::new(serde_json::to_string(&record).map_err(|_| failed())?);
+    if text.len() > 64 * 1024 {
+        let Outgoing::Result { id, .. } = record else { return Err(failed()); };
+        text = zeroize::Zeroizing::new(serde_json::to_string(&Outgoing::Result {
+            id, result: protocol::Outcome::account(Err(CoreError::new(
+                ErrorCode::MessageTooLarge, "Control result exceeds transport budget"))),
+        }).map_err(|_| failed())?);
+    }
     tokio::time::timeout(
         Duration::from_secs(5),
         socket.send(Message::Text(text.as_str().into())),
@@ -140,7 +148,7 @@ async fn run(
     let Message::Text(text) = message else {
         return Err(protocol::invalid());
     };
-    let Incoming::Config { relay, records } = protocol::parse(&text)? else {
+    let Incoming::Config { relay, records, controlled_time } = protocol::parse(&text)? else {
         return Err(protocol::invalid());
     };
     let relay = relay
@@ -151,10 +159,15 @@ async fn run(
         .transpose()?;
     // Account open uses this same mutex. Install first and retain configuration
     // even if native opening subsequently fails. No owned-task/core Arc cycle.
+    if controlled_time && records.is_none() { return Err(protocol::invalid()); }
     if let Some(url) = records {
         self::records::validate(&url)?;
         let mut slot = account.lock().expect("account slot lock poisoned");
         if slot.handle.is_some() || slot.records.is_some() { return Err(protocol::invalid()); }
+        if controlled_time {
+            use crate::account::clock::{Clock, FakeClock, SystemClock};
+            slot.controlled_clock = Some(Arc::new(FakeClock::new(SystemClock::default().unix_seconds(), 0)));
+        }
         slot.records = Some(url);
         slot.configuring = true;
     }
@@ -169,6 +182,7 @@ async fn run(
     }));
     let _ = ready.take().unwrap().send(Ok(()));
     let mut ids = protocol::RequestIds::default();
+    let ack_loss = Arc::new(message::AckLossControl::default());
     let mut pending: FuturesUnordered<
         futures_util::future::BoxFuture<'static, (u64, protocol::Outcome)>,
     > = FuturesUnordered::new();
@@ -201,6 +215,16 @@ async fn run(
                             ids.accept(id)?;
                             if pending.len() >= 64 {
                                 send(&mut socket, Outgoing::Result { id, result: protocol::Outcome::account(Err(CoreError::new(ErrorCode::Busy, "control request limit"))) }).await?;
+                            } else if op == "clock_advance" {
+                                let result = message::advance(&account.lock().expect("account slot lock poisoned"), args);
+                                send(&mut socket, Outgoing::Result { id, result: protocol::Outcome::account(result) }).await?;
+                            } else if op.starts_with("message_local_test_") {
+                                let handle = account.lock().expect("account slot lock poisoned").handle.clone();
+                                let control = ack_loss.clone();
+                                pending.push(Box::pin(async move { (id, protocol::Outcome::account(message::execute_test(handle, control, &op, args).await)) }));
+                            } else if op.starts_with("message_local_") {
+                                let handle = account.lock().expect("account slot lock poisoned").handle.clone();
+                                pending.push(Box::pin(async move { (id, protocol::Outcome::account(message::execute(handle, &op, args).await)) }));
                             } else if op.starts_with("account_local_") {
                                 let handle = account.lock().expect("account slot lock poisoned").handle.clone();
                                 let network = network.clone();
@@ -223,6 +247,7 @@ async fn run(
     // Dropping pending futures leaves the normal network actor alive. The control
     // server observes socket closure and fails its outstanding RPCs.
     drop(pending);
+    ack_loss.release().await;
     drop(events);
     let _ = tokio::time::timeout(Duration::from_secs(1), socket.close(None)).await;
     result
@@ -231,6 +256,27 @@ async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn oversized_private_result_returns_fixed_error_with_original_id() {
+        use serde_json::json;
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let connect=tokio_tungstenite::connect_async(format!("ws://{}",listener.local_addr().unwrap()));
+        let accept=async { tokio_tungstenite::accept_async(listener.accept().await.unwrap().0).await.unwrap() };
+        let (client,mut server)=tokio::join!(connect,accept);
+        let mut client=client.unwrap().0;
+        for (id,value) in [(7,json!({"body":"\u{1}".repeat(16_384)})),
+            (8,json!({"items":vec![json!({"body":"x".repeat(16_384)});50]}))] {
+            let outgoing=Outgoing::Result { id,result:protocol::Outcome::account(Ok(value)) };
+            let (sent,reply)=tokio::join!(send(&mut client,outgoing),server.next());
+            sent.unwrap();
+            let Message::Text(reply)=reply.unwrap().unwrap() else {panic!()};
+            assert!(reply.len()<=64*1024);
+            let parsed:serde_json::Value=serde_json::from_str(&reply).unwrap();
+            assert_eq!(parsed["id"],id);
+            assert_eq!(parsed["error"]["code"],"MessageTooLarge");
+            assert!(parsed.get("value").is_none());
+        }
+    }
     #[test]
     fn overflowing_sink_signals_without_reentering_bus_or_advancing_sequence() {
         let bus = EventBus::new();

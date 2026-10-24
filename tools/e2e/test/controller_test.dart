@@ -371,49 +371,32 @@ void main() {
   });
 
   test(
-    'command timeout releases pending capacity and ids keep increasing',
+    'command timeout is terminal and retains the original failure',
     () async {
       final peer = await join();
       final participant = await controller.waitParticipant('node');
+      expectedCloseFailure = isA<TimeoutException>();
       final timeout = expectLater(
         participant.call('network_info', {}, timeout: short),
         throwsA(isA<TimeoutException>()),
       );
       expect((await peer.next())['id'], 1);
       await timeout;
-      final calls = <Future<Object?>>[];
-      for (var i = 0; i < 64; i++) {
-        calls.add(participant.call('network_stop', {}));
-      }
       await expectLater(
         participant.call('network_stop', {}),
-        throwsA(failure('pending')),
+        throwsA(isA<TimeoutException>()),
       );
-      for (var i = 0; i < 64; i++) {
-        final command = await peer.next();
-        expect(command['id'], i + 2);
-        peer.result(command['id'] as int, null);
-      }
-      await Future.wait(calls);
+      await expectLater(
+        controller.waitParticipant('node'),
+        throwsA(isA<TimeoutException>()),
+      );
+      peer.result(1, null);
+      await expectLater(
+        participant.expectEvent((_) => true),
+        throwsA(isA<TimeoutException>()),
+      );
     },
   );
-
-  test('late result after timeout is unmatched and visible', () async {
-    final peer = await join();
-    final participant = await controller.waitParticipant('node');
-    final timeout = expectLater(
-      participant.call('network_info', {}, timeout: short),
-      throwsA(isA<TimeoutException>()),
-    );
-    await peer.next();
-    await timeout;
-    final waiter = expectLater(
-      participant.expectEvent((_) => true),
-      throwsA(scenarioFailure('protocol')),
-    );
-    peer.result(1, null);
-    await waiter;
-  });
 
   for (final seq in [1, 0, 3]) {
     test('sequence $seq after 1 fails the entire scenario', () async {
