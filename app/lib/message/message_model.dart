@@ -397,8 +397,10 @@ class MessageModel extends ChangeNotifier {
   Future<bool> retry(MessageKey key) =>
       _command(() => client.retrySend(key: key));
 
-  Future<void> markVisibleRead(List<MessageKey> keys) async {
-    if (!ready || currentConversation == null) return;
+  /// Per-call completion for UI retry bookkeeping, never remote read truth.
+  /// An empty filtered set is a successful no-op only while still current.
+  Future<bool> markVisibleRead(List<MessageKey> keys) async {
+    if (!ready || currentConversation == null) return false;
     final generation = _generation;
     final conversation = Uint8List.fromList(currentConversation!.id);
     final incoming = {
@@ -413,15 +415,17 @@ class MessageModel extends ChangeNotifier {
     final selected = visible.values.toList();
     try {
       for (var i = 0; i < selected.length; i += 50) {
-        if (!_current(generation)) return;
+        if (!_current(generation)) return false;
         await client.markRead(
           conversation: conversation,
           keys: selected.skip(i).take(50).toList(),
         );
-        if (!_current(generation)) return;
+        if (!_current(generation)) return false;
       }
+      return _current(generation);
     } catch (failure) {
       if (_current(generation)) _failure(failure);
+      return false;
     }
   }
 

@@ -3,6 +3,10 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 
 import '../core_client.dart';
+import '../account/account_model.dart';
+import '../message/message_client.dart';
+import '../message/message_model.dart';
+import '../message/screens/conversation_list_screen.dart';
 import '../network/network_client.dart';
 import '../network/network_screen.dart';
 import '../probe/probe_host.dart';
@@ -19,10 +23,21 @@ String connectionLabel(ChatEvent_ConnectionState state) {
 }
 
 class HomeScreen extends StatefulWidget {
-  const HomeScreen({super.key, required this.core, this.probe, this.network});
+  const HomeScreen({
+    super.key,
+    required this.core,
+    this.probe,
+    this.network,
+    this.account,
+    this.messages,
+    this.onOpenConversation,
+  });
 
   final CoreClient core;
   final NetworkClient? network;
+  final AccountModel? account;
+  final MessageClient? messages;
+  final ValueChanged<List<int>>? onOpenConversation;
 
   /// M1b device probe (iOS only). Null hides the probe button.
   final ProbeHost? probe;
@@ -36,10 +51,12 @@ class _HomeScreenState extends State<HomeScreen> {
   ChatEvent_ConnectionState? _connection;
   String? _startError;
   String? _streamError;
+  MessageModel? _messages;
 
   @override
   void initState() {
     super.initState();
+    _createMessages();
     // Subscribe before starting: the core replays the latest connection state anyway.
     _events = widget.core.events().listen((event) {
       if (!mounted) return;
@@ -66,7 +83,26 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   @override
+  void didUpdateWidget(HomeScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.account != widget.account ||
+        oldWidget.messages != widget.messages) {
+      _messages?.dispose();
+      _createMessages();
+    }
+  }
+
+  void _createMessages() {
+    final account = widget.account;
+    final messages = widget.messages;
+    _messages = account == null || messages == null
+        ? null
+        : MessageModel(messages, account: account);
+  }
+
+  @override
   void dispose() {
+    _messages?.dispose();
     _events?.cancel();
     super.dispose();
   }
@@ -83,6 +119,9 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+      appBar: ModalRoute.of(context)?.canPop == true
+          ? AppBar(title: const Text('대화'))
+          : null,
       body: SafeArea(
         child: Padding(
           padding: const EdgeInsets.fromLTRB(22, 16, 22, 16),
@@ -124,24 +163,36 @@ class _HomeScreenState extends State<HomeScreen> {
                 ),
                 child: Text(_status, style: const TextStyle(fontSize: 14, color: AppColors.textSecondary)),
               ),
-              const Expanded(
-                child: Center(
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Text(
-                        '아직 대화가 없어요',
-                        style: TextStyle(fontSize: 22, fontWeight: FontWeight.w600, color: AppColors.text),
+              Expanded(
+                child: _messages != null && widget.onOpenConversation != null
+                    ? ConversationListScreen(
+                        model: _messages!,
+                        onOpen: widget.onOpenConversation!,
+                      )
+                    : const Center(
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Text(
+                              '아직 대화가 없어요',
+                              style: TextStyle(
+                                fontSize: 22,
+                                fontWeight: FontWeight.w600,
+                                color: AppColors.text,
+                              ),
+                            ),
+                            SizedBox(height: 12),
+                            Text(
+                              '초대를 확인하고 연락처를 추가해 보세요.',
+                              textAlign: TextAlign.center,
+                              style: TextStyle(
+                                fontSize: 15,
+                                color: AppColors.textSecondary,
+                              ),
+                            ),
+                          ],
+                        ),
                       ),
-                      SizedBox(height: 12),
-                      Text(
-                        '초대를 확인하고 연락처를 추가해 보세요.',
-                        textAlign: TextAlign.center,
-                        style: TextStyle(fontSize: 15, color: AppColors.textSecondary),
-                      ),
-                    ],
-                  ),
-                ),
               ),
               Text('코어 ${widget.core.version}', style: const TextStyle(fontSize: 12, color: AppColors.textMuted)),
             ],

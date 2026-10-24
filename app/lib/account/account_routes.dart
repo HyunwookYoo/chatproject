@@ -25,10 +25,12 @@ class AccountRoutes extends StatefulWidget {
     required this.model,
     required this.child,
     this.onPair,
+    this.onOpenConversation,
   });
   final AccountModel model;
   final Widget child;
   final VoidCallback? onPair;
+  final ValueChanged<List<int>>? onOpenConversation;
   @override
   State<AccountRoutes> createState() => _AccountRoutesState();
 }
@@ -345,6 +347,13 @@ class _AccountRoutesState extends State<AccountRoutes>
             ),
         if (_contact!.deviceUnverified) const Text('기기 목록을 확인하지 못했어요'),
         if (!_contact!.deviceUnverified) const Text('현재 기기 인증됨'),
+        if (widget.onOpenConversation != null)
+          FilledButton(
+            onPressed: model.busy
+                ? null
+                : () => widget.onOpenConversation!(selectedPeer),
+            child: const Text('대화 시작'),
+          ),
         FilledButton(
           onPressed: model.busy
               ? null

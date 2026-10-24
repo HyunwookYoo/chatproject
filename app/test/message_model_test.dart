@@ -43,6 +43,110 @@ void main() {
     await accountClient.controller.close();
   });
 
+  Future<_ReadOutcomeClient> readOutcomeClient() async {
+    model.dispose();
+    await client.controller.close();
+    final next = _ReadOutcomeClient();
+    client = next;
+    model = MessageModel(next, account: accounts);
+    return next;
+  }
+
+  test('visible_read_outcome_success_preserves_unrelated_send_error', () async {
+    client.rows = [message(1, outgoing: false)];
+    await model.openConversation(bytes(2));
+    client.sending = (_, _) async => throw const rust.CoreError(
+      code: rust.ErrorCode.messageTooLarge,
+      detail: 'fixture',
+    );
+    expect(await model.send('fixture'), false);
+    await expectLater(
+      model.markVisibleRead([message(1).key]),
+      completion(isTrue),
+    );
+    expect(model.errorCode, rust.ErrorCode.messageTooLarge);
+  });
+
+  test(
+    'visible_read_outcome_unavailable_false_filtered_empty_noop_true',
+    () async {
+      await expectLater(model.markVisibleRead([]), completion(isFalse));
+      await model.openConversation(bytes(2));
+      await expectLater(
+        model.markVisibleRead([
+          message(1).key,
+          message(1, conversation: 9).key,
+        ]),
+        completion(isTrue),
+      );
+      expect(
+        client.reads,
+        isEmpty,
+      ); // outgoing and foreign keys are not proof of read
+      accounts.applySnapshot(
+        fixture.view(BigInt.from(3), phase: account.AccountPhase.locked),
+      );
+      await expectLater(model.markVisibleRead([]), completion(isFalse));
+    },
+  );
+
+  test('visible_read_outcome_failed_partial_batch_false_and_stops', () async {
+    final reads = await readOutcomeClient();
+    reads.rows = List.generate(120, (i) => message(i + 1, outgoing: false));
+    reads.failAt = 2;
+    await model.openConversation(bytes(2));
+    await model.loadOlder();
+    await model.loadOlder();
+    await expectLater(
+      model.markVisibleRead(model.messages.map((row) => row.key).toList()),
+      completion(isFalse),
+    );
+    expect(reads.reads.map((batch) => batch.length), [50, 50]);
+    expect(model.errorCode, rust.ErrorCode.storageFull);
+  });
+
+  test(
+    'visible_read_outcome_lock_during_await_false_without_late_error',
+    () async {
+      final reads = await readOutcomeClient();
+      reads.rows = [message(1, outgoing: false)];
+      final held = Completer<void>();
+      reads.wait = held.future;
+      await model.openConversation(bytes(2));
+      final reading = model.markVisibleRead([message(1).key]);
+      accounts.applySnapshot(
+        fixture.view(BigInt.from(3), phase: account.AccountPhase.locked),
+      );
+      held.complete();
+      await expectLater(reading, completion(isFalse));
+      expect(model.errorCode, isNull);
+    },
+  );
+
+  test(
+    'visible_read_outcome_route_change_or_dispose_during_await_false',
+    () async {
+      final reads = await readOutcomeClient();
+      reads.rows = [message(1, outgoing: false)];
+      final held = Completer<void>();
+      reads.wait = held.future;
+      await model.openConversation(bytes(2));
+      final reading = model.markVisibleRead([message(1).key]);
+      await model.openConversation(bytes(3));
+      held.complete();
+      await expectLater(reading, completion(isFalse));
+      reads.rows = [message(2, conversation: 2, outgoing: false)];
+      await model.openConversation(bytes(3));
+      final disposing = Completer<void>();
+      reads.wait = disposing.future;
+      final beforeDispose = model.markVisibleRead([reads.rows.single.key]);
+      model.dispose();
+      disposing.complete();
+      await expectLater(beforeDispose, completion(isFalse));
+      await expectLater(model.markVisibleRead([]), completion(isFalse));
+    },
+  );
+
   Future<DurableMessageClient> durableLostReply() async {
     model.dispose();
     await client.controller.close();
@@ -745,6 +849,25 @@ void main() {
       model = MessageModel(client, account: accounts);
     },
   );
+}
+
+class _ReadOutcomeClient extends FakeMessageClient {
+  Future<void>? wait;
+  int failAt = 0;
+  @override
+  Future<void> markRead({
+    required List<int> conversation,
+    required List<MessageKey> keys,
+  }) async {
+    reads.add(keys);
+    await wait;
+    if (reads.length == failAt) {
+      throw const rust.CoreError(
+        code: rust.ErrorCode.storageFull,
+        detail: 'fixture',
+      );
+    }
+  }
 }
 
 class _SharedApi implements RustLibApi {

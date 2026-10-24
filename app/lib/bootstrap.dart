@@ -46,6 +46,7 @@ Future<Widget> bootstrap(
     final app = ChatApp(
       core: core,
       account: accountModel,
+      messages: core is FrbCoreClient ? core.messages : null,
       network: core is NetworkClient ? core as NetworkClient : null,
       probe: Platform.isIOS ? IosProbeHost() : null,
     );
