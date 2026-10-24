@@ -41,16 +41,24 @@ class Fake implements ProcessRunner {
   int identityReads = 0;
   int launches = 0;
   int appPid = 100;
+  bool finalStopPending = false;
+  int finalStopReads = 0;
+  final forceStopLaunches = <int>[];
   String? contractRoot;
   Future<OwnedProcess> start(String exe, List<String> args, {required Directory logDir, String? workingDirectory, String? stdin, bool retainOutput = false}) async {
     final child = Child(next++, Completer<int>(), this);
     var output = '';
     if (mode.startsWith('android-')) {
       if (args.contains('pidof')) {
+        if (finalStopPending) {
+          finalStopReads++;
+          if (mode == 'android-contract2-stop-delayed' && finalStopReads == 3) launched = false;
+        }
         if (launched) {
           identityReads++;
           output = mode == 'android-cancel-foreign' && identityReads > 1 ? '999' : '${320 + launches}';
           if (mode == 'android-cancel-identity' || mode == 'android-cancel-foreign') cancel.cancel();
+          if (finalStopPending && mode == 'android-contract2-stop-replacement') output = '999';
         }
       }
       if (args.contains('package')) output = 'android.permission.INTERNET android.permission.ACCESS_NETWORK_STATE${mode == 'android-backup' ? ' ALLOW_BACKUP' : ''}';
@@ -60,7 +68,12 @@ class Fake implements ProcessRunner {
         launched = true;
         if (mode == 'android-cancel-launch') cancel.cancel();
       }
-      if (args.contains('force-stop')) { forceStopped = true; launched = false; }
+      if (args.contains('force-stop')) {
+        forceStopped = true;
+        forceStopLaunches.add(launches);
+        finalStopPending = launches == 3 && mode.startsWith('android-contract2-stop-');
+        if (!finalStopPending) launched = false;
+      }
       if (args.contains('activities')) output = mode == 'android-wrong-activity' ? 'topResumedActivity=ActivityRecord{other.app/.Other}' : 'topResumedActivity=ActivityRecord{dev.chatproject.chat_app/.MainActivity}';
       if (args.contains('uiautomator')) output = '<node package="dev.chatproject.chat_app" text="내 계정 시작하기 새 계정 만들기 복구 문구로 복구 다른 기기로 연결" />';
       if (args.contains('logcat')) {
@@ -141,6 +154,8 @@ Future<void> main(List<String> args) async {
   final phaseLogs = fake.launches == 3 ? 'cleaned' : fake.launches == 2 ? 'reopened' : 'created';
   final ownershipFile = File(args[0].contains('contract') ? '${logs.path}/$phaseLogs/ownership.json' : '${logs.path}/ownership.json');
   print(jsonEncode({'result': result, 'stops': fake.stops, 'forceStopped': fake.forceStopped,
+    'finalStopReads': fake.finalStopReads, 'forceStopLaunches': fake.forceStopLaunches,
+    'contractSuccess': File('${logs.path}/contract-success.json').existsSync(),
     'launches': fake.launches, 'rootRetained': fake.contractRoot != null && Directory(fake.contractRoot!).existsSync(),
     'ownership': jsonDecode(ownershipFile.readAsStringSync())}));
 }
@@ -222,6 +237,27 @@ class ReleaseSmokeTests(unittest.TestCase):
 
     def test_android_release_rejects_backup_enabled_manifest(self):
         self.probe('android-backup', False)
+
+    def test_android_final_stop_requires_observed_absence(self):
+        data = self.probe('android-contract2-stop-persistent', False)
+        self.assertFalse(data['contractSuccess'])
+        self.assertGreater(data['finalStopReads'], 1)
+        self.assertEqual(data['ownership']['activities'][0]['pid'], '323')
+        self.assertEqual(data['forceStopLaunches'], [1, 2, 3])
+
+    def test_android_final_stop_waits_for_delayed_absence(self):
+        data = self.probe('android-contract2-stop-delayed', True)
+        self.assertTrue(data['contractSuccess'])
+        self.assertEqual(data['finalStopReads'], 3)
+        self.assertEqual(data['ownership']['activities'], [])
+        self.assertEqual(data['forceStopLaunches'], [1, 2, 3])
+
+    def test_android_final_stop_preserves_replacement(self):
+        data = self.probe('android-contract2-stop-replacement', False)
+        self.assertFalse(data['contractSuccess'])
+        self.assertEqual(data['finalStopReads'], 1)
+        self.assertEqual(data['ownership']['activities'][0]['pid'], '323')
+        self.assertEqual(data['forceStopLaunches'], [1, 2, 3])
 
     def test_android_cancellation_drains_launch_and_identity_acquisition(self):
         for mode in ('android-cancel-launch', 'android-cancel-identity'):

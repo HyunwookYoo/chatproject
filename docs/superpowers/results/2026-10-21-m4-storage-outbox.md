@@ -17,7 +17,7 @@ The platform storage-root selectors now preserve a previously selected directory
 | Focused actual native bridge/errors | 12 passed, zero skipped. |
 | Dart tools | 233 passed, one Windows signal-test skip; fatal-info analyzer clean. |
 | Flutter analyzer / Release smoke analyzer | Both clean. |
-| CI unit checks | 124 passed, one Linux `/proc`-specific skip. |
+| CI unit checks | Full suite before the runner review fix: 124 passed, one Linux `/proc`-specific skip. The subsequent focused Release-runner suite passed all 15 tests. |
 | Windows native message storage | Fresh write/read processes passed: 55 messages, 50+5 paging, typed change events, same account identity, distinct runtime instances. |
 | Windows native account storage | Write/read/locked/missing/read passed on an exact canonical Korean root of 305 characters; actual DB path 316 characters. |
 | Windows ordinary and contract Release | Both built, archived, scanned, and launched successfully. Contract reopened the same SQL binding in a fresh process and verified owned-file cleanup. |
@@ -27,6 +27,8 @@ The platform storage-root selectors now preserve a previously selected directory
 | Seven native CLI rows | M4 Windows/Android/mixed and M3/M3-auth Windows/Android all passed. Each run ended with an empty ownership ledger; final process, emulator-port and adb observations were clear. |
 
 The Release contract uses existing ordinary `openAccount` and snapshot APIs in the Unconfigured state. A successful open validates the encrypted database, metadata binding, SQLCipher version, and crypto provider. Networking stays stopped. It does not create an Active/Candidate account or insert a message. The public `storage.mode` binding survives process-close/reopen; wrapped key bytes never enter Dart. Windows cleanup follows process exit. Android uses an additional cleanup-only launch before Rust initialization. A success receipt is emitted only after the complete sequence.
+
+Independent review found that Android's final stop request lacked an explicit PID-absence observation in the runner. The runner now retains activity ownership while polling within its existing bounds, and rejects a persistent or replacement PID. The focused tests reproduce the former false success and cover delayed disappearance and replacement preservation. This finding concerns the reusable completion gate; it does not establish a process leak in the earlier retained run.
 
 The initial Android contract rejected a trusted cache spelling before Rust initialization. A separate diagnostic measured `/data/user/0/dev.chatproject.chat_app/cache` resolving to `/data/data/dev.chatproject.chat_app/cache`, with a real directory and a differing canonical spelling. Only the Android OS-provided parent is now canonicalized; Windows caller-root checks and nonce-child ownership checks remain strict. The diagnostic could not satisfy contract success, and final dedicated Windows/APK contracts were rebuilt and rerun after this change.
 

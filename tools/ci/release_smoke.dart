@@ -261,8 +261,23 @@ Future<Map<String, dynamic>?> _runSmokeOnce({
             'Android activity identity changed; preserved for manual cleanup',
           );
         }
-        if (current.isNotEmpty)
+        if (current.isNotEmpty) {
           await command(['shell', 'am', 'force-stop', _package], cleanup: true);
+          final stopped = Stopwatch()..start();
+          while (true) {
+            final remaining = await appPid(cleanup: true);
+            if (remaining.isEmpty) break;
+            if (remaining != ownedPid) {
+              throw StateError(
+                'Android activity identity changed; preserved for manual cleanup',
+              );
+            }
+            if (stopped.elapsed >= readyTimeout) {
+              throw StateError('Android activity exit was not observed');
+            }
+            await Future<void>.delayed(pollInterval);
+          }
+        }
         run.activities.clear();
         run.save();
       });
