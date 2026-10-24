@@ -4,6 +4,7 @@ import 'package:chat_app/account/account_client.dart';
 import 'package:chat_app/account/account_model.dart';
 import 'package:chat_app/src/rust/api/account.dart' as account;
 import 'package:chat_app/src/rust/api/chat.dart' as rust;
+import 'package:flutter/foundation.dart' show debugPrint;
 import 'package:flutter_test/flutter_test.dart';
 
 account.AccountView view(
@@ -65,6 +66,55 @@ class FakeAccountClient implements AccountClient {
 }
 
 void main() {
+  test('command failure logs only the CoreError code', () async {
+    final messages = <String?>[];
+    final previousDebugPrint = debugPrint;
+    debugPrint = (message, {wrapWidth}) => messages.add(message);
+    addTearDown(() => debugPrint = previousDebugPrint);
+    final client = FakeAccountClient()
+      ..commandError = const rust.CoreError(
+        code: rust.ErrorCode.transportFailed,
+        detail: 'private-core-error-sentinel',
+      );
+    final model = AccountModel(client);
+    addTearDown(() async {
+      await model.close();
+      await client.controller.close();
+    });
+    await model.open();
+
+    expect(await model.prepareCandidate(), isNull);
+
+    expect(model.errorCode, rust.ErrorCode.transportFailed);
+    expect(model.error, '계정 작업을 완료할 수 없어요. 다시 시도해 주세요.');
+    expect(model.snapshot!.phase, account.AccountPhase.unconfigured);
+    expect(model.busy, isFalse);
+    expect(messages, ['ChatProject account operation failed: transportFailed']);
+    expect(messages.join(), isNot(contains('private-core-error-sentinel')));
+  });
+  test('unknown command failure logs only the fallback code', () async {
+    final messages = <String?>[];
+    final previousDebugPrint = debugPrint;
+    debugPrint = (message, {wrapWidth}) => messages.add(message);
+    addTearDown(() => debugPrint = previousDebugPrint);
+    final client = FakeAccountClient()
+      ..commandError = Exception('private-unknown-error-sentinel');
+    final model = AccountModel(client);
+    addTearDown(() async {
+      await model.close();
+      await client.controller.close();
+    });
+    await model.open();
+
+    expect(await model.prepareCandidate(), isNull);
+
+    expect(model.errorCode, rust.ErrorCode.notAvailable);
+    expect(model.error, '이 기기에서 계정 보호 기능을 사용할 수 없어요.');
+    expect(model.snapshot!.phase, account.AccountPhase.unconfigured);
+    expect(model.busy, isFalse);
+    expect(messages, ['ChatProject account operation failed: notAvailable']);
+    expect(messages.join(), isNot(contains('private-unknown-error-sentinel')));
+  });
   test(
     'clearing a flow invalidates its pending secret response and suppresses duplicate taps',
     () async {

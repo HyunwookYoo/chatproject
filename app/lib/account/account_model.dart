@@ -85,6 +85,7 @@ class AccountModel extends ChangeNotifier {
     errorCode = error is rust.CoreError
         ? error.code
         : rust.ErrorCode.notAvailable;
+    debugPrint('ChatProject account operation failed: ${errorCode!.name}');
     if (opening || _storageError(errorCode!)) {
       clearSecrets();
       snapshot = lockedAccountView(
