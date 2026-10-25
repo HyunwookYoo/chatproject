@@ -1,6 +1,6 @@
 # Manual recovery of a retained stale own-list conflict
 
-**Status: proposal for user review; implementation and resend are not authorized yet.**
+**Status: approved by the user on 2026-10-25; subagent implementation authorized.** Real recovery remains subject to all operation guards and observed network results.
 
 ## Why this is needed
 
