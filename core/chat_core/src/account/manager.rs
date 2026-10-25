@@ -2715,7 +2715,12 @@ impl Manager {
         match lookup {
             Ok(super::Lookup::Found(packet)) => {
                 let signed = super::publication::SignedRecord::new(packet, peer)?;
-                self.observe_remote(peer, signed, request).await?;
+                let observed = self.observe_remote(peer, signed, request).await;
+                if let Err(error) = &observed && error.code == ErrorCode::RecordConflict {
+                    use std::io::Write;
+                    let _ = writeln!(std::io::stderr().lock(), "record_conflict remote_observation source=lookup");
+                }
+                observed?;
             }
             Ok(super::Lookup::CompletedAbsent) | Err(_) => {
                 cached = true;

@@ -10,6 +10,7 @@ use crate::{CoreError, ErrorCode};
 use iroh::endpoint::Connection;
 use minicbor::{Decoder, Encoder, data::Type};
 use std::{
+    cmp::Ordering,
     collections::BTreeMap,
     sync::{Arc, Mutex},
     time::Duration,
@@ -32,15 +33,33 @@ pub(crate) struct RemoteRecord {
     pub(crate) floor: u64,
     pub(crate) conflict: Option<SignedRecord>,
 }
+struct RemoteRecordComparison {
+    retained_before: bool,
+    hash_equal: bool,
+    seq_vs_accepted: Ordering,
+    below_prior_floor: bool,
+    generation_equal: bool,
+    devices_equal: bool,
+    time_valid: bool,
+}
 impl RemoteRecord {
     pub(crate) fn observe(&mut self, found: SignedRecord, now: u64) -> Result<(), CoreError> {
+        let comparison = RemoteRecordComparison {
+            retained_before: self.conflict.is_some(),
+            hash_equal: found.hash == self.accepted.hash,
+            seq_vs_accepted: found.seq.cmp(&self.accepted.seq),
+            below_prior_floor: found.seq < self.floor,
+            generation_equal: found.record.generation == self.accepted.record.generation,
+            devices_equal: found.record.devices == self.accepted.record.devices,
+            time_valid: found.current(now),
+        };
         self.floor = self.floor.max(found.seq);
         if found.hash == self.accepted.hash {
             return if self.conflict.is_none() {
                 Ok(())
             } else {
                 self.conflict = Some(found);
-                Err(conflict())
+                Err(conflict(comparison))
             };
         }
         if self.conflict.is_none()
@@ -54,11 +73,19 @@ impl RemoteRecord {
             Ok(())
         } else {
             self.conflict = Some(found);
-            Err(conflict())
+            Err(conflict(comparison))
         }
     }
 }
-fn conflict() -> CoreError {
+fn conflict(comparison: RemoteRecordComparison) -> CoreError {
+    use std::io::Write;
+    let _ = writeln!(
+        std::io::stderr().lock(),
+        "record_conflict remote_observation RemoteRecordComparison {{ retained_before: {}, hash_equal: {}, seq_vs_accepted: {:?}, below_prior_floor: {}, generation_equal: {}, devices_equal: {}, time_valid: {} }}",
+        comparison.retained_before, comparison.hash_equal, comparison.seq_vs_accepted,
+        comparison.below_prior_floor, comparison.generation_equal, comparison.devices_equal,
+        comparison.time_valid,
+    );
     CoreError::new(ErrorCode::RecordConflict, "Account record conflict")
 }
 pub(crate) fn encode_cache(cache: &[RemoteRecord]) -> Vec<u8> {
@@ -357,5 +384,146 @@ impl Default for Runtime {
             send,
             cancel: CancellationToken::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::account::{
+        DeviceKind, Generation, IdentityRecord, RecordDevice, Secret32, derive_account,
+        derive_device, record_packet,
+    };
+
+    const NOW: u64 = 1_800_000_000;
+    const SEQ: u64 = NOW * 1_000_000;
+    const CHILD: &str = "CHAT_CORE_RECORD_CONFLICT_FIXTURE";
+
+    fn signed(seq: u64, generation: u8, device: u8, issued: u64, expires: u64) -> SignedRecord {
+        let keys = derive_account(&Secret32::from(*b"record-conflict-private-sentinel")).unwrap();
+        let device = derive_device(Secret32::from([device; 32])).unwrap();
+        let packet = record_packet(
+            &keys,
+            &IdentityRecord {
+                generation: Generation([generation; 16]),
+                issued_at: issued,
+                expires_at: expires,
+                devices: vec![RecordDevice {
+                    installation_id: device.installation_id(),
+                    transport_public_key: device.transport_public_key(),
+                    kind: DeviceKind::Desktop,
+                }],
+            },
+            seq,
+        ).unwrap();
+        SignedRecord::new(packet, keys.peer_id()).unwrap()
+    }
+
+    // Removing failure diagnostics, capturing retained state after mutation, or
+    // accepting a rollback must fail this real-observer stderr/state regression.
+    #[test]
+    fn remote_record_failure_diagnostic_preserves_observation_policy() {
+        if let Ok(case) = std::env::var(CHILD) {
+            let retained = std::env::var("CHAT_CORE_RECORD_CONFLICT_RETAINED").unwrap() == "true";
+            let accepted = signed(SEQ, 1, 7, NOW, NOW + 600);
+            let mut remote = RemoteRecord {
+                peer: PeerId(accepted.packet.as_bytes()[..32].try_into().unwrap()),
+                accepted: accepted.clone(),
+                floor: if case == "prior_floor" { SEQ + 2 } else { SEQ },
+                conflict: retained.then(|| signed(SEQ, 2, 7, NOW, NOW + 600)),
+            };
+            let found = match case.as_str() {
+                "exact" => accepted.clone(),
+                "renewal" | "prior_floor" => signed(SEQ + 1, 1, 7, NOW, NOW + 601),
+                "lower" => signed(SEQ - 1, 1, 7, NOW, NOW + 600),
+                "equal" => signed(SEQ, 1, 7, NOW, NOW + 601),
+                "generation" => signed(SEQ + 1, 2, 7, NOW, NOW + 600),
+                "devices" => signed(SEQ + 1, 1, 8, NOW, NOW + 600),
+                "future" => signed(SEQ + 600_000_000, 1, 7, NOW + 600, NOW + 1200),
+                _ => panic!("unknown child fixture"),
+            };
+            if std::env::var_os("CHAT_CORE_RECORD_CONFLICT_CLOSED_STDERR").is_some() {
+                use std::io::Read;
+                // Parent closes the pipe reader before releasing observation.
+                std::io::stdin().read_exact(&mut [0]).unwrap();
+            }
+            let result = remote.observe(found.clone(), NOW);
+            let succeeds = !retained && matches!(case.as_str(), "exact" | "renewal");
+            if succeeds {
+                result.unwrap();
+                assert!(remote.conflict.is_none());
+            } else {
+                let error = result.unwrap_err();
+                assert_eq!(error.code, ErrorCode::RecordConflict);
+                assert_eq!(error.detail, "Account record conflict");
+                assert_eq!(remote.conflict.as_ref().unwrap().packet.as_bytes(), found.packet.as_bytes());
+            }
+            let expected_accepted = if succeeds && case == "renewal" { &found } else { &accepted };
+            assert_eq!(remote.accepted.packet.as_bytes(), expected_accepted.packet.as_bytes());
+            let expected_floor = match case.as_str() {
+                "prior_floor" => SEQ + 2,
+                "renewal" | "generation" | "devices" => SEQ + 1,
+                "future" => SEQ + 600_000_000,
+                _ => SEQ,
+            };
+            assert_eq!(remote.floor, expected_floor);
+            // A retained conflict must also survive durable cache encoding.
+            let restored = decode_cache(&encode_cache(&[remote.clone()]), PeerId([0; 32])).unwrap();
+            assert_eq!(encode_cache(&restored), encode_cache(&[remote]));
+            return;
+        }
+
+        // These literal facts are hand-derived from the signed fixtures, before
+        // observation mutates the floor or replaces retained conflict evidence.
+        let cases = [
+            ("exact", "true", "Equal", "false", "true", "true", "true"),
+            ("renewal", "false", "Greater", "false", "true", "true", "true"),
+            ("lower", "false", "Less", "true", "true", "true", "true"),
+            ("equal", "false", "Equal", "false", "true", "true", "true"),
+            ("generation", "false", "Greater", "false", "false", "true", "true"),
+            ("devices", "false", "Greater", "false", "true", "false", "true"),
+            ("future", "false", "Greater", "false", "true", "true", "false"),
+            ("prior_floor", "false", "Greater", "true", "true", "true", "true"),
+        ];
+        for retained in [false, true] {
+            for (case, hash, seq, below, generation, devices, time) in cases {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "account::connection::tests::remote_record_failure_diagnostic_preserves_observation_policy", "--nocapture"])
+                    .env(CHILD, case)
+                    .env("CHAT_CORE_RECORD_CONFLICT_RETAINED", retained.to_string())
+                    .output().unwrap();
+                assert!(output.status.success(), "child {case}/{retained} failed: {}", String::from_utf8_lossy(&output.stderr));
+                let stderr = String::from_utf8(output.stderr).unwrap().replace("\r\n", "\n");
+                let expected = if !retained && matches!(case, "exact" | "renewal") {
+                    String::new()
+                } else {
+                    format!("record_conflict remote_observation RemoteRecordComparison {{ retained_before: {retained}, hash_equal: {hash}, seq_vs_accepted: {seq}, below_prior_floor: {below}, generation_equal: {generation}, devices_equal: {devices}, time_valid: {time} }}\n")
+                };
+                assert!(!stderr.contains("record-conflict-private-sentinel"));
+                // Exact stderr equality permits no packet/key/hash/number or
+                // other fixture material alongside the approved comparison facts.
+                assert_eq!(stderr, expected, "diagnostic for {case}/{retained}");
+            }
+        }
+    }
+
+    #[test]
+    fn remote_record_diagnostic_ignores_closed_stderr() {
+        use std::io::Write;
+        use std::process::Stdio;
+
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "account::connection::tests::remote_record_failure_diagnostic_preserves_observation_policy", "--nocapture"])
+            .env(CHILD, "lower")
+            .env("CHAT_CORE_RECORD_CONFLICT_RETAINED", "false")
+            .env("CHAT_CORE_RECORD_CONFLICT_CLOSED_STDERR", "true")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn().unwrap();
+        drop(child.stderr.take().unwrap());
+        child.stdin.take().unwrap().write_all(&[1]).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "closed stderr changed the observer outcome: {}", String::from_utf8_lossy(&output.stdout));
     }
 }

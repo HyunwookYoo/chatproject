@@ -11,7 +11,7 @@ use super::{
 use crate::{CoreError, ErrorCode};
 use minicbor::{Decoder, Encoder, data::Type};
 use pkarr::SignedPacket;
-use std::sync::Arc;
+use std::{cmp::Ordering, sync::Arc};
 
 pub struct AccountServices {
     pub(crate) backend: Option<Arc<dyn RecordBackend>>,
@@ -174,6 +174,19 @@ pub(crate) struct RecordState {
     pub(crate) pending: Vec<PacketIntent>,
     pub(crate) state: PublicationState,
 }
+struct OwnRecordComparison {
+    retained_before: bool,
+    accepted_present: bool,
+    accepted_hash_equal: bool,
+    seq_vs_observed_at_hold: Ordering,
+    seq_vs_allocated_at_hold: Ordering,
+    generation_equal: bool,
+    devices_equal_to_accepted: bool,
+    pending_hash_match: bool,
+    pending_ready_hash_match: bool,
+    time_valid: bool,
+    expired: bool,
+}
 #[derive(Clone, Copy)]
 pub(crate) enum Action {
     Refresh,
@@ -319,7 +332,32 @@ impl RecordState {
             })
             && !self.removed(local)
     }
-    fn hold(&mut self, found: SignedRecord) -> CoreError {
+    fn hold(&mut self, found: SignedRecord, now: u64) -> CoreError {
+        use std::io::Write;
+        // Hold-entry facts: the future guard in reconcile may already have
+        // raised observed_seq. This is not a pre-reconcile snapshot.
+        let comparison = OwnRecordComparison {
+            retained_before: self.conflict.is_some(),
+            accepted_present: self.accepted.is_some(),
+            accepted_hash_equal: self.accepted.as_ref().is_some_and(|a| a.hash == found.hash),
+            seq_vs_observed_at_hold: found.seq.cmp(&self.observed_seq),
+            seq_vs_allocated_at_hold: found.seq.cmp(&self.allocated_seq),
+            generation_equal: found.record.generation == self.generation,
+            devices_equal_to_accepted: self.accepted.as_ref().is_some_and(|a| a.record.devices == found.record.devices),
+            pending_hash_match: self.pending.iter().any(|p| p.signed.hash == found.hash),
+            pending_ready_hash_match: self.pending.iter().any(|p| p.signed.hash == found.hash && p.status == PacketStatus::Ready),
+            time_valid: found.current(now),
+            expired: found.record.is_expired(now),
+        };
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "own_publication hold retained_before={} accepted_present={} accepted_hash_equal={} seq_vs_observed_at_hold={:?} seq_vs_allocated_at_hold={:?} generation_equal={} devices_equal_to_accepted={} pending_hash_match={} pending_ready_hash_match={} time_valid={} expired={}",
+            comparison.retained_before, comparison.accepted_present, comparison.accepted_hash_equal,
+            comparison.seq_vs_observed_at_hold, comparison.seq_vs_allocated_at_hold,
+            comparison.generation_equal, comparison.devices_equal_to_accepted,
+            comparison.pending_hash_match, comparison.pending_ready_hash_match,
+            comparison.time_valid, comparison.expired,
+        );
         self.observed_seq = self.observed_seq.max(found.seq);
         if self.conflict.as_ref().is_none_or(|c| found.seq >= c.seq) {
             self.conflict = Some(found);
@@ -428,7 +466,7 @@ impl RecordState {
             if !known {
                 // Time policy cannot erase a competing signed base or release
                 // its dependent work on a later absence/clock correction.
-                self.hold(found.clone());
+                self.hold(found.clone(), now);
                 if initial_replacement {
                     self.state = PublicationState::LocalBlocked;
                 }
@@ -456,7 +494,7 @@ impl RecordState {
                 return Err(conflict());
             };
             if found.hash != hash {
-                return Err(self.hold(found));
+                return Err(self.hold(found, now));
             }
             if !self.owns(&found.record, local)
                 || found.record.is_expired(now)
@@ -495,10 +533,10 @@ impl RecordState {
                 .iter()
                 .position(|p| p.signed.hash == found.hash && p.status == PacketStatus::Ready);
             if self.conflict.is_some() {
-                return Err(self.hold(found));
+                return Err(self.hold(found, now));
             }
             if found.seq < self.observed_seq {
-                return Err(self.hold(found));
+                return Err(self.hold(found, now));
             }
             if let Some(index) = exact {
                 self.observed_seq = self.observed_seq.max(found.seq);
@@ -514,9 +552,11 @@ impl RecordState {
                 self.observed_seq = self.observed_seq.max(found.seq);
                 self.accepted = Some(found);
             } else {
-                return Err(self.hold(found));
+                return Err(self.hold(found, now));
             }
         } else if self.conflict.is_some() {
+            use std::io::Write;
+            let _ = writeln!(std::io::stderr().lock(), "own_publication hold lookup_present=false retained_before=true");
             return Err(conflict());
         }
 
@@ -867,6 +907,166 @@ mod tests {
             1,
         )
         .unwrap()
+    }
+
+    const OWN_CHILD: &str = "CHAT_CORE_OWN_PUBLICATION_FIXTURE";
+    const OWN_TEST: &str = "account::publication::tests::own_publication_diagnostic_preserves_reconcile_outcomes";
+
+    // Missing hold diagnostics, using pre-reconcile rather than hold-entry
+    // sequence facts, or changing reconciliation outcomes must fail this test.
+    #[test]
+    fn own_publication_diagnostic_preserves_reconcile_outcomes() {
+        if let Ok(case) = std::env::var(OWN_CHILD) {
+            const SEQ: u64 = 1_000_000_000;
+            let mut local = local();
+            local.device = super::super::derive_device(Secret32::from([7; 32])).unwrap();
+            local.cert = super::super::sign_cert(&local.keys, &local.device, super::super::DeviceKind::Desktop, 1000).unwrap();
+            let mut records = local.records.clone();
+            records.generation = Generation([1; 16]);
+            let mut record = records.first_record(&local);
+            record.issued_at = 1000;
+            record.expires_at = 1600;
+            let signed = |record: &IdentityRecord, seq| {
+                SignedRecord::new(record_packet(&local.keys, record, seq).unwrap(), local.keys.peer_id()).unwrap()
+            };
+            let accepted = signed(&record, SEQ);
+            records.accepted = Some(accepted.clone());
+            records.observed_seq = SEQ;
+            records.allocated_seq = SEQ;
+            records.state = PublicationState::Observed;
+            let mut found = accepted.clone();
+            match case.as_str() {
+                "accepted" | "retained" | "retained_absent" => {}
+                "stale" => found = signed(&record, SEQ - 1),
+                "later_unknown" => {
+                    record.generation = Generation([2; 16]);
+                    record.devices[0].transport_public_key = [8; 32];
+                    found = signed(&record, SEQ + 1);
+                }
+                "pending_held" | "pending_ready" | "retained_pending_ready" => {
+                    record.expires_at = 1601;
+                    found = signed(&record, SEQ + 1);
+                    records.pending.push(PacketIntent {
+                        signed: found.clone(),
+                        base_hash: Some(accepted.hash),
+                        operation: PacketOperation::Renew,
+                        status: if case == "pending_held" { PacketStatus::Held } else { PacketStatus::Ready },
+                        revoke_nonce: None,
+                        recipients: None,
+                    });
+                    records.allocated_seq = SEQ + 1;
+                    records.state = PublicationState::Pending;
+                }
+                "future" => {
+                    record.issued_at = 1600;
+                    record.expires_at = 2200;
+                    found = signed(&record, SEQ + 600_000_000);
+                }
+                "unaccepted" => {
+                    records.accepted = None;
+                    records.observed_seq = 0;
+                    records.allocated_seq = 0;
+                    records.state = PublicationState::LocalBlocked;
+                }
+                "expired" => {
+                    record.issued_at = 400;
+                    record.expires_at = 1000;
+                    found = signed(&record, SEQ - 1);
+                }
+                _ => panic!("unknown own-publication child fixture"),
+            }
+            if matches!(case.as_str(), "retained" | "retained_absent" | "retained_pending_ready") {
+                record.expires_at = 1602;
+                records.conflict = Some(signed(&record, SEQ + 2));
+                records.observed_seq = SEQ + 2;
+                records.state = PublicationState::Conflict;
+            }
+            let mut expected = records.clone();
+            match case.as_str() {
+                "accepted" | "retained_absent" => {}
+                "pending_ready" => {
+                    expected.accepted = Some(found.clone());
+                    expected.observed_seq = SEQ + 1;
+                    expected.pending.clear();
+                    expected.state = PublicationState::Observed;
+                }
+                "retained" | "retained_pending_ready" => {
+                    for intent in &mut expected.pending { intent.status = PacketStatus::Held; }
+                }
+                _ => {
+                    expected.conflict = Some(found.clone());
+                    expected.state = PublicationState::Conflict;
+                    expected.observed_seq = match case.as_str() {
+                        "later_unknown" | "pending_held" => SEQ + 1,
+                        "future" => SEQ + 600_000_000,
+                        _ => SEQ,
+                    };
+                }
+            }
+            if std::env::var_os("CHAT_CORE_OWN_PUBLICATION_CLOSED_STDERR").is_some() {
+                use std::io::Read;
+                std::io::stdin().read_exact(&mut [0]).unwrap();
+            }
+            let lookup = if case == "retained_absent" { Lookup::CompletedAbsent } else { Lookup::Found(found.packet) };
+            let result = records.reconcile(lookup, &local, 1000, Action::Refresh);
+            if matches!(case.as_str(), "accepted" | "pending_ready") {
+                result.unwrap();
+            } else {
+                let error = result.unwrap_err();
+                if case == "future" {
+                    assert_eq!(error.code, ErrorCode::AccountRestricted);
+                    assert_eq!(error.detail, "Account publication requires a valid clock and current membership");
+                } else {
+                    assert_eq!(error.code, ErrorCode::RecordConflict);
+                    assert_eq!(error.detail, "Device list changed; confirm the current list");
+                }
+            }
+            assert_eq!(records.encode(), expected.encode(), "reconcile changed the original outcome for {case}");
+            assert_eq!(RecordState::decode(&records.encode(), local.keys.peer_id()).unwrap().encode(), expected.encode());
+            return;
+        }
+
+        let cases = [
+            ("accepted", ""),
+            ("stale", "retained_before=false accepted_present=true accepted_hash_equal=false seq_vs_observed_at_hold=Less seq_vs_allocated_at_hold=Less generation_equal=true devices_equal_to_accepted=true pending_hash_match=false pending_ready_hash_match=false time_valid=true expired=false"),
+            ("later_unknown", "retained_before=false accepted_present=true accepted_hash_equal=false seq_vs_observed_at_hold=Greater seq_vs_allocated_at_hold=Greater generation_equal=false devices_equal_to_accepted=false pending_hash_match=false pending_ready_hash_match=false time_valid=true expired=false"),
+            ("retained", "retained_before=true accepted_present=true accepted_hash_equal=true seq_vs_observed_at_hold=Less seq_vs_allocated_at_hold=Equal generation_equal=true devices_equal_to_accepted=true pending_hash_match=false pending_ready_hash_match=false time_valid=true expired=false"),
+            ("pending_held", "retained_before=false accepted_present=true accepted_hash_equal=false seq_vs_observed_at_hold=Greater seq_vs_allocated_at_hold=Equal generation_equal=true devices_equal_to_accepted=true pending_hash_match=true pending_ready_hash_match=false time_valid=true expired=false"),
+            ("pending_ready", ""),
+            ("retained_pending_ready", "retained_before=true accepted_present=true accepted_hash_equal=false seq_vs_observed_at_hold=Less seq_vs_allocated_at_hold=Equal generation_equal=true devices_equal_to_accepted=true pending_hash_match=true pending_ready_hash_match=true time_valid=true expired=false"),
+            ("future", "retained_before=false accepted_present=true accepted_hash_equal=false seq_vs_observed_at_hold=Equal seq_vs_allocated_at_hold=Greater generation_equal=true devices_equal_to_accepted=true pending_hash_match=false pending_ready_hash_match=false time_valid=false expired=false"),
+            ("unaccepted", "retained_before=false accepted_present=false accepted_hash_equal=false seq_vs_observed_at_hold=Greater seq_vs_allocated_at_hold=Greater generation_equal=true devices_equal_to_accepted=false pending_hash_match=false pending_ready_hash_match=false time_valid=true expired=false"),
+            ("expired", "retained_before=false accepted_present=true accepted_hash_equal=false seq_vs_observed_at_hold=Less seq_vs_allocated_at_hold=Less generation_equal=true devices_equal_to_accepted=true pending_hash_match=false pending_ready_hash_match=false time_valid=true expired=true"),
+            ("retained_absent", "lookup_present=false retained_before=true"),
+        ];
+        for (case, facts) in cases {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", OWN_TEST, "--nocapture"])
+                .env(OWN_CHILD, case)
+                .output().unwrap();
+            assert!(output.status.success(), "child {case} failed: {}", String::from_utf8_lossy(&output.stderr));
+            let stderr = String::from_utf8(output.stderr).unwrap().replace("\r\n", "\n");
+            let expected = if facts.is_empty() { String::new() } else { format!("own_publication hold {facts}\n") };
+            // Exact whitelist admits no private fixture data, record/packet,
+            // identifiers, raw sequence/time values, or arbitrary error text.
+            assert_eq!(stderr, expected, "own-publication diagnostic for {case}");
+        }
+    }
+
+    #[test]
+    fn own_publication_diagnostic_ignores_closed_stderr() {
+        use std::io::Write;
+        use std::process::Stdio;
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", OWN_TEST, "--nocapture"])
+            .env(OWN_CHILD, "stale")
+            .env("CHAT_CORE_OWN_PUBLICATION_CLOSED_STDERR", "true")
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+            .spawn().unwrap();
+        drop(child.stderr.take().unwrap());
+        child.stdin.take().unwrap().write_all(&[1]).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "closed stderr changed reconcile outcome: {}", String::from_utf8_lossy(&output.stdout));
     }
     #[test]
     fn durable_notification_recipients_are_bounded_canonical_and_survive_renew_rebase() {
