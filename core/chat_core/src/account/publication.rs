@@ -71,6 +71,8 @@ pub enum PublicationState {
 }
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PublicationView {
+    /// Actor-computed presentation hint; the command rechecks every guard.
+    pub can_republish_accepted: bool,
     pub state: PublicationState,
     pub generation: Option<Generation>,
     pub observed_seq: u64,
@@ -86,6 +88,7 @@ pub struct PublicationView {
 impl Default for PublicationView {
     fn default() -> Self {
         Self {
+            can_republish_accepted: false,
             state: PublicationState::LocalBlocked,
             generation: None,
             observed_seq: 0,
@@ -274,6 +277,7 @@ impl RecordState {
     }
     pub(crate) fn view(&self) -> PublicationView {
         PublicationView {
+            can_republish_accepted: false,
             state: self.state,
             generation: Some(self.generation),
             observed_seq: self.observed_seq,

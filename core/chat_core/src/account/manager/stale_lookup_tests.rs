@@ -31,6 +31,11 @@ impl KeyProtector for Protector {
 struct Backend {
     lookup: Mutex<Option<pkarr::SignedPacket>>,
     published: AtomicUsize,
+    published_bytes: Mutex<Vec<Vec<u8>>>,
+    publish_error: Mutex<Option<ErrorCode>>,
+    publish_hang: AtomicBool,
+    clock_after_publish: Mutex<Option<(Arc<FakeClock>, u64)>>,
+    lifecycle_after_publish: Mutex<Option<Arc<Shared>>>,
     notified: AtomicUsize,
     clock_after_lookup: Mutex<Option<(Arc<FakeClock>, u64)>>,
     unavailable: AtomicBool,
@@ -53,9 +58,29 @@ impl RecordBackend for Backend {
                 .map_or(Lookup::CompletedAbsent, Lookup::Found))
         })
     }
-    fn publish<'a>(&'a self, _: &'a pkarr::SignedPacket) -> RecordFuture<'a, ()> {
+    fn publish<'a>(&'a self, packet: &'a pkarr::SignedPacket) -> RecordFuture<'a, ()> {
         Box::pin(async {
             self.published.fetch_add(1, Ordering::SeqCst);
+            self.published_bytes
+                .lock()
+                .unwrap()
+                .push(packet.as_bytes().to_vec());
+            tokio::task::yield_now().await;
+            if let Some((clock, time)) = self.clock_after_publish.lock().unwrap().take() {
+                clock.set_unix_seconds(time);
+            }
+            if let Some(shared) = self.lifecycle_after_publish.lock().unwrap().take() {
+                shared.requests.send_modify(|request| {
+                    request.ticket += 1;
+                    request.suspend = true;
+                });
+            }
+            if self.publish_hang.load(Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
+            if let Some(code) = *self.publish_error.lock().unwrap() {
+                return Err(unavailable(code));
+            }
             Ok(())
         })
     }
@@ -171,6 +196,11 @@ impl Harness {
         let backend = Arc::new(Backend {
             lookup: Mutex::new(packet),
             published: AtomicUsize::new(0),
+            published_bytes: Mutex::new(vec![]),
+            publish_error: Mutex::new(None),
+            publish_hang: AtomicBool::new(false),
+            clock_after_publish: Mutex::new(None),
+            lifecycle_after_publish: Mutex::new(None),
             notified: AtomicUsize::new(0),
             clock_after_lookup: Mutex::new(None),
             unavailable: AtomicBool::new(false),
@@ -721,3 +751,6 @@ async fn stale_lookup_exact_ready_pending_keeps_acceptance_path() {
     assert!(h.manager.local_authorized());
     h.no_effects();
 }
+
+#[path = "retained_republish_tests.rs"]
+mod retained_republish_tests;

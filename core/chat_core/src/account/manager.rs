@@ -118,6 +118,7 @@ enum Command {
     Refresh(PeerId, oneshot::Sender<Result<(), CoreError>>),
     Revoke(InstallationId, oneshot::Sender<Result<(), CoreError>>),
     Resolve([u8; 32], oneshot::Sender<Result<(), CoreError>>),
+    RepublishAccepted([u8; 32], oneshot::Sender<Result<(), CoreError>>),
     ResolveRemote(PeerId, [u8; 32], oneshot::Sender<Result<(), CoreError>>),
 }
 struct Queued {
@@ -177,6 +178,7 @@ impl Command {
             | Self::Revoke(_, reply)
             | Self::ResolveRemote(_, _, reply)
             | Self::Resolve(_, reply)
+            | Self::RepublishAccepted(_, reply)
             | Self::ConfirmSafety(_, _, reply) => {
                 let _ = reply.send(Err(error));
             }
@@ -393,6 +395,11 @@ impl AccountHandle {
     }
     pub async fn confirm_record_conflict(&self, base_hash: [u8; 32]) -> Result<(), CoreError> {
         self.send(|reply| Command::Resolve(base_hash, reply)).await
+    }
+    /// Resend the exact accepted packet without observing or resolving a conflict.
+    pub async fn republish_accepted_record(&self, accepted_hash: [u8; 32]) -> Result<(), CoreError> {
+        self.send(|reply| Command::RepublishAccepted(accepted_hash, reply))
+            .await
     }
     pub async fn confirm_remote_record(&self, peer: PeerId, hash: [u8; 32]) -> Result<(), CoreError> {
         self.send(|reply| Command::ResolveRemote(peer, hash, reply)).await
@@ -1230,6 +1237,7 @@ impl Manager {
                         }
                         Command::Revoke(target, reply) => { let result = self.publication(Action::Revoke(target)).await; let _ = reply.send(result); }
                         Command::ResolveRemote(peer, hash, reply) => { let result = self.confirm_remote(peer, hash).await; let _ = reply.send(result); }
+                        Command::RepublishAccepted(hash, reply) => { let result = self.republish_accepted_record(hash).await; let _ = reply.send(result); }
                         Command::Resolve(hash, reply) => { let result = self.publication(Action::Confirm(hash)).await; let _ = reply.send(result); }
                     }
                 }
@@ -1550,6 +1558,56 @@ impl Manager {
         }
         Ok(())
     }
+    fn accepted_republish_packet(
+        &self,
+        accepted_hash: [u8; 32],
+    ) -> Result<&pkarr::SignedPacket, CoreError> {
+        self.ready()?;
+        let local = self.local()?;
+        let records = &local.records;
+        let accepted = records.accepted.as_ref()
+            .ok_or_else(|| unavailable(ErrorCode::AccountRestricted))?;
+        if accepted.hash != accepted_hash {
+            return Err(unavailable(ErrorCode::RecordConflict));
+        }
+        let now = self.services.clock.unix_seconds();
+        if records.state != PublicationState::Conflict
+            || !records.pending.is_empty()
+            || accepted.seq < records.observed_seq
+            || accepted.seq < records.allocated_seq
+            || !accepted.current(now)
+            || accepted.record.is_expired(now)
+            || !records.can_publish(&accepted.record, local)
+            || records.conflict.as_ref().is_none_or(|conflict| {
+                conflict.seq >= accepted.seq
+                    || conflict.record.generation != accepted.record.generation
+                    || conflict.record.devices != accepted.record.devices
+            })
+            // Keep the stored expected-account signature/shape rules at this boundary.
+            || !super::publication::SignedRecord::new(accepted.packet.clone(), local.keys.peer_id())
+                .is_ok_and(|verified| {
+                    verified.hash == accepted.hash
+                        && verified.seq == accepted.seq
+                        && verified.record == accepted.record
+                })
+        {
+            return Err(unavailable(ErrorCode::AccountRestricted));
+        }
+        Ok(&accepted.packet)
+    }
+    async fn republish_accepted_record(&mut self, accepted_hash: [u8; 32]) -> Result<(), CoreError> {
+        let request = self.ready()?;
+        let packet = self.accepted_republish_packet(accepted_hash)?.clone();
+        let backend = self.services.backend()?;
+        self.ensure_ready(request)?;
+        self.accepted_republish_packet(accepted_hash)?;
+        let result = self.service(request, backend.publish(&packet)).await;
+        self.ensure_ready(request)?;
+        let eligible = self.accepted_republish_packet(accepted_hash).map(|_| ());
+        // Backend failures retain their codes; even a successful ACK grants no authority.
+        result?;
+        eligible
+    }
     async fn publication(&mut self, action: Action) -> Result<(), CoreError> {
         let request = self.ready()?;
         let local = self.local()?;
@@ -1768,6 +1826,8 @@ impl Manager {
                 }).collect();
                 view.publish_intents.push(local.intent);
                 view.publication = local.records.view();
+                view.publication.can_republish_accepted = local.records.accepted.as_ref()
+                    .is_some_and(|accepted| self.accepted_republish_packet(accepted.hash).is_ok());
                 match local.records.state {
                     PublicationState::Observed if self.local_authorized() => view.phase = AccountPhase::Active,
                     PublicationState::Observed => view.publication.state = PublicationState::LocalBlocked,
