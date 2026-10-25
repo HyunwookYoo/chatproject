@@ -74,3 +74,19 @@ Task 2에서는 일반 `lib/main.dart` Windows Release를 한 번 빌드해 성�
 실제 hold 진입 관찰에서 수용 목록은 관찰·할당 순서 이상이고 현재 유효·미만료이며 로컬 세대와 같았다. 저장된 충돌은 수용 목록보다 엄격히 오래됐고 세대·전체 기기 구성이 같았으며 미완료 게시물은 없었다. 현재 조회 응답도 관찰 순서보다 낮으므로 수용 목록보다 오래됐음을 이제 구분할 수 있다. 이는 앞선 진단에서 미확정이던 관계를 보완하지만, 최초 충돌을 만든 정확한 사건이나 전역 최신성을 증명하지 않는다. 현재 기기 키의 소유·해제 표식 등 복구 실행에 필요한 모든 조건을 새로 관찰한 것은 아니다.
 
 진단 영수증은 `build/e2e/m4-physical-2026-10-25/physical01-retained-context-observation.json`, 소스·시험·검토·빌드 보고서는 `.superpowers/sdd/2026-10-25-m4-stale-record-lookup/physical01-context-*.md`에 보관했다. 재게시·충돌 해제·서명·새 메시지 전송은 하지 않았으며 실물 자동 복귀 판정은 계속 보류한다.
+
+## 저장된 수용 목록의 명시적 재게시 구현 및 Release 검증
+
+사용자가 승인한 복구 동작을 `6773b87`, `86fd16e`, `70a4df2`에 구현했다. 계정 actor가 활성·준비 상태, 표시했던 수용 해시, 유효·미만료 수용 목록과 두 floor, 더 오래된 동일 세대·전체 기기 구성의 보존 충돌, 현재 기기 키 소유권 및 전체 목록의 tombstone, 미완료 게시·알림 없음 등을 다시 검사한다. 이미 저장된 정확한 서명 packet을 기존 시간 제한·생명주기 취소 경로로 한 번 게시하며 서명·순서 할당·저장·충돌 해제·권한 부여·메시지 재시도를 추가하지 않는다. ACK 뒤에도 충돌은 남고 실제 공개 목록 조회와 기존 명시적 확인이 필요하다.
+
+‘내 기기’의 `저장된 목록 다시 게시`는 실제 공개 projection인 계정 Conflict·게시 Conflict와 actor 자격·수용 증거가 있을 때 표시된다. 검토 창은 수용 세대·전체 기기 목록·해시를 보여주고, 창을 열 때 복사한 해시에 대한 사용자 확인을 요구한다. 취소·busy·오래된 해시·비활성 생명주기·폐기된 창·늦은 ACK를 처리한다. 최초 UI의 Active 조건을 독립 검토에서 발견해 실제 Conflict projection을 사용하는 회귀 시험과 함께 수정했다. 최종 Task 1 및 Task 2 재검토의 열린 지적은 0건이다.
+
+보존된 시험 증거는 코어 집중 11건·Release 단위 116건, Release 코어 Clippy/check, Rust bridge 2건·Release FFI check/Clippy, 수정 후 Flutter 집중 52건·전체 219건 통과 및 기존 선택 시험 10건 건너뜀, 정적 검사 이상 없음이다. pinned FRB 2.11.1의 최종 반복 생성은 10개 소스·생성 파일 해시가 동일했다. Task 3에서 이 시험 묶음을 중복 실행하지 않았다. 최초 생성 시도는 Release 확장 경로가 적용되지 않아 679,749,111바이트의 부분 Debug 캐시를 만든 뒤 중단됐고, 수정된 생성 경로는 Release였다. 이후 해당 캐시 삭제는 자동 승인 검토가 정책상 거부했으며 삭제·재시도·우회 없이 그대로 유지했다.
+
+수용된 HEAD `70a4df21f223a325d61ffeb14fb2071580eb7fa8`에서 `C:\tools\flutter\bin\flutter.bat build windows --release --target lib/main.dart`를 app 디렉터리에서 기존 Rust 1.92.0·portable Perl의 자식 환경으로 한 번 빌드했다. exit 0, 76.151초이며 별도 `windows-release-retained-recovery`에 15개 파일을 보관하고 전부 재해시했다. 먼저 시도한 forward-slash batch 경로는 cmd 구문 오류로 0.017초 만에 종료돼 Flutter가 시작되지 않았고, 별도 실패 영수증을 보존한 후 Windows 경로 표기를 바로잡았다. 빌드 중 572개 추적 파일·HEAD·상태·보호 문서 3개 해시는 모두 유지됐다.
+
+새 `chat_ffi.dll`은 22,051,840바이트, SHA-256 `9d1dc649439bb070a420bc8eab6212e9ccaf8a46624698ae383141f5fc26f211`이며 Dart AOT `data/app.so`는 5,981,072바이트, SHA-256 `ba076e979f82401f0b7cebb58bee59cd6b282e3a97e152c8eccd6c33dbd4c8c7`이다. 이전 context01 번들과 실제 바이트·해시를 비교하면 이 두 파일만 변경됐고 나머지 13개는 동일하다. 기존 번들은 보존했다. Release hooks 검사(네이티브 5개) 및 15개 전체 파일에 대한 새 비공개 시험 표식 30개의 UTF-8·UTF-16LE/BE 제외 검사가 통과했다. AOT에서 재게시 진입·ACK 문구의 UTF-16LE 존재도 확인했다.
+
+같은 준비된 helper로 새 DLL의 순수 상수 함수 `frb_get_rust_content_hash`만 호출했다. native·생성 Rust·생성 Dart가 모두 `-1289420996`으로 일치해 exit 0이었다. 이전 DLL은 같은 helper에서 `1276311813`으로 불일치해 exit 2였다는 음성 대조 영수증도 보존돼 있다. CoreSlot·RustLib 초기화, 저장소·네트워크 API는 호출하지 않았다. 상세 명령·환경·소스 및 전체 산출물 manifest·로그·검토 근거는 `.superpowers/sdd/2026-10-25-m4-retained-stale-recovery/task-3-report.md`와 인접 JSON 영수증에 있다.
+
+이번 단계는 산출물 검증까지이며 시험 앱 교체·실행, 휴대전화 조작, 실제 재게시·조회·충돌 확인·메시지 복귀를 수행하지 않았다. 후속 실물 시험은 정상 UI의 명시적 재게시 동의와 실제 조회·기존 확인 절차를 거쳐야 한다. 원래 대기 메시지가 수동 재전송·추가 티켓 없이 한 번 복귀하고 정확한 수신·읽음 상태를 확인하기 전에는 기존 설치의 복구나 M4 전체 완료를 주장하지 않는다. 선택 native·visual 및 debug 전용 socket/control 시험의 기존 제외 한계도 남아 있다.
