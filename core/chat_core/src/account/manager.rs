@@ -1567,6 +1567,18 @@ impl Manager {
         let backend = self.services.backend()?;
         let lookup = self.service(request, backend.lookup(peer)).await;
         self.ensure_ready(request)?;
+        let local = self.local()?;
+        let now = self.services.clock.unix_seconds();
+        if local.records.pending.is_empty()
+            && Self::local_authorized_at(local, now)
+            && let Ok(super::Lookup::Found(packet)) = &lookup
+            && let Ok(candidate) = super::publication::SignedRecord::new(packet.clone(), peer)
+            && Self::stale_lookup(&candidate, local.records.accepted.as_ref().unwrap(), now)
+        {
+            // This lookup supplies no fresh publication base. Keep valid local
+            // authority without observing the old packet or persisting changes.
+            return Err(unavailable(ErrorCode::RecordUnavailable));
+        }
         let mut records = self.local()?.records.clone();
         let result = match lookup {
             Ok(lookup) => records.reconcile(
@@ -1770,6 +1782,9 @@ impl Manager {
         view
     }
 }
+
+#[cfg(test)]
+mod stale_lookup_tests;
 
 #[cfg(all(test, feature = "test-hooks", debug_assertions))]
 mod tests {
@@ -2480,6 +2495,19 @@ mod tests {
 }
 
 impl Manager {
+    fn stale_lookup(
+        candidate: &super::publication::SignedRecord,
+        accepted: &super::publication::SignedRecord,
+        now: u64,
+    ) -> bool {
+        candidate.seq < accepted.seq
+            && candidate.record.generation == accepted.record.generation
+            && candidate.record.devices == accepted.record.devices
+            && candidate.current(now)
+            && !candidate.record.is_expired(now)
+            && accepted.current(now)
+            && !accepted.record.is_expired(now)
+    }
     fn local_authorized(&self) -> bool {
         self.ready().is_ok() && self.local().is_ok_and(|local| Self::local_authorized_at(local,self.services.clock.unix_seconds()))
     }
@@ -2711,16 +2739,24 @@ impl Manager {
     ) -> Result<super::publication::SignedRecord, CoreError> {
         self.ensure_ready(request)?;
         self.auth.cached_lookups.remove(&peer);
-        let mut cached = false;
+        let cached;
         match lookup {
             Ok(super::Lookup::Found(packet)) => {
                 let signed = super::publication::SignedRecord::new(packet, peer)?;
-                let observed = self.observe_remote(peer, signed, request).await;
-                if let Err(error) = &observed && error.code == ErrorCode::RecordConflict {
-                    use std::io::Write;
-                    let _ = writeln!(std::io::stderr().lock(), "record_conflict remote_observation source=lookup");
+                let now = self.services.clock.unix_seconds();
+                cached = self.local()?.remote.iter().find(|r| r.peer == peer).is_some_and(|r| {
+                    r.conflict.is_none()
+                        && r.accepted.seq >= r.floor
+                        && Self::stale_lookup(&signed, &r.accepted, now)
+                });
+                if !cached {
+                    let observed = self.observe_remote(peer, signed, request).await;
+                    if let Err(error) = &observed && error.code == ErrorCode::RecordConflict {
+                        use std::io::Write;
+                        let _ = writeln!(std::io::stderr().lock(), "record_conflict remote_observation source=lookup");
+                    }
+                    observed?;
                 }
-                observed?;
             }
             Ok(super::Lookup::CompletedAbsent) | Err(_) => {
                 cached = true;
