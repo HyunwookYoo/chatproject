@@ -33,12 +33,12 @@
 
 **Interfaces:** Consume `Manager::publication`, `Manager::finish_remote_record`, `Manager::local_authorized_at`, SignedRecord, RemoteRecord and existing private snapshot/storage facilities. Preserve all public signatures. Produce only private eligibility logic and lookup-only branches; no new public fixture entry points.
 
-- [ ] Add signed Manager-level regressions named with `stale_lookup`: own returns RecordUnavailable with unchanged encoded state/authorization/floors and zero publish/notify calls; remote returns accepted with cached provenance, unchanged floor and no installed grant merely from lookup. Include durable restart/roundtrip and an authorized fixture tombstone for an unrelated device.
-- [ ] Add strict rejection/non-fallback cases from Spec Verification, including own pending publication, current-device tombstone, wrong account/signature, accepted expiry/future/higher floor, equal-seq equivocation, and candidate greater than accepted but below observed. Check meaningful original state/error outcomes; do not assert only a predicate's return.
-- [ ] Run cached `cargo +1.92.0 test --locked --release -p chat_core --lib stale_lookup` before production edits; capture behavioral RED rather than compilation failure.
-- [ ] Implement the smallest private classification at the two Manager boundaries, validating against current clock after await. Eligible own lookup returns unavailable before persistence; eligible remote lookup uses existing cache checks/event/proof route. Preserve strict paths and the exact accepted case.
-- [ ] Run focused GREEN, then `cargo +1.92.0 test --locked --release -p chat_core --lib` once. Run scoped applicable Release check/lint; do not recreate Debug fixtures or weaken cfg fences. Record excluded integration coverage honestly.
-- [ ] Self-review exact diff/protected hashes, commit only Task 1 files, and write full report with RED/GREEN commands, exits, logs and limits. Controller dispatches independent spec/quality review.
+- [x] Add signed Manager-level regressions named with `stale_lookup`: own returns RecordUnavailable with unchanged encoded state/authorization/floors and zero publish/notify calls; remote returns accepted with cached provenance, unchanged floor and no installed grant merely from lookup. Include durable restart/roundtrip and an authorized fixture tombstone for an unrelated device.
+- [x] Add strict rejection/non-fallback cases from Spec Verification, including own pending publication, current-device tombstone, wrong account/signature, accepted expiry/future/higher floor, equal-seq equivocation, and candidate greater than accepted but below observed. Check meaningful original state/error outcomes; do not assert only a predicate's return.
+- [x] Run cached `cargo +1.92.0 test --locked --release -p chat_core --lib stale_lookup` before production edits; capture behavioral RED rather than compilation failure.
+- [x] Implement the smallest private classification at the two Manager boundaries, validating against current clock after await. Eligible own lookup returns unavailable before persistence; eligible remote lookup uses existing cache checks/event/proof route. Preserve strict paths and the exact accepted case.
+- [x] Run focused GREEN, then `cargo +1.92.0 test --locked --release -p chat_core --lib` once. Run scoped applicable Release check/lint; do not recreate Debug fixtures or weaken cfg fences. Record excluded integration coverage honestly.
+- [x] Self-review exact diff/protected hashes, commit only Task 1 files, and write full report with RED/GREEN commands, exits, logs and limits. Controller dispatches independent spec/quality review.
 
 ### Task 2: Verify ordinary Release artifact and record limits
 
@@ -46,6 +46,6 @@
 
 **Interfaces:** Consume accepted Task 1 commit/source hashes and existing `tools/ci/check_release_hooks.py`; produce archived bundle/hash manifest/source stability/marker scan and concise results.
 
-- [ ] Build one ordinary `flutter build windows --release --target lib/main.dart` using existing Rust1.92/portable Perl child environment, capturing full command/exit/log, source hashes and free disk before/after. Do not run/replace the live app.
-- [ ] Run `tools/ci/check_release_hooks.py` on the new archive and confirm new test-specific markers are absent; compare with diagnostic3 only as provenance, not a runtime test.
-- [ ] Update factual results, verify protected documents/source stability, commit exact results file and report artifacts. Controller performs task review and final whole-change review over the prevention baseline.
+- [x] Build one ordinary `flutter build windows --release --target lib/main.dart` using existing Rust1.92/portable Perl child environment, capturing full command/exit/log, source hashes and free disk before/after. Do not run/replace the live app.
+- [x] Run `tools/ci/check_release_hooks.py` on the new archive and confirm new test-specific markers are absent; compare with diagnostic3 only as provenance, not a runtime test.
+- [x] Update factual results, verify protected documents/source stability, commit exact results file and report artifacts. Controller performs task review and final whole-change review over the prevention baseline.
