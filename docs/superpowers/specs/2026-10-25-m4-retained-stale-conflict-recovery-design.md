@@ -37,7 +37,7 @@ Add one explicit account command and ordinary Rust/FFI/Dart action carrying the 
 
 Reuse exact packet bytes and sequence. Do not call record_packet, allocate, reconcile or signing for this resend. Do not clear/replace accepted, conflict, pending or tombstones; do not persist an automatic resend intent; do not install a grant or enable otherwise blocked work. A backend ACK is not Observed. Preserve NotMostRecent/RecordConflict, unavailable, timeout and lifecycle errors; do not fabricate lookup success or global absence. Normal periodic Refresh remains unchanged and may separately stage new evidence through existing strict policy.
 
-Keep NetworkOnly, the DHT/relay configuration, message routing and shared observer/control rollback behavior unchanged. No store reset, new account, Android reinstall or force-close is needed for this operation. Previously approved public-network use remains in force; this proposal seeks approval for the new recovery operation, not a second network permission.
+Keep NetworkOnly, the DHT/relay configuration, message routing and shared observer/control rollback behavior unchanged. No store reset, new account, Android reinstall or force-close is needed for this operation. Previously approved public-network use remains in force. The user additionally approved this recovery operation on 2026-10-25; its normal dialog confirmation still binds the exact displayed accepted hash.
 
 This is an explicit addition to existing retry policy: M3 permits same-packet/same-sequence retry, but current code only retries pending packets after reconciliation and refuses this retained-conflict state. It must not be represented as already implemented or covered by the prevention-only approval.
 
