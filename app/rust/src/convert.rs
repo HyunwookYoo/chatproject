@@ -312,6 +312,7 @@ impl From<chat_core::account::RevokeIntent> for crate::api::account::RevocationV
 impl From<chat_core::account::PublicationView> for crate::api::account::PublicationView {
     fn from(v: chat_core::account::PublicationView) -> Self {
         Self {
+            can_republish_accepted: v.can_republish_accepted,
             state: v.state.into(),
             generation: v.generation.map(|g| g.0.to_vec()),
             observed_seq: v.observed_seq,

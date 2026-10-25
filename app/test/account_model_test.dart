@@ -18,6 +18,7 @@ account.AccountView view(
   remoteRecords: [],
   publishIntents: [],
   publication: account.PublicationView(
+    canRepublishAccepted: false,
     state: account.PublicationState.localBlocked,
     observedSeq: BigInt.zero,
     allocatedSeq: BigInt.zero,
@@ -36,6 +37,15 @@ class FakeAccountClient implements AccountClient {
   Future<account.AccountView>? delayed;
   final secret = Completer<account.RecoveryDisplay>();
   int begins = 0;
+  final republishedHashes = <List<int>>[];
+  Completer<void>? republishWait;
+  @override
+  Future<void> republishAcceptedRecord(List<int> acceptedHash) async {
+    republishedHashes.add(List.of(acceptedHash));
+    await republishWait?.future;
+    if (commandError != null) throw commandError!;
+  }
+
   Object? openError;
   Object? commandError;
   @override
@@ -66,6 +76,49 @@ class FakeAccountClient implements AccountClient {
 }
 
 void main() {
+  test(
+    'republish command is once-only while busy and late close never succeeds',
+    () async {
+      final client = FakeAccountClient()..republishWait = Completer<void>();
+      final model = AccountModel(client);
+      await model.open();
+      final hash = List<int>.filled(32, 7);
+      final pending = model.republishAcceptedRecord(hash);
+      expect(model.busy, isTrue);
+      expect(await model.republishAcceptedRecord(hash), isFalse);
+      expect(client.republishedHashes, [hash]);
+      await model.close();
+      client.republishWait!.complete();
+      expect(await pending, isFalse);
+      expect(await model.republishAcceptedRecord(hash), isFalse);
+      expect(client.republishedHashes, [hash]);
+      await client.controller.close();
+    },
+  );
+  test(
+    'republish ACK preserves the projection and error is not success',
+    () async {
+      final client = FakeAccountClient();
+      final model = AccountModel(client);
+      await model.open();
+      final before = model.snapshot;
+      final hash = List<int>.filled(32, 7);
+      expect(await model.republishAcceptedRecord(hash), isTrue);
+      expect(model.snapshot, same(before));
+      expect(client.republishedHashes, [hash]);
+      client.commandError = const rust.CoreError(
+        code: rust.ErrorCode.recordConflict,
+        detail: 'PUBLIC_STALE_HASH',
+      );
+      expect(await model.republishAcceptedRecord(hash), isFalse);
+      expect(model.errorCode, rust.ErrorCode.recordConflict);
+      expect(model.snapshot, same(before));
+      expect(model.busy, isFalse);
+      await model.close();
+      await client.controller.close();
+    },
+  );
+
   test('command failure logs only the CoreError code', () async {
     final messages = <String?>[];
     final previousDebugPrint = debugPrint;

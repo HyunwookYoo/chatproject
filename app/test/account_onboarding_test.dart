@@ -79,6 +79,7 @@ class ScreenClient implements AccountClient {
     remoteRecords: remoteRecords,
     publishIntents: [],
     publication: a.PublicationView(
+      canRepublishAccepted: false,
       state: a.PublicationState.pending,
       observedSeq: BigInt.zero,
       allocatedSeq: BigInt.one,

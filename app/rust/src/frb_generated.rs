@@ -37,7 +37,7 @@ flutter_rust_bridge::frb_generated_boilerplate!(
     default_rust_auto_opaque = RustAutoOpaqueMoi,
 );
 pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_VERSION: &str = "2.11.1";
-pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = 1276311813;
+pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = -1289420996;
 
 // Section: executor
 
@@ -1339,6 +1339,44 @@ fn wire__crate__api__account__refresh_record_impl(
                 transform_result_sse::<_, crate::api::chat::CoreError>(
                     (move || async move {
                         let output_ok = crate::api::account::refresh_record(api_peer).await?;
+                        Ok(output_ok)
+                    })()
+                    .await,
+                )
+            }
+        },
+    )
+}
+fn wire__crate__api__account__republish_accepted_record_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_async::<flutter_rust_bridge::for_generated::SseCodec, _, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "republish_accepted_record",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_accepted_hash = <Vec<u8>>::sse_decode(&mut deserializer);
+            deserializer.end();
+            move |context| async move {
+                transform_result_sse::<_, crate::api::chat::CoreError>(
+                    (move || async move {
+                        let output_ok =
+                            crate::api::account::republish_accepted_record(api_accepted_hash)
+                                .await?;
                         Ok(output_ok)
                     })()
                     .await,
@@ -2662,6 +2700,7 @@ impl SseDecode for crate::api::account::PublicationState {
 impl SseDecode for crate::api::account::PublicationView {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut var_canRepublishAccepted = <bool>::sse_decode(deserializer);
         let mut var_state = <crate::api::account::PublicationState>::sse_decode(deserializer);
         let mut var_generation = <Option<Vec<u8>>>::sse_decode(deserializer);
         let mut var_observedSeq = <u64>::sse_decode(deserializer);
@@ -2676,6 +2715,7 @@ impl SseDecode for crate::api::account::PublicationView {
         let mut var_pendingNotifications =
             <Vec<crate::api::account::RevocationView>>::sse_decode(deserializer);
         return crate::api::account::PublicationView {
+            can_republish_accepted: var_canRepublishAccepted,
             state: var_state,
             generation: var_generation,
             observed_seq: var_observedSeq,
@@ -2869,15 +2909,21 @@ fn pde_ffi_dispatcher_primary_impl(
         34 => wire__crate__api__account__prepare_candidate_impl(port, ptr, rust_vec_len, data_len),
         35 => wire__crate__api__account__recover_impl(port, ptr, rust_vec_len, data_len),
         36 => wire__crate__api__account__refresh_record_impl(port, ptr, rust_vec_len, data_len),
-        37 => wire__crate__api__account__retry_open_impl(port, ptr, rust_vec_len, data_len),
-        38 => wire__crate__api__message__retry_send_impl(port, ptr, rust_vec_len, data_len),
-        39 => wire__crate__api__account__revoke_device_impl(port, ptr, rust_vec_len, data_len),
-        40 => wire__crate__api__account__safety_display_impl(port, ptr, rust_vec_len, data_len),
-        41 => wire__crate__api__chat__send_probe_text_impl(port, ptr, rust_vec_len, data_len),
-        42 => wire__crate__api__message__send_text_impl(port, ptr, rust_vec_len, data_len),
-        43 => wire__crate__api__account__snapshot_impl(port, ptr, rust_vec_len, data_len),
-        44 => wire__crate__api__chat__test_hooks_start_impl(port, ptr, rust_vec_len, data_len),
-        45 => wire__crate__api__account__test_storage_start_impl(port, ptr, rust_vec_len, data_len),
+        37 => wire__crate__api__account__republish_accepted_record_impl(
+            port,
+            ptr,
+            rust_vec_len,
+            data_len,
+        ),
+        38 => wire__crate__api__account__retry_open_impl(port, ptr, rust_vec_len, data_len),
+        39 => wire__crate__api__message__retry_send_impl(port, ptr, rust_vec_len, data_len),
+        40 => wire__crate__api__account__revoke_device_impl(port, ptr, rust_vec_len, data_len),
+        41 => wire__crate__api__account__safety_display_impl(port, ptr, rust_vec_len, data_len),
+        42 => wire__crate__api__chat__send_probe_text_impl(port, ptr, rust_vec_len, data_len),
+        43 => wire__crate__api__message__send_text_impl(port, ptr, rust_vec_len, data_len),
+        44 => wire__crate__api__account__snapshot_impl(port, ptr, rust_vec_len, data_len),
+        45 => wire__crate__api__chat__test_hooks_start_impl(port, ptr, rust_vec_len, data_len),
+        46 => wire__crate__api__account__test_storage_start_impl(port, ptr, rust_vec_len, data_len),
         _ => unreachable!(),
     }
 }
@@ -3719,6 +3765,7 @@ impl flutter_rust_bridge::IntoIntoDart<crate::api::account::PublicationState>
 impl flutter_rust_bridge::IntoDart for crate::api::account::PublicationView {
     fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
         [
+            self.can_republish_accepted.into_into_dart().into_dart(),
             self.state.into_into_dart().into_dart(),
             self.generation.into_into_dart().into_dart(),
             self.observed_seq.into_into_dart().into_dart(),
@@ -4713,6 +4760,7 @@ impl SseEncode for crate::api::account::PublicationState {
 impl SseEncode for crate::api::account::PublicationView {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <bool>::sse_encode(self.can_republish_accepted, serializer);
         <crate::api::account::PublicationState>::sse_encode(self.state, serializer);
         <Option<Vec<u8>>>::sse_encode(self.generation, serializer);
         <u64>::sse_encode(self.observed_seq, serializer);

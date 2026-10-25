@@ -90,6 +90,11 @@ Future<void> confirmRecordConflict({required List<int> baseHash}) => RustLib
     .api
     .crateApiAccountConfirmRecordConflict(baseHash: baseHash);
 
+Future<void> republishAcceptedRecord({required List<int> acceptedHash}) =>
+    RustLib.instance.api.crateApiAccountRepublishAcceptedRecord(
+      acceptedHash: acceptedHash,
+    );
+
 Future<PairDisplay> pairBegin({
   required PairDirection direction,
   Uint8List? resume,
@@ -458,6 +463,7 @@ class PairView {
 enum PublicationState { localBlocked, pending, observed, conflict }
 
 class PublicationView {
+  final bool canRepublishAccepted;
   final PublicationState state;
   final Uint8List? generation;
   final BigInt observedSeq;
@@ -471,6 +477,7 @@ class PublicationView {
   final List<RevocationView> pendingNotifications;
 
   const PublicationView({
+    required this.canRepublishAccepted,
     required this.state,
     this.generation,
     required this.observedSeq,
@@ -486,6 +493,7 @@ class PublicationView {
 
   @override
   int get hashCode =>
+      canRepublishAccepted.hashCode ^
       state.hashCode ^
       generation.hashCode ^
       observedSeq.hashCode ^
@@ -503,6 +511,7 @@ class PublicationView {
       identical(this, other) ||
       other is PublicationView &&
           runtimeType == other.runtimeType &&
+          canRepublishAccepted == other.canRepublishAccepted &&
           state == other.state &&
           generation == other.generation &&
           observedSeq == other.observedSeq &&

@@ -112,6 +112,20 @@ class LinkClient extends ScreenClient {
 
 class UiPairClient extends ScreenClient {
   a.PublicationView? publication;
+  final republishedHashes = <List<int>>[];
+  @override
+  Future<void> republishAcceptedRecord(List<int> hash) async {
+    republishedHashes.add(List.of(hash));
+    await commandWait?.future;
+    if (!listEquals(hash, publication?.acceptedHash)) {
+      throw const r.CoreError(
+        code: r.ErrorCode.recordConflict,
+        detail: 'PUBLIC_STALE_HASH',
+      );
+    }
+    check();
+  }
+
   final confirmedHashes = <List<int>>[];
   bool staleConflict = false;
   @override
@@ -322,7 +336,242 @@ Future<void> keyboardActivate(
   await t.pumpAndSettle();
 }
 
+a.PublicationView retainedPublication({
+  bool eligible = true,
+  int hashByte = 19,
+  bool missingAccepted = false,
+}) {
+  final devices = List.generate(
+    5,
+    (i) => a.DeviceView(
+      installationId: Uint8List.fromList(List.filled(32, i)),
+      transportPublicKey: Uint8List.fromList(List.filled(32, i + 10)),
+      kind: i.isEven ? a.DeviceKind.desktop : a.DeviceKind.mobile,
+    ),
+  );
+  final accepted = a.RecordView(
+    generation: Uint8List.fromList(List.filled(16, 3)),
+    issuedAt: BigInt.one,
+    expiresAt: BigInt.from(9999999999),
+    devices: devices,
+  );
+  return a.PublicationView(
+    canRepublishAccepted: eligible,
+    state: a.PublicationState.conflict,
+    observedSeq: BigInt.one,
+    allocatedSeq: BigInt.one,
+    acceptedHash: missingAccepted
+        ? null
+        : Uint8List.fromList(List.filled(32, hashByte)),
+    accepted: missingAccepted ? null : accepted,
+    conflictHash: Uint8List.fromList(List.filled(32, 25)),
+    conflict: accepted,
+    tombstones: [],
+    pendingCount: 0,
+    pendingNotifications: [],
+  );
+}
+
 void expandedTests() {
+  testWidgets(
+    'retained resend reviews accepted full list at 200 percent and cancel sends nothing',
+    (t) async {
+      t.view.physicalSize = const Size(360, 640);
+      t.view.devicePixelRatio = 1;
+      addTearDown(t.view.resetPhysicalSize);
+      addTearDown(t.view.resetDevicePixelRatio);
+      final c = UiPairClient()
+        ..phase = a.AccountPhase.active
+        ..publication = retainedPublication();
+      await mountPair(t, c, devices: true, scale: 2);
+      expect(find.text('저장된 목록 다시 게시'), findsOneWidget);
+      await keyboardActivate(t, '저장된 목록 다시 게시');
+      final dialog = find.byType(AlertDialog);
+      expect(
+        find.descendant(
+          of: dialog,
+          matching: find.textContaining(publicId(List.filled(32, 19))),
+        ),
+        findsOneWidget,
+      );
+      expect(
+        find.descendant(
+          of: dialog,
+          matching: find.textContaining(publicId(List.filled(32, 25))),
+        ),
+        findsNothing,
+      );
+      expect(
+        find.descendant(
+          of: dialog,
+          matching: find.text('세대: ${publicId(List.filled(16, 3))}'),
+        ),
+        findsOneWidget,
+      );
+      for (final d in c.publication!.accepted!.devices) {
+        expect(
+          find.descendant(
+            of: dialog,
+            matching: find.textContaining(publicId(d.installationId)),
+          ),
+          findsOneWidget,
+        );
+      }
+      expect(
+        find.text(
+          '저장된 기기 목록을 그대로 다시 게시합니다. 기존 충돌은 유지되며, 이후 공개 목록을 다시 확인하고 충돌 해결을 완료해야 합니다.',
+        ),
+        findsOneWidget,
+      );
+      expect(t.takeException(), isNull);
+      await keyboardActivate(t, '취소');
+      expect(c.republishedHashes, isEmpty);
+      expect(c.refreshes, 0);
+      expect(c.confirmedHashes, isEmpty);
+    },
+  );
+  testWidgets(
+    'retained resend captures accepted hash while dialog snapshot changes',
+    (t) async {
+      final c = UiPairClient()
+        ..phase = a.AccountPhase.active
+        ..publication = retainedPublication();
+      final m = await mountPair(t, c, devices: true);
+      expect(find.text('저장된 목록 다시 게시'), findsOneWidget);
+      await hit(t, '저장된 목록 다시 게시');
+      c.publication = retainedPublication(hashByte: 20);
+      c.emit();
+      await t.pumpAndSettle();
+      final dialog = find.byType(AlertDialog);
+      expect(
+        find.descendant(
+          of: dialog,
+          matching: find.textContaining(publicId(List.filled(32, 19))),
+        ),
+        findsOneWidget,
+      );
+      expect(
+        find.descendant(
+          of: dialog,
+          matching: find.textContaining(publicId(List.filled(32, 20))),
+        ),
+        findsNothing,
+      );
+      await hit(t, '다시 게시');
+      expect(c.republishedHashes, [List.filled(32, 19)]);
+      expect(m.errorCode, r.ErrorCode.recordConflict);
+      expect(find.text('목록을 다시 보냈어요. 공개 목록 확인이 필요해요.'), findsNothing);
+      expect(find.text('목록 충돌'), findsOneWidget);
+      expect(c.refreshes, 0);
+      expect(c.confirmedHashes, isEmpty);
+    },
+  );
+  testWidgets(
+    'retained resend ACK is once-only and leaves conflict without refresh or apply',
+    (t) async {
+      final c = UiPairClient()
+        ..phase = a.AccountPhase.active
+        ..publication = retainedPublication()
+        ..commandWait = Completer<void>();
+      final m = await mountPair(t, c, devices: true);
+      expect(find.text('저장된 목록 다시 게시'), findsOneWidget);
+      await hit(t, '저장된 목록 다시 게시');
+      await hit(t, '다시 게시');
+      expect(m.busy, isTrue);
+      expect(c.republishedHashes, [List.filled(32, 19)]);
+      expect(
+        t
+            .widget<TextButton>(find.widgetWithText(TextButton, '저장된 목록 다시 게시'))
+            .onPressed,
+        isNull,
+      );
+      await t.tap(find.text('저장된 목록 다시 게시'));
+      await t.pump();
+      expect(c.republishedHashes, hasLength(1));
+      c.commandWait!.complete();
+      await t.pumpAndSettle();
+      expect(find.text('목록을 다시 보냈어요. 공개 목록 확인이 필요해요.'), findsOneWidget);
+      expect(find.text('목록 충돌'), findsOneWidget);
+      expect(m.snapshot!.publication.state, a.PublicationState.conflict);
+      expect(c.refreshes, 0);
+      expect(c.confirmedHashes, isEmpty);
+      expect(c.connectedPeers, isEmpty);
+    },
+  );
+  for (final missing in [false, true]) {
+    testWidgets(
+      'retained resend absent without eligibility/evidence missing=$missing',
+      (t) async {
+        final c = UiPairClient()
+          ..phase = a.AccountPhase.active
+          ..publication = retainedPublication(
+            eligible: missing,
+            missingAccepted: missing,
+          );
+        await mountPair(t, c, devices: true);
+        expect(find.text('저장된 목록 다시 게시'), findsNothing);
+        expect(c.republishedHashes, isEmpty);
+      },
+    );
+  }
+  testWidgets(
+    'retained resend hides consent on inactive lifecycle and cannot send',
+    (t) async {
+      final c = UiPairClient()
+        ..phase = a.AccountPhase.active
+        ..publication = retainedPublication();
+      await mountPair(t, c, devices: true);
+      expect(find.text('저장된 목록 다시 게시'), findsOneWidget);
+      await hit(t, '저장된 목록 다시 게시');
+      t.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+      await t.pumpAndSettle();
+      expect(find.text('다시 게시'), findsNothing);
+      expect(find.textContaining('저장된 기기 목록을 그대로'), findsNothing);
+      t.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+      await t.pumpAndSettle();
+      expect(find.text('다시 게시'), findsNothing);
+      expect(c.republishedHashes, isEmpty);
+      await t.binding.handlePopRoute();
+      await t.pumpAndSettle();
+    },
+  );
+
+  testWidgets(
+    'retained resend late ACK after inactive/resume cannot report success',
+    (t) async {
+      final c = UiPairClient()
+        ..phase = a.AccountPhase.active
+        ..publication = retainedPublication()
+        ..commandWait = Completer<void>();
+      await mountPair(t, c, devices: true);
+      expect(find.text('저장된 목록 다시 게시'), findsOneWidget);
+      await hit(t, '저장된 목록 다시 게시');
+      await hit(t, '다시 게시');
+      t.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+      await t.pump();
+      t.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+      c.commandWait!.complete();
+      await t.pumpAndSettle();
+      expect(c.republishedHashes, hasLength(1));
+      expect(find.text('목록을 다시 보냈어요. 공개 목록 확인이 필요해요.'), findsNothing);
+      expect(find.text('목록 충돌'), findsOneWidget);
+      expect(c.refreshes, 0);
+      expect(c.confirmedHashes, isEmpty);
+    },
+  );
+  testWidgets('retained resend disposed dialog never sends', (t) async {
+    final c = UiPairClient()
+      ..phase = a.AccountPhase.active
+      ..publication = retainedPublication();
+    await mountPair(t, c, devices: true);
+    expect(find.text('저장된 목록 다시 게시'), findsOneWidget);
+    await hit(t, '저장된 목록 다시 게시');
+    await t.pumpWidget(const SizedBox());
+    await t.pumpAndSettle();
+    expect(c.republishedHashes, isEmpty);
+    expect(t.takeException(), isNull);
+  });
+
   testWidgets(
     'conflict review five devices at 200 percent supports keyboard and stale hash',
     (t) async {
@@ -342,6 +591,7 @@ void expandedTests() {
         ),
       );
       a.PublicationView publication(Uint8List h) => a.PublicationView(
+        canRepublishAccepted: false,
         state: a.PublicationState.conflict,
         observedSeq: BigInt.one,
         allocatedSeq: BigInt.one,
@@ -453,6 +703,7 @@ void expandedTests() {
         final c = UiPairClient()
           ..phase = a.AccountPhase.conflict
           ..publication = a.PublicationView(
+            canRepublishAccepted: false,
             state: a.PublicationState.conflict,
             observedSeq: BigInt.one,
             allocatedSeq: BigInt.one,

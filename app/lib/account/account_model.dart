@@ -233,6 +233,8 @@ class AccountModel extends ChangeNotifier {
       _command(() => client.confirmRemoteRecord(peer, hash));
   Future<bool> confirmRecordConflict(List<int> baseHash) =>
       _command(() => client.confirmRecordConflict(baseHash));
+  Future<bool> republishAcceptedRecord(List<int> acceptedHash) =>
+      _command(() => client.republishAcceptedRecord(acceptedHash));
   Future<Uint8List?> pairScan(String qr, {List<int>? expectedResume}) async {
     final generation = _generation;
     final secretGeneration = _secretGeneration;
@@ -354,6 +356,7 @@ account.AccountView lockedAccountView(
   pendingImportRequiresRemoteRevoke:
       previous?.pendingImportRequiresRemoteRevoke ?? false,
   publication: account.PublicationView(
+    canRepublishAccepted: false,
     state: account.PublicationState.localBlocked,
     observedSeq: BigInt.zero,
     allocatedSeq: BigInt.zero,

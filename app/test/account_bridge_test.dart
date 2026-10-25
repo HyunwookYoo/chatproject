@@ -14,6 +14,14 @@ const _qrMarker = 'PUBLIC_TEST_PAIR_REPLY_MARKER';
 
 class _SecretReplyApi implements RustLibApi {
   final controller = StreamController<rust.ChatEvent>.broadcast(sync: true);
+  final republishedHashes = <List<int>>[];
+  @override
+  Future<void> crateApiAccountRepublishAcceptedRecord({
+    required List<int> acceptedHash,
+  }) async {
+    republishedHashes.add(List.of(acceptedHash));
+  }
+
   int begins = 0;
   int pairs = 0;
   int subscriptions = 0;
@@ -98,6 +106,11 @@ void main() {
     final events = <rust.ChatEvent>[];
     final sub = core.events().listen(events.add);
     await model.open();
+    final acceptedHash = List<int>.filled(32, 11);
+    expect(api.republishedHashes, isEmpty);
+    expect(model.snapshot!.publication.canRepublishAccepted, isFalse);
+    expect(await model.republishAcceptedRecord(acceptedHash), isTrue);
+    expect(api.republishedHashes, [acceptedHash]);
     final peer = List<int>.filled(32, 7);
     final hash = List<int>.filled(32, 9);
     expect(await model.connectAccount(peer), isTrue);

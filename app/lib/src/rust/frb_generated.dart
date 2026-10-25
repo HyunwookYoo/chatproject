@@ -68,7 +68,7 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
   String get codegenVersion => '2.11.1';
 
   @override
-  int get rustContentHash => 1276311813;
+  int get rustContentHash => -1289420996;
 
   static const kDefaultExternalLibraryLoaderConfig =
       ExternalLibraryLoaderConfig(
@@ -186,6 +186,10 @@ abstract class RustLibApi extends BaseApi {
   });
 
   Future<void> crateApiAccountRefreshRecord({required List<int> peer});
+
+  Future<void> crateApiAccountRepublishAcceptedRecord({
+    required List<int> acceptedHash,
+  });
 
   Future<AccountView> crateApiAccountRetryOpen();
 
@@ -1307,6 +1311,39 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       const TaskConstMeta(debugName: "refresh_record", argNames: ["peer"]);
 
   @override
+  Future<void> crateApiAccountRepublishAcceptedRecord({
+    required List<int> acceptedHash,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_list_prim_u_8_loose(acceptedHash, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 37,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_unit,
+          decodeErrorData: sse_decode_core_error,
+        ),
+        constMeta: kCrateApiAccountRepublishAcceptedRecordConstMeta,
+        argValues: [acceptedHash],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiAccountRepublishAcceptedRecordConstMeta =>
+      const TaskConstMeta(
+        debugName: "republish_accepted_record",
+        argNames: ["acceptedHash"],
+      );
+
+  @override
   Future<AccountView> crateApiAccountRetryOpen() {
     return handler.executeNormal(
       NormalTask(
@@ -1315,7 +1352,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 37,
+            funcId: 38,
             port: port_,
           );
         },
@@ -1343,7 +1380,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 38,
+            funcId: 39,
             port: port_,
           );
         },
@@ -1371,7 +1408,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 39,
+            funcId: 40,
             port: port_,
           );
         },
@@ -1403,7 +1440,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 40,
+            funcId: 41,
             port: port_,
           );
         },
@@ -1438,7 +1475,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 41,
+            funcId: 42,
             port: port_,
           );
         },
@@ -1474,7 +1511,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 42,
+            funcId: 43,
             port: port_,
           );
         },
@@ -1503,7 +1540,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 43,
+            funcId: 44,
             port: port_,
           );
         },
@@ -1535,7 +1572,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 44,
+            funcId: 45,
             port: port_,
           );
         },
@@ -1569,7 +1606,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 45,
+            funcId: 46,
             port: port_,
           );
         },
@@ -2274,20 +2311,21 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   PublicationView dco_decode_publication_view(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     final arr = raw as List<dynamic>;
-    if (arr.length != 11)
-      throw Exception('unexpected arr length: expect 11 but see ${arr.length}');
+    if (arr.length != 12)
+      throw Exception('unexpected arr length: expect 12 but see ${arr.length}');
     return PublicationView(
-      state: dco_decode_publication_state(arr[0]),
-      generation: dco_decode_opt_list_prim_u_8_strict(arr[1]),
-      observedSeq: dco_decode_u_64(arr[2]),
-      allocatedSeq: dco_decode_u_64(arr[3]),
-      acceptedHash: dco_decode_opt_list_prim_u_8_strict(arr[4]),
-      accepted: dco_decode_opt_box_autoadd_record_view(arr[5]),
-      conflictHash: dco_decode_opt_list_prim_u_8_strict(arr[6]),
-      conflict: dco_decode_opt_box_autoadd_record_view(arr[7]),
-      tombstones: dco_decode_list_revocation_view(arr[8]),
-      pendingCount: dco_decode_u_32(arr[9]),
-      pendingNotifications: dco_decode_list_revocation_view(arr[10]),
+      canRepublishAccepted: dco_decode_bool(arr[0]),
+      state: dco_decode_publication_state(arr[1]),
+      generation: dco_decode_opt_list_prim_u_8_strict(arr[2]),
+      observedSeq: dco_decode_u_64(arr[3]),
+      allocatedSeq: dco_decode_u_64(arr[4]),
+      acceptedHash: dco_decode_opt_list_prim_u_8_strict(arr[5]),
+      accepted: dco_decode_opt_box_autoadd_record_view(arr[6]),
+      conflictHash: dco_decode_opt_list_prim_u_8_strict(arr[7]),
+      conflict: dco_decode_opt_box_autoadd_record_view(arr[8]),
+      tombstones: dco_decode_list_revocation_view(arr[9]),
+      pendingCount: dco_decode_u_32(arr[10]),
+      pendingNotifications: dco_decode_list_revocation_view(arr[11]),
     );
   }
 
@@ -3290,6 +3328,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   @protected
   PublicationView sse_decode_publication_view(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_canRepublishAccepted = sse_decode_bool(deserializer);
     var var_state = sse_decode_publication_state(deserializer);
     var var_generation = sse_decode_opt_list_prim_u_8_strict(deserializer);
     var var_observedSeq = sse_decode_u_64(deserializer);
@@ -3304,6 +3343,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       deserializer,
     );
     return PublicationView(
+      canRepublishAccepted: var_canRepublishAccepted,
       state: var_state,
       generation: var_generation,
       observedSeq: var_observedSeq,
@@ -4237,6 +4277,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     SseSerializer serializer,
   ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_bool(self.canRepublishAccepted, serializer);
     sse_encode_publication_state(self.state, serializer);
     sse_encode_opt_list_prim_u_8_strict(self.generation, serializer);
     sse_encode_u_64(self.observedSeq, serializer);

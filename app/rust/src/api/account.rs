@@ -72,6 +72,7 @@ pub struct RevocationView {
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublicationView {
+    pub can_republish_accepted: bool,
     pub state: PublicationState,
     pub generation: Option<Vec<u8>>,
     pub observed_seq: u64,
@@ -314,6 +315,37 @@ pub async fn confirm_record_conflict(base_hash: Vec<u8>) -> Result<(), CoreError
         .await
         .map_err(Into::into)
 }
+pub async fn republish_accepted_record(accepted_hash: Vec<u8>) -> Result<(), CoreError> {
+    let accepted_hash = id(accepted_hash)?;
+    handle()?
+        .republish_accepted_record(accepted_hash)
+        .await
+        .map_err(Into::into)
+}
+
+#[cfg(test)]
+mod retained_republish_bridge_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn retained_republish_bridge_rejects_malformed_hash_before_account_access() {
+        for len in [0, 31, 33] {
+            let error = republish_accepted_record(vec![7; len]).await.unwrap_err();
+            assert_eq!(error.code, super::super::chat::ErrorCode::InvalidConfig);
+        }
+    }
+
+    #[test]
+    fn retained_republish_bridge_preserves_actor_eligibility_and_false_default() {
+        let mut source = chat_core::account::PublicationView::default();
+        let projected: PublicationView = source.clone().into();
+        assert!(!projected.can_republish_accepted);
+        source.can_republish_accepted = true;
+        let projected: PublicationView = source.into();
+        assert!(projected.can_republish_accepted);
+    }
+}
+
 pub async fn pair_begin(
     direction: PairDirection,
     resume: Option<Vec<u8>>,

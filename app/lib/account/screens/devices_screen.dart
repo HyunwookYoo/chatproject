@@ -4,12 +4,103 @@ import '../../src/rust/api/account.dart' as a;
 import '../account_model.dart';
 import '../public_id.dart';
 import '../record_review.dart';
+import '../sensitive_screen.dart';
 import 'device_warning_screen.dart';
 
-class DevicesScreen extends StatelessWidget {
+class DevicesScreen extends StatefulWidget {
   const DevicesScreen({super.key, required this.model, required this.onPair});
   final AccountModel model;
   final void Function(a.PairResumeView?) onPair;
+  @override
+  State<DevicesScreen> createState() => _DevicesScreenState();
+}
+
+class _DevicesScreenState extends State<DevicesScreen>
+    with WidgetsBindingObserver {
+  AccountModel get model => widget.model;
+  int _lifecycle = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state != AppLifecycleState.resumed) ++_lifecycle;
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  bool _current(int lifecycle) =>
+      mounted &&
+      lifecycle == _lifecycle &&
+      (WidgetsBinding.instance.lifecycleState == null ||
+          WidgetsBinding.instance.lifecycleState == AppLifecycleState.resumed);
+
+  Future<void> _republish(
+    BuildContext context,
+    a.RecordView record,
+    List<int> hash,
+  ) async {
+    final displayedHash = List<int>.unmodifiable(hash);
+    final lifecycle = _lifecycle;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => SensitiveScreen(
+        onHidden: () => ++_lifecycle,
+        onProtectionFailure: () => ++_lifecycle,
+        child: AnimatedBuilder(
+          animation: model,
+          builder: (context, _) => AlertDialog(
+            title: const Text('저장된 목록 다시 게시'),
+            content: SingleChildScrollView(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Text(
+                    '저장된 기기 목록을 그대로 다시 게시합니다. 기존 충돌은 유지되며, 이후 공개 목록을 다시 확인하고 충돌 해결을 완료해야 합니다.',
+                  ),
+                  Text('세대: ${publicId(record.generation)}'),
+                  Text('목록 해시: ${publicId(displayedHash)}'),
+                  for (final device in record.devices)
+                    Text(
+                      '${device.kind == a.DeviceKind.desktop ? '데스크톱' : '모바일'} · ${publicId(device.installationId)}',
+                    ),
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(dialogContext, false),
+                child: const Text('취소'),
+              ),
+              FilledButton(
+                onPressed: model.busy
+                    ? null
+                    : () => Navigator.pop(dialogContext, true),
+                child: const Text('다시 게시'),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+    if (confirmed != true || !_current(lifecycle) || !context.mounted) return;
+    final sent = await model.republishAcceptedRecord(displayedHash);
+    if (sent && _current(lifecycle) && context.mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('목록을 다시 보냈어요. 공개 목록 확인이 필요해요.')),
+      );
+    }
+  }
+
   Future<void> _revoke(BuildContext context, a.DeviceView device) async {
     final target = List<int>.of(device.installationId);
     final confirmed = await showDialog<bool>(
@@ -94,6 +185,20 @@ class DevicesScreen extends StatelessWidget {
                       onConfirm: model.confirmRecordConflict,
                     ),
                 ],
+                if (view.phase == a.AccountPhase.active &&
+                    view.publication.canRepublishAccepted &&
+                    view.publication.accepted != null &&
+                    view.publication.acceptedHash != null)
+                  TextButton(
+                    onPressed: model.busy
+                        ? null
+                        : () => _republish(
+                            context,
+                            view.publication.accepted!,
+                            view.publication.acceptedHash!,
+                          ),
+                    child: const Text('저장된 목록 다시 게시'),
+                  ),
                 Text('게시 대기 작업: ${view.publication.pendingCount}'),
                 const Text('이전에 수용한 기기 목록'),
                 for (final device in view.devices)
@@ -123,12 +228,12 @@ class DevicesScreen extends StatelessWidget {
                 FilledButton(
                   onPressed: model.busy || view.devices.length >= 5 || pending
                       ? null
-                      : () => onPair(null),
+                      : () => widget.onPair(null),
                   child: const Text('기기 연결'),
                 ),
                 for (final resume in view.pairResumes)
                   TextButton(
-                    onPressed: model.busy ? null : () => onPair(resume),
+                    onPressed: model.busy ? null : () => widget.onPair(resume),
                     child: Text(
                       '중단된 기기 연결 재개 · ${resume.role == a.PairRole.existing ? '기존 기기' : '새 기기'} · ${publicId(resume.transaction)}',
                     ),
