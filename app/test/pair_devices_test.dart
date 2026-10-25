@@ -358,6 +358,7 @@ a.PublicationView retainedPublication({
   return a.PublicationView(
     canRepublishAccepted: eligible,
     state: a.PublicationState.conflict,
+    generation: accepted.generation,
     observedSeq: BigInt.one,
     allocatedSeq: BigInt.one,
     acceptedHash: missingAccepted
@@ -372,6 +373,13 @@ a.PublicationView retainedPublication({
   );
 }
 
+// Manager.view projects a stored Active account's retained publication Conflict
+// as AccountPhase.conflict; the local Rust conversion preserves that projection.
+UiPairClient retainedClient(a.PublicationView publication) => UiPairClient()
+  ..phase = a.AccountPhase.conflict
+  ..publication = publication
+  ..devices = publication.accepted?.devices ?? [];
+
 void expandedTests() {
   testWidgets(
     'retained resend reviews accepted full list at 200 percent and cancel sends nothing',
@@ -380,9 +388,7 @@ void expandedTests() {
       t.view.devicePixelRatio = 1;
       addTearDown(t.view.resetPhysicalSize);
       addTearDown(t.view.resetDevicePixelRatio);
-      final c = UiPairClient()
-        ..phase = a.AccountPhase.active
-        ..publication = retainedPublication();
+      final c = retainedClient(retainedPublication());
       await mountPair(t, c, devices: true, scale: 2);
       expect(find.text('저장된 목록 다시 게시'), findsOneWidget);
       await keyboardActivate(t, '저장된 목록 다시 게시');
@@ -433,10 +439,11 @@ void expandedTests() {
   testWidgets(
     'retained resend captures accepted hash while dialog snapshot changes',
     (t) async {
-      final c = UiPairClient()
-        ..phase = a.AccountPhase.active
-        ..publication = retainedPublication();
+      final c = retainedClient(retainedPublication());
       final m = await mountPair(t, c, devices: true);
+      expect(m.snapshot!.phase, a.AccountPhase.conflict);
+      expect(m.snapshot!.publication.state, a.PublicationState.conflict);
+      expect(m.snapshot!.publication.canRepublishAccepted, isTrue);
       expect(find.text('저장된 목록 다시 게시'), findsOneWidget);
       await hit(t, '저장된 목록 다시 게시');
       c.publication = retainedPublication(hashByte: 20);
@@ -469,11 +476,12 @@ void expandedTests() {
   testWidgets(
     'retained resend ACK is once-only and leaves conflict without refresh or apply',
     (t) async {
-      final c = UiPairClient()
-        ..phase = a.AccountPhase.active
-        ..publication = retainedPublication()
+      final c = retainedClient(retainedPublication())
         ..commandWait = Completer<void>();
       final m = await mountPair(t, c, devices: true);
+      expect(m.snapshot!.phase, a.AccountPhase.conflict);
+      expect(m.snapshot!.publication.state, a.PublicationState.conflict);
+      expect(m.snapshot!.publication.canRepublishAccepted, isTrue);
       expect(find.text('저장된 목록 다시 게시'), findsOneWidget);
       await hit(t, '저장된 목록 다시 게시');
       await hit(t, '다시 게시');
@@ -492,7 +500,9 @@ void expandedTests() {
       await t.pumpAndSettle();
       expect(find.text('목록을 다시 보냈어요. 공개 목록 확인이 필요해요.'), findsOneWidget);
       expect(find.text('목록 충돌'), findsOneWidget);
+      expect(m.snapshot!.phase, a.AccountPhase.conflict);
       expect(m.snapshot!.publication.state, a.PublicationState.conflict);
+      expect(c.republishedHashes, [List.filled(32, 19)]);
       expect(c.refreshes, 0);
       expect(c.confirmedHashes, isEmpty);
       expect(c.connectedPeers, isEmpty);
@@ -502,12 +512,9 @@ void expandedTests() {
     testWidgets(
       'retained resend absent without eligibility/evidence missing=$missing',
       (t) async {
-        final c = UiPairClient()
-          ..phase = a.AccountPhase.active
-          ..publication = retainedPublication(
-            eligible: missing,
-            missingAccepted: missing,
-          );
+        final c = retainedClient(
+          retainedPublication(eligible: missing, missingAccepted: missing),
+        );
         await mountPair(t, c, devices: true);
         expect(find.text('저장된 목록 다시 게시'), findsNothing);
         expect(c.republishedHashes, isEmpty);
@@ -517,9 +524,7 @@ void expandedTests() {
   testWidgets(
     'retained resend hides consent on inactive lifecycle and cannot send',
     (t) async {
-      final c = UiPairClient()
-        ..phase = a.AccountPhase.active
-        ..publication = retainedPublication();
+      final c = retainedClient(retainedPublication());
       await mountPair(t, c, devices: true);
       expect(find.text('저장된 목록 다시 게시'), findsOneWidget);
       await hit(t, '저장된 목록 다시 게시');
@@ -539,9 +544,7 @@ void expandedTests() {
   testWidgets(
     'retained resend late ACK after inactive/resume cannot report success',
     (t) async {
-      final c = UiPairClient()
-        ..phase = a.AccountPhase.active
-        ..publication = retainedPublication()
+      final c = retainedClient(retainedPublication())
         ..commandWait = Completer<void>();
       await mountPair(t, c, devices: true);
       expect(find.text('저장된 목록 다시 게시'), findsOneWidget);
@@ -560,9 +563,7 @@ void expandedTests() {
     },
   );
   testWidgets('retained resend disposed dialog never sends', (t) async {
-    final c = UiPairClient()
-      ..phase = a.AccountPhase.active
-      ..publication = retainedPublication();
+    final c = retainedClient(retainedPublication());
     await mountPair(t, c, devices: true);
     expect(find.text('저장된 목록 다시 게시'), findsOneWidget);
     await hit(t, '저장된 목록 다시 게시');

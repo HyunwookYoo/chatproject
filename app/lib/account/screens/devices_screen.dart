@@ -185,7 +185,8 @@ class _DevicesScreenState extends State<DevicesScreen>
                       onConfirm: model.confirmRecordConflict,
                     ),
                 ],
-                if (view.phase == a.AccountPhase.active &&
+                if (view.phase == a.AccountPhase.conflict &&
+                    view.publication.state == a.PublicationState.conflict &&
                     view.publication.canRepublishAccepted &&
                     view.publication.accepted != null &&
                     view.publication.acceptedHash != null)
