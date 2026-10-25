@@ -358,6 +358,19 @@ impl RecordState {
             comparison.pending_hash_match, comparison.pending_ready_hash_match,
             comparison.time_valid, comparison.expired,
         );
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "own_publication retained_context accepted_meets_observed_floor={} accepted_meets_allocated_floor={} retained_older_than_accepted={} retained_membership_equal_accepted={} accepted_current_unexpired={} accepted_generation_equal_local={} pending_empty={}",
+            self.accepted.as_ref().is_some_and(|a| a.seq >= self.observed_seq),
+            self.accepted.as_ref().is_some_and(|a| a.seq >= self.allocated_seq),
+            self.conflict.as_ref().zip(self.accepted.as_ref()).is_some_and(|(c, a)| c.seq < a.seq),
+            self.conflict.as_ref().zip(self.accepted.as_ref()).is_some_and(|(c, a)| {
+                c.record.generation == a.record.generation && c.record.devices == a.record.devices
+            }),
+            self.accepted.as_ref().is_some_and(|a| a.current(now) && !a.record.is_expired(now)),
+            self.accepted.as_ref().is_some_and(|a| a.record.generation == self.generation),
+            self.pending.is_empty(),
+        );
         self.observed_seq = self.observed_seq.max(found.seq);
         if self.conflict.as_ref().is_none_or(|c| found.seq >= c.seq) {
             self.conflict = Some(found);
@@ -937,6 +950,25 @@ mod tests {
             let mut found = accepted.clone();
             match case.as_str() {
                 "accepted" | "retained" | "retained_absent" => {}
+                "retained_stale" | "retained_changed_generation" | "retained_changed_devices" => {
+                    let mut retained_record = record.clone();
+                    retained_record.expires_at = 1602;
+                    if case == "retained_changed_generation" { retained_record.generation = Generation([2; 16]); }
+                    if case == "retained_changed_devices" { retained_record.devices[0].kind = super::super::DeviceKind::Mobile; }
+                    records.conflict = Some(signed(&retained_record, SEQ - 1));
+                    records.state = PublicationState::Conflict;
+                }
+                "accepted_expired" | "accepted_future" | "accepted_other_generation" => {
+                    let mut accepted_record = record.clone();
+                    match case.as_str() {
+                        "accepted_expired" => { accepted_record.issued_at = 400; accepted_record.expires_at = 1000; }
+                        "accepted_future" => { accepted_record.issued_at = 1600; accepted_record.expires_at = 2200; }
+                        "accepted_other_generation" => accepted_record.generation = Generation([2; 16]),
+                        _ => unreachable!(),
+                    }
+                    records.accepted = Some(signed(&accepted_record, SEQ));
+                    found = signed(&record, SEQ - 1);
+                }
                 "stale" => found = signed(&record, SEQ - 1),
                 "later_unknown" => {
                     record.generation = Generation([2; 16]);
@@ -1031,12 +1063,18 @@ mod tests {
             ("stale", "retained_before=false accepted_present=true accepted_hash_equal=false seq_vs_observed_at_hold=Less seq_vs_allocated_at_hold=Less generation_equal=true devices_equal_to_accepted=true pending_hash_match=false pending_ready_hash_match=false time_valid=true expired=false"),
             ("later_unknown", "retained_before=false accepted_present=true accepted_hash_equal=false seq_vs_observed_at_hold=Greater seq_vs_allocated_at_hold=Greater generation_equal=false devices_equal_to_accepted=false pending_hash_match=false pending_ready_hash_match=false time_valid=true expired=false"),
             ("retained", "retained_before=true accepted_present=true accepted_hash_equal=true seq_vs_observed_at_hold=Less seq_vs_allocated_at_hold=Equal generation_equal=true devices_equal_to_accepted=true pending_hash_match=false pending_ready_hash_match=false time_valid=true expired=false"),
+            ("retained_stale", "retained_before=true accepted_present=true accepted_hash_equal=true seq_vs_observed_at_hold=Equal seq_vs_allocated_at_hold=Equal generation_equal=true devices_equal_to_accepted=true pending_hash_match=false pending_ready_hash_match=false time_valid=true expired=false"),
+            ("retained_changed_generation", "retained_before=true accepted_present=true accepted_hash_equal=true seq_vs_observed_at_hold=Equal seq_vs_allocated_at_hold=Equal generation_equal=true devices_equal_to_accepted=true pending_hash_match=false pending_ready_hash_match=false time_valid=true expired=false"),
+            ("retained_changed_devices", "retained_before=true accepted_present=true accepted_hash_equal=true seq_vs_observed_at_hold=Equal seq_vs_allocated_at_hold=Equal generation_equal=true devices_equal_to_accepted=true pending_hash_match=false pending_ready_hash_match=false time_valid=true expired=false"),
             ("pending_held", "retained_before=false accepted_present=true accepted_hash_equal=false seq_vs_observed_at_hold=Greater seq_vs_allocated_at_hold=Equal generation_equal=true devices_equal_to_accepted=true pending_hash_match=true pending_ready_hash_match=false time_valid=true expired=false"),
             ("pending_ready", ""),
             ("retained_pending_ready", "retained_before=true accepted_present=true accepted_hash_equal=false seq_vs_observed_at_hold=Less seq_vs_allocated_at_hold=Equal generation_equal=true devices_equal_to_accepted=true pending_hash_match=true pending_ready_hash_match=true time_valid=true expired=false"),
             ("future", "retained_before=false accepted_present=true accepted_hash_equal=false seq_vs_observed_at_hold=Equal seq_vs_allocated_at_hold=Greater generation_equal=true devices_equal_to_accepted=true pending_hash_match=false pending_ready_hash_match=false time_valid=false expired=false"),
             ("unaccepted", "retained_before=false accepted_present=false accepted_hash_equal=false seq_vs_observed_at_hold=Greater seq_vs_allocated_at_hold=Greater generation_equal=true devices_equal_to_accepted=false pending_hash_match=false pending_ready_hash_match=false time_valid=true expired=false"),
             ("expired", "retained_before=false accepted_present=true accepted_hash_equal=false seq_vs_observed_at_hold=Less seq_vs_allocated_at_hold=Less generation_equal=true devices_equal_to_accepted=true pending_hash_match=false pending_ready_hash_match=false time_valid=true expired=true"),
+            ("accepted_expired", "retained_before=false accepted_present=true accepted_hash_equal=false seq_vs_observed_at_hold=Less seq_vs_allocated_at_hold=Less generation_equal=true devices_equal_to_accepted=true pending_hash_match=false pending_ready_hash_match=false time_valid=true expired=false"),
+            ("accepted_future", "retained_before=false accepted_present=true accepted_hash_equal=false seq_vs_observed_at_hold=Less seq_vs_allocated_at_hold=Less generation_equal=true devices_equal_to_accepted=true pending_hash_match=false pending_ready_hash_match=false time_valid=true expired=false"),
+            ("accepted_other_generation", "retained_before=false accepted_present=true accepted_hash_equal=false seq_vs_observed_at_hold=Less seq_vs_allocated_at_hold=Less generation_equal=true devices_equal_to_accepted=true pending_hash_match=false pending_ready_hash_match=false time_valid=true expired=false"),
             ("retained_absent", "lookup_present=false retained_before=true"),
         ];
         for (case, facts) in cases {
@@ -1046,7 +1084,22 @@ mod tests {
                 .output().unwrap();
             assert!(output.status.success(), "child {case} failed: {}", String::from_utf8_lossy(&output.stderr));
             let stderr = String::from_utf8(output.stderr).unwrap().replace("\r\n", "\n");
-            let expected = if facts.is_empty() { String::new() } else { format!("own_publication hold {facts}\n") };
+            let context = match case {
+                "accepted" | "pending_ready" | "retained_absent" => "",
+                "stale" | "later_unknown" | "expired" => "accepted_meets_observed_floor=true accepted_meets_allocated_floor=true retained_older_than_accepted=false retained_membership_equal_accepted=false accepted_current_unexpired=true accepted_generation_equal_local=true pending_empty=true",
+                "retained" => "accepted_meets_observed_floor=false accepted_meets_allocated_floor=true retained_older_than_accepted=false retained_membership_equal_accepted=true accepted_current_unexpired=true accepted_generation_equal_local=true pending_empty=true",
+                "retained_stale" => "accepted_meets_observed_floor=true accepted_meets_allocated_floor=true retained_older_than_accepted=true retained_membership_equal_accepted=true accepted_current_unexpired=true accepted_generation_equal_local=true pending_empty=true",
+                "retained_changed_generation" | "retained_changed_devices" => "accepted_meets_observed_floor=true accepted_meets_allocated_floor=true retained_older_than_accepted=true retained_membership_equal_accepted=false accepted_current_unexpired=true accepted_generation_equal_local=true pending_empty=true",
+                "pending_held" => "accepted_meets_observed_floor=true accepted_meets_allocated_floor=false retained_older_than_accepted=false retained_membership_equal_accepted=false accepted_current_unexpired=true accepted_generation_equal_local=true pending_empty=false",
+                "retained_pending_ready" => "accepted_meets_observed_floor=false accepted_meets_allocated_floor=false retained_older_than_accepted=false retained_membership_equal_accepted=true accepted_current_unexpired=true accepted_generation_equal_local=true pending_empty=false",
+                "future" => "accepted_meets_observed_floor=false accepted_meets_allocated_floor=true retained_older_than_accepted=false retained_membership_equal_accepted=false accepted_current_unexpired=true accepted_generation_equal_local=true pending_empty=true",
+                "unaccepted" => "accepted_meets_observed_floor=false accepted_meets_allocated_floor=false retained_older_than_accepted=false retained_membership_equal_accepted=false accepted_current_unexpired=false accepted_generation_equal_local=false pending_empty=true",
+                "accepted_expired" | "accepted_future" => "accepted_meets_observed_floor=true accepted_meets_allocated_floor=true retained_older_than_accepted=false retained_membership_equal_accepted=false accepted_current_unexpired=false accepted_generation_equal_local=true pending_empty=true",
+                "accepted_other_generation" => "accepted_meets_observed_floor=true accepted_meets_allocated_floor=true retained_older_than_accepted=false retained_membership_equal_accepted=false accepted_current_unexpired=true accepted_generation_equal_local=false pending_empty=true",
+                _ => unreachable!(),
+            };
+            let mut expected = if facts.is_empty() { String::new() } else { format!("own_publication hold {facts}\n") };
+            if !context.is_empty() { expected.push_str(&format!("own_publication retained_context {context}\n")); }
             // Exact whitelist admits no private fixture data, record/packet,
             // identifiers, raw sequence/time values, or arbitrary error text.
             assert_eq!(stderr, expected, "own-publication diagnostic for {case}");
