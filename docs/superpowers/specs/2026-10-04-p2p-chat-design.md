@@ -284,7 +284,7 @@ Invite {
 
 **iOS 주의**
 
-- iroh의 mDNS는 raw multicast UDP라 `com.apple.developer.networking.multicast` entitlement(Apple 승인)가 필요하다. iOS에서는 iroh mDNS를 끄고, 같은 LAN의 메일박스 발견은 Bonjour(NWBrowser) 네이티브 구현이나 캐시·DHT로 한다. entitlement는 병행해서 신청한다.
+- iroh의 mDNS는 raw multicast UDP라 `com.apple.developer.networking.multicast` entitlement(Apple 승인)가 필요하다. iOS에서는 iroh mDNS를 끄고, 같은 LAN의 메일박스 발견은 Bonjour(NWBrowser) 네이티브 구현이나 캐시·DHT로 한다. 테스트 단계에서는 entitlement 신청을 보류하고, raw mDNS 기능 구현 시 재검토한다(2026-10-12 사용자 결정).
 - mDNS를 꺼도 Local Network 권한 팝업이 뜬다(iroh #3474). `NSLocalNetworkUsageDescription` 문구를 준비한다.
 - iroh 기본 feature `fast-apple-datapath`는 Apple 비공개 API를 쓴다. 끈 빌드와 성능을 비교한 뒤 정한다.
 
@@ -470,7 +470,7 @@ PushHandle = base64( AEAD_encrypt(proxy_key, {
 ```
 
 - APNs 페이로드 상한은 4,096 B다. MLS 암호문이 푸시 버킷 안이면 `e`에 담고, 아니면 빼고 "새 메시지"로만 표시한다.
-- 기기가 꺼져 있거나 망 밖이면 APNs는 **앱당 1개만** 보관한다(최대 30일). 그래서 iOS에서 푸시는 깨우기·미리보기용이고, 메시지 자체는 메일박스나 큐에서 받는다.
+- 기기가 꺼져 있거나 망 밖이면 APNs는 **앱당 1개만** 보관한다(최대 30일). 2026-10 실측에서는 iPhone 14 Pro·iOS 26.7.1에서 전원 끄기와 비행기 모드 각각 5개를 보내 최신 알림 1개만 남았다([스파이크 C](../../../spikes/c-push/RESULTS.md)). 그래서 iOS에서 푸시는 깨우기·미리보기용이고, 메시지 자체는 메일박스나 큐에서 받는다.
 - NSE는 앱이 포그라운드여도 실행된다. 처리 순서는 12.3절이다.
 - 차단한 대화의 푸시를 아예 숨기려면 `com.apple.developer.usernotifications.filtering` entitlement(Apple 승인)가 필요하다. 승인 전에는 "새 메시지"로 표시된다.
 
@@ -770,7 +770,7 @@ struct IdentityBinding {
 | 앱 콜드스타트 → 대화 목록 (Windows) | < 600 ms | 실측 Flutter 328 ms(Windows) + DB |
 | 앱 콜드스타트 → 대화 목록 (모바일) | 스파이크에서 정함 | Android 중급기·iPhone에서 측정 |
 | 유휴 RSS (Windows) | < 150 MB | 실측 Hello World 83 MB + 코어/DB |
-| iOS NSE 메모리 | < 15 MB | 관측값 15–24 MB (Apple 미문서화). MLS 로드+복호 피크는 Windows 근사치로 200 leaf에서 4.0 MiB 이하 |
+| iOS NSE 메모리 | < 15 MB | 2026-10-11 TestFlight 기기 실측 피크 6.20 MiB, 기준값 2.16 MiB (iPhone 14 Pro·iOS 26.7.1, 200 B 자격 증명, 약 1.35 MB 상태 파일). SQLCipher 캐시는 미포함 ([스파이크 B](../../../spikes/b-mls-memory/RESULTS.md)) |
 | 푸시 발송 → 알림 표시 | 스파이크 C에서 정함 | — |
 
 ### 14.1 반응성 전략
@@ -818,7 +818,7 @@ struct IdentityBinding {
 
 | # | 항목 | 영향 | 대응 |
 |---|---|---|---|
-| 1 | **NSE 15 MB 안에 OpenMLS 그룹 상태가 들어가는가** | iOS 알림 내용 표시 | MLS 부분은 들어간다(스파이크 B Windows 근사치: 200 leaf에서 상태 0.6–1.4 MiB, 로드+복호 피크 1.5–4.0 MiB). Swift 런타임·SQLite 캐시를 포함한 기기 실측은 TestFlight 빌드로 한다. 실패 시 "새 메시지"만 표시 |
+| 1 | **NSE 15 MB 안에 OpenMLS 그룹 상태가 들어가는가** | iOS 알림 내용 표시 | 2026-10-11 TestFlight 기기 실측 피크 6.20 MiB로 통과 (iPhone 14 Pro·iOS 26.7.1, Swift 런타임 포함). SQLCipher 캐시와 실제 M5 저장 경로는 미포함이므로 통합 후 다시 잰다. 실패 시 "새 메시지"만 표시 |
 | 2 | VPS 한 대가 푸시 프록시와 큐 서버를 함께 맡음 | VPS 장애 시 푸시·큐 동시 중단 | 감시와 자동 재시작. 규모가 커지면 이중화 |
 | 3 | **한국 모바일망 직접 연결 비율** | 릴레이 부하·지연 | **스파이크 A.** KT LTE ↔ 가정 회선은 12/12 직접 연결. LTE ↔ LTE와 SKT·LG U+는 미측정 |
 | 4 | 메일박스 없는 사용자 비율 | 큐 서버 부하·비용 (rev.2에서는 구성 P의 성패였으나 이제 비용 문제) | 초기 측정 |
@@ -829,7 +829,7 @@ struct IdentityBinding {
 | 9 | 그룹 규모 상한 | 푸시 팬아웃(받는 기기 수), VPS 발송 부하 | 초기 50명 |
 | 10 | 첨부 크기 상한 | 미정 | 초기 25 MB |
 | 11 | 안전번호 검증 UX | MITM 방어 실효성 | 별도 UX 설계 필요 |
-| 12 | Apple entitlement 승인 (알림 필터링, multicast) | 차단한 대화 알림 숨기기, iOS mDNS | 신청 병행. 거절되면 현행 폴백 유지 |
+| 12 | Apple entitlement 승인 (알림 필터링, multicast) | 차단한 대화 알림 숨기기, iOS mDNS | 테스트 단계에서는 신청 보류(2026-10-12 사용자 결정). 관련 기능 구현 시 재검토하며 승인 전에는 현행 폴백 유지 |
 | 13 | Android OEM 배터리 킬러 | 상시 연결 모드 안정성 | 사용자 안내. 가동률로 자동 판정하므로 큐로 넘어감 |
 | 14 | n0 공개 릴레이 정책 | 베타 중 rate limit | 출시 전 서울로 교체. 필요하면 앞당김 |
 | 15 | 복구 문구 분실·유출 | 아이덴티티 상실·탈취 | 생성 시 확인 절차. 유출 시 아이덴티티 교체 |

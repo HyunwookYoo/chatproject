@@ -133,7 +133,7 @@
    - APNs 키
    - App Store Connect 앱 레코드와 API 키
    - `testflight` Environment 시크릿 7개
-4. **Task 10:** iPhone에 TestFlight 앱을 깔고 측정 절차를 함께 진행한다. 알림 필터링·multicast entitlement 신청서도 이때 제출한다.
+4. **Task 10:** iPhone에 TestFlight 앱을 깔고 측정 절차를 함께 진행한다. 알림 필터링·multicast entitlement 신청은 테스트 단계에서는 보류한다(2026-10-12 사용자 결정).
 
 ## 파일 구조
 
@@ -3842,9 +3842,9 @@ P="cargo run --release -q -- send --key ../secrets/AuthKey_<KEYID>.p8 --key-id <
    - 사용자 준비의 "APNs 인증 키(.p8) … GitHub 저장소 시크릿에"를 "APNs 키는 이 PC에만 둔다(서버 시크릿은 M7)"로 바꾼다.
    - 자동 시험 줄의 "main 브랜치 push와 매일 밤"을 "매 push"로 바꾼다.
 
-- [ ] **Step 5: entitlement 신청 (사용자)**
+- [ ] **Step 5: entitlement 신청 (보류 — 관련 기능 구현 시 재검토)**
 
-설계 17절 #12와 로드맵 §7을 따른다. 승인 전에는 지금 방식(폴백)을 그대로 쓴다.
+2026-10-12 사용자 결정: 지금은 테스트 단계이므로 두 권한 신청을 보류하고 M1b 완료 조건에서 제외한다. 아래 신청 절차는 관련 기능 구현 시 재검토한다. 설계 17절 #12와 로드맵 §7을 따르며, 승인 전에는 지금 방식(폴백)을 그대로 쓴다.
 
 1. 알림 필터링: https://developer.apple.com/contact/request/notification-service
    - 대상 번들 ID는 `dev.chatproject.chatapp.NotificationService`다.
@@ -3890,7 +3890,7 @@ git push
 - [ ] NSE 피크 메모리가 15 MB 미만이다(Task 10 Step 2). 넘으면 설계 17절 #1의 대안을 사용자와 정한다.
 - [ ] APNs 실측값이 설계 8.2절과 스파이크 C 결과에 적혀 있다(Task 10 Step 3·4).
 - [ ] M1a가 넘긴 일 M1b 절의 8개 항목이 모두 끝났다(위 표).
-- [ ] 알림 필터링·multicast entitlement 신청일이 로드맵 §7에 적혀 있다.
+- 알림 필터링·multicast entitlement 신청은 이번 완료 기준에서 제외한다(2026-10-12 사용자 결정). 보류 상태와 재검토 시점은 로드맵 §7에 적는다.
 - [ ] main ruleset의 필수 검사에 `workflows`, `bindings`, `ios`, `ios-release`가 있고 `allowed_merge_methods`가 `["merge"]`다(마무리).
 
 ---

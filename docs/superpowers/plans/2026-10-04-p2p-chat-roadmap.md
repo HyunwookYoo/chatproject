@@ -207,7 +207,7 @@ ChatProject/
 
 ## 7. 마일스톤 밖에서 계속 챙길 것
 
-- Apple entitlement 신청(알림 필터링, multicast): M1b에서 신청, 승인 전에는 현행 폴백(설계 17절 #12).
+- Apple entitlement 신청(알림 필터링, multicast): 테스트 단계에서는 보류하고 M1b 완료 조건에서 제외한다(2026-10-12 사용자 결정). 차단한 대화 알림 숨기기와 iOS raw mDNS 기능을 구현할 때 신청 필요성을 재검토한다. 승인 전에는 현행 폴백(설계 17절 #12).
 - n0 공개 릴레이 rate limit: 걸리면 M11을 앞당긴다.
 - 스파이크 A 미측정분(LTE ↔ LTE, SKT·LG U+): M2 기기 확인 때 함께 잰다.
 - 스파이크 C의 Firebase 서비스 계정 키: M7에서 운영용 키를 만들 때 삭제한다.
