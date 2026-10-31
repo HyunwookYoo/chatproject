@@ -323,29 +323,6 @@ pub async fn republish_accepted_record(accepted_hash: Vec<u8>) -> Result<(), Cor
         .map_err(Into::into)
 }
 
-#[cfg(test)]
-mod retained_republish_bridge_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn retained_republish_bridge_rejects_malformed_hash_before_account_access() {
-        for len in [0, 31, 33] {
-            let error = republish_accepted_record(vec![7; len]).await.unwrap_err();
-            assert_eq!(error.code, super::super::chat::ErrorCode::InvalidConfig);
-        }
-    }
-
-    #[test]
-    fn retained_republish_bridge_preserves_actor_eligibility_and_false_default() {
-        let mut source = chat_core::account::PublicationView::default();
-        let projected: PublicationView = source.clone().into();
-        assert!(!projected.can_republish_accepted);
-        source.can_republish_accepted = true;
-        let projected: PublicationView = source.into();
-        assert!(projected.can_republish_accepted);
-    }
-}
-
 pub async fn pair_begin(
     direction: PairDirection,
     resume: Option<Vec<u8>>,
@@ -540,5 +517,28 @@ mod release_tests {
             })
         ));
         assert!(crate::global::CORE.info().is_none());
+    }
+}
+
+#[cfg(test)]
+mod retained_republish_bridge_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn retained_republish_bridge_rejects_malformed_hash_before_account_access() {
+        for len in [0, 31, 33] {
+            let error = republish_accepted_record(vec![7; len]).await.unwrap_err();
+            assert_eq!(error.code, super::super::chat::ErrorCode::InvalidConfig);
+        }
+    }
+
+    #[test]
+    fn retained_republish_bridge_preserves_actor_eligibility_and_false_default() {
+        let mut source = chat_core::account::PublicationView::default();
+        let projected: PublicationView = source.clone().into();
+        assert!(!projected.can_republish_accepted);
+        source.can_republish_accepted = true;
+        let projected: PublicationView = source.into();
+        assert!(projected.can_republish_accepted);
     }
 }
