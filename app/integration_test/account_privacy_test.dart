@@ -15,6 +15,13 @@ void main() {
     final initial = Platform.isWindows
         ? await channel.invokeMapMethod<String, dynamic>('privacyTest', 'state')
         : null;
+    // Lifecycle transitions around activation, to tell startup focus changes
+    // from ones caused by turning protection on.
+    final transitions = <String>['start:${tester.binding.lifecycleState}'];
+    final lifecycle = AppLifecycleListener(
+      onStateChange: (state) => transitions.add('$state'),
+    );
+    transitions.add('pump');
     await tester.pumpWidget(
       const MaterialApp(
         home: Scaffold(
@@ -23,6 +30,7 @@ void main() {
       ),
     );
     await tester.pumpAndSettle();
+    lifecycle.dispose();
     if (Platform.isWindows) {
       debugPrint(
         'PUBLIC_NATIVE_API: ${await channel.invokeMapMethod<String, dynamic>("privacyTest", "state")}',
@@ -30,7 +38,8 @@ void main() {
     }
     // Which placeholder replaced the child, if any: hidden by a lifecycle change or failed protection.
     debugPrint(
-      'PUBLIC_PRIVACY_STATE: lifecycle=${tester.binding.lifecycleState} '
+      'PUBLIC_PRIVACY_STATE: transitions=$transitions '
+      'lifecycle=${tester.binding.lifecycleState} '
       'hidden=${find.textContaining('숨겼어요').evaluate().length} '
       'failed=${find.textContaining('보호할 수 없어요').evaluate().length}',
     );
