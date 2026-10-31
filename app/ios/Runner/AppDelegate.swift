@@ -27,6 +27,8 @@ import UserNotifications
     _ application: UIApplication,
     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
   ) -> Bool {
+    // Before the Flutter engine starts, so Dart cannot open account storage without the Keychain.
+    _ = cp_key_register(cpKeyProtect, cpKeyUnprotect, cpKeyDelete)
     return super.application(application, didFinishLaunchingWithOptions: launchOptions)
   }
 
