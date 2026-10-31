@@ -178,7 +178,7 @@ jobs:
       - name: Every Windows integration file in a fresh Flutter process
         run: |
           # Flutter 3.44.6 closes DesktopDevice's log reader after the first file.
-          foreach ($test in Get-ChildItem integration_test -Filter '*_test.dart' | Where-Object { $_.Name -notin @('account_storage_test.dart', 'message_test.dart') } | Sort-Object Name) {
+          foreach ($test in Get-ChildItem integration_test -Filter '*_test.dart' | Where-Object { $_.Name -notin @('account_storage_test.dart', 'message_test.dart', 'release_contract_test.dart') } | Sort-Object Name) {
             flutter test $test.FullName -d windows
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
@@ -350,7 +350,7 @@ jobs:
             python3 tools/ci/check_workflows.py --android-instrumentation "$RUNNER_TEMP/native-worker.log" full
             # android-emulator-runner runs each script line in its own `sh -c`, so every loop must fit on one line.
             set -e; for phase in write read; do adb -s emulator-5554 shell am instrument -w -r -e class dev.chatproject.chat_app.AccountKeyStoreTest#restartPersistence -e accountPhase "$phase" dev.chatproject.chat_app.test/androidx.test.runner.AndroidJUnitRunner | tee "$RUNNER_TEMP/native-restart-$phase.log"; python3 tools/ci/check_workflows.py --android-instrumentation "$RUNNER_TEMP/native-restart-$phase.log" "$phase"; done
-            set -e; for test in app/integration_test/*_test.dart; do case "$test" in *account_storage_test.dart|*message_test.dart) continue ;; esac; (cd app && flutter test "${test#app/}" -d emulator-5554); done
+            set -e; for test in app/integration_test/*_test.dart; do case "$test" in *account_storage_test.dart|*message_test.dart|*release_contract_test.dart) continue ;; esac; (cd app && flutter test "${test#app/}" -d emulator-5554); done
             set -e; for phase in write read locked missing read; do (cd app && flutter test integration_test/account_storage_test.dart -d emulator-5554 --no-uninstall --dart-define=ACCOUNT_STORAGE_PHASE="$phase" --dart-define=ACCOUNT_STORAGE_ROOT=/data/user/0/dev.chatproject.chat_app/files/ci-account-storage); done
             set -e; for phase in write read; do (cd app && flutter test integration_test/message_test.dart -d emulator-5554 --no-uninstall --dart-define=MESSAGE_TEST_PHASE="$phase" --dart-define=MESSAGE_TEST_ROOT=/data/user/0/dev.chatproject.chat_app/no_backup/ci-message-storage); done
             dart --packages=tools/e2e/.dart_tool/package_config.json tools/ci/release_smoke.dart --platform android --artifact "$RUNNER_TEMP/ordinary-release.apk" --serial emulator-5554
