@@ -1,4 +1,4 @@
-//! Process-wide core state. Every entry point (Dart through `api`, Kotlin and Swift
+//! Process-wide core state. Every entry point in this process (Dart through `api`, Kotlin
 //! through `native`) goes through these two statics.
 
 use std::sync::LazyLock;

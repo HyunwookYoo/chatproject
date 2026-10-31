@@ -75,11 +75,11 @@ ChatProject/
 
 ### M1b — iOS 파이프라인 + 기기 실측
 
-- 범위: GitHub Actions macOS 러너에서 iOS 빌드, App Store Connect API 키로 클라우드 서명, TestFlight 업로드. App Group과 알림 확장(NSE) 타깃 추가(Mac이 없으므로 Ruby `xcodeproj` 스크립트로 프로젝트를 고친다). `chat_nse` 크레이트(UniFFI, `nse` 기능만).
+- 범위: GitHub Actions macOS 러너에서 iOS 빌드, App Store Connect API 키로 클라우드 서명, TestFlight 업로드. App Group과 알림 확장(NSE) 타깃 추가(Mac이 없으므로 Ruby `xcodeproj` 스크립트로 프로젝트를 고친다). `chat_nse` 크레이트(UniFFI Swift로 노출). M1b의 `chat_nse`는 `chat_core`의 `nse` 기능이 아니라 OpenMLS를 직접 부르는 별도 크레이트이고, M5에서 `chat_core`의 `nse` 기능을 감싸는 것으로 바뀐다.
 - 기기 실측 (설계 18절에서 미룬 것)
   - 스파이크 B 기기판: 알림 확장이 200 leaf OpenMLS 그룹 상태를 열고 복호한 뒤 자기 메모리(`phys_footprint`)를 App Group 파일에 쓴다. 앱이 그 값을 보여 준다. 기준 15 MB.
   - 스파이크 C iOS판: 꺼진 iPhone에 APNs로 여러 통 보낸 뒤 켰을 때 남는 개수(설계 가정: 앱당 1개)와 지연을 잰다.
-- 자동 시험(③): iOS 시뮬레이터 통합 테스트 CI 작업(main 브랜치 push와 매일 밤, 앱 서명 불필요). `xcrun simctl push`로 알림 확장 처리 경로까지 시험할 수 있는지 확인한다.
+- 자동 시험(③): iOS 시뮬레이터 통합 테스트 CI 작업(main 브랜치 push와 매일 밤, 앱 서명 불필요). `xcrun simctl push`는 알림 확장을 실행하지 않아서(자동 테스트 설계 6절) CI는 NSE가 빌드되어 앱 안에 들어갔는지만 확인한다.
 - 완료 기준: TestFlight 빌드가 iPhone에 설치·실행된다. NSE 피크 메모리 < 15 MB. APNs 실측값을 설계 8.2절과 스파이크 C 결과에 적는다. iOS 시뮬레이터 CI 작업이 녹색.
 - 사용자 준비: Apple Developer에서 App ID 2개(앱, NSE)와 App Group 만들기, APNs 인증 키(.p8), App Store Connect API 키(.p8)를 GitHub 저장소 시크릿에 넣기.
 - 위험: 15 MB를 넘으면 설계 17절 #1의 대안(알림은 "새 메시지"만)으로 간다.
@@ -207,9 +207,10 @@ ChatProject/
 
 ## 7. 마일스톤 밖에서 계속 챙길 것
 
-- Apple entitlement 신청(알림 필터링, multicast): M1b에서 신청, 승인 전에는 현행 폴백(설계 17절 #12).
+- Apple entitlement 신청(알림 필터링, multicast): 테스트 단계에서는 보류하고 M1b 완료 조건에서 제외한다(2026-10-12 사용자 결정). 차단한 대화 알림 숨기기와 iOS raw mDNS 기능을 구현할 때 신청 필요성을 재검토한다. 승인 전에는 현행 폴백(설계 17절 #12).
 - n0 공개 릴레이 rate limit: 걸리면 M11을 앞당긴다.
 - 스파이크 A 미측정분(LTE ↔ LTE, SKT·LG U+): M2 기기 확인 때 함께 잰다.
 - 스파이크 C의 Firebase 서비스 계정 키: M7에서 운영용 키를 만들 때 삭제한다.
 - `docs/study/p2p-chat/` 학습 문서는 rev.2 기준이다. 필요할 때 rev.3로 다시 만든다.
 - M1a가 일부러 뒤로 미룬 일: [`2026-10-05-m1a-carry-forward.md`](2026-10-05-m1a-carry-forward.md)에 마일스톤별로 모았다. 각 마일스톤의 상세 계획은 쓰기 전에 자기 절을 읽는다.
+- M1b가 일부러 뒤로 미룬 일: [`2026-10-11-m1b-carry-forward.md`](2026-10-11-m1b-carry-forward.md)에 마일스톤별로 모았다. 업스트림 수정을 기다리는 일(`libc` 고정, Flutter 우회)과 러너 이미지 전환은 마지막의 "지켜볼 것"에 있다.

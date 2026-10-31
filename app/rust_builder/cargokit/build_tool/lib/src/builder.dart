@@ -1,6 +1,8 @@
 /// This is copied from Cargokit (which is the official way to use it currently)
 /// Details: https://fzyzcjy.github.io/flutter_rust_bridge/manual/integrate/builtin
 
+import 'dart:io' show Platform;
+
 import 'package:collection/collection.dart';
 import 'package:logging/logging.dart';
 import 'package:path/path.dart' as path;
@@ -133,7 +135,12 @@ class RustBuilder {
   CargoBuildOptions? get _buildOptions =>
       environment.crateOptions.cargo[environment.configuration];
 
-  String get _toolchain => _buildOptions?.toolchain.name ?? 'stable';
+  /// ChatProject: CARGOKIT_TOOLCHAIN pins the toolchain to rust-toolchain.toml's channel.
+  /// Upstream cargokit always builds with `stable` unless cargokit.yaml says otherwise.
+  String get _toolchain =>
+      Platform.environment['CARGOKIT_TOOLCHAIN'] ??
+      _buildOptions?.toolchain.name ??
+      'stable';
 
   /// Returns the path of directory containing build artifacts.
   Future<String> build() async {

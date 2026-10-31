@@ -1,2 +1,5 @@
 # Shell scripts must keep LF so Git Bash and CI shells can run them.
 *.sh text eol=lf
+
+# Binary fixtures: never convert line endings.
+*.bin binary

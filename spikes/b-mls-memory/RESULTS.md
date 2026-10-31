@@ -128,3 +128,18 @@ Other checks:
 
 - **rev3 without the traffic phase** (only the add commits, N = 200): 320.9 KiB state, 698.6 KiB peak. After 3 add commits, R holds 3 past epochs with smaller member lists.
 - **Decomposing (b) for rev3 at N = 10**: load 59 KiB, decrypt +126 KiB. At small N the 199 retained ratchet secrets dominate, not the member lists.
+
+## Device run (iPhone, TestFlight)
+
+Measured 2026-10-11 on an iPhone 14 Pro, iOS 26.7.1 (owner confirmed), TestFlight 1.0.0 (1). The fixture is 1,348,191 B, with 200 B credentials. Its snapshot wraps OpenMLS JSON storage values; this does not measure the planned M5 binary storage or SQLCipher cache.
+
+| Measurement | Result |
+|---|---|
+| Baseline peak (no ciphertext) | 2.16 MiB |
+| Maximum peak with MLS load and decrypt | 6.20 MiB (6,505,104 B) |
+| Decrypt time, eight messages | 3.271–4.498 ms |
+| Load time, eight messages | 13.524–18.789 ms |
+| Successful decrypts | 8/8; each plaintext 1,024 B |
+| Start records without an end | 0/9 |
+
+All nine notifications ran in the same NSE process (pid 10941). The measured decrypt peak is below the design's 15 MB budget. This validates this fixture and device; it does not establish an operating-system memory limit or cover other group shapes. Raw measurements are preserved locally in the plan workspace's `device-step2.jsonl`.
