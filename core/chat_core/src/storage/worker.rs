@@ -349,9 +349,24 @@ enum DbOp {
 #[allow(dead_code)]
 #[derive(Clone)]
 pub(crate) struct StorageHandle {
+    // Declared first so it drops before `writer` waits: the closed queue is
+    // what ends the writer thread.
     sender: mpsc::Sender<Request>,
     fence: Arc<Mutex<Fence>>,
     pub(crate) counts: Arc<Counts>,
+    writer: Arc<WriterExit>,
+}
+/// The last handle waits for the writer thread to finish its current
+/// operation and exit. A process exit otherwise runs SQLCipher's atexit
+/// teardown under an in-flight commit, which crashes on freed key memory.
+struct WriterExit(Mutex<std::sync::mpsc::Receiver<()>>);
+impl Drop for WriterExit {
+    fn drop(&mut self) {
+        if let Ok(done) = self.0.get_mut() {
+            // Disconnected means the writer exited; a timeout bounds a stuck writer.
+            let _ = done.recv_timeout(std::time::Duration::from_secs(5));
+        }
+    }
 }
 #[allow(dead_code)]
 impl StorageHandle {
@@ -402,15 +417,21 @@ impl StorageHandle {
             cancellation: CancellationToken::new(),
         }));
         let shared = fence.clone();
+        let (exited, done) = std::sync::mpsc::channel();
         std::thread::Builder::new()
             .name("chat-storage-writer".into())
-            .spawn(move || run(worker, receiver, shared))
+            .spawn(move || {
+                // Dropped after run returns, once the worker and its connection are gone.
+                let _exited = exited;
+                run(worker, receiver, shared)
+            })
             .map_err(|_| CoreError::new(ErrorCode::NotAvailable, "storage_worker_unavailable"))?;
         Ok((
             Self {
                 sender,
                 fence,
                 counts,
+                writer: Arc::new(WriterExit(Mutex::new(done))),
             },
             initial,
         ))

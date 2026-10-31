@@ -62,7 +62,13 @@ impl Drop for RunningCore {
         #[cfg(all(feature = "test-hooks", debug_assertions))]
         self.hooks.cancel.cancel();
         if let Some(runtime) = self.runtime.take() {
-            runtime.shutdown_background();
+            // Drop the core's tasks before returning, so the account actor's
+            // storage handle waits for the writer thread. This drop can run in
+            // an async context, where a runtime cannot shut down in place.
+            let _ = std::thread::spawn(move || {
+                runtime.shutdown_timeout(std::time::Duration::from_secs(10))
+            })
+            .join();
         }
     }
 }
