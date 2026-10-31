@@ -482,7 +482,9 @@ async fn raw_new(e: &Fixture, qr: &str, mutation: Mutation) -> Option<Raw> {
         .connect(ticket.endpoint_addr().clone(), b"chatproject/pair/1")
         .await
         .unwrap();
-    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    // A peer the session cannot bind is closed on accept, and that close can
+    // arrive before this stream opens; it is the same rejection as a closed read.
+    let (mut send, mut recv) = conn.open_bi().await.ok()?;
     let mut claimed = *endpoint.id().as_bytes();
     if matches!(mutation, Mutation::WrongEndpoint) {
         claimed[0] ^= 1;
