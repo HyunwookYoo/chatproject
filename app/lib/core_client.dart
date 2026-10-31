@@ -1,5 +1,6 @@
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 
@@ -59,7 +60,13 @@ Future<String> accountStorageRoot(String existing) async {
 }
 
 Future<void> setSensitiveScreen(bool sensitive) async {
-  if (Platform.isAndroid || Platform.isIOS || Platform.isWindows) {
+  // defaultTargetPlatform equals the host OS in the app, and widget tests pin
+  // it, so the native protection path runs in tests on every CI host.
+  if (const {
+    TargetPlatform.android,
+    TargetPlatform.iOS,
+    TargetPlatform.windows,
+  }.contains(defaultTargetPlatform)) {
     await _accountStorage.invokeMethod<void>('setSensitiveScreen', sensitive);
   }
 }
