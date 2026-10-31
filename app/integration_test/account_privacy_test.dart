@@ -28,6 +28,12 @@ void main() {
         'PUBLIC_NATIVE_API: ${await channel.invokeMapMethod<String, dynamic>("privacyTest", "state")}',
       );
     }
+    // Which placeholder replaced the child, if any: hidden by a lifecycle change or failed protection.
+    debugPrint(
+      'PUBLIC_PRIVACY_STATE: lifecycle=${tester.binding.lifecycleState} '
+      'hidden=${find.textContaining('숨겼어요').evaluate().length} '
+      'failed=${find.textContaining('보호할 수 없어요').evaluate().length}',
+    );
     expect(find.text('PUBLIC PRIVACY FIXTURE'), findsOneWidget);
     if (Platform.isWindows) {
       final state = (await channel.invokeMapMethod<String, dynamic>(

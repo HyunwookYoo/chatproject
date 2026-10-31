@@ -211,8 +211,10 @@ async fn invalid_frames_mutate_no_history_dedupe_or_receipts() {
             .message_counts()
             .await
             .unwrap();
+        let result = a.account.message_test_attempt(m.key, false, mutation).await;
         assert!(
-            matches!(a.account.message_test_attempt(m.key,false,mutation).await,Err(e) if e.code==code)
+            matches!(&result, Err(e) if e.code == code),
+            "frame {i}: expected {code:?}, got {result:?}"
         );
         assert_eq!(
             b.account
