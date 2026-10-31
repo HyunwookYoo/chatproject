@@ -52,6 +52,9 @@ mod commands {
     async fn seven_commands_use_the_owning_handle_and_reject_unknown_fields() {
         let (a, b, _) = pair().await;
         contacts(&a, &b).await;
+        // Automatic delivery could send key 71 before cancel_send, and B's
+        // ContactRequired reply would then count as a response write below.
+        a.account.message_test_hold_scheduler(true).await.unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:47000")
             .await
             .unwrap();
@@ -150,6 +153,7 @@ mod commands {
             "NotAvailable"
         );
         let _ = socket.close(None).await;
+        a.account.message_test_hold_scheduler(false).await.unwrap();
 
         // The fault controls must be backed by the existing authenticated path.
         contacts(&b, &a).await;
