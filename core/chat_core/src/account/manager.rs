@@ -69,6 +69,8 @@ enum Command {
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     MessageWriteStarts(oneshot::Sender<Result<(usize,usize),CoreError>>),
     #[cfg(all(feature="test-hooks",debug_assertions))]
+    MessageHoldScheduler(bool,oneshot::Sender<Result<(),CoreError>>),
+    #[cfg(all(feature="test-hooks",debug_assertions))]
     MessagePause(messages::MessagePoint,oneshot::Sender<Result<messages::MessagePause,CoreError>>),
     #[cfg(all(feature="test-hooks",debug_assertions))]
     MessageAckPause(crate::MessageKey,oneshot::Sender<Result<(messages::MessagePause,messages::MessagePause),CoreError>>),
@@ -133,6 +135,8 @@ impl Command {
             Self::MessageProofWriteStarts(reply)=>{let _=reply.send(Err(error));}
             #[cfg(all(feature = "test-hooks", debug_assertions))]
             Self::MessageWriteStarts(reply)=>{let _=reply.send(Err(error));}
+            #[cfg(all(feature="test-hooks",debug_assertions))]
+            Self::MessageHoldScheduler(_,reply)=>{let _=reply.send(Err(error));}
             #[cfg(all(feature="test-hooks",debug_assertions))]
             Self::MessagePause(_,reply)=>{let _=reply.send(Err(error));}
             #[cfg(all(feature="test-hooks",debug_assertions))]
@@ -1191,6 +1195,8 @@ impl Manager {
                         Command::MessageProofWriteStarts(reply)=>{let _=reply.send(Ok(self.message_proof_write_starts()));}
                         #[cfg(all(feature = "test-hooks", debug_assertions))]
                         Command::MessageWriteStarts(reply)=>{let _=reply.send(Ok(self.message_write_starts()));}
+                        #[cfg(all(feature="test-hooks",debug_assertions))]
+                        Command::MessageHoldScheduler(hold,reply)=>{self.message_hold_scheduler(hold);let _=reply.send(Ok(()));}
                         #[cfg(all(feature="test-hooks",debug_assertions))]
                         Command::MessagePause(response,reply)=>{let _=reply.send(Ok(self.message_pause(response)));}
                         #[cfg(all(feature="test-hooks",debug_assertions))]

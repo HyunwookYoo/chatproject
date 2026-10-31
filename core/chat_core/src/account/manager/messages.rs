@@ -63,6 +63,8 @@ pub(super) struct Runtime {
     reply_pause: Option<TestPause>,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     write_pause: Option<TestPause>,
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    scheduler_held: bool,
 }
 #[cfg(all(feature = "test-hooks", debug_assertions))]
 struct TestPause {
@@ -176,6 +178,14 @@ impl AccountHandle {
         mutation: MessageMutation,
     ) -> Result<(), CoreError> {
         self.send(|reply| Command::MessageAttempt(key, receipt, mutation, reply))
+            .await
+    }
+
+    /// Stops automatic delivery from starting attempts, so a test that drives
+    /// message_test_attempt by hand does not race the 100 ms scheduler poll.
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    pub async fn message_test_hold_scheduler(&self, hold: bool) -> Result<(), CoreError> {
+        self.send(|reply| Command::MessageHoldScheduler(hold, reply))
             .await
     }
 }
@@ -351,6 +361,11 @@ impl Manager {
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     pub(super) fn message_proof_write_starts(&self) -> usize {
         self.messages.proof_writes.load(Ordering::SeqCst)
+    }
+
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    pub(super) fn message_hold_scheduler(&mut self, hold: bool) {
+        self.messages.scheduler_held = hold;
     }
 
     #[cfg(all(feature = "test-hooks", debug_assertions))]
@@ -1212,6 +1227,10 @@ impl Manager {
         Ok(())
     }
     pub(super) async fn poll_messages(&mut self) {
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        if self.messages.scheduler_held {
+            return;
+        }
         let Ok(request) = self.ready() else { return };
         if self.messages.scheduler.is_none() {
             if let Err(e) = self.restore_message_scheduler(request).await {

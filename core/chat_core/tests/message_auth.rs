@@ -1,5 +1,14 @@
 #![cfg(all(feature = "test-hooks", debug_assertions))]
 include!("support/message_network.rs");
+/// For tests that drive every attempt with message_test_attempt: automatic
+/// delivery would otherwise start the same job first and turn the attempt into Busy.
+async fn manual_pair() -> (Fixture, Fixture, Arc<Backend>) {
+    let (a, b, backend) = pair().await;
+    for f in [&a, &b] {
+        f.account.message_test_hold_scheduler(true).await.unwrap();
+    }
+    (a, b, backend)
+}
 #[tokio::test]
 async fn before_auth_no_message_bytes() {
     let (a, b, _) = pair().await;
@@ -32,7 +41,7 @@ async fn before_auth_no_message_bytes() {
 }
 #[tokio::test]
 async fn unknown_contact_gets_no_stored_text() {
-    let (a, b, _) = pair().await;
+    let (a, b, _) = manual_pair().await;
     contacts(&a, &b).await;
     a.account.connect_account(b.peer).await.unwrap();
     let m = enqueue(&a, &b).await;
@@ -67,7 +76,7 @@ async fn unknown_contact_gets_no_stored_text() {
 }
 #[tokio::test]
 async fn sender_and_receipt_are_session_bound() {
-    let (a, b, _) = pair().await;
+    let (a, b, _) = manual_pair().await;
     contacts(&a, &b).await;
     contacts(&b, &a).await;
     a.account.connect_account(b.peer).await.unwrap();
@@ -92,7 +101,7 @@ async fn sender_and_receipt_are_session_bound() {
 }
 #[tokio::test]
 async fn actual_text_and_durable_receipt_roundtrip() {
-    let (a, b, _) = pair().await;
+    let (a, b, _) = manual_pair().await;
     contacts(&a, &b).await;
     contacts(&b, &a).await;
     a.account.connect_account(b.peer).await.unwrap();
@@ -132,7 +141,7 @@ async fn actual_text_and_durable_receipt_roundtrip() {
 
 #[tokio::test]
 async fn expiry_after_db_commit_sends_no_ack() {
-    let (a, b, _) = pair().await;
+    let (a, b, _) = manual_pair().await;
     contacts(&a, &b).await;
     contacts(&b, &a).await;
     a.account.connect_account(b.peer).await.unwrap();
@@ -177,7 +186,7 @@ async fn expiry_after_db_commit_sends_no_ack() {
 }
 #[tokio::test]
 async fn invalid_frames_mutate_no_history_dedupe_or_receipts() {
-    let (a, b, _) = pair().await;
+    let (a, b, _) = manual_pair().await;
     contacts(&a, &b).await;
     contacts(&b, &a).await;
     a.account.connect_account(b.peer).await.unwrap();
@@ -228,7 +237,7 @@ async fn invalid_frames_mutate_no_history_dedupe_or_receipts() {
 }
 #[tokio::test]
 async fn receipt_jobs_require_matching_committed_application_ack() {
-    let (a, b, _) = pair().await;
+    let (a, b, _) = manual_pair().await;
     contacts(&a, &b).await;
     contacts(&b, &a).await;
     a.account.connect_account(b.peer).await.unwrap();
@@ -271,7 +280,7 @@ async fn receipt_jobs_require_matching_committed_application_ack() {
 }
 #[tokio::test]
 async fn out_of_order_chain_gap_preserves_exact_predecessor_hash() {
-    let (a, b, _) = pair().await;
+    let (a, b, _) = manual_pair().await;
     contacts(&a, &b).await;
     contacts(&b, &a).await;
     a.account.connect_account(b.peer).await.unwrap();
@@ -322,7 +331,7 @@ async fn out_of_order_chain_gap_preserves_exact_predecessor_hash() {
 
 #[tokio::test]
 async fn expiry_after_response_handoff_sends_no_ack() {
-    let (a, b, _) = pair().await;
+    let (a, b, _) = manual_pair().await;
     contacts(&a, &b).await;
     contacts(&b, &a).await;
     a.account.connect_account(b.peer).await.unwrap();
@@ -364,7 +373,7 @@ async fn expiry_after_response_handoff_sends_no_ack() {
 }
 #[tokio::test]
 async fn expiry_after_stream_open_sends_no_message_bytes() {
-    let (a, b, _) = pair().await;
+    let (a, b, _) = manual_pair().await;
     contacts(&a, &b).await;
     contacts(&b, &a).await;
     a.account.connect_account(b.peer).await.unwrap();
@@ -408,7 +417,7 @@ async fn expiry_after_stream_open_sends_no_message_bytes() {
 
 #[tokio::test]
 async fn lost_text_ack_retries_same_payload_without_duplicate_storage() {
-    let (a, b, _) = pair().await;
+    let (a, b, _) = manual_pair().await;
     contacts(&a, &b).await;
     contacts(&b, &a).await;
     a.account.connect_account(b.peer).await.unwrap();
@@ -464,7 +473,7 @@ async fn lost_text_ack_retries_same_payload_without_duplicate_storage() {
 
 #[tokio::test]
 async fn conflicting_duplicate_preserves_original_and_sender_wire() {
-    let (a, b, _) = pair().await;
+    let (a, b, _) = manual_pair().await;
     contacts(&a, &b).await;
     contacts(&b, &a).await;
     a.account.connect_account(b.peer).await.unwrap();
@@ -538,7 +547,7 @@ async fn conflicting_duplicate_preserves_original_and_sender_wire() {
 }
 #[tokio::test]
 async fn uncertain_receiver_commit_sends_no_success_and_reconciles_original_key() {
-    let (a, b, _) = pair().await;
+    let (a, b, _) = manual_pair().await;
     contacts(&a, &b).await;
     contacts(&b, &a).await;
     a.account.connect_account(b.peer).await.unwrap();
@@ -672,7 +681,7 @@ async fn restart(f: &Fixture) {
 }
 #[tokio::test]
 async fn uncertain_prebyte_attempt_reconciles_before_retry_without_sending() {
-    let (a, b, _) = pair().await;
+    let (a, b, _) = manual_pair().await;
     contacts(&a, &b).await;
     contacts(&b, &a).await;
     a.account.connect_account(b.peer).await.unwrap();
@@ -714,7 +723,7 @@ async fn uncertain_prebyte_attempt_reconciles_before_retry_without_sending() {
 #[tokio::test]
 async fn fenced_successful_prepare_releases_only_never_launched_job_on_restore() {
     for before_reply in [true, false] {
-        let (a, b, _) = pair().await;
+        let (a, b, _) = manual_pair().await;
         contacts(&a, &b).await;
         contacts(&b, &a).await;
         a.account.connect_account(b.peer).await.unwrap();
@@ -807,7 +816,7 @@ async fn fenced_successful_prepare_releases_only_never_launched_job_on_restore()
 }
 #[tokio::test]
 async fn lost_receipt_applied_ack_keeps_job_until_repeated_commit_ack() {
-    let (a, b, _) = pair().await;
+    let (a, b, _) = manual_pair().await;
     contacts(&a, &b).await;
     contacts(&b, &a).await;
     a.account.connect_account(b.peer).await.unwrap();
@@ -859,7 +868,7 @@ async fn lost_receipt_applied_ack_keeps_job_until_repeated_commit_ack() {
 
 #[tokio::test]
 async fn sender_contact_requirement_keeps_explicit_blocked_job() {
-    let (a, b, _) = pair().await;
+    let (a, b, _) = manual_pair().await;
     a.account.connect_account(b.peer).await.unwrap();
     let m = enqueue(&a, &b).await;
     assert!(
