@@ -34,7 +34,8 @@ elif tool == "otool":
 
 @unittest.skipUnless(BASH and pathlib.Path(BASH).is_file(), "requires native bash")
 class IosSymbolsTest(unittest.TestCase):
-    def run_check(self, imports="_getaddrinfo\n_nw_path_get_status\n_CCHmac", network=None, fail_tool="", sqlite_link=""):
+    # SQLCipher 4.14's CommonCrypto provider imports CCHmacInit/Update/Final, never CCHmac itself.
+    def run_check(self, imports="_getaddrinfo\n_nw_path_get_status\n_CCHmacInit", network=None, fail_tool="", sqlite_link=""):
         with tempfile.TemporaryDirectory(prefix="ios symbols fixture ") as folder:
             root = pathlib.Path(folder)
             app = root / "Runner.app"
@@ -65,7 +66,7 @@ class IosSymbolsTest(unittest.TestCase):
             return subprocess.run([BASH, "-c", command], env=env, capture_output=True, text=True)
 
     def test_clean_public_imports_pass(self):
-        result = self.run_check(imports="_getaddrinfo\n_nw_path_get_status\n_SCNetworkReachabilityCreateWithName\n_CCHmac")
+        result = self.run_check(imports="_getaddrinfo\n_nw_path_get_status\n_SCNetworkReachabilityCreateWithName\n_CCHmacInit")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_missing_commoncrypto_provider_is_rejected(self):

@@ -95,7 +95,8 @@ grep -Eq '^[[:space:]]+/System/Library/Frameworks/Network\.framework/Network([[:
   || fail "chat_ffi must link the public Network.framework"
 echo "chat_ffi uses public Network.framework without macOS-only SystemConfiguration imports"
 # Static provider evidence complements, but never replaces, the native SQL query.
-grep -Eq '(^|[[:space:]])_CCHmac([[:space:]]|$)' "$work/chat_ffi.imports" \
+# SQLCipher 4.14's CommonCrypto provider calls CCHmacInit/Update/Final, never CCHmac itself.
+grep -Eq '(^|[[:space:]])_CCHmacInit([[:space:]]|$)' "$work/chat_ffi.imports" \
   || fail "chat_ffi must import the SQLCipher CommonCrypto provider"
 if grep -Eq '/libsqlite3([.][0-9]+)*[.]dylib([[:space:]]|$)' "$work/chat_ffi.links"; then
   fail "chat_ffi links ordinary SQLite instead of only the bundled SQLCipher engine"
