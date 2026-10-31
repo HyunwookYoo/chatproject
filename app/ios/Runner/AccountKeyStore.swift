@@ -50,7 +50,6 @@ private func keyQuery(_ id: UnsafePointer<UInt8>) -> [String: Any]? {
     kSecUseAuthenticationUI as String: kSecUseAuthenticationUIFail]
 }
 
-@_cdecl("cp_key_protect")
 func cpKeyProtect(_ id: UnsafePointer<UInt8>?, _ input: UnsafePointer<UInt8>?, _ inputLength: Int,
   _ out: UnsafeMutablePointer<UInt8>?, _ capacity: Int, _ outLength: UnsafeMutablePointer<Int>?) -> Int32 {
   outLength?.pointee = 0
@@ -76,7 +75,6 @@ func cpKeyProtect(_ id: UnsafePointer<UInt8>?, _ input: UnsafePointer<UInt8>?, _
   }
 }
 
-@_cdecl("cp_key_unprotect")
 func cpKeyUnprotect(_ id: UnsafePointer<UInt8>?, _ input: UnsafePointer<UInt8>?, _ inputLength: Int,
   _ out: UnsafeMutablePointer<UInt8>?, _ capacity: Int, _ outLength: UnsafeMutablePointer<Int>?) -> Int32 {
   outLength?.pointee = 0
@@ -100,7 +98,6 @@ func cpKeyUnprotect(_ id: UnsafePointer<UInt8>?, _ input: UnsafePointer<UInt8>?,
   }
 }
 
-@_cdecl("cp_key_delete")
 func cpKeyDelete(_ id: UnsafePointer<UInt8>?) -> Int32 {
   guard let id else { return 3 }
   guard let query = keyQuery(id) else { return 4 }
