@@ -137,7 +137,9 @@ void main() {
       final projections = events
           .whereType<rust.ChatEvent_AccountChanged>()
           .toList();
-      expect(projections.isNotEmpty || phase == 'read', isTrue);
+      // Only the write phase changes the account after subscribing; read and
+      // lifecycle both restore it unchanged.
+      expect(projections.isNotEmpty || phase != 'write', isTrue);
       for (final event in projections) {
         expect(event.revision, event.view.revision);
         expect(event.revision <= latest.revision, isTrue);
