@@ -1,4 +1,4 @@
-use std::{future::Future, pin::Pin};
+use std::{future::Future, io::Write, pin::Pin};
 
 use pkarr::{
     Client, PublicKey, ResolvePolicy, SignedPacket,
@@ -43,6 +43,7 @@ impl RecordBackend for PkarrBackend {
         Box::pin(async move {
             let key = PublicKey::try_from(&peer.0)
                 .map_err(|_| CoreError::new(ErrorCode::AuthFailed, "invalid account public key"))?;
+            let _ = writeln!(std::io::stderr().lock(), "account_dht lookup started");
             resolve_result(self.client.resolve(&key, ResolvePolicy::NetworkOnly).await)
         })
     }
@@ -50,16 +51,16 @@ impl RecordBackend for PkarrBackend {
     fn publish<'a>(&'a self, packet: &'a SignedPacket) -> RecordFuture<'a, ()> {
         Box::pin(async move {
             check_packet_size(packet)?;
-            self.client
-                .publish(packet)
-                .await
-                .map(|_| ())
-                .map_err(publish_error)
+            let _ = writeln!(std::io::stderr().lock(), "account_dht publish started");
+            let result = self.client.publish(packet).await;
+            log_publish(&result, &mut std::io::stderr().lock());
+            result.map(|_| ()).map_err(publish_error)
         })
     }
 }
 
 fn resolve_result(result: Result<SignedPacket, ResolveError>) -> Result<Lookup, CoreError> {
+    log_lookup(&result, &mut std::io::stderr().lock());
     match result {
         Ok(packet) => Ok(Lookup::Found(packet)),
         Err(ResolveError::NotFound) => Ok(Lookup::CompletedAbsent),
@@ -78,10 +79,125 @@ fn publish_error(error: PublishError) -> CoreError {
     CoreError::new(code, "account DHT publication failed")
 }
 
+fn log_publish(result: &Result<pkarr::StoredNodeCount, PublishError>, output: &mut impl Write) {
+    let outcome = match result {
+        Ok(count) => {
+            let _ = writeln!(
+                output,
+                "account_dht publish outcome=stored stored_nodes={count}"
+            );
+            return;
+        }
+        Err(PublishError::NoDhtNodesQueried) => "no_nodes_queried",
+        Err(PublishError::NoResponses) => "no_responses",
+        Err(PublishError::UnexpectedResponses) => "unexpected_responses",
+        Err(PublishError::NotMostRecent) => "not_most_recent",
+        Err(PublishError::Rejected { .. }) => "rejected",
+    };
+    let _ = writeln!(output, "account_dht publish outcome={outcome}");
+}
+
+fn log_lookup(result: &Result<SignedPacket, ResolveError>, output: &mut impl Write) {
+    let outcome = match result {
+        Ok(_) => "found",
+        Err(ResolveError::NotFound) => "not_found",
+        Err(ResolveError::NoDhtNodesQueried) => "no_nodes_queried",
+        Err(ResolveError::NoResponses) => "no_responses",
+        Err(ResolveError::NoUsableResponses) => "no_usable_responses",
+        Err(ResolveError::UnexpectedResponses) => "unexpected_responses",
+        Err(ResolveError::InvalidSignedPacket { .. }) => "invalid_signed_packet",
+    };
+    let _ = writeln!(output, "account_dht lookup outcome={outcome}");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use pkarr::errors::{PublishError, ResolveError};
+
+    #[test]
+    fn backend_diagnostics_preserve_store_count_and_redact_publish_errors() {
+        for count in [0, 1, 20] {
+            let mut output = Vec::new();
+            log_publish(&Ok(count), &mut output);
+            assert_eq!(
+                String::from_utf8(output).unwrap(),
+                format!("account_dht publish outcome=stored stored_nodes={count}\n")
+            );
+        }
+        for (error, expected) in [
+            (PublishError::NoDhtNodesQueried, "no_nodes_queried"),
+            (PublishError::NoResponses, "no_responses"),
+            (PublishError::UnexpectedResponses, "unexpected_responses"),
+            (PublishError::NotMostRecent, "not_most_recent"),
+            (
+                PublishError::Rejected {
+                    code: 7634521,
+                    description: "private-rejection-marker".into(),
+                },
+                "rejected",
+            ),
+        ] {
+            let mut output = Vec::new();
+            log_publish(&Err(error), &mut output);
+            assert_eq!(
+                String::from_utf8(output).unwrap(),
+                format!("account_dht publish outcome={expected}\n")
+            );
+        }
+    }
+
+    #[test]
+    fn backend_diagnostics_redact_lookup_packets_and_error_payloads() {
+        let packet = SignedPacket::builder()
+            .txt(
+                "_account".try_into().unwrap(),
+                "private-packet-marker".try_into().unwrap(),
+                30,
+            )
+            .sign(&pkarr::Keypair::from_secret_key(&[7; 32]))
+            .unwrap();
+        let mut output = Vec::new();
+        log_lookup(&Ok(packet), &mut output);
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "account_dht lookup outcome=found\n"
+        );
+        for (error, expected) in [
+            (ResolveError::NotFound, "not_found"),
+            (ResolveError::NoDhtNodesQueried, "no_nodes_queried"),
+            (ResolveError::NoResponses, "no_responses"),
+            (ResolveError::NoUsableResponses, "no_usable_responses"),
+            (ResolveError::UnexpectedResponses, "unexpected_responses"),
+            (
+                ResolveError::InvalidSignedPacket { seq: 7634521 },
+                "invalid_signed_packet",
+            ),
+        ] {
+            let mut output = Vec::new();
+            log_lookup(&Err(error), &mut output);
+            assert_eq!(
+                String::from_utf8(output).unwrap(),
+                format!("account_dht lookup outcome={expected}\n")
+            );
+        }
+    }
+
+    #[test]
+    fn backend_diagnostics_ignore_output_failure() {
+        struct Closed;
+        impl Write for Closed {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        log_publish(&Ok(1), &mut Closed);
+        log_publish(&Err(PublishError::NoResponses), &mut Closed);
+        log_lookup(&Err(ResolveError::NoResponses), &mut Closed);
+    }
 
     struct FakeBackend(std::sync::Mutex<Option<Result<SignedPacket, ResolveError>>>);
 
