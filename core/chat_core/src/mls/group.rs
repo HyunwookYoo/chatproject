@@ -1021,6 +1021,44 @@ mod tests {
         }
     }
 
+    /// Measurement (Task 11): the `mls_kv` bytes `KvStore::flush` writes per message, 100 1 KiB
+    /// messages in alternating directions, sealed on one device and opened on the other. The
+    /// JSON storage of spike B wrote 437 KiB per message. `--nocapture` prints the numbers.
+    #[test]
+    fn kv_bytes_per_message() {
+        let (a, b, gid) = pair();
+        let flush = |party: &Party| {
+            let tx = party.conn.unchecked_transaction().unwrap();
+            let written = party.provider.storage().flush(&tx, CONV.0).unwrap();
+            tx.commit().unwrap();
+            written
+        };
+        let setup = (flush(&a), flush(&b));
+        let (mut sealed, mut opened_bytes) = (Vec::new(), Vec::new());
+        for n in 0..100 {
+            let (from, to) = if n % 2 == 0 { (&a, &b) } else { (&b, &a) };
+            let message = text(800);
+            let ct = from.seal(&gid, &message);
+            sealed.push(flush(from));
+            assert_eq!(opened(to, &gid, &ct), message);
+            opened_bytes.push(flush(to));
+        }
+        let stats = |v: &[usize]| {
+            (
+                v.iter().sum::<usize>() / v.len(),
+                *v.iter().min().unwrap(),
+                *v.iter().max().unwrap(),
+            )
+        };
+        let (seal, open) = (stats(&sealed), stats(&opened_bytes));
+        eprintln!(
+            "mls_kv bytes per message: seal avg {} (min {}, max {}), open avg {} (min {}, max {}); group set-up {} + {}",
+            seal.0, seal.1, seal.2, open.0, open.1, open.2, setup.0, setup.1
+        );
+        // Both sides together stay far below what one message cost spike B's JSON store.
+        assert!(seal.2 + open.2 < 437 * 1024 / 10, "{seal:?} {open:?}");
+    }
+
     /// Release-only measurement (run by Task 11): `cargo test --release -p chat_core --lib
     /// one_kib -- --ignored`.
     #[test]
