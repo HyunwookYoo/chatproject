@@ -470,6 +470,8 @@ async fn wall_clock_backward_restart_is_bounded() {
     contacts(&a, &b).await;
     contacts(&b, &a).await;
     a.account.connect_account(b.peer).await.unwrap();
+    // Automatic delivery could send the message before the pause is armed.
+    a.account.message_test_hold_scheduler(true).await.unwrap();
     let m = enqueue(&a, &b).await;
     let mut pause = a
         .account
@@ -512,6 +514,9 @@ async fn live_attempt_survives_lifecycle_until_actual_completion_without_duplica
     contacts(&a, &b).await;
     contacts(&b, &a).await;
     a.account.connect_account(b.peer).await.unwrap();
+    // Automatic delivery could send the message before the pause is armed;
+    // nothing would then reach the pause and wait_entered would never return.
+    a.account.message_test_hold_scheduler(true).await.unwrap();
     let m = enqueue(&a, &b).await;
     let mut pause = a
         .account
@@ -541,6 +546,8 @@ async fn live_attempt_survives_lifecycle_until_actual_completion_without_duplica
     assert_eq!(facts.dispatch_state, Some(1));
     assert_eq!(facts.retry.unwrap().0, 1);
     assert_eq!(a.account.message_test_write_starts().await.unwrap().0, 0);
+    // The retry after the failed attempt is automatic.
+    a.account.message_test_hold_scheduler(false).await.unwrap();
     pause.release();
     assert!(attempt.await.unwrap().is_err());
     wait_state(&a, m.key, DeliveryState::Delivered).await;
@@ -596,6 +603,8 @@ async fn retry_only_releases_current_resolvable_blocked_and_never_recreates_term
     let (a, b, _) = pair().await;
     contacts(&a, &b).await;
     a.account.connect_account(b.peer).await.unwrap();
+    // Automatic delivery could take the message before the manual attempt.
+    a.account.message_test_hold_scheduler(true).await.unwrap();
     let m = enqueue(&a, &b).await;
     assert_eq!(
         a.account
@@ -630,12 +639,16 @@ async fn retry_only_releases_current_resolvable_blocked_and_never_recreates_term
         DeliveryState::Blocked
     );
     contacts(&b, &a).await;
+    // The released retry is delivered automatically.
+    a.account.message_test_hold_scheduler(false).await.unwrap();
     repo.retry_send(m.key, NOW * 1000).await.unwrap();
     wait_state(&a, m.key, DeliveryState::Delivered).await;
     assert_eq!(
         repo.retry_send(m.key, NOW * 1000).await.unwrap().state,
         DeliveryState::Delivered
     );
+    // Hold again so the next message cannot be sent before it is cancelled.
+    a.account.message_test_hold_scheduler(true).await.unwrap();
     assert_eq!(
         a.account
             .storage_test_fixture()
@@ -674,6 +687,8 @@ async fn locked_completion_retains_exact_owner_across_failed_settlement() {
     contacts(&a, &b).await;
     contacts(&b, &a).await;
     a.account.connect_account(b.peer).await.unwrap();
+    // Automatic delivery could send the message before the pause is armed.
+    a.account.message_test_hold_scheduler(true).await.unwrap();
     let m = enqueue(&a, &b).await;
     let mut pause = a
         .account
@@ -721,6 +736,8 @@ async fn locked_completion_retains_exact_owner_across_failed_settlement() {
         .unwrap();
     assert_eq!(facts.dispatch_state, Some(0));
     assert_eq!(facts.retry.unwrap().0, 1);
+    // Final delivery is automatic.
+    a.account.message_test_hold_scheduler(false).await.unwrap();
     network_start(&a).await;
     a.route(&b).await;
     b.route(&a).await;
@@ -769,6 +786,8 @@ async fn offline_after_write_remains_retryable_without_new_user_connect() {
     contacts(&a, &b).await;
     contacts(&b, &a).await;
     a.account.connect_account(b.peer).await.unwrap();
+    // Automatic delivery could send the message before the manual attempt.
+    a.account.message_test_hold_scheduler(true).await.unwrap();
     let m = enqueue(&a, &b).await;
     let mut pause = b
         .account
@@ -804,6 +823,8 @@ async fn offline_after_write_remains_retryable_without_new_user_connect() {
         DeliveryState::SentDirect,
         "transport closure with current records is transient, not an authorization block"
     );
+    // The retry is automatic, without a new user connect.
+    a.account.message_test_hold_scheduler(false).await.unwrap();
     network_start(&b).await;
     a.route(&b).await;
     b.route(&a).await;
