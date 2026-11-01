@@ -9,6 +9,7 @@ pub(crate) mod identity;
 pub(crate) mod kv;
 pub(crate) mod membership;
 pub(crate) mod payload;
+pub(crate) mod wire;
 
 use openmls_rust_crypto::RustCrypto;
 use openmls_traits::OpenMlsProvider;

@@ -966,22 +966,12 @@ mod tests {
     }
 
     fn app_frame(ciphertext: &[u8]) -> (usize, usize) {
-        let mut e = minicbor::Encoder::new(Vec::new());
-        e.array(4)
-            .unwrap()
-            .u8(1)
-            .unwrap()
-            .u8(0)
-            .unwrap()
-            .bytes(&CONV.0)
-            .unwrap()
-            .bytes(ciphertext)
-            .unwrap();
-        let inner = e.into_writer();
-        (
-            inner.len(),
-            crate::account::auth::envelope(17, &inner).len(),
-        )
+        let frame = crate::mls::wire::MlsFrame::App {
+            conversation: CONV,
+            ciphertext: ciphertext.to_vec(),
+        };
+        assert!(crate::mls::wire::MlsFrame::decode(&frame.inner()).unwrap() == frame);
+        (frame.inner().len(), frame.encode().len())
     }
 
     #[test]

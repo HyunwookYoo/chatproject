@@ -526,3 +526,4 @@ impl Fixture {
 // Codec fixtures expose the real decoder only in debug test-hook builds.
 pub use crate::message::wire::{decode as decode_message, Frame as MessageFrame};
 pub use crate::account::MessageMutation;
+pub use crate::mls::wire::{MlsFrame, MlsReply};
