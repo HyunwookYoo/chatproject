@@ -28,6 +28,9 @@ type R<T> = Result<T, CoreError>;
 const GLOBAL: [u8; 32] = [0; 32];
 /// First byte of every stored value: encoding version 1 (MessagePack).
 const FORMAT: u8 = 1;
+/// `mls_kv` column limits (see the schema); `restore` refuses anything larger.
+const MAX_KEY_BYTES: usize = 4_096;
+const MAX_VALUE_BYTES: usize = 4_194_304;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum KvError {
@@ -221,6 +224,67 @@ impl KvStore {
         }
         state.dirty.clear();
         Ok(written)
+    }
+
+    /// Binary snapshot of this store's conversation rows (every row except the global labels),
+    /// for `restore`. `[FORMAT]` then, per row in key order, `u32be key_len, key, u32be
+    /// value_len, value`. One conversation scope holds one group, so this is that group's state.
+    pub(crate) fn snapshot(&self) -> R<Vec<u8>> {
+        let state = self.state.read().map_err(|_| corrupt())?;
+        let mut out = vec![FORMAT];
+        for (key, value) in state.rows.iter().filter(|(key, _)| !is_global(key)) {
+            out.extend_from_slice(&(key.len() as u32).to_be_bytes());
+            out.extend_from_slice(key);
+            out.extend_from_slice(&(value.len() as u32).to_be_bytes());
+            out.extend_from_slice(value);
+        }
+        Ok(out)
+    }
+
+    /// Replaces this store's conversation rows with a `snapshot`: rows missing from it are
+    /// deleted, differing rows are rewritten, and every change is marked for the next `flush`.
+    /// A malformed snapshot is rejected before anything changes.
+    pub(crate) fn restore(&self, snapshot: &[u8]) -> R<()> {
+        fn take<'a>(input: &mut &'a [u8], limit: usize) -> Option<&'a [u8]> {
+            let (len, rest) = input.split_first_chunk::<4>()?;
+            let len = u32::from_be_bytes(*len) as usize;
+            if len > limit || len > rest.len() {
+                return None;
+            }
+            let (item, rest) = rest.split_at(len);
+            *input = rest;
+            Some(item)
+        }
+        let mut input = match snapshot.split_first() {
+            Some((&FORMAT, rest)) => rest,
+            _ => return Err(corrupt()),
+        };
+        let mut rows = BTreeMap::new();
+        while !input.is_empty() {
+            let key = take(&mut input, MAX_KEY_BYTES).ok_or_else(corrupt)?;
+            let value = take(&mut input, MAX_VALUE_BYTES).ok_or_else(corrupt)?;
+            if key.is_empty()
+                || is_global(key)
+                || value.first() != Some(&FORMAT)
+                || rows.insert(key.to_vec(), value.to_vec()).is_some()
+            {
+                return Err(corrupt());
+            }
+        }
+        let mut state = self.state.write().map_err(|_| corrupt())?;
+        let stale: Vec<Vec<u8>> = state
+            .rows
+            .keys()
+            .filter(|key| !is_global(key) && !rows.contains_key(*key))
+            .cloned()
+            .collect();
+        for key in stale {
+            state.remove(&key);
+        }
+        for (key, value) in rows {
+            state.put(key, value);
+        }
+        Ok(())
     }
 
     fn read(&self) -> Result<std::sync::RwLockReadGuard<'_, State>, KvError> {
@@ -1141,5 +1205,60 @@ mod tests {
             )
             .is_some()
         );
+    }
+
+    #[test]
+    fn kv_snapshot_restore_reverts_scoped_rows_only() {
+        let (alice, _bob, id) = established();
+        let store = alice.provider.storage();
+        let before = store.snapshot().unwrap();
+        assert_eq!(before[0], FORMAT);
+        // The snapshot holds no global (signature key) rows.
+        assert!(!before.windows(16).any(|w| w == b"SignatureKeyPair"));
+
+        let mut group = alice.load_group(&id);
+        assert_eq!(group.epoch().as_u64(), 1);
+        group
+            .self_update(
+                &alice.provider,
+                &alice.signer,
+                LeafNodeParameters::default(),
+            )
+            .unwrap();
+        group.merge_pending_commit(&alice.provider).unwrap();
+        assert_eq!(group.epoch().as_u64(), 2);
+        assert_ne!(store.snapshot().unwrap(), before);
+
+        store.restore(&before).unwrap();
+        assert_eq!(store.snapshot().unwrap(), before);
+        assert_eq!(alice.load_group(&id).epoch().as_u64(), 1);
+        assert!(
+            SignatureKeyPair::read(store, alice.signer.public(), CS.signature_algorithm())
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn kv_restore_rejects_malformed_snapshots() {
+        let (alice, _bob, _id) = established();
+        let store = alice.provider.storage();
+        let good = store.snapshot().unwrap();
+        for bad in [
+            Vec::new(),
+            vec![FORMAT + 1],
+            // Truncated length, key longer than the data, zero-length key, wrong value format.
+            vec![FORMAT, 0, 0, 0],
+            vec![FORMAT, 0, 0, 0, 9, 7],
+            vec![FORMAT, 0, 0, 0, 0],
+            vec![FORMAT, 0, 0, 0, 1, 7, 0, 0, 0, 1, FORMAT + 1],
+        ] {
+            assert!(store.restore(&bad).is_err(), "{bad:?}");
+            assert_eq!(
+                store.snapshot().unwrap(),
+                good,
+                "a bad snapshot changed state"
+            );
+        }
+        store.restore(&good).unwrap();
     }
 }

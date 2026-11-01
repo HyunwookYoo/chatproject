@@ -7,6 +7,7 @@
 pub(crate) mod group;
 pub(crate) mod identity;
 pub(crate) mod kv;
+pub(crate) mod membership;
 pub(crate) mod payload;
 
 use openmls_rust_crypto::RustCrypto;

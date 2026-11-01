@@ -68,7 +68,7 @@ fn credential_with_key(
     })
 }
 
-fn group_id_of(bytes: &[u8]) -> GroupId {
+pub(super) fn group_id_of(bytes: &[u8]) -> GroupId {
     GroupId::from_slice(bytes)
 }
 
@@ -101,14 +101,55 @@ pub(crate) fn new_key_package(
     Ok(bytes)
 }
 
-fn parse_key_package(p: &MlsProvider, bytes: &[u8]) -> R<KeyPackage> {
+fn parse_key_package(crypto: &impl OpenMlsCrypto, bytes: &[u8]) -> R<KeyPackage> {
     if bytes.len() > MAX_KEY_PACKAGE_BYTES {
         return Err(invalid("mls key package too large"));
     }
     KeyPackageIn::tls_deserialize_exact(bytes)
         .map_err(|_| invalid("invalid mls key package"))?
-        .validate(p.crypto(), ProtocolVersion::Mls10)
+        .validate(crypto, ProtocolVersion::Mls10)
         .map_err(|_| invalid("invalid mls key package"))
+}
+
+/// A leaf's credential and signature key, as the `verify` callbacks take them.
+pub(crate) type LeafVerifier<'a> = &'a dyn Fn(&[u8], &[u8]) -> R<()>;
+
+/// Runs `verify` on a leaf's `(credential, signature key)`. Only basic credentials are accepted.
+pub(super) fn verify_leaf_node(leaf: &LeafNode, verify: LeafVerifier<'_>) -> R<()> {
+    let credential = BasicCredential::try_from(leaf.credential().clone())
+        .map_err(|_| invalid("unsupported mls credential"))?;
+    verify(credential.identity(), leaf.signature_key().as_slice())
+}
+
+/// Parses a KeyPackage and has `verify` check its leaf; the KeyPackage is unusable otherwise.
+pub(super) fn checked_key_package(
+    p: &MlsProvider,
+    bytes: &[u8],
+    verify: LeafVerifier<'_>,
+) -> R<KeyPackage> {
+    let key_package = parse_key_package(p.crypto(), bytes)?;
+    verify_leaf_node(key_package.leaf_node(), verify)?;
+    Ok(key_package)
+}
+
+/// What a KeyPackage's leaf claims, for callers that must vet it against an account record
+/// before using it.
+pub(crate) struct KeyPackageInfo {
+    pub credential: Vec<u8>,
+    pub signature_key: Vec<u8>,
+}
+
+/// Validates a KeyPackage (TLS, at most `MAX_KEY_PACKAGE_BYTES`) through OpenMLS and returns the
+/// credential and signature key of its leaf. Nothing is stored.
+pub(crate) fn inspect_key_package(bytes: &[u8]) -> R<KeyPackageInfo> {
+    let key_package = parse_key_package(&openmls_rust_crypto::RustCrypto::default(), bytes)?;
+    let leaf = key_package.leaf_node();
+    let credential = BasicCredential::try_from(leaf.credential().clone())
+        .map_err(|_| invalid("unsupported mls credential"))?;
+    Ok(KeyPackageInfo {
+        credential: credential.identity().to_vec(),
+        signature_key: leaf.signature_key().as_slice().to_vec(),
+    })
 }
 
 pub(crate) struct Created {
@@ -123,8 +164,9 @@ pub(crate) struct Created {
 }
 
 /// Creates the group and adds `members` (peer KeyPackages) with one by-value Add Commit,
-/// which the creator merges immediately (epoch 1). The caller has already checked each
-/// KeyPackage's leaf against the peer's account record.
+/// which the creator merges immediately (epoch 1). `verify(credential, signature_key)` vets each
+/// KeyPackage's leaf (against the peer's account record); a rejection aborts before any group
+/// exists.
 ///
 /// The group id is `conversation || 16 random bytes`.
 pub(crate) fn create_group(
@@ -133,13 +175,14 @@ pub(crate) fn create_group(
     credential: &MlsCredential,
     conversation: ConversationId,
     members: &[Vec<u8>],
+    verify: LeafVerifier<'_>,
 ) -> R<Created> {
     if members.is_empty() {
         return Err(invalid("mls group needs a member"));
     }
     let key_packages = members
         .iter()
-        .map(|bytes| parse_key_package(p, bytes))
+        .map(|bytes| checked_key_package(p, bytes, verify))
         .collect::<R<Vec<_>>>()?;
     let mut group_id = conversation.0.to_vec();
     group_id.extend(
@@ -188,11 +231,7 @@ pub(crate) struct Joined {
 /// Staging the Welcome consumes the KeyPackage in the provider's in-memory store, so after an
 /// `Err` the caller must drop the provider without flushing it (the SQL rows are untouched
 /// and the KeyPackage stays usable).
-pub(crate) fn join(
-    p: &MlsProvider,
-    welcome: &[u8],
-    verify: &dyn Fn(&[u8], &[u8]) -> R<()>,
-) -> R<Joined> {
+pub(crate) fn join(p: &MlsProvider, welcome: &[u8], verify: LeafVerifier<'_>) -> R<Joined> {
     if welcome.len() > MAX_MLS_MESSAGE_BYTES {
         return Err(invalid("mls welcome too large"));
     }
@@ -272,11 +311,15 @@ pub(crate) struct OpenFailure {
     pub class: u8,
 }
 
-const fn fail(class: u8) -> OpenFailure {
+pub(super) const fn fail(class: u8) -> OpenFailure {
     OpenFailure { class }
 }
 
-fn classify(error: &ProcessMessageError<KvError>, message_epoch: u64, current: u64) -> u8 {
+pub(super) fn classify(
+    error: &ProcessMessageError<KvError>,
+    message_epoch: u64,
+    current: u64,
+) -> u8 {
     if message_epoch > current {
         return CLASS_FUTURE_EPOCH;
     }
@@ -437,6 +480,7 @@ mod tests {
                 &self.credential,
                 CONV,
                 members,
+                &|_, _| Ok(()),
             )
             .unwrap()
         }
@@ -693,6 +737,7 @@ mod tests {
         // A credential for another key is refused.
         let other = Party::new(2);
         assert!(new_key_package(&a.provider, &a.signer, &other.credential).is_err());
+        let accept = |_: &[u8], _: &[u8]| -> R<()> { Ok(()) };
         // create_group refuses garbage, an oversized blob and an empty member list.
         assert!(
             create_group(
@@ -700,7 +745,8 @@ mod tests {
                 &a.signer,
                 &a.credential,
                 CONV,
-                &[vec![1, 2, 3]]
+                &[vec![1, 2, 3]],
+                &accept
             )
             .is_err()
         );
@@ -710,11 +756,53 @@ mod tests {
                 &a.signer,
                 &a.credential,
                 CONV,
-                &[vec![0; MAX_KEY_PACKAGE_BYTES + 1]]
+                &[vec![0; MAX_KEY_PACKAGE_BYTES + 1]],
+                &accept
             )
             .is_err()
         );
-        assert!(create_group(&a.provider, &a.signer, &a.credential, CONV, &[]).is_err());
+        assert!(create_group(&a.provider, &a.signer, &a.credential, CONV, &[], &accept).is_err());
+    }
+
+    #[test]
+    fn create_group_rejects_unverified_member() {
+        let (a, b) = (Party::new(1), Party::new(2));
+        let kp = b.key_package();
+        let b_peer = b.peer;
+        let reject_b = move |credential: &[u8], _key: &[u8]| -> R<()> {
+            if MlsCredential::decode(credential)?.peer == b_peer {
+                return Err(CoreError::new(ErrorCode::AuthFailed, "rejected"));
+            }
+            Ok(())
+        };
+        let error = create_group(
+            &a.provider,
+            &a.signer,
+            &a.credential,
+            CONV,
+            &[kp],
+            &reject_b,
+        )
+        .err()
+        .expect("a rejected member must stop group creation");
+        assert_eq!(error.code, ErrorCode::AuthFailed);
+        // Nothing was created: A's store holds no conversation rows.
+        assert_eq!(a.provider.storage().snapshot().unwrap(), vec![1]);
+    }
+
+    #[test]
+    fn inspect_key_package_returns_leaf_credential_and_key() {
+        let a = Party::new(1);
+        let kp = a.key_package();
+        let info = inspect_key_package(&kp).unwrap();
+        assert_eq!(info.credential, a.credential.encode());
+        assert_eq!(info.signature_key, a.credential.mls_public.to_vec());
+        assert!(inspect_key_package(&[]).is_err());
+        assert!(inspect_key_package(&[1, 2, 3]).is_err());
+        assert!(inspect_key_package(&vec![0; MAX_KEY_PACKAGE_BYTES + 1]).is_err());
+        let mut truncated = kp.clone();
+        truncated.pop();
+        assert!(inspect_key_package(&truncated).is_err());
     }
 
     #[test]
