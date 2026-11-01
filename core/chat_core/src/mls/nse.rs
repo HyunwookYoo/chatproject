@@ -58,8 +58,15 @@ pub enum NseError {
     NoPreview,
 }
 
-/// The snapshot for [`decrypt_readonly`]: the group id and every `mls_kv` row of the
-/// conversation's scope plus the global rows, in the `CNS2` format. Reads only.
+/// The snapshot for [`decrypt_readonly`]: the group id and the `mls_kv` rows of the
+/// conversation's scope, in the `CNS2` format. Reads only.
+///
+/// The global rows (the installation's MLS signature key pair, KeyPackage private keys, PSKs)
+/// are left out: decrypting needs none of them, and the extension must not hold long-term
+/// keys. What remains is still plaintext at rest: the group's epoch secrets, secret tree and
+/// private tree keys let anyone who reads the file decrypt that conversation's traffic of the
+/// retained epochs. M7 must store the file in the App Group container with an iOS data
+/// protection class (not `NSFileProtectionNone`) and delete it when the conversation goes.
 ///
 /// Call it when no write to the MLS state is in flight (inside the writer's turn or a read
 /// transaction), so the group id and the rows belong to one state.
@@ -73,7 +80,7 @@ pub fn export_snapshot(c: &Connection, conversation: ConversationId) -> Result<V
         .optional()
         .map_err(storage_error)?
         .ok_or_else(|| CoreError::new(ErrorCode::NotAvailable, "mls group not found"))?;
-    let rows = KvStore::load(c, conversation.0)?.rows()?;
+    let rows = KvStore::scope_rows(c, conversation.0)?;
     state::encode(&group_id, &rows)
         .map_err(|_| CoreError::new(ErrorCode::StorageCorrupt, "mls_snapshot_invalid"))
 }
@@ -237,42 +244,114 @@ mod tests {
         assert_eq!(app_body, body(2));
     }
 
-    #[test]
-    fn snapshot_contains_only_scope_and_global_rows() {
-        let built = built();
+    /// A key of a global label (the installation signature key pair), as `flush` files it.
+    fn global_key(tail: &[u8]) -> Vec<u8> {
+        let label = b"SignatureKeyPair";
+        let mut key = vec![label.len() as u8];
+        key.extend_from_slice(label);
+        key.extend_from_slice(tail);
+        key
+    }
+
+    /// Adds rows the snapshot must not carry: another conversation's, and global ones.
+    fn add_foreign_and_global_rows(built: &Built) -> (Vec<u8>, Vec<Vec<u8>>) {
         let c = &built.receiver;
-        // A row of another conversation, and a global row.
-        for (scope, key) in [
-            ([9u8; 32], b"other-conversation".as_slice()),
-            ([0u8; 32], b"global-row"),
-        ] {
+        let foreign = b"other-conversation".to_vec();
+        let globals = vec![
+            global_key(b"installation"),
+            b"unlabelled-global-row".to_vec(),
+        ];
+        let insert = |scope: [u8; 32], key: &[u8]| {
             c.execute(
                 "INSERT INTO mls_kv(scope,key,value) VALUES(?1,?2,?3)",
                 params![scope.as_slice(), key, [1u8, 2, 3].as_slice()],
             )
             .unwrap();
+        };
+        insert([9; 32], &foreign);
+        for key in &globals {
+            insert([0; 32], key);
         }
+        (foreign, globals)
+    }
+
+    #[test]
+    fn snapshot_contains_only_the_conversation_scope_rows() {
+        let built = built();
+        let (foreign, globals) = add_foreign_and_global_rows(&built);
+        let c = &built.receiver;
         let snapshot = snapshot_of(&built);
         let decoded = state::decode(&snapshot).unwrap();
         assert_eq!(decoded.group_id, built.group_id.as_slice());
 
-        let mut expected: Vec<Vec<u8>> = c
-            .prepare("SELECT key FROM mls_kv WHERE scope IN (?1, ?2) ORDER BY key")
+        let expected: Vec<Vec<u8>> = c
+            .prepare("SELECT key FROM mls_kv WHERE scope=?1 ORDER BY key")
             .unwrap()
-            .query_map(
-                params![CONVERSATION.0.as_slice(), [0u8; 32].as_slice()],
-                |r| r.get(0),
-            )
+            .query_map(params![CONVERSATION.0.as_slice()], |r| r.get(0))
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();
-        expected.sort();
         let keys: Vec<Vec<u8>> = decoded.rows.iter().map(|(key, _)| key.to_vec()).collect();
         assert_eq!(keys, expected);
-        assert!(keys.contains(&b"global-row".to_vec()));
-        assert!(!keys.contains(&b"other-conversation".to_vec()));
-        // Rows of the conversation are there too (more than just the two inserted).
-        assert!(keys.len() > 3);
+        assert!(keys.len() > 3, "the conversation's own rows are there");
+        assert!(!keys.contains(&foreign));
+        for key in &globals {
+            assert!(!keys.contains(key), "no global row in the snapshot");
+        }
+        assert!(keys.iter().all(|key| !crate::mls::kv::is_global(key)));
+        // The database really holds global rows, so the filter had something to drop.
+        let global_rows: i64 = c
+            .query_row(
+                "SELECT count(*) FROM mls_kv WHERE scope=?1",
+                params![[0u8; 32].as_slice()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(global_rows >= 2);
+    }
+
+    #[test]
+    fn a_global_label_stored_under_the_conversation_scope_is_still_left_out() {
+        let built = built();
+        let key = global_key(b"misfiled");
+        built
+            .receiver
+            .execute(
+                "INSERT INTO mls_kv(scope,key,value) VALUES(?1,?2,?3)",
+                params![CONVERSATION.0.as_slice(), key, [1u8, 2].as_slice()],
+            )
+            .unwrap();
+        let snapshot = snapshot_of(&built);
+        let decoded = state::decode(&snapshot).unwrap();
+        assert!(decoded.rows.iter().all(|(row, _)| *row != key.as_slice()));
+    }
+
+    #[test]
+    fn snapshot_without_global_rows_still_decrypts() {
+        let built = built();
+        add_foreign_and_global_rows(&built);
+        let snapshot = snapshot_of(&built);
+        let decoded = state::decode(&snapshot).unwrap();
+        assert!(
+            decoded
+                .rows
+                .iter()
+                .all(|(key, _)| !crate::mls::kv::is_global(key))
+        );
+        for (seq, ciphertext) in built.ciphertexts.iter().enumerate() {
+            let preview = decrypt_readonly(&snapshot, ciphertext).unwrap();
+            assert!(
+                preview
+                    .preview
+                    .starts_with(&format!("M1b probe message {seq} "))
+            );
+        }
+        // The app, which holds everything, reads the same text.
+        let app = MlsProvider::new(KvStore::load(&built.receiver, CONVERSATION.0).unwrap());
+        assert!(matches!(
+            group::open(&app, &built.group_id, &built.ciphertexts[0]),
+            Ok(Opened::Application { .. })
+        ));
     }
 
     #[test]

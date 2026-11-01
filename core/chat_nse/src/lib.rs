@@ -18,8 +18,9 @@ compile_error!("chat_nse needs panic = \"unwind\"; do not set panic = \"abort\" 
 uniffi::setup_scaffolding!();
 
 /// A state file larger than this is refused before it is read. The extension is a ~15 MB
-/// process; one conversation's rows are far smaller (the 200-leaf probe group is about 1 MB).
-const MAX_STATE_FILE: u64 = 64 << 20;
+/// process; one conversation's rows are far smaller (the 200-leaf probe group is about
+/// 0.4 MB), so 8 MiB is a ceiling for a corrupt file, not a target.
+const MAX_STATE_FILE: u64 = 8 << 20;
 
 #[derive(Debug, uniffi::Record)]
 pub struct ProbeOutcome {

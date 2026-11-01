@@ -106,7 +106,7 @@ fn de<V: DeserializeOwned>(bytes: &[u8]) -> Result<V, KvError> {
 fn make_key<K: Serialize + ?Sized>(label: Label, key: &K) -> Result<Vec<u8>, KvError> {
     Ok(label_key(label, &ser(key)?))
 }
-fn is_global(key: &[u8]) -> bool {
+pub(super) fn is_global(key: &[u8]) -> bool {
     let Some((len, rest)) = key.split_first() else {
         return false;
     };
@@ -209,14 +209,34 @@ impl KvStore {
         })
     }
 
-    /// Every loaded row (the conversation's and the global ones) in key order.
-    pub(crate) fn rows(&self) -> R<Vec<(Vec<u8>, Vec<u8>)>> {
-        let state = self.state.read().map_err(|_| corrupt())?;
-        Ok(state
-            .rows
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect())
+    /// The rows of one conversation `scope` in key order, and nothing of the global scope: no
+    /// row of that scope and no row with a global label (installation signature key pair,
+    /// KeyPackage private keys, PSKs), even if one were stored under `scope`. For handing a
+    /// conversation's state to a process that must not hold long-term keys.
+    pub(crate) fn scope_rows(c: &Connection, scope: [u8; 32]) -> R<Vec<(Vec<u8>, Vec<u8>)>> {
+        if scope == GLOBAL {
+            return Err(corrupt());
+        }
+        let mut statement = c
+            .prepare("SELECT key,value FROM mls_kv WHERE scope=?1 ORDER BY key")
+            .map_err(storage_error)?;
+        let mut rows = statement
+            .query(params![scope.as_slice()])
+            .map_err(storage_error)?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().map_err(storage_error)? {
+            let (key, value): (Vec<u8>, Vec<u8>) = (
+                row.get(0).map_err(storage_error)?,
+                row.get(1).map_err(storage_error)?,
+            );
+            if value.first() != Some(&FORMAT) {
+                return Err(corrupt());
+            }
+            if !is_global(&key) {
+                out.push((key, value));
+            }
+        }
+        Ok(out)
     }
 
     /// Writes only the keys changed since `load`/the last flush (upsert or delete) into `tx`
