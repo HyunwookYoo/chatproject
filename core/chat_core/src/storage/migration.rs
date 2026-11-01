@@ -19,6 +19,8 @@ use std::{fs, path::Path};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 type R<T> = Result<T, CoreError>;
+/// Current SQL schema. v1 (M4) is upgraded in place by `upgrade_v1_to_v2`; nothing else is accepted.
+const SCHEMA_VERSION: i64 = 2;
 const DB: &str = "db.sqlite3";
 const PREP: &str = "migration.prep";
 pub(crate) struct OpenedStore {
@@ -192,7 +194,7 @@ fn ready(conn: &Connection, id: &[u8; 16], p: &Preparation) -> R<Option<StoredPl
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .map_err(|_| corrupt())?;
-    if version != 1 || complete != 1 || hash.as_deref() != p.source.as_ref().map(|h| h.as_slice()) {
+    if version != SCHEMA_VERSION || complete != 1 || hash.as_deref() != p.source.as_ref().map(|h| h.as_slice()) {
         return Err(corrupt());
     }
     load(conn, id)
@@ -397,14 +399,15 @@ fn open_locked(root: &Path, protector: &dyn KeyProtector) -> R<(Connection, DbSe
         let tx = conn.transaction().map_err(|_| corrupt())?;
         tx.execute_batch(include_str!("schema.sql"))
             .map_err(|_| corrupt())?;
-        tx.pragma_update(None, "user_version", 1)
+        tx.pragma_update(None, "user_version", SCHEMA_VERSION)
             .map_err(|_| corrupt())?;
         tx.execute(
-            "INSERT INTO storage_meta VALUES(1,1,?1,?2,?3,1,0)",
+            "INSERT INTO storage_meta VALUES(1,?4,?1,?2,?3,1,0)",
             params![
                 secrets.db_id.as_slice(),
                 binding(legacy.as_ref())?,
-                p.source.as_ref().map(|h| h.as_slice())
+                p.source.as_ref().map(|h| h.as_slice()),
+                SCHEMA_VERSION
             ],
         )
         .map_err(|_| corrupt())?;
@@ -431,6 +434,7 @@ fn open_locked(root: &Path, protector: &dyn KeyProtector) -> R<(Connection, DbSe
     if !p.importing {
         return Err(corrupt());
     }
+    upgrade_if_v1(&mut conn)?;
     ready(&conn, &secrets.db_id, &p)?;
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     checkpoint(root, MigrationStage::AfterImport);
@@ -492,6 +496,111 @@ fn open_locked(root: &Path, protector: &dyn KeyProtector) -> R<(Connection, DbSe
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     checkpoint(root, MigrationStage::CleanupComplete);
     Ok((conn, secrets))
+}
+
+fn upgrade_failed(e: rusqlite::Error) -> CoreError {
+    if let rusqlite::Error::SqliteFailure(code, _) = e
+        && code.code == rusqlite::ErrorCode::DiskFull
+    {
+        return CoreError::new(ErrorCode::StorageFull, "schema_upgrade_storage_full");
+    }
+    CoreError::new(ErrorCode::StorageCorrupt, "schema_upgrade_failed")
+}
+fn upgrade_if_v1(conn: &mut Connection) -> R<()> {
+    let version: i64 = conn
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .map_err(|_| corrupt())?;
+    if version == 1 {
+        upgrade_v1_to_v2(conn)?;
+    }
+    Ok(())
+}
+/// One transaction: new MLS tables, `storage_meta`/`outbox` rebuilt as v2, `user_version = 2`.
+/// Any failure rolls the whole transaction back, leaving an intact v1 database that the next
+/// open upgrades again. A v1 app opening the result rejects it as corrupt (version != 1).
+pub(crate) fn upgrade_v1_to_v2(c: &mut Connection) -> R<()> {
+    let tx = c.transaction().map_err(upgrade_failed)?;
+    let version: i64 = tx
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .map_err(|_| corrupt())?;
+    let schema: i64 = tx
+        .query_row(
+            "SELECT schema_version FROM storage_meta WHERE singleton=1",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|_| corrupt())?;
+    if version != 1 || schema != 1 {
+        return Err(corrupt());
+    }
+    tx.execute_batch(include_str!("upgrade_v1_to_v2.sql"))
+        .map_err(upgrade_failed)?;
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    if take_upgrade_fault(&tx) {
+        return Err(CoreError::new(
+            ErrorCode::StorageCorrupt,
+            "schema_upgrade_fixture_fault",
+        ));
+    }
+    tx.pragma_update(None, "user_version", SCHEMA_VERSION)
+        .map_err(upgrade_failed)?;
+    tx.commit().map_err(|_| {
+        CoreError::new(ErrorCode::StorageUncertain, "schema_upgrade_commit_uncertain")
+    })
+}
+
+// ---- debug fixtures: raw access that deliberately bypasses the upgrade -------------------
+
+#[cfg(all(feature = "test-hooks", debug_assertions))]
+static UPGRADE_FAULTS: std::sync::Mutex<Vec<std::path::PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
+/// Make the next upgrade of the database under `root` fail after its DDL, before commit.
+#[cfg(all(feature = "test-hooks", debug_assertions))]
+pub(crate) fn fail_next_upgrade(root: &Path) {
+    let db = fs::canonicalize(root.join(DB)).unwrap_or_else(|_| root.join(DB));
+    UPGRADE_FAULTS.lock().unwrap().push(db);
+}
+#[cfg(all(feature = "test-hooks", debug_assertions))]
+fn take_upgrade_fault(conn: &Connection) -> bool {
+    let Some(path) = conn.path().and_then(|p| fs::canonicalize(p).ok()) else {
+        return false;
+    };
+    let mut faults = UPGRADE_FAULTS.lock().unwrap();
+    let before = faults.len();
+    faults.retain(|f| *f != path);
+    faults.len() != before
+}
+/// Opens an existing, fully migrated store's database WITHOUT upgrading or validating it.
+#[cfg(all(feature = "test-hooks", debug_assertions))]
+pub(crate) fn with_raw_connection<T>(
+    root: &Path,
+    protector: &dyn KeyProtector,
+    action: impl FnOnce(&mut Connection) -> R<T>,
+) -> R<T> {
+    let mut ownership = Ownership::open(root)?;
+    ownership.with_lock(|root| {
+        let secrets = keys::load_existing(root, protector, None)?;
+        let mut conn = open(root, &secrets)?;
+        action(&mut conn)
+    })
+}
+/// Test-only copy of the M4 (v1) reader's version check, to prove v1 rejects a v2 database.
+#[cfg(all(feature = "test-hooks", debug_assertions))]
+pub(crate) fn ready_v1(conn: &Connection) -> R<()> {
+    let version: i64 = conn
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .map_err(|_| corrupt())?;
+    let schema: i64 = conn
+        .query_row(
+            "SELECT schema_version FROM storage_meta WHERE singleton=1",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|_| corrupt())?;
+    if version != 1 || schema != 1 {
+        return Err(corrupt());
+    }
+    Ok(())
 }
 
 #[cfg(all(feature = "test-hooks", debug_assertions))]
@@ -585,7 +694,7 @@ pub(crate) fn load_validated(
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .map_err(|_| corrupt())?;
-    if version != 1 || db != id {
+    if version != SCHEMA_VERSION || db != id {
         return Err(corrupt());
     }
     let state = conn

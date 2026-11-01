@@ -609,7 +609,7 @@ fn insert_outgoing(tx: &Transaction<'_>, frame: &TextFrame, hash: &[u8; 32], wir
     )
     .map_err(sql_error)?;
     tx.execute(
-        "INSERT INTO outbox VALUES(?1,?2,?3,?4,1,?5,0,1000,0,0)",
+        "INSERT INTO outbox(conversation,sender_peer,sender_install,msg_id,codec,wire,attempts,retry_delay_ms,next_retry_at_ms,dispatch_state) VALUES(?1,?2,?3,?4,1,?5,0,1000,0,0)",
         params![
             k.conversation.0.as_slice(),
             k.sender.0.as_slice(),
@@ -700,6 +700,7 @@ pub(crate) enum FixtureOp {
     ),
     Delivered(MessageKey, tokio::sync::oneshot::Sender<R<()>>),
     Lamport(ConversationId, u64, tokio::sync::oneshot::Sender<R<()>>),
+    OutboxRetry(MessageKey, u64, u64, u64, tokio::sync::oneshot::Sender<R<()>>),
 }
 #[cfg(all(feature = "test-hooks", debug_assertions))]
 pub(crate) fn fixture(c: &mut Connection, op: FixtureOp) {
@@ -750,6 +751,14 @@ pub(crate) fn fixture(c: &mut Connection, op: FixtureOp) {
                 .map(|_| ())
                 .map_err(sql_error)
             });
+            let _ = reply.send(result);
+        }
+        FixtureOp::OutboxRetry(k, attempts, delay, next, reply) => {
+            let result = (|| {
+                let (a, d, n) = (integer(attempts)?, integer(delay)?, integer(next)?);
+                let changed = c.execute("UPDATE outbox SET attempts=?5,retry_delay_ms=?6,next_retry_at_ms=?7 WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",params![k.conversation.0.as_slice(),k.sender.0.as_slice(),k.installation.0.as_slice(),k.id.0.as_slice(),a,d,n]).map_err(sql_error)?;
+                if changed == 1 { Ok(()) } else { Err(missing()) }
+            })();
             let _ = reply.send(result);
         }
         FixtureOp::Delivered(key, reply) => {
@@ -1641,7 +1650,7 @@ mod due_tests {
             )
             .unwrap();
             tx.execute(
-                "INSERT INTO outbox VALUES(?1,?1,?1,?2,1,X'01',0,0,0,0)",
+                "INSERT INTO outbox(conversation,sender_peer,sender_install,msg_id,codec,wire,attempts,retry_delay_ms,next_retry_at_ms,dispatch_state) VALUES(?1,?1,?1,?2,1,X'01',0,0,0,0)",
                 params![[peer; 32].as_slice(), id.as_slice()],
             )
             .unwrap();
@@ -1847,7 +1856,7 @@ mod due_tests {
             )
             .unwrap();
             c.execute(
-                "INSERT INTO outbox VALUES(?1,?1,?1,?2,1,X'01',0,0,0,0)",
+                "INSERT INTO outbox(conversation,sender_peer,sender_install,msg_id,codec,wire,attempts,retry_delay_ms,next_retry_at_ms,dispatch_state) VALUES(?1,?1,?1,?2,1,X'01',0,0,0,0)",
                 params![[peer; 32].as_slice(), [peer; 16].as_slice()],
             )
             .unwrap();

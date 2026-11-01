@@ -137,7 +137,7 @@ fn schema_enforces_identity_ordering_foreign_keys_and_ranges() {
             "invalid message constraint accepted"
         );
     }
-    c.execute("INSERT INTO outbox SELECT conversation,sender_peer,sender_install,msg_id,1,X'01',0,1000,1,0 FROM message",[]).unwrap();
+    c.execute("INSERT INTO outbox(conversation,sender_peer,sender_install,msg_id,codec,wire,attempts,retry_delay_ms,next_retry_at_ms,dispatch_state) SELECT conversation,sender_peer,sender_install,msg_id,1,X'01',0,1000,1,0 FROM message",[]).unwrap();
     for sql in [
         "UPDATE outbox SET wire=zeroblob(61441)",
         "UPDATE outbox SET attempts=4294967296",

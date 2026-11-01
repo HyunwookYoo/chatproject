@@ -120,6 +120,10 @@ fn schema_enforces_version_one_bounds() {
             "account_state",
             "conversation",
             "message",
+            "mls_conversation",
+            "mls_delivery",
+            "mls_hold",
+            "mls_kv",
             "outbox",
             "processed_ct",
             "receipt_job",
@@ -130,13 +134,14 @@ fn schema_enforces_version_one_bounds() {
         .query_row("SELECT count(*) FROM account_state", [], |r| r.get(0))
         .unwrap();
     assert_eq!(unconfigured, 0);
-    conn.execute_batch("INSERT INTO storage_meta VALUES (1,1,zeroblob(16),x'01',NULL,0,0)")
+    conn.execute_batch("INSERT INTO storage_meta VALUES (1,2,zeroblob(16),x'01',NULL,0,0)")
         .unwrap();
     for update in [
         "singleton=2",
         "singleton=NULL",
         "schema_version=NULL",
-        "schema_version=2",
+        "schema_version=1",
+        "schema_version=3",
         "db_id=NULL",
         "db_id=zeroblob(15)",
         "binding=NULL",

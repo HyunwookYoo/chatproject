@@ -79,6 +79,180 @@ impl Messages {
         self.0.list_conversations(before, limit).await
     }
 }
+
+/// Read-only snapshot of a closed store's SQL, taken WITHOUT upgrading it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DbProbe {
+    pub user_version: i64,
+    pub schema_version: i64,
+    pub tables: Vec<String>,
+    /// (name, whitespace/quote-normalised DDL) of every table and index.
+    pub schema: Vec<(String, String)>,
+    pub message_count: u64,
+    /// Canonical, type-tagged dump of every `message` row (all columns, primary-key order).
+    pub message_rows: Vec<u8>,
+    pub outbox: Vec<OutboxProbe>,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboxProbe {
+    pub msg_id: Vec<u8>,
+    pub codec: i64,
+    pub wire: Vec<u8>,
+    pub attempts: i64,
+    pub retry_delay_ms: i64,
+    pub next_retry_at_ms: i64,
+    pub dispatch_state: i64,
+    /// `None` on a v1 table, which has no such column.
+    pub reencrypts: Option<i64>,
+    pub waiting_peer_update: Option<i64>,
+}
+const V1_DOWNGRADE: &str = "
+DROP TABLE mls_kv;
+DROP TABLE mls_conversation;
+DROP TABLE mls_delivery;
+DROP TABLE mls_hold;
+CREATE TABLE storage_meta_v1 (
+    singleton INTEGER PRIMARY KEY NOT NULL CHECK(singleton = 1),
+    schema_version INTEGER NOT NULL CHECK(schema_version = 1),
+    db_id BLOB NOT NULL CHECK(length(db_id) = 16),
+    binding BLOB NOT NULL,
+    legacy_hash BLOB CHECK(legacy_hash IS NULL OR length(legacy_hash) = 32),
+    migration_ready INTEGER NOT NULL CHECK(migration_ready IN (0, 1)),
+    message_revision INTEGER NOT NULL CHECK(message_revision BETWEEN 0 AND 9223372036854775807)
+) STRICT;
+INSERT INTO storage_meta_v1
+    SELECT singleton,1,db_id,binding,legacy_hash,migration_ready,message_revision FROM storage_meta;
+DROP TABLE storage_meta;
+ALTER TABLE storage_meta_v1 RENAME TO storage_meta;
+CREATE TABLE outbox_v1 (
+    conversation BLOB NOT NULL CHECK(length(conversation)=32),
+    sender_peer BLOB NOT NULL CHECK(length(sender_peer)=32),
+    sender_install BLOB NOT NULL CHECK(length(sender_install)=32),
+    msg_id BLOB NOT NULL CHECK(length(msg_id)=16),
+    codec INTEGER NOT NULL CHECK(codec=1),
+    wire BLOB NOT NULL CHECK(length(wire) BETWEEN 1 AND 61440),
+    attempts INTEGER NOT NULL CHECK(attempts BETWEEN 0 AND 4294967295),
+    retry_delay_ms INTEGER NOT NULL CHECK(retry_delay_ms BETWEEN 0 AND 300000),
+    next_retry_at_ms INTEGER NOT NULL CHECK(next_retry_at_ms>=0),
+    dispatch_state INTEGER NOT NULL CHECK(dispatch_state IN (0,1,2)),
+    PRIMARY KEY(conversation,sender_peer,sender_install,msg_id),
+    FOREIGN KEY(conversation,sender_peer,sender_install,msg_id)
+        REFERENCES message(conversation,sender_peer,sender_install,msg_id)
+) STRICT;
+INSERT INTO outbox_v1
+    SELECT conversation,sender_peer,sender_install,msg_id,codec,wire,attempts,
+           retry_delay_ms,next_retry_at_ms,dispatch_state FROM outbox;
+DROP TABLE outbox;
+ALTER TABLE outbox_v1 RENAME TO outbox;
+CREATE INDEX outbox_due ON outbox(dispatch_state,next_retry_at_ms,conversation);
+";
+fn probe_error(_: rusqlite::Error) -> CoreError {
+    CoreError::new(ErrorCode::StorageCorrupt, "fixture_probe_failed")
+}
+fn probe(c: &rusqlite::Connection) -> Result<DbProbe, CoreError> {
+    use rusqlite::types::ValueRef;
+    let user_version = c
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .map_err(probe_error)?;
+    let schema_version = c
+        .query_row("SELECT schema_version FROM storage_meta", [], |r| r.get(0))
+        .map_err(probe_error)?;
+    let names = |sql: &str| -> Result<Vec<String>, CoreError> {
+        c.prepare(sql)
+            .map_err(probe_error)?
+            .query_map([], |r| r.get(0))
+            .map_err(probe_error)?
+            .collect::<Result<_, _>>()
+            .map_err(probe_error)
+    };
+    let tables = names("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")?;
+    let schema = c
+        .prepare("SELECT name,sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name")
+        .map_err(probe_error)?
+        .query_map([], |r| {
+            let sql: String = r.get(1)?;
+            let sql = sql.replace('"', "").split_whitespace().collect::<Vec<_>>().join(" ");
+            Ok((r.get(0)?, sql))
+        })
+        .map_err(probe_error)?
+        .collect::<Result<_, _>>()
+        .map_err(probe_error)?;
+    let mut message_rows = Vec::new();
+    let mut message_count = 0;
+    {
+        let mut stmt = c
+            .prepare("SELECT * FROM message ORDER BY conversation,sender_peer,sender_install,msg_id")
+            .map_err(probe_error)?;
+        let columns = stmt.column_count();
+        let mut rows = stmt.query([]).map_err(probe_error)?;
+        while let Some(row) = rows.next().map_err(probe_error)? {
+            message_count += 1;
+            for i in 0..columns {
+                match row.get_ref(i).map_err(probe_error)? {
+                    ValueRef::Null => message_rows.push(0),
+                    ValueRef::Integer(n) => {
+                        message_rows.push(1);
+                        message_rows.extend(n.to_be_bytes());
+                    }
+                    ValueRef::Real(f) => {
+                        message_rows.push(2);
+                        message_rows.extend(f.to_be_bytes());
+                    }
+                    ValueRef::Text(t) | ValueRef::Blob(t) => {
+                        message_rows.push(3);
+                        message_rows.extend((t.len() as u64).to_be_bytes());
+                        message_rows.extend(t);
+                    }
+                }
+            }
+        }
+    }
+    let has_v2_columns = c
+        .query_row(
+            "SELECT count(*) FROM pragma_table_info('outbox') WHERE name='reencrypts'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map_err(probe_error)?
+        == 1;
+    let columns = if has_v2_columns {
+        "reencrypts,waiting_peer_update"
+    } else {
+        "NULL,NULL"
+    };
+    let outbox = c
+        .prepare(&format!(
+            "SELECT msg_id,codec,wire,attempts,retry_delay_ms,next_retry_at_ms,dispatch_state,{columns} \
+             FROM outbox ORDER BY msg_id"
+        ))
+        .map_err(probe_error)?
+        .query_map([], |r| {
+            Ok(OutboxProbe {
+                msg_id: r.get(0)?,
+                codec: r.get(1)?,
+                wire: r.get(2)?,
+                attempts: r.get(3)?,
+                retry_delay_ms: r.get(4)?,
+                next_retry_at_ms: r.get(5)?,
+                dispatch_state: r.get(6)?,
+                reencrypts: r.get(7)?,
+                waiting_peer_update: r.get(8)?,
+            })
+        })
+        .map_err(probe_error)?
+        .collect::<Result<_, _>>()
+        .map_err(probe_error)?;
+    Ok(DbProbe {
+        user_version,
+        schema_version,
+        tables,
+        schema,
+        message_count,
+        message_rows,
+        outbox,
+    })
+}
+
 pub struct Fixture {
     pub handle: Handle,
 }
@@ -219,6 +393,57 @@ impl Fixture {
                 CoreError::new(ErrorCode::StorageCorrupt, "fixture_schema_write_failed")
             })
         })
+    }
+    /// Rewrite a closed, migrated store into the exact M4 (schema v1) shape: the four MLS tables
+    /// and the v2 outbox columns go away, `user_version` and `schema_version` return to 1.
+    /// Only valid while every outbox row is still codec 1.
+    pub fn downgrade_to_v1(root: &Path, p: Arc<dyn KeyProtector>) -> Result<(), CoreError> {
+        crate::storage::migration::with_raw_connection(root, &*p, |c| {
+            let tx = c.transaction().map_err(probe_error)?;
+            let other: i64 = tx
+                .query_row("SELECT count(*) FROM outbox WHERE codec<>1", [], |r| r.get(0))
+                .map_err(probe_error)?;
+            if other != 0 {
+                return Err(CoreError::new(ErrorCode::InvalidMessage, "fixture_not_downgradable"));
+            }
+            tx.execute_batch(V1_DOWNGRADE).map_err(probe_error)?;
+            tx.pragma_update(None, "user_version", 1).map_err(probe_error)?;
+            tx.commit().map_err(probe_error)
+        })
+    }
+    /// Inspect a closed store without upgrading it.
+    pub fn probe_database(root: &Path, p: Arc<dyn KeyProtector>) -> Result<DbProbe, CoreError> {
+        crate::storage::migration::with_raw_connection(root, &*p, |c| probe(c))
+    }
+    /// Run the M4 (v1) reader's version check against a closed store.
+    pub fn v1_reader_check(root: &Path, p: Arc<dyn KeyProtector>) -> Result<(), CoreError> {
+        crate::storage::migration::with_raw_connection(root, &*p, |c| {
+            crate::storage::migration::ready_v1(c)
+        })
+    }
+    /// The next schema upgrade of the store under `root` fails after its DDL, before commit.
+    pub fn fail_next_upgrade(root: &Path) {
+        crate::storage::migration::fail_next_upgrade(root);
+    }
+    pub async fn set_outbox_retry(
+        &self,
+        key: MessageKey,
+        attempts: u64,
+        retry_delay_ms: u64,
+        next_retry_at_ms: u64,
+    ) -> Result<(), CoreError> {
+        let (tx, rx) = oneshot::channel();
+        self.handle
+            .0
+            .test(TestOp::Message(FixtureOp::OutboxRetry(
+                key,
+                attempts,
+                retry_delay_ms,
+                next_retry_at_ms,
+                tx,
+            )))
+            .await;
+        rx.await.unwrap()
     }
     pub async fn open(root: &Path, p: Arc<dyn KeyProtector>) -> Result<Self, CoreError> {
         let root = root.to_owned();
