@@ -96,6 +96,7 @@ impl Messages {
                 rejoin: None,
                 joined_with: None,
                 now,
+                wall: now,
             },
         );
         match self.mls(op).await? {
@@ -124,6 +125,47 @@ impl Messages {
         match self.mls(op).await? {
             MessageDbReply::Group(GroupReply::Committed(Committed::Done { epoch })) => Ok(Some(epoch)),
             MessageDbReply::Group(GroupReply::Committed(_)) => Ok(None),
+            _ => unreachable!(),
+        }
+    }
+    /// What this device does with a received Commit (the store half of a kind 17 `Commit`),
+    /// as the group protocol would answer it.
+    pub async fn mls_apply_commit(
+        &self,
+        conversation: ConversationId,
+        peer: crate::account::PeerId,
+        sender_peer: crate::account::PeerId,
+        epoch: u64,
+        commit: Vec<u8>,
+        now: u64,
+    ) -> Result<MlsCommitOutcome, CoreError> {
+        let op = MessageDbOp::MlsGroupOp(
+            conversation,
+            GroupOp::ApplyCommit { peer, sender_peer, epoch, commit, now },
+        );
+        match self.mls(op).await? {
+            MessageDbReply::Group(GroupReply::Outcome(outcome)) => Ok(MlsCommitOutcome::from(outcome)),
+            _ => unreachable!(),
+        }
+    }
+    /// The store half of a kind 17 `JoinRequest` from `sender_peer`'s installation named in the
+    /// KeyPackage: `"done"`, `"busy"` or `"held"`.
+    pub async fn mls_join_request(
+        &self,
+        conversation: ConversationId,
+        peer: crate::account::PeerId,
+        sender_peer: crate::account::PeerId,
+        key_package: Vec<u8>,
+        now: u64,
+    ) -> Result<&'static str, CoreError> {
+        let op = MessageDbOp::MlsGroupOp(
+            conversation,
+            GroupOp::JoinRequest { peer, sender_peer, key_package, now },
+        );
+        match self.mls(op).await? {
+            MessageDbReply::Group(GroupReply::Committed(Committed::Done { .. })) => Ok("done"),
+            MessageDbReply::Group(GroupReply::Committed(Committed::Busy)) => Ok("busy"),
+            MessageDbReply::Group(GroupReply::Committed(Committed::Held(_))) => Ok("held"),
             _ => unreachable!(),
         }
     }
@@ -440,6 +482,32 @@ pub struct MlsCreated {
     pub commit: Vec<u8>,
     pub welcome: Vec<u8>,
 }
+/// What became of a received Commit, as the group protocol reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MlsCommitOutcome {
+    Ack,
+    Joined,
+    Adopted,
+    Held,
+    Failed { class: u8, epoch: u64 },
+    Rejoin,
+    Later,
+    Removed,
+}
+impl From<Outcome> for MlsCommitOutcome {
+    fn from(outcome: Outcome) -> Self {
+        match outcome {
+            Outcome::Ack => Self::Ack,
+            Outcome::Joined => Self::Joined,
+            Outcome::Adopted => Self::Adopted,
+            Outcome::Held(_) => Self::Held,
+            Outcome::Failed { class, epoch } => Self::Failed { class, epoch },
+            Outcome::Rejoin { .. } => Self::Rejoin,
+            Outcome::Later => Self::Later,
+            Outcome::Removed => Self::Removed,
+        }
+    }
+}
 /// A valid KeyPackage of the installation derived from `device_seed` for account `peer`, whose
 /// private keys are thrown away: it can be added to a group but that device never joins.
 pub fn mls_detached_key_package(peer: crate::account::PeerId, device_seed: [u8; 32]) -> Vec<u8> {
@@ -455,6 +523,14 @@ pub fn mls_detached_key_package(peer: crate::account::PeerId, device_seed: [u8; 
         &crate::mls::identity::MlsCredential::issue(peer, &device),
     )
     .unwrap()
+}
+/// The conversation, epoch and Commit inside a kind 17 `Commit` frame (the complete envelope).
+pub fn mls_commit_from_wire(wire: &[u8]) -> Option<(ConversationId, u64, Vec<u8>)> {
+    let inner = crate::account::auth::payload(wire, 17).ok()?;
+    match crate::mls::wire::MlsFrame::decode(&inner).ok()? {
+        crate::mls::wire::MlsFrame::Commit { conversation, epoch, commit } => Some((conversation, epoch, commit)),
+        _ => None,
+    }
 }
 /// The conversation and ciphertext inside a kind 17 `App` frame (the complete envelope).
 pub fn mls_app_from_wire(wire: &[u8]) -> Option<(ConversationId, Vec<u8>)> {
@@ -571,6 +647,31 @@ impl Fixture {
     pub async fn mls_clear_commit_flag(&self, conversation: ConversationId) -> Result<(), CoreError> {
         let (tx, rx) = oneshot::channel();
         self.handle.0.test(TestOp::Message(FixtureOp::MlsClearCommitFlag(conversation, tx))).await;
+        rx.await.unwrap()
+    }
+    /// The kind 17 frame of one queued delivery (kind 1 Commit, 2 Welcome), if it is queued.
+    pub async fn mls_delivery_frame(
+        &self,
+        conversation: ConversationId,
+        recipient: crate::account::InstallationId,
+        kind: u8,
+        epoch: u64,
+    ) -> Result<Option<Vec<u8>>, CoreError> {
+        let (tx, rx) = oneshot::channel();
+        self.handle.0.test(TestOp::Message(FixtureOp::MlsDeliveryFrame(conversation, recipient, kind, epoch, tx))).await;
+        rx.await.unwrap()
+    }
+    /// Queues a delivery row as is (`Some((body, next_retry_at_ms))`) or deletes one (`None`).
+    pub async fn mls_set_delivery(
+        &self,
+        conversation: ConversationId,
+        recipient: crate::account::InstallationId,
+        kind: u8,
+        epoch: u64,
+        row: Option<(Vec<u8>, u64)>,
+    ) -> Result<(), CoreError> {
+        let (tx, rx) = oneshot::channel();
+        self.handle.0.test(TestOp::Message(FixtureOp::MlsSetDelivery(conversation, recipient, kind, epoch, row, tx))).await;
         rx.await.unwrap()
     }
     pub async fn due_hint(&self, now: u64) -> Result<bool, CoreError> {

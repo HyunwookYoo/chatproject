@@ -180,4 +180,4 @@ fn acked(reply: &MlsReply) -> bool {
     matches!(reply, MlsReply::Ack { .. })
 }
 
-use chat_core::storage_fixture::{MlsReply, mls_app_from_wire};
+use chat_core::storage_fixture::{MlsCommitOutcome, MlsReply, mls_app_from_wire};

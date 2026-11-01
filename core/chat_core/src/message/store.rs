@@ -738,6 +738,10 @@ pub(crate) enum FixtureOp {
     MlsState(ConversationId, tokio::sync::oneshot::Sender<R<super::mls_store::MlsState>>),
     MlsOutboxCap(Option<u64>, tokio::sync::oneshot::Sender<()>),
     MlsClearCommitFlag(ConversationId, tokio::sync::oneshot::Sender<R<()>>),
+    /// Body of one queued delivery: conversation, recipient, kind, epoch.
+    MlsDeliveryFrame(ConversationId, InstallationId, u8, u64, tokio::sync::oneshot::Sender<R<Option<Vec<u8>>>>),
+    /// Queues (`Some(body, next_retry_at_ms)`) or deletes (`None`) one delivery row.
+    MlsSetDelivery(ConversationId, InstallationId, u8, u64, Option<(Vec<u8>, u64)>, tokio::sync::oneshot::Sender<R<()>>),
 }
 #[cfg(all(feature = "test-hooks", debug_assertions))]
 pub(crate) fn fixture(c: &mut Connection, op: FixtureOp) {
@@ -813,6 +817,36 @@ pub(crate) fn fixture(c: &mut Connection, op: FixtureOp) {
         }
         FixtureOp::MlsClearCommitFlag(id, reply) => {
             let _ = reply.send(super::mls_store::fixture_clear_commit_flag(c, id));
+        }
+        FixtureOp::MlsDeliveryFrame(id, recipient, kind, epoch, reply) => {
+            let result = integer(epoch).and_then(|epoch| {
+                c.query_row(
+                    "SELECT body FROM mls_delivery WHERE conversation=?1 AND recipient_install=?2 AND kind=?3 AND epoch=?4",
+                    params![id.0.as_slice(), recipient.0.as_slice(), kind, epoch],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(sql_error)
+            });
+            let _ = reply.send(result);
+        }
+        FixtureOp::MlsSetDelivery(id, recipient, kind, epoch, row, reply) => {
+            let result = (|| {
+                let epoch = integer(epoch)?;
+                match row {
+                    Some((body, next)) => c.execute(
+                        "INSERT OR REPLACE INTO mls_delivery VALUES(?1,?2,?3,?4,?5,0,?6)",
+                        params![id.0.as_slice(), recipient.0.as_slice(), kind, epoch, body, integer(next)?],
+                    ),
+                    None => c.execute(
+                        "DELETE FROM mls_delivery WHERE conversation=?1 AND recipient_install=?2 AND kind=?3 AND epoch=?4",
+                        params![id.0.as_slice(), recipient.0.as_slice(), kind, epoch],
+                    ),
+                }
+                .map(|_| ())
+                .map_err(sql_error)
+            })();
+            let _ = reply.send(result);
         }
         FixtureOp::Delivered(key, reply) => {
             let result = (|| {

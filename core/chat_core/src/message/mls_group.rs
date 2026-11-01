@@ -34,12 +34,13 @@ const HOLDS_PER_CONVERSATION: i64 = 32;
 const HOLDS_TOTAL: i64 = 1024;
 const HOLD_COMMIT: u8 = 1;
 const HOLD_WELCOME: u8 = 2;
+const HOLD_JOIN_REQUEST: u8 = 3;
 /// `[tag][first_commit_hash 32][sender peer 32][conversation peer 32]` before the frame body.
 const HOLD_HEADER: usize = 97;
 
 /// Changes to a conversation's group, each one SQL transaction (spec 4.4-4.6). `now` is the
-/// scheduler time used for delivery retries, except in `Rejoin`, which takes wall-clock time
-/// because its limit outlives the process.
+/// scheduler time used for delivery retries; `wall` (and `now` in `Rejoin`) is wall-clock time
+/// for the rejoin limit, which outlives the process.
 pub(crate) enum GroupOp {
     /// A fresh KeyPackage for this installation (its private keys go to the global scope).
     NewKeyPackage,
@@ -54,9 +55,10 @@ pub(crate) enum GroupOp {
         now: u64,
     },
     /// Joins through a Welcome. With a group already present the smaller first-Commit hash
-    /// wins (spec 4.4); a newer Welcome for the same group replaces the stale state, and a
-    /// different Welcome for the epoch this device joined at means two members added it on
-    /// competing branches: it rejoins.
+    /// wins (spec 4.4) and switching to it counts as a rejoin (rate limited, Ruling 15); a
+    /// newer Welcome for the same group replaces the stale state, and a different Welcome for
+    /// the epoch this device joined at means two members added it on competing branches: it
+    /// rejoins.
     Join {
         peer: PeerId,
         sender_peer: PeerId,
@@ -66,6 +68,15 @@ pub(crate) enum GroupOp {
         rejoin: Option<(u32, u64)>,
         /// SHA-256 of the Welcome this device joined the current group with, if known.
         joined_with: Option<[u8; 32]>,
+        now: u64,
+        wall: u64,
+    },
+    /// A `JoinRequest` from `sender_peer`'s installation named in `key_package`: an Add (and
+    /// Remove of its old leaf) Commit. A device missing from the record is held and looked up.
+    JoinRequest {
+        peer: PeerId,
+        sender_peer: PeerId,
+        key_package: Vec<u8>,
         now: u64,
     },
     /// A received Commit leading to `epoch`: applied, held, or settled as a fork (spec 4.5).
@@ -88,8 +99,13 @@ pub(crate) enum GroupOp {
     },
     /// Leaves the group to rejoin it (spec 4.6), if the rate limit allows.
     Rejoin { now: u64 },
-    /// Due Commit/Welcome deliveries, the oldest epoch of each recipient first.
-    DueDeliveries { now: u64 },
+    /// Due Commit/Welcome deliveries to the given (reachable) recipients, the oldest epoch of
+    /// each recipient first. Rows of other recipients are not even read, so any number of
+    /// unreachable recipients cannot crowd out the reachable ones.
+    DueDeliveries {
+        now: u64,
+        recipients: Vec<InstallationId>,
+    },
     /// The result of one delivery attempt.
     Delivered {
         recipient: InstallationId,
@@ -101,11 +117,13 @@ pub(crate) enum GroupOp {
     /// Accounts whose record lacked a device that a held Commit/Welcome needs.
     HoldPeers,
     /// Processes the holds waiting on `lookup`'s record again; with `drop_unknown` (a fresh
-    /// lookup found no newer list) the ones still unknown are dropped.
+    /// lookup found no newer list) the ones still unknown are dropped, and a dropped Commit or
+    /// Welcome means this device cannot follow the group any more: it rejoins (spec 4.6).
     Reprocess {
         lookup: PeerId,
         drop_unknown: bool,
         now: u64,
+        wall: u64,
     },
     /// Every conversation with a group, and its peer.
     Groups,
@@ -152,8 +170,10 @@ pub(crate) enum Outcome {
     Held(PeerId),
     /// Not applied; `class` is the `DecryptFailed` class and `epoch` this device's epoch.
     Failed { class: u8, epoch: u64 },
-    /// The fork is deeper than the one stored epoch: rejoin (spec 4.6).
+    /// This device cannot follow the group any more: rejoin (spec 4.6).
     Rejoin { epoch: u64 },
+    /// Not now (a group switch the rejoin limit does not allow yet): the sender tries again.
+    Later,
     /// The Commit removed this device; the group is gone here.
     Removed,
 }
@@ -544,6 +564,7 @@ pub(super) fn group_op(
             rejoin,
             joined_with,
             now,
+            wall,
         } => GroupReply::Outcome(join(
             c,
             identity,
@@ -554,6 +575,7 @@ pub(super) fn group_op(
                 sender_peer,
                 hold: true,
                 now,
+                wall,
             },
             Welcome {
                 sender_install,
@@ -580,9 +602,30 @@ pub(super) fn group_op(
                 sender_peer,
                 hold: true,
                 now,
+                wall: now,
             },
             epoch,
             &commit,
+            fault,
+        )?),
+        GroupOp::JoinRequest {
+            peer,
+            sender_peer,
+            key_package,
+            now,
+        } => GroupReply::Committed(join_request(
+            c,
+            identity,
+            local,
+            conversation,
+            Arrival {
+                peer,
+                sender_peer,
+                hold: true,
+                now,
+                wall: now,
+            },
+            &key_package,
             fault,
         )?),
         GroupOp::Plan { peer } => GroupReply::Plan(plan(c, identity, local, conversation, peer)?),
@@ -615,7 +658,9 @@ pub(super) fn group_op(
             finish(tx, fault)?;
             GroupReply::Rejoin(Some(counters))
         }
-        GroupOp::DueDeliveries { now } => GroupReply::Due(due_deliveries(c, now)?),
+        GroupOp::DueDeliveries { now, recipients } => {
+            GroupReply::Due(due_deliveries(c, now, &recipients)?)
+        }
         GroupOp::Delivered {
             recipient,
             kind,
@@ -641,7 +686,16 @@ pub(super) fn group_op(
             lookup,
             drop_unknown,
             now,
-        } => GroupReply::Reprocessed(reprocess(c, identity, local, lookup, drop_unknown, now)?),
+            wall,
+        } => GroupReply::Reprocessed(reprocess(
+            c,
+            identity,
+            local,
+            lookup,
+            drop_unknown,
+            now,
+            wall,
+        )?),
         GroupOp::Groups => {
             let mut q = c
                 .prepare("SELECT g.conversation,c.peer FROM mls_conversation g JOIN conversation c ON c.id=g.conversation ORDER BY g.conversation")
@@ -777,6 +831,8 @@ struct Arrival {
     /// Store it in `mls_hold` when a device is missing (false while reprocessing a hold).
     hold: bool,
     now: u64,
+    /// Wall-clock time for the rejoin limit.
+    wall: u64,
 }
 struct Welcome<'a> {
     sender_install: InstallationId,
@@ -866,6 +922,16 @@ fn join(
         let replacing = existing
             .as_ref()
             .is_some_and(|old| old.first_commit_hash != welcome.first_commit_hash);
+        // Leaving this device's group for the winning one is a rejoin: it goes through the
+        // same limit (Ruling 15) and is counted. Refused for now, the sender tries again later.
+        let counters = match &existing {
+            Some(old) if replacing => match rejoin_allowed(old.rejoin, arrival.wall) {
+                Some(counters) => Some(counters),
+                None => return Ok(Outcome::Later),
+            },
+            Some(old) => Some(old.rejoin),
+            None => welcome.rejoin,
+        };
         ensure_conversation(&tx, conversation, arrival.peer)?;
         // The old state (another group, or this group's stale state) goes before the new is
         // loaded, so the snapshot and rows that follow belong to the new group only.
@@ -903,11 +969,7 @@ fn join(
                         // The Commit that made this epoch was not seen here.
                         last_commit_hash: None,
                         unacked: false,
-                        rejoin: existing
-                            .as_ref()
-                            .map(|old| old.rejoin)
-                            .or(welcome.rejoin)
-                            .unwrap_or((0, 0)),
+                        rejoin: counters.unwrap_or((0, 0)),
                         peer_mls: arrival.sender_peer != identity.peer
                             || existing.as_ref().is_some_and(|old| old.peer_mls),
                     },
@@ -981,9 +1043,17 @@ fn apply(
             epoch: row.epoch,
         });
     }
+    // This device is past that epoch already (typically a resend after a lost Ack): nothing
+    // to decide, and nothing it says can move this device.
+    if epoch < row.epoch {
+        return Ok(Outcome::Failed {
+            class: group::CLASS_PAST_EPOCH,
+            epoch: row.epoch,
+        });
+    }
     let provider = MlsProvider::new(KvStore::load(&tx, conversation.0)?);
     let before = membership::group_installations(&provider, &row.group_id)?;
-    let failure = match membership::apply_commit(&provider, &row.group_id, commit, &verify) {
+    match membership::apply_commit(&provider, &row.group_id, commit, &verify) {
         Ok(applied) => {
             if applied.self_removed {
                 forget(&tx, conversation)?;
@@ -1004,8 +1074,8 @@ fn apply(
             finish(tx, fault)?;
             return Ok(Outcome::Ack);
         }
-        Err(failure) => failure,
-    };
+        Err(_) => {}
+    }
     if let Some(lookup) = vetting.held() {
         drop(provider);
         drop(tx);
@@ -1026,68 +1096,65 @@ fn apply(
         }
         return Ok(Outcome::Held(lookup));
     }
+    let refused = Outcome::Failed {
+        class: group::CLASS_OTHER,
+        epoch: row.epoch,
+    };
     if vetting.refused.get() {
-        return Ok(Outcome::Failed {
-            class: group::CLASS_OTHER,
-            epoch: row.epoch,
-        });
+        return Ok(refused);
     }
     if epoch > row.epoch {
-        // Ahead of this device: an earlier Commit is missing (class 2), or it belongs to a
-        // branch this device is not on.
-        let class = if epoch > row.epoch + 1 {
-            group::CLASS_FUTURE_EPOCH
-        } else {
-            failure.class
-        };
+        // Ahead of this device: an earlier Commit is missing, or it follows a Commit of this
+        // epoch that this device has not adopted yet. Either way the sender keeps it and tries
+        // again (class 2), and it applies once this device has caught up.
         return Ok(Outcome::Failed {
-            class,
+            class: group::CLASS_FUTURE_EPOCH,
             epoch: row.epoch,
         });
     }
-    // A competing Commit for an epoch this device already reached (spec 4.5).
-    let decision = match row.last_commit_hash {
-        Some(mine) => {
-            membership::resolve_fork(row.epoch, mine, epoch, hash, row.previous.is_some())
-        }
-        None => ForkDecision::Rejoin,
+    // A competing Commit for the epoch this device is at (spec 4.5). It decides nothing until
+    // it is processed against the state before this epoch: only a real Commit of the same
+    // group can win, and a lost one leaves this device exactly as it was.
+    let (Some(mine), Some(previous)) = (row.last_commit_hash, row.previous.as_deref()) else {
+        return Ok(refused);
     };
-    match decision {
-        ForkDecision::KeepMine => Ok(Outcome::Failed {
-            class: group::CLASS_OTHER,
-            epoch: row.epoch,
-        }),
-        ForkDecision::Rejoin => Ok(Outcome::Rejoin { epoch: row.epoch }),
-        ForkDecision::AdoptTheirs => {
-            let previous = row.previous.as_deref().ok_or_else(invalid)?;
-            membership::restore_snapshot(&provider, previous)?;
-            let before = membership::group_installations(&provider, &row.group_id)?;
-            match membership::apply_commit(&provider, &row.group_id, commit, &verify) {
-                Ok(applied) if !applied.self_removed => {
-                    settle_applied(
-                        &tx,
-                        &provider,
-                        conversation,
-                        &row,
-                        &before,
-                        applied,
-                        hash,
-                        arrival.sender_peer != identity.peer,
-                        Some(epoch),
-                    )?;
-                    finish(tx, fault)?;
-                    Ok(Outcome::Adopted)
-                }
-                _ => Ok(Outcome::Rejoin { epoch: row.epoch }),
+    if membership::resolve_fork(row.epoch, mine, epoch, hash, true) != ForkDecision::AdoptTheirs {
+        return Ok(refused);
+    }
+    membership::restore_snapshot(&provider, previous)?;
+    let before = membership::group_installations(&provider, &row.group_id)?;
+    let checked = Vetting::new(&records);
+    let verify = |credential: &[u8], key: &[u8]| checked.check(credential, key);
+    match membership::apply_commit(&provider, &row.group_id, commit, &verify) {
+        Ok(applied) if applied.epoch == row.epoch => {
+            if applied.self_removed {
+                forget(&tx, conversation)?;
+                finish(tx, fault)?;
+                return Ok(Outcome::Removed);
             }
+            settle_applied(
+                &tx,
+                &provider,
+                conversation,
+                &row,
+                &before,
+                applied,
+                hash,
+                arrival.sender_peer != identity.peer,
+                Some(epoch),
+            )?;
+            finish(tx, fault)?;
+            Ok(Outcome::Adopted)
         }
+        // Not a valid Commit for this epoch: the transaction is dropped, nothing changes.
+        _ => Ok(refused),
     }
 }
 
 /// Stores an applied Commit: the new epoch, the state before it as the one kept snapshot, its
-/// hash for later forks, and no more deliveries to the installations it removed. With
-/// `abandoned` (a lost fork) the deliveries of the abandoned branch go too, and no own Commit is
-/// waiting any more.
+/// hash for later forks, no more deliveries to the installations it removed, and no own Commit
+/// waiting any more. With `abandoned` (a lost fork) the deliveries of the abandoned branch go
+/// too.
 #[allow(clippy::too_many_arguments)]
 fn settle_applied(
     tx: &Transaction<'_>,
@@ -1121,7 +1188,9 @@ fn settle_applied(
             epoch: applied.epoch,
             previous: Some(applied.previous),
             last_commit_hash: Some(hash),
-            unacked: row.unacked && abandoned.is_none(),
+            // A Commit applied on top of this device's state (or replacing its lost one) means
+            // its own last Commit is settled: whoever committed had processed it, or it lost.
+            unacked: false,
             rejoin: row.rejoin,
             peer_mls: row.peer_mls || from_peer,
         },
@@ -1159,6 +1228,46 @@ fn plan(
             .filter(|installation| *installation != identity.installation)
             .collect(),
     }))
+}
+
+/// A `JoinRequest`: the asking installation (named by its KeyPackage) is added, replacing its
+/// old leaf if it has one. When its account's record does not list it yet, the request is held
+/// like a Commit and the record looked up again (spec 4.2).
+fn join_request(
+    c: &mut Connection,
+    identity: Identity,
+    local: &LocalAccount,
+    conversation: ConversationId,
+    arrival: Arrival,
+    key_package: &[u8],
+    fault: Fault,
+) -> R<Committed> {
+    let asker = key_package_installation(key_package)?;
+    let committed = own_commit(
+        c,
+        identity,
+        local,
+        conversation,
+        arrival.peer,
+        &[key_package.to_vec()],
+        &[asker],
+        arrival.now,
+        fault,
+    )?;
+    if let Committed::Held(lookup) = committed
+        && arrival.hold
+    {
+        let inner = MlsFrame::JoinRequest {
+            conversation,
+            key_package: key_package.to_vec(),
+        }
+        .inner();
+        let body = hold_body(HOLD_JOIN_REQUEST, [0; 32], &arrival, &inner);
+        if !hold(c, conversation, lookup, &body, arrival.now)? {
+            return Ok(Committed::Busy);
+        }
+    }
+    Ok(committed)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1270,13 +1379,21 @@ fn own_commit(
     })
 }
 
-fn due_deliveries(c: &Connection, now: u64) -> R<Vec<DueDelivery>> {
-    // One recipient of one conversation gets its rows in epoch order (a Welcome before the
-    // Commits that follow it); a later row never overtakes an earlier one that waits.
+fn due_deliveries(c: &Connection, now: u64, recipients: &[InstallationId]) -> R<Vec<DueDelivery>> {
+    if recipients.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Only recipients this device can reach now are read: the rows of unreachable ones stay
+    // as they are (no attempt counted) and can never fill the batch. One recipient of one
+    // conversation gets its rows in epoch order (a Welcome before the Commits that follow it);
+    // a later row never overtakes an earlier one that waits.
+    let reachable = vec!["?"; recipients.len()].join(",");
     let mut q = c
-        .prepare("SELECT d.conversation,d.recipient_install,d.kind,d.epoch,d.body FROM mls_delivery d WHERE d.next_retry_at_ms<=?1 AND NOT EXISTS(SELECT 1 FROM mls_delivery e WHERE e.conversation=d.conversation AND e.recipient_install=d.recipient_install AND (e.epoch<d.epoch OR (e.epoch=d.epoch AND e.kind>d.kind))) ORDER BY d.next_retry_at_ms,d.conversation,d.recipient_install LIMIT 16")
+        .prepare(&format!("SELECT d.conversation,d.recipient_install,d.kind,d.epoch,d.body FROM mls_delivery d WHERE d.next_retry_at_ms<=? AND d.recipient_install IN ({reachable}) AND NOT EXISTS(SELECT 1 FROM mls_delivery e WHERE e.conversation=d.conversation AND e.recipient_install=d.recipient_install AND (e.epoch<d.epoch OR (e.epoch=d.epoch AND e.kind>d.kind))) ORDER BY d.next_retry_at_ms,d.conversation,d.recipient_install LIMIT 16"))
         .map_err(sql)?;
-    q.query_map(params![integer(now)?], |r| {
+    let mut values: Vec<rusqlite::types::Value> = vec![integer(now)?.into()];
+    values.extend(recipients.iter().map(|r| r.0.to_vec().into()));
+    q.query_map(rusqlite::params_from_iter(values.iter()), |r| {
         Ok(DueDelivery {
             conversation: ConversationId(bytes(r, 0)?),
             recipient: InstallationId(bytes(r, 1)?),
@@ -1316,14 +1433,15 @@ fn delivered(
                 key,
             )
             .map_err(sql)?;
-            // Any acknowledgement of the current epoch confirms the own Commit; so does the
-            // last of its Commit deliveries being settled.
-            let current = load_row(&tx, conversation)?.map(|row| row.epoch);
-            if current == Some(epoch) {
+            // An acknowledgement up to the current epoch confirms the own Commit; so does the
+            // last Commit delivery of the current epoch being settled.
+            if let Some(current) = load_row(&tx, conversation)?.map(|row| row.epoch)
+                && epoch <= current
+            {
                 let open: bool = tx
                     .query_row(
                         "SELECT EXISTS(SELECT 1 FROM mls_delivery WHERE conversation=?1 AND kind=?2 AND epoch=?3)",
-                        params![conversation.0.as_slice(), DELIVER_COMMIT, integer(epoch)?],
+                        params![conversation.0.as_slice(), DELIVER_COMMIT, integer(current)?],
                         |r| r.get(0),
                     )
                     .map_err(sql)?;
@@ -1375,6 +1493,7 @@ fn reprocess(
     lookup: PeerId,
     drop_unknown: bool,
     now: u64,
+    wall: u64,
 ) -> R<Vec<(ConversationId, PeerId, Outcome)>> {
     let held: Vec<([u8; 32], [u8; 32], Vec<u8>)> = {
         let mut q = c
@@ -1390,24 +1509,31 @@ fn reprocess(
     let mut settled = Vec::new();
     for (conversation, hash, body) in held {
         let conversation = ConversationId(conversation);
-        let outcome = match reprocess_one(c, identity, local, conversation, &body, now) {
+        let outcome = match reprocess_one(c, identity, local, conversation, &body, now, wall) {
             // Storage trouble leaves the hold for the next pass.
             Err(error) if error.code == ErrorCode::StorageUncertain => return Err(error),
             outcome => outcome,
         };
-        let keep = matches!(outcome, Ok(Outcome::Held(_))) && !drop_unknown;
-        if !keep {
-            c.execute(
-                "DELETE FROM mls_hold WHERE conversation=?1 AND body_hash=?2",
-                params![conversation.0.as_slice(), hash.as_slice()],
-            )
-            .map_err(sql)?;
-            if let Ok(outcome) = outcome
-                && body.len() >= HOLD_HEADER
-            {
-                let peer = PeerId(body[65..97].try_into().map_err(|_| invalid())?);
-                settled.push((conversation, peer, outcome));
+        let still_unknown = matches!(outcome, Ok(Outcome::Held(_)));
+        if still_unknown && !drop_unknown {
+            continue;
+        }
+        c.execute(
+            "DELETE FROM mls_hold WHERE conversation=?1 AND body_hash=?2",
+            params![conversation.0.as_slice(), hash.as_slice()],
+        )
+        .map_err(sql)?;
+        let Ok(outcome) = outcome else { continue };
+        let peer = PeerId(body[65..97].try_into().map_err(|_| invalid())?);
+        if still_unknown {
+            // A Commit or Welcome this device had to refuse for good: it can no longer follow
+            // the group and rejoins (spec 4.6). A refused JoinRequest needs nothing more; the
+            // asking device asks again.
+            if body[0] != HOLD_JOIN_REQUEST {
+                settled.push((conversation, peer, Outcome::Rejoin { epoch: 0 }));
             }
+        } else {
+            settled.push((conversation, peer, outcome));
         }
     }
     Ok(settled)
@@ -1420,6 +1546,7 @@ fn reprocess_one(
     conversation: ConversationId,
     body: &[u8],
     now: u64,
+    wall: u64,
 ) -> R<Outcome> {
     if body.len() < HOLD_HEADER {
         return Err(invalid());
@@ -1431,6 +1558,7 @@ fn reprocess_one(
         peer: PeerId(body[65..97].try_into().map_err(|_| invalid())?),
         hold: false,
         now,
+        wall,
     };
     let no_fault = Fault::default();
     match (tag, MlsFrame::decode(&body[HOLD_HEADER..])?) {
@@ -1473,6 +1601,33 @@ fn reprocess_one(
             &commit,
             no_fault,
         ),
+        (
+            HOLD_JOIN_REQUEST,
+            MlsFrame::JoinRequest {
+                conversation: id,
+                key_package,
+            },
+        ) if id == conversation => {
+            Ok(
+                match join_request(
+                    c,
+                    identity,
+                    local,
+                    conversation,
+                    arrival,
+                    &key_package,
+                    no_fault,
+                )? {
+                    Committed::Done { .. } => Outcome::Ack,
+                    Committed::Held(lookup) => Outcome::Held(lookup),
+                    // The asking device asks again when its wait is over.
+                    Committed::Busy => Outcome::Failed {
+                        class: group::CLASS_OTHER,
+                        epoch: 0,
+                    },
+                },
+            )
+        }
         _ => Err(invalid()),
     }
 }

@@ -249,8 +249,11 @@ async fn removed_device_delivery_dropped() {
 
 /// B1 and B2 share a group; A's record gains A2 while B1 still holds the older record. B2
 /// reviews the new record and adds A2; its Commit reaches B1, which does not know A2 yet.
+/// `revert`: the lookup B1 makes finds the old record again. `block_lookup`: B1's lookup of A
+/// never returns.
 async fn unknown_device_setup(
     revert: bool,
+    block_lookup: bool,
 ) -> (
     Fixture,
     Fixture,
@@ -299,13 +302,19 @@ async fn unknown_device_setup(
     if revert {
         publish(&net, A, &old);
     }
+    if block_lookup {
+        net.lookup_holds
+            .lock()
+            .unwrap()
+            .insert(a1.peer, Arc::new(tokio::sync::Notify::new()));
+    }
     b2.account.mls_test_hold_delivery(false).await.unwrap();
     (a1, a2, b1, b2, net, conv, new)
 }
 
 #[tokio::test]
 async fn unknown_device_commit_is_held_then_applied_after_lookup() {
-    let (_a1, a2, b1, b2, _net, conv, new) = unknown_device_setup(false).await;
+    let (_a1, a2, b1, b2, _net, conv, new) = unknown_device_setup(false, false).await;
     let ia2 = installation(&a2).await;
     // B1 holds the Commit and looks A up; the new list is a record change to review.
     settle!(
@@ -335,22 +344,90 @@ async fn unknown_device_commit_is_held_then_applied_after_lookup() {
 
 #[tokio::test]
 async fn still_unknown_after_lookup_is_dropped() {
-    let (_a1, _a2, b1, b2, _net, conv, _new) = unknown_device_setup(true).await;
-    let ib1 = installation(&b1).await;
+    let (_a1, a2, b1, b2, _net, conv, _new) = unknown_device_setup(true, false).await;
+    let (ib1, ia2) = (installation(&b1).await, installation(&a2).await);
     // B1 got the Commit (B2 has nothing left for it), held it, looked A up again, still found
-    // no A2, and dropped it.
+    // no A2, and dropped it: the Commit adding A2 is never applied on B1.
     settle!(
         [&b1, &b2],
         state(&b2, conv).await.deliveries.iter().all(|d| d.0 != ib1)
-            && state(&b1, conv).await.holds == 0
             && b1.account.mls_test_held_total().await.unwrap() >= 1
+            && b1.account.mls_test_rejoin_total().await.unwrap() >= 1
     );
-    assert_eq!(state(&b1, conv).await.group_epoch, Some(1));
+    assert!(!state(&b1, conv).await.members.contains(&ia2));
 }
 
 #[tokio::test]
-async fn deep_fork_rejoins_and_resends_unacked() {
-    let (ra, rb) = (record(A, &[A1, A2], 0), record(B, &[B1, B2], 0));
+async fn dropped_hold_leads_to_rejoin() {
+    let (_a1, _a2, b1, b2, _net, conv, _new) = unknown_device_setup(true, false).await;
+    // The dropped Commit leaves B1 unable to follow the group: it rejoins (spec 4.6).
+    settle!(
+        [&b1, &b2],
+        b1.account.mls_test_held_total().await.unwrap() >= 1
+            && b1.account.mls_test_rejoin_total().await.unwrap() >= 1
+    );
+    // The rejoin is a real one: B1 left its group state and asks to join again.
+    let frames = b1.account.mls_test_sent_frames().await.unwrap();
+    assert!(frames.iter().any(|f| f == "group_query"), "{frames:?}");
+    let _ = conv;
+}
+
+#[tokio::test]
+async fn held_lookup_does_not_block_inbound_requests() {
+    let (_a1, a2, b1, b2, net, conv, _new) = unknown_device_setup(false, true).await;
+    // B1 holds the Commit and its lookup of A hangs.
+    settle!(
+        [&b1, &b2],
+        state(&b1, conv).await.holds == 1 && net.lookup_starts.lock().unwrap().contains(&a2.peer)
+    );
+    // B1 still answers a kind 17 request right away.
+    let started = tokio::time::Instant::now();
+    let answers = b2.account.mls_test_query(a2.peer).await.unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(
+        answers.contains(&(installation(&b1).await, true)),
+        "{answers:?}"
+    );
+}
+
+#[tokio::test]
+async fn unknown_device_join_request_is_looked_up() {
+    let (a1, b1, net, conv) = two_party(&[A1], &[B1]).await;
+    let mb = b1.account.storage_test_fixture().messages().await.unwrap();
+    // A JoinRequest from a device A's record does not list (A9): held, not refused outright.
+    let k9 = chat_core::storage_fixture::mls_detached_key_package(a1.peer, [29; 32]);
+    let hold = Arc::new(tokio::sync::Notify::new());
+    net.lookup_holds
+        .lock()
+        .unwrap()
+        .insert(a1.peer, hold.clone());
+    assert_eq!(
+        mb.mls_join_request(conv, a1.peer, a1.peer, k9, NOW * 1000)
+            .await
+            .unwrap(),
+        "held"
+    );
+    assert_eq!(state(&b1, conv).await.holds, 1);
+    // B1 looks A up again (stopped here to see it start), finds no A9 and drops the request.
+    settle!([&b1], net.lookup_starts.lock().unwrap().contains(&a1.peer));
+    net.lookup_holds.lock().unwrap().remove(&a1.peer);
+    hold.notify_one();
+    settle!([&b1], state(&b1, conv).await.holds == 0);
+    assert_eq!(state(&b1, conv).await.group_epoch, Some(1));
+    // A refused JoinRequest is no reason for B1 to leave its group.
+    assert_eq!(b1.account.mls_test_rejoin_total().await.unwrap(), 0);
+}
+
+/// A1 and B1 in a group at epoch 1, nothing left to deliver.
+async fn two_party(
+    a_devices: &[u8],
+    b_devices: &[u8],
+) -> (Fixture, Fixture, Arc<Backend>, ConversationId) {
+    let (ra, rb) = (record(A, a_devices, 0), record(B, b_devices, 0));
     let net = backend(&[(A, ra.clone()), (B, rb.clone())]);
     let a1 = device(A, A1, &ra, &net).await;
     let b1 = device(B, B1, &rb, &net).await;
@@ -364,6 +441,328 @@ async fn deep_fork_rejoins_and_resends_unacked() {
         [&a1, &b1],
         agreed(&a1, &b1, conv).await && state(&a1, conv).await.deliveries.is_empty()
     );
+    (a1, b1, net, conv)
+}
+
+fn detached(peer: PeerId, seed: u8) -> Vec<u8> {
+    chat_core::storage_fixture::mls_detached_key_package(peer, [seed; 32])
+}
+
+fn installation_of(seed: u8) -> chat_core::account::InstallationId {
+    chat_core::account::derive_device(Secret32::from([seed; 32]))
+        .unwrap()
+        .installation_id()
+}
+
+/// The Commit `from` has queued for `to` at `epoch`.
+async fn queued_commit(from: &Fixture, conv: ConversationId, to: &Fixture, epoch: u64) -> Vec<u8> {
+    let wire = from
+        .account
+        .storage_test_fixture()
+        .mls_delivery_frame(conv, installation(to).await, 1, epoch)
+        .await
+        .unwrap()
+        .expect("queued Commit");
+    let (id, claimed, commit) = chat_core::storage_fixture::mls_commit_from_wire(&wire).unwrap();
+    assert_eq!((id, claimed), (conv, epoch));
+    commit
+}
+
+fn digest(bytes: &[u8]) -> [u8; 32] {
+    use sha2::Digest as _;
+    Sha256::digest(bytes).into()
+}
+
+#[tokio::test]
+async fn redelivered_commit_after_lost_ack_is_ignored() {
+    let (a1, b1, _net, conv) = two_party(&[A1, A2], &[B1, B2]).await;
+    let ib1 = installation(&b1).await;
+    let (ma, mb) = (
+        a1.account.storage_test_fixture().messages().await.unwrap(),
+        b1.account.storage_test_fixture().messages().await.unwrap(),
+    );
+    a1.account.mls_test_hold_delivery(true).await.unwrap();
+    b1.account.mls_test_hold_delivery(true).await.unwrap();
+    let now = NOW * 1000;
+    assert_eq!(
+        ma.mls_commit(conv, b1.peer, vec![detached(a1.peer, A2)], vec![], now)
+            .await
+            .unwrap(),
+        Some(2)
+    );
+    // B1 applies A1's epoch-2 Commit, but the Ack never reaches A1.
+    let commit = queued_commit(&a1, conv, &b1, 2).await;
+    assert_eq!(
+        mb.mls_apply_commit(conv, a1.peer, a1.peer, 2, commit, now)
+            .await
+            .unwrap(),
+        MlsCommitOutcome::Ack
+    );
+    // B1 moves on to epoch 3.
+    assert_eq!(
+        mb.mls_commit(conv, a1.peer, vec![detached(b1.peer, B2)], vec![], now)
+            .await
+            .unwrap(),
+        Some(3)
+    );
+    let before = state(&b1, conv).await;
+    // A1's retry of the epoch-2 Commit arrives: B1 is past it, says so, and stays put.
+    a1.account.mls_test_hold_delivery(false).await.unwrap();
+    settle!(
+        [&a1, &b1],
+        !state(&a1, conv)
+            .await
+            .deliveries
+            .iter()
+            .any(|d| d.0 == ib1 && d.2 == 2)
+    );
+    let after = state(&b1, conv).await;
+    assert_eq!(after.epoch_authenticator, before.epoch_authenticator);
+    assert_eq!(after.group_epoch, Some(3));
+    assert_eq!(after.rejoin_count, Some(0));
+    assert_eq!(b1.account.mls_test_rejoin_total().await.unwrap(), 0);
+    // B1's own Commit then brings A1 along.
+    b1.account.mls_test_hold_delivery(false).await.unwrap();
+    settle!([&a1, &b1], agreed(&a1, &b1, conv).await);
+}
+
+#[tokio::test]
+async fn garbage_commit_does_not_force_rejoin() {
+    let (a1, b1, _net, conv) = two_party(&[A1, A2], &[B1]).await;
+    let (ma, mb) = (
+        a1.account.storage_test_fixture().messages().await.unwrap(),
+        b1.account.storage_test_fixture().messages().await.unwrap(),
+    );
+    a1.account.mls_test_hold_delivery(true).await.unwrap();
+    let now = NOW * 1000;
+    ma.mls_commit(conv, b1.peer, vec![detached(a1.peer, A2)], vec![], now)
+        .await
+        .unwrap();
+    let commit = queued_commit(&a1, conv, &b1, 2).await;
+    mb.mls_apply_commit(conv, a1.peer, a1.peer, 2, commit.clone(), now)
+        .await
+        .unwrap();
+    let before = state(&b1, conv).await;
+    assert_eq!(before.group_epoch, Some(2));
+
+    // Tampered copies of the real Commit, claiming an old, the current and the next epoch;
+    // some of them hash below the Commit B1 is on, so they reach the fork comparison.
+    let mut below = 0;
+    for i in 1..=24 {
+        let mut bad = commit.clone();
+        let at = bad.len() - i;
+        bad[at] ^= 0x5a;
+        if digest(&bad) < digest(&commit) {
+            below += 1;
+        }
+        for claim in [0, 2, 3] {
+            let outcome = mb
+                .mls_apply_commit(conv, a1.peer, a1.peer, claim, bad.clone(), now)
+                .await
+                .unwrap();
+            assert!(
+                matches!(outcome, MlsCommitOutcome::Failed { .. }),
+                "claim {claim}: {outcome:?}"
+            );
+        }
+    }
+    assert!(below > 0, "no tampered Commit reached the fork comparison");
+    for claim in [0, 2, 3] {
+        let outcome = mb
+            .mls_apply_commit(conv, a1.peer, a1.peer, claim, vec![7; 40], now)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, MlsCommitOutcome::Failed { .. }));
+    }
+    let after = state(&b1, conv).await;
+    assert_eq!(after.epoch_authenticator, before.epoch_authenticator);
+    assert_eq!(after.rejoin_count, Some(0));
+    assert_eq!(after.holds, 0);
+    // The real Commit, resent, is recognised as applied.
+    a1.account.mls_test_hold_delivery(false).await.unwrap();
+    settle!(
+        [&a1, &b1],
+        agreed(&a1, &b1, conv).await && state(&a1, conv).await.own_commit_unacked == Some(false)
+    );
+}
+
+#[tokio::test]
+async fn next_epoch_commit_on_winning_branch_is_retried_until_applied() {
+    let (a1, b1, _net, conv) = two_party(&[A1, A2], &[B1, B2]).await;
+    let (ma, mb) = (
+        a1.account.storage_test_fixture().messages().await.unwrap(),
+        b1.account.storage_test_fixture().messages().await.unwrap(),
+    );
+    a1.account.mls_test_hold_delivery(true).await.unwrap();
+    b1.account.mls_test_hold_delivery(true).await.unwrap();
+    let now = NOW * 1000;
+    // Both commit from epoch 1.
+    ma.mls_commit(conv, b1.peer, vec![detached(a1.peer, A2)], vec![], now)
+        .await
+        .unwrap();
+    mb.mls_commit(conv, a1.peer, vec![detached(b1.peer, B2)], vec![], now)
+        .await
+        .unwrap();
+    let (by_a, by_b) = (
+        queued_commit(&a1, conv, &b1, 2).await,
+        queued_commit(&b1, conv, &a1, 2).await,
+    );
+    let a_wins = digest(&by_a) < digest(&by_b);
+    let (winner, loser, wm, lm, winning, added) = if a_wins {
+        (&a1, &b1, &ma, &mb, by_a, A2)
+    } else {
+        (&b1, &a1, &mb, &ma, by_b, B2)
+    };
+    // The winner goes on to epoch 3 before the loser hears of anything.
+    winner
+        .account
+        .storage_test_fixture()
+        .mls_clear_commit_flag(conv)
+        .await
+        .unwrap();
+    assert_eq!(
+        wm.mls_commit(conv, loser.peer, vec![], vec![installation_of(added)], now)
+            .await
+            .unwrap(),
+        Some(3)
+    );
+    let next = queued_commit(winner, conv, loser, 3).await;
+    // Epoch 3 first: not applicable yet, so the sender keeps it (class 2) and nothing changes.
+    let before = state(loser, conv).await;
+    assert_eq!(
+        lm.mls_apply_commit(conv, winner.peer, winner.peer, 3, next.clone(), now)
+            .await
+            .unwrap(),
+        MlsCommitOutcome::Failed { class: 2, epoch: 2 }
+    );
+    assert_eq!(
+        state(loser, conv).await.epoch_authenticator,
+        before.epoch_authenticator
+    );
+    // The winning epoch-2 Commit is verified against the previous state and adopted...
+    assert_eq!(
+        lm.mls_apply_commit(conv, winner.peer, winner.peer, 2, winning, now)
+            .await
+            .unwrap(),
+        MlsCommitOutcome::Adopted
+    );
+    // ...and the retried epoch 3 applies.
+    assert_eq!(
+        lm.mls_apply_commit(conv, winner.peer, winner.peer, 3, next, now)
+            .await
+            .unwrap(),
+        MlsCommitOutcome::Ack
+    );
+    assert!(agreed(winner, loser, conv).await);
+    // The real deliveries that follow (both branches' Commits) settle without moving anyone.
+    a1.account.mls_test_hold_delivery(false).await.unwrap();
+    b1.account.mls_test_hold_delivery(false).await.unwrap();
+    let ia = installation(&a1).await;
+    let ib = installation(&b1).await;
+    settle!(
+        [&a1, &b1],
+        state(&a1, conv).await.deliveries.iter().all(|d| d.0 != ib)
+            && state(&b1, conv).await.deliveries.iter().all(|d| d.0 != ia)
+    );
+    assert!(agreed(&a1, &b1, conv).await);
+    assert_eq!(a1.account.mls_test_rejoin_total().await.unwrap(), 0);
+    assert_eq!(b1.account.mls_test_rejoin_total().await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn own_commit_flag_clears_when_a_later_commit_lands() {
+    let (a1, b1, _net, conv) = two_party(&[A1, A2], &[B1, B2]).await;
+    let (ma, mb) = (
+        a1.account.storage_test_fixture().messages().await.unwrap(),
+        b1.account.storage_test_fixture().messages().await.unwrap(),
+    );
+    // A1's Commit reaches B1 another way; its own delivery (and so any Ack) stays held.
+    a1.account.mls_test_hold_delivery(true).await.unwrap();
+    let now = NOW * 1000;
+    ma.mls_commit(conv, b1.peer, vec![detached(a1.peer, A2)], vec![], now)
+        .await
+        .unwrap();
+    assert_eq!(state(&a1, conv).await.own_commit_unacked, Some(true));
+    assert_eq!(
+        ma.mls_commit(conv, b1.peer, vec![], vec![installation_of(A2)], now)
+            .await
+            .unwrap(),
+        None,
+        "no second Commit before the first is confirmed"
+    );
+    let commit = queued_commit(&a1, conv, &b1, 2).await;
+    mb.mls_apply_commit(conv, a1.peer, a1.peer, 2, commit, now)
+        .await
+        .unwrap();
+    // B1 commits on top of it and that Commit is delivered to A1.
+    assert_eq!(
+        mb.mls_commit(conv, a1.peer, vec![detached(b1.peer, B2)], vec![], now)
+            .await
+            .unwrap(),
+        Some(3)
+    );
+    settle!([&a1, &b1], state(&a1, conv).await.group_epoch == Some(3));
+    let s = state(&a1, conv).await;
+    assert_eq!(s.own_commit_unacked, Some(false));
+    let ib1 = installation(&b1).await;
+    assert!(
+        s.deliveries.iter().any(|d| d.0 == ib1 && d.2 == 2),
+        "A1's own delivery was never acknowledged"
+    );
+    assert_eq!(
+        ma.mls_commit(conv, b1.peer, vec![], vec![installation_of(A2)], now)
+            .await
+            .unwrap(),
+        Some(4)
+    );
+}
+
+#[tokio::test]
+async fn offline_recipients_do_not_starve_online_deliveries() {
+    let (ra, rb) = (record(A, &[A1], 0), record(B, &[B1], 0));
+    let net = backend(&[(A, ra.clone()), (B, rb.clone())]);
+    let a1 = device(A, A1, &ra, &net).await;
+    let b1 = device(B, B1, &rb, &net).await;
+    link(&a1, &b1).await;
+    befriend(&a1, &b1).await;
+    befriend(&b1, &a1).await;
+    a1.account.connect_account(b1.peer).await.unwrap();
+    let conv = conversation(&a1, &b1).await;
+    a1.account.mls_test_hold_delivery(true).await.unwrap();
+    ensure(&a1, b1.peer).await;
+    settle!([&a1], state(&a1, conv).await.deliveries.len() == 1);
+    // Twenty recipients that never connect, all due before B1's Welcome.
+    let fixture = a1.account.storage_test_fixture();
+    for n in 0..20u8 {
+        fixture
+            .mls_set_delivery(
+                ConversationId([100 + n; 32]),
+                chat_core::account::InstallationId([200 + n; 32]),
+                2,
+                1,
+                Some((vec![1; 8], 0)),
+            )
+            .await
+            .unwrap();
+    }
+    a1.account.mls_test_hold_delivery(false).await.unwrap();
+    settle!(
+        [&a1, &b1],
+        agreed(&a1, &b1, conv).await && state(&a1, conv).await.deliveries.is_empty()
+    );
+    // The unreachable ones are still queued as they were.
+    for n in [0u8, 19] {
+        assert_eq!(
+            state(&a1, ConversationId([100 + n; 32])).await.deliveries,
+            vec![(chat_core::account::InstallationId([200 + n; 32]), 2, 1)]
+        );
+    }
+}
+
+#[tokio::test]
+async fn deep_fork_rejoins_and_resends_unacked() {
+    let (a1, b1, _net, conv) = two_party(&[A1, A2], &[B1, B2]).await;
+    let ib1 = installation(&b1).await;
 
     // B1 has a sealed message nobody acknowledged yet.
     b1.account.message_test_hold_scheduler(true).await.unwrap();
@@ -391,43 +790,37 @@ async fn deep_fork_rejoins_and_resends_unacked() {
         .unwrap()
         .wire;
 
-    // Each side commits without hearing the other: A1 once (epoch 2), B1 twice (epoch 3).
+    // A1 moves two epochs ahead, and its epoch-2 Commit to B1 is lost for good: B1's state can
+    // no longer be brought forward, only replaced.
     a1.account.mls_test_hold_delivery(true).await.unwrap();
-    b1.account.mls_test_hold_delivery(true).await.unwrap();
     let ma = a1.account.storage_test_fixture().messages().await.unwrap();
-    let ka2 = chat_core::storage_fixture::mls_detached_key_package(a1.peer, [A2; 32]);
-    let kb2 = chat_core::storage_fixture::mls_detached_key_package(b1.peer, [B2; 32]);
-    let ib2 = chat_core::account::derive_device(Secret32::from([B2; 32]))
-        .unwrap()
-        .installation_id();
+    let now = NOW * 1000;
     assert_eq!(
-        ma.mls_commit(conv, b1.peer, vec![ka2], vec![], NOW * 1000)
+        ma.mls_commit(conv, b1.peer, vec![detached(a1.peer, A2)], vec![], now)
             .await
             .unwrap(),
         Some(2)
     );
-    assert_eq!(
-        mb.mls_commit(conv, a1.peer, vec![kb2], vec![], NOW * 1000)
-            .await
-            .unwrap(),
-        Some(2)
-    );
-    b1.account
+    a1.account
         .storage_test_fixture()
         .mls_clear_commit_flag(conv)
         .await
         .unwrap();
     assert_eq!(
-        mb.mls_commit(conv, a1.peer, vec![], vec![ib2], NOW * 1000)
+        ma.mls_commit(conv, b1.peer, vec![], vec![installation_of(A2)], now)
             .await
             .unwrap(),
         Some(3)
     );
+    a1.account
+        .storage_test_fixture()
+        .mls_set_delivery(conv, ib1, 1, 2, None)
+        .await
+        .unwrap();
     a1.account.mls_test_hold_delivery(false).await.unwrap();
-    b1.account.mls_test_hold_delivery(false).await.unwrap();
 
-    // B1 is two Commits away from A1's branch: it drops the group, rejoins through A1 and
-    // seals its unacknowledged message again in the new group state.
+    // B1 keeps answering "a Commit is missing" (class 2) and, once that has gone on long
+    // enough, drops the group, rejoins through A1 and seals its unacknowledged message again.
     settle!(
         [&a1, &b1],
         state(&b1, conv).await.rejoin_count == Some(1)

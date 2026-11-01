@@ -45,6 +45,11 @@ const LOOKUP_RETRY_MS: u64 = 30_000;
 /// Pause before planning again while the own Commit is unacknowledged.
 const SYNC_RETRY_MS: u64 = 1_000;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
+/// How often an empty `mls_hold` is looked at again (rows can be written outside this actor).
+const HOLD_CHECK_MS: u64 = 30_000;
+/// A conversation that keeps answering class 2 (a Commit it will never get) this long rejoins.
+const MISSING_REJOIN_MS: u64 = 30_000;
 /// The conversation argument of group operations that are not about one conversation.
 const NO_CONVERSATION: ConversationId = ConversationId([0; 32]);
 
@@ -110,10 +115,15 @@ pub(crate) struct Runtime {
     rejoins: BTreeMap<ConversationId, (u32, u64)>,
     /// Earliest next lookup per account with holds.
     lookups: BTreeMap<PeerId, u64>,
-    /// `mls_hold` is known to be empty (false until checked).
-    no_holds: bool,
+    /// Accounts whose lookup is running in a spawned task.
+    looking: BTreeSet<PeerId>,
+    /// `mls_hold` was found empty at this (scheduler) time; checked again after
+    /// `HOLD_CHECK_MS` or as soon as something is held.
+    no_holds_since: Option<u64>,
     /// Records or sessions changed since holds were last tried without a lookup.
     recheck: bool,
+    /// Conversations answering class 2 (a Commit missing here): since when, and at which epoch.
+    missing: BTreeMap<ConversationId, (u64, u64)>,
     /// Hash of the device lists and ready sessions seen by the last poll.
     fingerprint: Option<[u8; 32]>,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
@@ -122,6 +132,8 @@ pub(crate) struct Runtime {
     sent: Vec<String>,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     held: u64,
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    rejoined: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -148,13 +160,22 @@ enum Task {
         kind: u8,
         epoch: u64,
     },
+    /// A record lookup for the holds waiting on `peer`.
+    Lookup {
+        peer: PeerId,
+    },
 }
 
-/// The answer to one kind 17 request this actor sent.
+enum Answer {
+    Reply(Result<MlsReply, ErrorCode>),
+    Lookup(Result<Lookup, CoreError>),
+}
+
+/// The answer to one kind 17 request, or one record lookup, this actor started.
 pub(crate) struct MlsEvent {
     ticket: u64,
     task: Task,
-    result: Result<MlsReply, ErrorCode>,
+    answer: Answer,
 }
 
 /// One request/response exchange on an authenticated session.
@@ -215,6 +236,8 @@ pub(crate) enum MlsTest {
     HoldDelivery(bool),
     Sent,
     Held,
+    Rejoined,
+    Query(PeerId),
 }
 #[cfg(all(feature = "test-hooks", debug_assertions))]
 pub(crate) enum MlsTestReply {
@@ -223,6 +246,7 @@ pub(crate) enum MlsTestReply {
     Done,
     Sent(Vec<String>),
     Count(u64),
+    Answers(Vec<(InstallationId, bool)>),
 }
 
 #[cfg(all(feature = "test-hooks", debug_assertions))]
@@ -262,6 +286,24 @@ impl AccountHandle {
             _ => unreachable!(),
         }
     }
+    /// How many rejoins this actor started (any cause).
+    pub async fn mls_test_rejoin_total(&self) -> Result<u64, CoreError> {
+        match self.mls_test(MlsTest::Rejoined).await? {
+            MlsTestReply::Count(count) => Ok(count),
+            _ => unreachable!(),
+        }
+    }
+    /// Sends a `GroupQuery` for the conversation with `peer` to every connected device of the
+    /// peer and of this account and waits for each (5 s limit each): installation, has a group.
+    pub async fn mls_test_query(
+        &self,
+        peer: PeerId,
+    ) -> Result<Vec<(InstallationId, bool)>, CoreError> {
+        match self.mls_test(MlsTest::Query(peer)).await? {
+            MlsTestReply::Answers(answers) => Ok(answers),
+            _ => unreachable!(),
+        }
+    }
 }
 
 impl Manager {
@@ -283,6 +325,23 @@ impl Manager {
             }
             MlsTest::Sent => MlsTestReply::Sent(self.messages.mls.sent.clone()),
             MlsTest::Held => MlsTestReply::Count(self.messages.mls.held),
+            MlsTest::Rejoined => MlsTestReply::Count(self.messages.mls.rejoined),
+            MlsTest::Query(peer) => {
+                // Test only: this actor waits on the answers (the devices asked do not).
+                let conversation = conversation_id(own, peer)?;
+                let body = MlsFrame::GroupQuery { conversation }.encode().to_vec();
+                let mut answers = Vec::new();
+                for session in self.mls_sessions() {
+                    if session.grant.peer != peer && session.grant.peer != own {
+                        continue;
+                    }
+                    if let Ok(MlsReply::GroupInfo { exists, .. }) = exchange(&session, &body).await
+                    {
+                        answers.push((session.grant.installation, exists));
+                    }
+                }
+                MlsTestReply::Answers(answers)
+            }
         })
     }
 
@@ -336,12 +395,12 @@ impl Manager {
         let session = session.clone();
         let ticket = request.ticket;
         tokio::spawn(async move {
-            let result = exchange(&session, &body).await;
+            let answer = Answer::Reply(exchange(&session, &body).await);
             let _ = mailbox
                 .send(Input::Mls(MlsEvent {
                     ticket,
                     task,
-                    result,
+                    answer,
                 }))
                 .await;
         });
@@ -740,7 +799,12 @@ impl Manager {
         mls.collecting.remove(&conversation);
         mls.sync.remove(&conversation);
         mls.joined_with.remove(&conversation);
+        mls.missing.remove(&conversation);
         mls.known.retain(|(id, _), _| *id != conversation);
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        {
+            mls.rejoined += 1;
+        }
         self.ensure_group(conversation, peer).await?;
         Ok(true)
     }
@@ -749,10 +813,35 @@ impl Manager {
     /// that account ran within `LOOKUP_RETRY_MS`.
     fn note_hold(&mut self, _lookup: PeerId) {
         let mls = &mut self.messages.mls;
-        mls.no_holds = false;
+        mls.no_holds_since = None;
         #[cfg(all(feature = "test-hooks", debug_assertions))]
         {
             mls.held += 1;
+        }
+    }
+
+    /// A received Commit was answered class 2 at `epoch`: a Commit is missing here. If that has
+    /// gone on for `MISSING_REJOIN_MS` without this device moving on, it will not arrive (it was
+    /// dropped as unknown, or settled elsewhere) and the device rejoins (spec 4.6), subject to
+    /// the rejoin limit.
+    async fn note_missing(
+        &mut self,
+        conversation: ConversationId,
+        peer: PeerId,
+        epoch: u64,
+        request: Request,
+    ) {
+        let now = self.schedule_now();
+        let since = match self.messages.mls.missing.get(&conversation) {
+            Some((since, at)) if *at == epoch => *since,
+            _ => {
+                self.messages.mls.missing.insert(conversation, (now, epoch));
+                now
+            }
+        };
+        if now.saturating_sub(since) >= MISSING_REJOIN_MS {
+            self.messages.mls.missing.remove(&conversation);
+            let _ = self.rejoin(conversation, peer, request).await;
         }
     }
 
@@ -772,31 +861,78 @@ impl Manager {
             Outcome::Rejoin { .. } => {
                 let _ = self.rejoin(conversation, peer, request).await;
             }
-            Outcome::Held(_) => self.messages.mls.no_holds = false,
-            Outcome::Ack | Outcome::Failed { .. } | Outcome::Removed => {}
+            Outcome::Held(_) => self.messages.mls.no_holds_since = None,
+            Outcome::Ack | Outcome::Failed { .. } | Outcome::Removed | Outcome::Later => {}
         }
     }
 
-    /// A fresh lookup of `peer`'s record: true only when one was found and accepted (an
-    /// unchanged or newer list); a failed lookup, an absent record or a conflict is not one.
-    async fn mls_lookup(&mut self, peer: PeerId, request: Request) -> bool {
+    /// Starts a lookup of `peer`'s record in a spawned task (the actor never waits on the
+    /// network); the answer comes back as `Task::Lookup`.
+    fn start_lookup(&mut self, peer: PeerId, request: Request) {
         let Ok(backend) = self.services.backend() else {
-            return false;
+            return;
         };
-        let lookup = self.service(request, backend.lookup(peer)).await;
-        let found = matches!(lookup, Ok(Lookup::Found(_)));
-        self.finish_remote_record(peer, lookup, request)
-            .await
-            .is_ok()
-            && found
+        if !self.messages.mls.looking.insert(peer) {
+            return;
+        }
+        let mailbox = self.auth.send.clone();
+        let ticket = request.ticket;
+        tokio::spawn(async move {
+            let lookup = tokio::time::timeout(LOOKUP_TIMEOUT, backend.lookup(peer))
+                .await
+                .unwrap_or_else(|_| Err(unavailable(ErrorCode::RecordUnavailable)));
+            let _ = mailbox
+                .send(Input::Mls(MlsEvent {
+                    ticket,
+                    task: Task::Lookup { peer },
+                    answer: Answer::Lookup(lookup),
+                }))
+                .await;
+        });
+    }
+
+    /// A lookup for holds came back. A fresh list (found and accepted unchanged or newer; for
+    /// this account, found and equal to the accepted record) settles the holds: what is still
+    /// unknown is dropped. A failed lookup, an absent record, a conflict, or a newer own record
+    /// not accepted yet keeps them for the next try or record change.
+    async fn looked_up(
+        &mut self,
+        peer: PeerId,
+        lookup: Result<Lookup, CoreError>,
+        request: Request,
+    ) {
+        let Ok(local) = self.local() else { return };
+        let fresh = if peer == local.keys.peer_id() {
+            match (&lookup, local.records.accepted.as_ref()) {
+                (Ok(Lookup::Found(packet)), Some(accepted)) => {
+                    crate::account::publication::SignedRecord::new(packet.clone(), peer)
+                        .is_ok_and(|found| found.hash == accepted.hash)
+                }
+                _ => false,
+            }
+        } else {
+            let found = matches!(lookup, Ok(Lookup::Found(_)));
+            self.finish_remote_record(peer, lookup, request)
+                .await
+                .is_ok()
+                && found
+        };
+        self.reprocess(peer, fresh, request).await;
     }
 
     /// Holds waiting on an account's record (spec 4.2): it is looked up again (at most every
-    /// `LOOKUP_RETRY_MS`) and the holds processed with the new list; what is still unknown
-    /// after a successful lookup is dropped. While the record cannot be fetched or is in
-    /// conflict the holds stay, and they are tried again whenever the records change.
+    /// `LOOKUP_RETRY_MS`, in a spawned task) and the holds processed with the new list; what
+    /// is still unknown after a successful lookup is dropped. While the record cannot be
+    /// fetched or is in conflict the holds stay, and they are tried again whenever the records
+    /// change.
     async fn poll_holds(&mut self, request: Request) {
-        if self.messages.mls.no_holds {
+        let now = self.schedule_now();
+        if self
+            .messages
+            .mls
+            .no_holds_since
+            .is_some_and(|since| now < since.saturating_add(HOLD_CHECK_MS))
+        {
             return;
         }
         let peers = match self
@@ -808,35 +944,23 @@ impl Manager {
         };
         let recheck = std::mem::take(&mut self.messages.mls.recheck);
         if peers.is_empty() {
-            self.messages.mls.no_holds = true;
+            self.messages.mls.no_holds_since = Some(now);
             return;
         }
-        let Ok(own) = self.local().map(|local| local.keys.peer_id()) else {
-            return;
-        };
         for peer in peers {
-            let now = self.schedule_now();
             if self
                 .messages
                 .mls
                 .lookups
                 .get(&peer)
                 .is_none_or(|at| now >= *at)
+                && !self.messages.mls.looking.contains(&peer)
             {
                 self.messages
                     .mls
                     .lookups
                     .insert(peer, now.saturating_add(LOOKUP_RETRY_MS));
-                let fresh = if peer == own {
-                    // The own list is refreshed the M3 way (publication refresh).
-                    self.publication(Action::Refresh).await.is_ok()
-                } else {
-                    self.mls_lookup(peer, request).await
-                };
-                if fresh {
-                    self.reprocess(peer, true, request).await;
-                    continue;
-                }
+                self.start_lookup(peer, request);
             }
             if recheck {
                 self.reprocess(peer, false, request).await;
@@ -850,6 +974,7 @@ impl Manager {
             lookup,
             drop_unknown,
             now,
+            wall: self.services.clock.wall_ms(),
         };
         let Ok(GroupReply::Reprocessed(settled)) =
             self.group_db(NO_CONVERSATION, op, request).await
@@ -863,7 +988,8 @@ impl Manager {
     }
 
     /// Sends due Commits/Welcomes over ready sessions, one per recipient of a conversation at a
-    /// time and in epoch order. A recipient without a session simply waits.
+    /// time and in epoch order. Only rows of recipients with a ready session are read, so a
+    /// recipient without one simply waits (no attempt counted) and never holds others back.
     async fn poll_deliveries(&mut self, request: Request) {
         #[cfg(all(feature = "test-hooks", debug_assertions))]
         if self.messages.mls.hold_delivery {
@@ -874,8 +1000,13 @@ impl Manager {
             return;
         }
         let now = self.schedule_now();
+        let recipients = sessions.iter().map(|s| s.grant.installation).collect();
         let Ok(GroupReply::Due(rows)) = self
-            .group_db(NO_CONVERSATION, GroupOp::DueDeliveries { now }, request)
+            .group_db(
+                NO_CONVERSATION,
+                GroupOp::DueDeliveries { now, recipients },
+                request,
+            )
             .await
         else {
             return;
@@ -990,9 +1121,12 @@ impl Manager {
         let MlsEvent {
             ticket,
             task,
-            result,
+            answer,
         } = event;
         match task {
+            Task::Lookup { peer } => {
+                self.messages.mls.looking.remove(&peer);
+            }
             Task::Deliver {
                 conversation,
                 recipient,
@@ -1017,7 +1151,15 @@ impl Manager {
         let Some(request) = self.ready().ok().filter(|r| r.ticket == ticket) else {
             return;
         };
-        let _ = self.mls_answer(task, result, request).await;
+        match (task, answer) {
+            (Task::Lookup { peer }, Answer::Lookup(lookup)) => {
+                self.looked_up(peer, lookup, request).await
+            }
+            (task, Answer::Reply(result)) => {
+                let _ = self.mls_answer(task, result, request).await;
+            }
+            (_, Answer::Lookup(_)) => {}
+        }
     }
 
     async fn mls_answer(
@@ -1106,6 +1248,7 @@ impl Manager {
                 };
                 self.group_db(conversation, op, request).await.map(|_| ())
             }
+            Task::Lookup { .. } => Ok(()),
         }
     }
 
@@ -1196,11 +1339,12 @@ impl Manager {
                 }) {
                     return Ok(MlsReply::Busy);
                 }
-                // A device that rejoins still has its old leaf: it is replaced in one Commit.
-                let op = GroupOp::Commit {
+                // A device that rejoins still has its old leaf: it is replaced in one Commit. A
+                // device missing from its account's record is held and looked up (spec 4.2).
+                let op = GroupOp::JoinRequest {
                     peer,
-                    add: vec![key_package],
-                    remove: vec![session.grant.installation],
+                    sender_peer: sender,
+                    key_package,
                     now,
                 };
                 match self.group_db(conversation, op, request).await? {
@@ -1235,8 +1379,17 @@ impl Manager {
                 else {
                     return Ok(MlsReply::Busy);
                 };
-                if let Outcome::Held(lookup) = outcome {
-                    self.note_hold(lookup);
+                match outcome {
+                    Outcome::Held(lookup) => self.note_hold(lookup),
+                    Outcome::Failed {
+                        class: CLASS_FUTURE_EPOCH,
+                        epoch,
+                    } => self.note_missing(conversation, peer, epoch, request).await,
+                    Outcome::Failed { .. } => {}
+                    // This device moved on: nothing is missing any more.
+                    _ => {
+                        self.messages.mls.missing.remove(&conversation);
+                    }
                 }
                 let reply = match outcome {
                     Outcome::Failed { class, epoch } => MlsReply::DecryptFailed { class, epoch },
@@ -1244,6 +1397,7 @@ impl Manager {
                         class: CLASS_OTHER,
                         epoch,
                     },
+                    Outcome::Later => MlsReply::Busy,
                     // Applied, already applied, settled as a fork in its favour, or held (kept
                     // durably in `mls_hold`).
                     _ => MlsReply::Ack { ct_hash },
@@ -1296,22 +1450,28 @@ impl Manager {
                     rejoin: self.messages.mls.rejoins.get(&conversation).copied(),
                     joined_with: self.messages.mls.joined_with.get(&conversation).copied(),
                     now,
+                    wall: self.services.clock.wall_ms(),
                 };
-                if let GroupReply::Outcome(outcome) =
-                    self.group_db(conversation, op, request).await?
-                {
-                    match outcome {
-                        Outcome::Held(lookup) => self.note_hold(lookup),
-                        Outcome::Joined => {
-                            self.messages.mls.joined_with.insert(conversation, ct_hash);
-                        }
-                        _ => {}
+                let GroupReply::Outcome(outcome) = self.group_db(conversation, op, request).await?
+                else {
+                    return Ok(MlsReply::Busy);
+                };
+                match outcome {
+                    Outcome::Held(lookup) => self.note_hold(lookup),
+                    Outcome::Joined => {
+                        self.messages.mls.joined_with.insert(conversation, ct_hash);
+                        self.messages.mls.missing.remove(&conversation);
                     }
-                    self.after_outcome(conversation, peer, outcome, request)
-                        .await;
+                    _ => {}
                 }
-                // Settled here, joined or not: the sender stops resending it.
-                MlsReply::Ack { ct_hash }
+                self.after_outcome(conversation, peer, outcome, request)
+                    .await;
+                match outcome {
+                    // Switching groups is not allowed yet (rejoin limit): send it again later.
+                    Outcome::Later => MlsReply::Busy,
+                    // Settled here, joined or not: the sender stops resending it.
+                    _ => MlsReply::Ack { ct_hash },
+                }
             }
             // Application messages are the message protocol's (Task 8).
             MlsFrame::App { .. } => MlsReply::DecryptFailed {
