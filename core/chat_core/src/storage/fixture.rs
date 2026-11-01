@@ -208,7 +208,7 @@ impl Messages {
     ) -> Result<crate::mls::wire::MlsReply, CoreError> {
         let op = MessageDbOp::OpenApp(sender, installation, conversation, ciphertext, now);
         match self.mls(op).await? {
-            MessageDbReply::Opened(reply) => Ok(reply),
+            MessageDbReply::Opened(reply) | MessageDbReply::OpenedText(reply, _) => Ok(reply),
             // Answered with the M4 `Reject(InvalidMessage)` on the wire.
             MessageDbReply::Rejected => Err(CoreError::new(ErrorCode::InvalidMessage, "mls_text_rejected")),
             _ => unreachable!(),
@@ -343,6 +343,7 @@ DROP TABLE mls_kv;
 DROP TABLE mls_conversation;
 DROP TABLE mls_delivery;
 DROP TABLE mls_hold;
+DROP TABLE mls_peer;
 CREATE TABLE storage_meta_v1 (
     singleton INTEGER PRIMARY KEY NOT NULL CHECK(singleton = 1),
     schema_version INTEGER NOT NULL CHECK(schema_version = 1),

@@ -834,7 +834,13 @@ async fn v1_db_upgrades_to_v2_preserving_messages_and_outbox() {
     f.close().await;
     let after = Fixture::probe_database(dir.path(), p.clone()).unwrap();
     assert_eq!((after.user_version, after.schema_version), (2, 2));
-    for table in ["mls_kv", "mls_conversation", "mls_delivery", "mls_hold"] {
+    for table in [
+        "mls_kv",
+        "mls_conversation",
+        "mls_delivery",
+        "mls_hold",
+        "mls_peer",
+    ] {
         assert!(after.tables.iter().any(|t| t == table), "{table}");
     }
     // `message` rows (cancelled one included) are byte-for-byte unchanged.

@@ -975,6 +975,8 @@ pub(crate) enum MessageDbReply {
     Opened(crate::mls::wire::MlsReply),
     /// A received MLS text that M4 would refuse: answered with an M4 `Reject(InvalidMessage)`.
     Rejected,
+    /// The reply for a received MLS ciphertext that carried (or carried before) this text.
+    OpenedText(crate::mls::wire::MlsReply, MessageKey),
     Group(super::mls_group::GroupReply),
     Conversation(ConversationView),
     Message(MessageView),
@@ -1080,6 +1082,15 @@ impl MessageDbOp {
             _ => self.key(identity)?.is_some(),
         })
     }
+    /// Test hooks: a received MLS application ciphertext (its message is known only inside).
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    pub(crate) fn opens_app(&self) -> bool {
+        match self {
+            Self::Observed(op) => op.opens_app(),
+            Self::OpenApp(..) => true,
+            _ => false,
+        }
+    }
     pub(crate) fn key(&self, identity: Identity) -> R<Option<MessageKey>> {
         Ok(match self {
             Self::Observed(op) => return op.key(identity),
@@ -1176,7 +1187,7 @@ fn receive(
     // from it is refused (an M4 peer sends nothing else; an M5 peer never sends one).
     let peer_mls: bool = tx
         .query_row(
-            "SELECT EXISTS(SELECT 1 FROM mls_conversation WHERE conversation=?1 AND peer_mls=1)",
+            "SELECT EXISTS(SELECT 1 FROM mls_peer WHERE conversation=?1)",
             params![k.conversation.0.as_slice()],
             |r| r.get(0),
         )

@@ -35,6 +35,9 @@ pub(crate) enum AttemptOutcome {
     /// The recipient answered the kind 17 frame with the M4 `Reject(UnsupportedVersion)`: it
     /// has not updated yet. The message waits (`waiting_peer_update`), it does not fail.
     PeerUpdateRequired,
+    /// The `App` frame was written and the stream or connection ended without an answer: what a
+    /// released M4 app does with kind 17 (it closes the connection), or a lost answer.
+    NoReply,
     Transient(ErrorCode),
     Blocked(BlockReason),
     Permanent(ErrorCode),
@@ -86,6 +89,9 @@ pub(super) struct Runtime {
     scheduler_held: bool,
     /// Messages whose re-encryption found an attempt in flight: re-encrypted once it settles.
     reencrypt_after: std::collections::BTreeSet<MessageKey>,
+    /// The text the `Ack` about to be written stores (keys the response checkpoint).
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    pub(super) ack_key: Option<MessageKey>,
 }
 #[cfg(all(feature = "test-hooks", debug_assertions))]
 struct TestPause {
@@ -178,7 +184,7 @@ impl AccountHandle {
     }
 
     #[cfg(all(feature = "test-hooks", debug_assertions))]
-    pub(crate) async fn message_ack_pause(&self, key: MessageKey) -> Result<(MessagePause, MessagePause), CoreError> {
+    pub async fn message_ack_pause(&self, key: MessageKey) -> Result<(MessagePause, MessagePause), CoreError> {
         self.send(|reply| Command::MessageAckPause(key, reply)).await
     }
 
@@ -373,7 +379,7 @@ impl NetworkAttempt {
             send.finish().map_err(|_| ErrorCode::TransportFailed)?;
             let body = auth::read_frame(&mut recv, 61440)
                 .await
-                .map_err(|_| ErrorCode::TransportFailed)?;
+                .map_err(|_| ErrorCode::PeerNotConnected)?;
             if !self.authority.permits(&lease) {
                 return Err(ErrorCode::AccountRestricted);
             }
@@ -391,6 +397,10 @@ impl NetworkAttempt {
         let outcome = match tokio::time::timeout(Duration::from_secs(5), work).await {
             Ok(Ok(outcome)) => outcome,
             Ok(Err(ErrorCode::AccountRestricted)) => AttemptOutcome::Blocked(BlockReason::Account),
+            // An `App` frame nobody answered: decided by the actor (`NoReply`).
+            Ok(Err(ErrorCode::PeerNotConnected)) if written && sent_hash.is_some() => {
+                AttemptOutcome::NoReply
+            }
             Ok(Err(_)) | Err(_) if written => AttemptOutcome::Written,
             Ok(Err(code)) => AttemptOutcome::Transient(code),
             Err(_) => AttemptOutcome::Transient(ErrorCode::NetworkTimeout),
@@ -642,12 +652,22 @@ impl Manager {
         };
         #[cfg(all(feature = "test-hooks", debug_assertions))]
         let pause = {
-            // Only successful Text replies are Receipt; rejects and ReceiptApplied
-            // can never consume the keyed durable-ack checkpoint.
-            let key = auth::payload(response, 16).ok().and_then(|inner| match wire::decode(&inner).ok()? {
-                Frame::Receipt(receipt) => Some(receipt.key),
-                _ => None,
-            });
+            // Only successful Text replies are Receipt (kind 16) or an `Ack` that stored a
+            // text (kind 17); rejects and ReceiptApplied can never consume the keyed
+            // durable-ack checkpoint.
+            let stored = self.messages.ack_key.take();
+            let key = auth::payload(response, 16)
+                .ok()
+                .and_then(|inner| match wire::decode(&inner).ok()? {
+                    Frame::Receipt(receipt) => Some(receipt.key),
+                    _ => None,
+                })
+                .or_else(|| {
+                    let inner = auth::payload(response, 17).ok()?;
+                    matches!(MlsReply::decode(&inner).ok()?, MlsReply::Ack { .. })
+                        .then_some(stored)
+                        .flatten()
+                });
             if self.messages.reply_pause.as_ref().is_some_and(|pause| pause.key.is_none() || pause.key == key) {
                 self.messages.reply_pause.take()
             } else { None }
@@ -851,10 +871,7 @@ impl Manager {
                     #[cfg(all(feature = "test-hooks", debug_assertions))]
                     self.message_db(MessageDbOp::M4Encode(key), request).await?;
                 } else if let MessageDbReply::NeedGroup(conversation) = self
-                    .message_db(
-                        MessageDbOp::Seal(key, self.services.clock.wall_ms()),
-                        request,
-                    )
+                    .seal(key, request)
                     .await?
                 {
                     self.wait_for_group(key, false, conversation, peer, request)
@@ -1034,6 +1051,35 @@ impl Manager {
             if request.ticket != result.lease.ticket {
                 return Err(unavailable(ErrorCode::AccountRestricted));
             }
+            // Any kind 17 answer shows the account speaks MLS. An unanswered `App` frame from
+            // an account that never did is the M4 app's refusal (it closes the connection):
+            // the message waits for the update. Otherwise it was written and the answer lost.
+            match result.outcome {
+                AttemptOutcome::Acked | AttemptOutcome::DecryptFailed(..) => {
+                    self.messages.mls.spoke.insert(pending.peer);
+                    self.messages.mls.outdated.remove(&pending.peer);
+                }
+                AttemptOutcome::PeerUpdateRequired => self.mark_outdated(pending.peer),
+                AttemptOutcome::NoReply => {
+                    if self
+                        .peer_speaks_mls(result.key.conversation, pending.peer, request)
+                        .await?
+                    {
+                        result.outcome = AttemptOutcome::Written;
+                    } else {
+                        self.mark_outdated(pending.peer);
+                        if pending.receipt.is_none() {
+                            self.message_db(
+                                MessageDbOp::MarkWaitingPeerUpdate(result.key, true),
+                                request,
+                            )
+                            .await?;
+                        }
+                        result.outcome = AttemptOutcome::PeerUpdateRequired;
+                    }
+                }
+                _ => {}
+            }
             if let Err(error) = self.message_session(&result.lease.session.conn, request) {
                 // No receipt is accepted from a closed/restricted grant. The known
                 // completed attempt may still release its retained retry job.
@@ -1098,7 +1144,7 @@ impl Manager {
                     // A receipt is sealed afresh on its next attempt anyway.
                     return Err(unavailable(ErrorCode::NotAvailable));
                 }
-                AttemptOutcome::PeerUpdateRequired => {
+                AttemptOutcome::PeerUpdateRequired | AttemptOutcome::NoReply => {
                     if pending.receipt.is_none() {
                         self.message_db(
                             MessageDbOp::MarkWaitingPeerUpdate(result.key, true),
@@ -1228,6 +1274,30 @@ impl Manager {
         self.reencrypt(key, peer, request).await
     }
 
+    /// `Seal` before an attempt. A queue too full to take the sealed frame (an upgraded M4
+    /// backlog reserved nothing) backs the job off instead of retrying it every poll.
+    async fn seal(
+        &mut self,
+        key: MessageKey,
+        request: Request,
+    ) -> Result<MessageDbReply, CoreError> {
+        match self
+            .message_db(
+                MessageDbOp::Seal(key, self.services.clock.wall_ms()),
+                request,
+            )
+            .await
+        {
+            Err(error) if error.code == ErrorCode::StorageFull => {
+                let now = self.schedule_now();
+                self.message_db(MessageDbOp::Defer(key, false, now), request)
+                    .await?;
+                Err(error)
+            }
+            other => other,
+        }
+    }
+
     /// `Reencrypt`, or, while an attempt of the message is in flight, once it settles.
     async fn reencrypt(
         &mut self,
@@ -1267,7 +1337,7 @@ impl Manager {
         request: Request,
     ) -> Result<(), CoreError> {
         self.ensure_group(conversation, peer).await?;
-        if !receipt && self.messages.mls.outdated.contains(&peer) {
+        if !receipt && self.messages.mls.outdated.contains_key(&peer) {
             self.message_db(MessageDbOp::MarkWaitingPeerUpdate(key, true), request)
                 .await?;
         }

@@ -671,15 +671,41 @@ pub(super) fn open_app(
     }
     let now = integer(now)?;
     let tx = c.transaction().map_err(sql)?;
-    let seen: bool = tx
+    // Seen before: answered as it was answered then. A ciphertext whose text was refused stays
+    // refused (never an `Ack`, which would mean stored).
+    let seen: Option<u8> = tx
         .query_row(
-            "SELECT EXISTS(SELECT 1 FROM processed_ct WHERE codec=2 AND sender_peer=?1 AND sender_install=?2 AND hash=?3)",
+            "SELECT max(codec) FROM processed_ct WHERE codec IN (2,3) AND sender_peer=?1 AND sender_install=?2 AND hash=?3",
             params![sender_peer.0.as_slice(), sender_install.0.as_slice(), ct_hash.as_slice()],
             |r| r.get(0),
         )
         .map_err(sql)?;
-    if seen {
-        return Ok(ack);
+    match seen {
+        Some(REJECTED_CT) => return Ok(MessageDbReply::Rejected),
+        Some(_) => {
+            // The text it carried, if any (its first ciphertext is its payload hash).
+            let text: Option<[u8; 16]> = tx
+                .query_row(
+                    "SELECT msg_id FROM message WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND payload_hash=?4",
+                    params![conversation.0.as_slice(), sender_peer.0.as_slice(), sender_install.0.as_slice(), ct_hash.as_slice()],
+                    |r| bytes::<16>(r, 0),
+                )
+                .optional()
+                .map_err(sql)?;
+            return Ok(match text {
+                Some(id) => MessageDbReply::OpenedText(
+                    MlsReply::Ack { ct_hash },
+                    MessageKey {
+                        conversation,
+                        sender: sender_peer,
+                        installation: sender_install,
+                        id: MessageId(id),
+                    },
+                ),
+                None => ack,
+            });
+        }
+        None => {}
     }
     let Some(group) = group_row(&tx, conversation)? else {
         return Ok(decrypt_failed(group::CLASS_NO_GROUP, 0));
@@ -706,7 +732,16 @@ pub(super) fn open_app(
         Opened::Commit { .. } => return Ok(decrypt_failed(group::CLASS_OTHER, group.epoch)),
     };
     let mut stored = Stored::Yes;
+    let mut text = None;
     if let Some(message) = message {
+        if matches!(message.content, Content::Text { .. }) {
+            text = Some(MessageKey {
+                conversation,
+                sender: sender_peer,
+                installation: sender_install,
+                id: message.msg_id,
+            });
+        }
         stored = match &message.content {
             Content::Text { body } => store_text(
                 &tx,
@@ -727,8 +762,12 @@ pub(super) fn open_app(
         };
     }
     tx.execute(
-        "INSERT INTO processed_ct VALUES(2,?1,?2,?3,?4)",
+        "INSERT INTO processed_ct VALUES(?1,?2,?3,?4,?5)",
         params![
+            match stored {
+                Stored::Yes => 2,
+                Stored::Rejected => REJECTED_CT,
+            },
             sender_peer.0.as_slice(),
             sender_install.0.as_slice(),
             ct_hash.as_slice(),
@@ -741,12 +780,29 @@ pub(super) fn open_app(
         params![conversation.0.as_slice()],
     )
     .map_err(sql)?;
+    mark_peer_mls(&tx, conversation)?;
     provider.storage().flush(&tx, conversation.0)?;
     finish(tx, fault)?;
-    Ok(match stored {
-        Stored::Yes => ack,
-        Stored::Rejected => MessageDbReply::Rejected,
+    Ok(match (stored, text) {
+        (Stored::Rejected, _) => MessageDbReply::Rejected,
+        (Stored::Yes, Some(key)) => MessageDbReply::OpenedText(MlsReply::Ack { ct_hash }, key),
+        (Stored::Yes, None) => ack,
     })
+}
+
+/// `processed_ct` codec of a received MLS ciphertext whose text was refused (2 is one that was
+/// taken): a repeat is refused again, never acknowledged.
+const REJECTED_CT: u8 = 3;
+
+/// Records that the conversation's peer account spoke MLS to this device. Monotonic: kept in
+/// its own table, untouched when the group is dropped or rejoined (the downgrade guard).
+pub(super) fn mark_peer_mls(tx: &Transaction<'_>, conversation: ConversationId) -> R<()> {
+    tx.execute(
+        "INSERT OR IGNORE INTO mls_peer VALUES(?1)",
+        params![conversation.0.as_slice()],
+    )
+    .map_err(sql)?;
+    Ok(())
 }
 
 /// Whether a decrypted application message was taken (stored, already stored, or nothing to
@@ -922,7 +978,7 @@ pub struct MlsState {
     /// SHA-256 over every `mls_kv` row (key and value), in key order.
     pub kv_digest: [u8; 32],
     pub kv_rows: u64,
-    /// `processed_ct` rows of codec 2.
+    /// `processed_ct` rows of received or own MLS ciphertexts (codecs 2 and 3).
     pub processed_mls: u64,
     /// Calls of the MLS `open` on this database's writer thread.
     pub open_calls: u64,
@@ -941,6 +997,8 @@ pub struct MlsState {
     pub deliveries: Vec<(InstallationId, u8, u64)>,
     /// Held Commits/Welcomes of the conversation.
     pub holds: u64,
+    /// The peer account spoke MLS here (`mls_peer`, kept across group drops and rejoins).
+    pub peer_spoke: bool,
 }
 
 #[cfg(all(feature = "test-hooks", debug_assertions))]
@@ -1005,9 +1063,11 @@ pub(super) fn fixture_state(c: &Connection, conversation: ConversationId) -> R<M
         }
     }
     let processed_mls: u64 = c
-        .query_row("SELECT count(*) FROM processed_ct WHERE codec=2", [], |r| {
-            uint(r, 0)
-        })
+        .query_row(
+            "SELECT count(*) FROM processed_ct WHERE codec IN (2,3)",
+            [],
+            |r| uint(r, 0),
+        )
         .map_err(sql)?;
     type Group = (u64, bool, Vec<u8>, [u8; 32], Option<Vec<u8>>, bool, u64);
     let group: Option<Group> = c
@@ -1075,6 +1135,13 @@ pub(super) fn fixture_state(c: &Connection, conversation: ConversationId) -> R<M
         epoch_authenticator,
         deliveries,
         holds,
+        peer_spoke: c
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM mls_peer WHERE conversation=?1)",
+                params![conversation.0.as_slice()],
+                |r| r.get(0),
+            )
+            .map_err(sql)?,
     })
 }
 

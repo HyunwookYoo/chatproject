@@ -131,6 +131,9 @@ pub(crate) enum GroupOp {
     },
     /// Every conversation with a group, and its peer.
     Groups,
+    /// Whether the conversation's peer account ever spoke MLS here (`mls_peer`); with `mark`,
+    /// records that it just did (an accepted Commit or Welcome from it).
+    PeerSpokeMls { mark: bool },
     /// Forgets the group: its row, `mls_kv` rows, deliveries and holds.
     Drop,
 }
@@ -147,6 +150,7 @@ impl GroupOp {
                 | Self::Pending { .. }
                 | Self::HoldPeers
                 | Self::Groups
+                | Self::PeerSpokeMls { mark: false }
         )
     }
 }
@@ -232,6 +236,7 @@ pub(crate) enum GroupReply {
     /// Holds that were settled: conversation, its peer, and what became of the item.
     Reprocessed(Vec<(ConversationId, PeerId, Outcome)>),
     Groups(Vec<(ConversationId, PeerId)>),
+    Flag(bool),
     Done,
 }
 
@@ -718,6 +723,21 @@ pub(super) fn group_op(
                     .into_iter()
                     .map(|(id, peer)| (ConversationId(id), PeerId(peer)))
                     .collect(),
+            )
+        }
+        GroupOp::PeerSpokeMls { mark } => {
+            if mark {
+                let tx = c.transaction().map_err(sql)?;
+                super::mls_store::mark_peer_mls(&tx, conversation)?;
+                finish(tx, fault)?;
+            }
+            GroupReply::Flag(
+                c.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM mls_peer WHERE conversation=?1)",
+                    params![conversation.0.as_slice()],
+                    |r| r.get(0),
+                )
+                .map_err(sql)?,
             )
         }
         GroupOp::Drop => {

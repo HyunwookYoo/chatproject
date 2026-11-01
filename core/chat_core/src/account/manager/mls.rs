@@ -51,6 +51,10 @@ const LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
 const HOLD_CHECK_MS: u64 = 30_000;
 /// A conversation that keeps answering class 2 (a Commit it will never get) this long rejoins.
 const MISSING_REJOIN_MS: u64 = 30_000;
+/// An account that refused kind 17 (an M4 app) is not asked again for this long, doubling up to
+/// `OUTDATED_MAX_MS`, unless its record changes.
+const OUTDATED_RETRY_MS: u64 = 300_000;
+const OUTDATED_MAX_MS: u64 = 3_600_000;
 /// The conversation argument of group operations that are not about one conversation.
 const NO_CONVERSATION: ConversationId = ConversationId([0; 32]);
 
@@ -127,14 +131,23 @@ pub(crate) struct Runtime {
     missing: BTreeMap<ConversationId, (u64, u64)>,
     /// Hash of the device lists and ready sessions seen by the last poll.
     fingerprint: Option<[u8; 32]>,
-    /// Accounts with a device that answered a kind 17 request with the M4 `Reject
-    /// (UnsupportedVersion)`: messages for them wait for that update (`waiting_peer_update`).
-    pub(super) outdated: BTreeSet<PeerId>,
+    /// Accounts that refused kind 17 like an M4 app: they answered the M4 `Reject
+    /// (UnsupportedVersion)`, or, with no sign of MLS ever, closed the stream or connection
+    /// without an answer. Messages for them wait for the update (`waiting_peer_update`), and
+    /// they are not asked again before the back-off ends or their record changes.
+    pub(super) outdated: BTreeMap<PeerId, Outdated>,
+    /// Accounts that answered a kind 17 request properly (this run); with `mls_peer` the
+    /// evidence that an account speaks MLS, so a closed stream is not taken for a refusal.
+    pub(super) spoke: BTreeSet<PeerId>,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     pub(super) hold_delivery: bool,
     /// The M4-peer fixture: this core behaves like a released M4 app (kind 16 only).
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     pub(super) m4_peer: bool,
+    /// The M4-peer fixture closes the connection on a kind 17 frame (what a released M4 app
+    /// really does) instead of answering `Reject(UnsupportedVersion)`.
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    m4_close: bool,
     /// Every kind 16/17 request frame this actor sent (group requests and message attempts).
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     pub(super) frames: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
@@ -144,6 +157,15 @@ pub(crate) struct Runtime {
     held: u64,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     rejoined: u64,
+}
+
+/// Back-off of an account that refused kind 17.
+#[derive(Clone, Copy)]
+pub(crate) struct Outdated {
+    until: u64,
+    backoff: u64,
+    /// Its accepted record when it refused; a newer one may come with an updated app.
+    record: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Copy)]
@@ -206,9 +228,10 @@ pub(super) async fn exchange(session: &Session, body: &[u8]) -> Result<MlsReply,
             .await
             .map_err(|_| ErrorCode::TransportFailed)?;
         send.finish().map_err(|_| ErrorCode::TransportFailed)?;
+        // Sent, and the stream or connection ended without an answer: `PeerNotConnected`.
         let reply = auth::read_frame(&mut recv, 61_440)
             .await
-            .map_err(|_| ErrorCode::TransportFailed)?;
+            .map_err(|_| ErrorCode::PeerNotConnected)?;
         if let Ok(inner) = auth::payload(&reply, 16) {
             return Err(match crate::message::wire::decode(&inner) {
                 Ok(Frame::Reject(RejectReason::UnsupportedVersion)) => {
@@ -227,6 +250,19 @@ pub(super) async fn exchange(session: &Session, body: &[u8]) -> Result<MlsReply,
 
 fn sha256(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
+}
+
+/// The conversation a request was about (none for a record lookup or a KeyPackage request
+/// made for no particular conversation).
+fn task_conversation(task: &Task) -> Option<ConversationId> {
+    match *task {
+        Task::Query { conversation, .. }
+        | Task::KeyPackage { conversation, .. }
+        | Task::Join { conversation }
+        | Task::Learn { conversation, .. }
+        | Task::Deliver { conversation, .. } => Some(conversation),
+        Task::Lookup { .. } => None,
+    }
 }
 
 /// What a Commit/Welcome delivery attempt's answer means for its queued row.
@@ -275,6 +311,7 @@ pub(crate) enum MlsTest {
     Rejoined,
     Query(PeerId),
     M4Peer(bool),
+    M4Close(bool),
     Frames,
 }
 #[cfg(all(feature = "test-hooks", debug_assertions))]
@@ -349,6 +386,11 @@ impl AccountHandle {
     pub async fn message_test_m4_peer(&self, m4: bool) -> Result<(), CoreError> {
         self.mls_test(MlsTest::M4Peer(m4)).await.map(|_| ())
     }
+    /// The M4-peer fixture as a released M4 app really answers kind 17: it closes the
+    /// connection (the frame is no account frame it knows).
+    pub async fn message_test_m4_peer_closing(&self, m4: bool) -> Result<(), CoreError> {
+        self.mls_test(MlsTest::M4Close(m4)).await.map(|_| ())
+    }
     /// Every kind 16/17 request frame this core sent so far (complete envelopes).
     pub async fn message_test_sent_frames(&self) -> Result<Vec<Vec<u8>>, CoreError> {
         match self.mls_test(MlsTest::Frames).await? {
@@ -378,6 +420,12 @@ impl Manager {
             MlsTest::Sent => MlsTestReply::Sent(self.messages.mls.sent.clone()),
             MlsTest::M4Peer(m4) => {
                 self.messages.mls.m4_peer = m4;
+                self.messages.mls.m4_close = false;
+                MlsTestReply::Done
+            }
+            MlsTest::M4Close(m4) => {
+                self.messages.mls.m4_peer = m4;
+                self.messages.mls.m4_close = m4;
                 MlsTestReply::Done
             }
             MlsTest::Frames => {
@@ -502,6 +550,67 @@ impl Manager {
         }
     }
 
+    /// Whether the account answered kind 17 properly this run, or ever spoke MLS here.
+    pub(super) async fn peer_speaks_mls(
+        &mut self,
+        conversation: ConversationId,
+        peer: PeerId,
+        request: Request,
+    ) -> Result<bool, CoreError> {
+        if self.messages.mls.spoke.contains(&peer) {
+            return Ok(true);
+        }
+        match self
+            .group_db(conversation, GroupOp::PeerSpokeMls { mark: false }, request)
+            .await?
+        {
+            GroupReply::Flag(spoke) => Ok(spoke),
+            _ => Err(unavailable(ErrorCode::InvalidMessage)),
+        }
+    }
+
+    /// The account refused kind 17: not asked again before the back-off (doubling from
+    /// `OUTDATED_RETRY_MS`) ends. A second refusal within one back-off does not extend it.
+    pub(super) fn mark_outdated(&mut self, peer: PeerId) {
+        let now = self.schedule_now();
+        let record = self.local().ok().and_then(|local| {
+            local
+                .remote
+                .iter()
+                .find(|r| r.peer == peer)
+                .map(|r| r.accepted.hash)
+        });
+        let backoff = match self.messages.mls.outdated.get(&peer) {
+            Some(o) if now < o.until => return,
+            Some(o) => o.backoff.saturating_mul(2).min(OUTDATED_MAX_MS),
+            None => OUTDATED_RETRY_MS,
+        };
+        self.messages.mls.outdated.insert(
+            peer,
+            Outdated {
+                until: now.saturating_add(backoff),
+                backoff,
+                record,
+            },
+        );
+    }
+
+    /// Whether kind 17 requests to `peer` wait now: it refused within its back-off and its
+    /// record did not change since.
+    fn outdated_now(&self, peer: PeerId) -> bool {
+        let Some(outdated) = self.messages.mls.outdated.get(&peer) else {
+            return false;
+        };
+        let record = self.local().ok().and_then(|local| {
+            local
+                .remote
+                .iter()
+                .find(|r| r.peer == peer)
+                .map(|r| r.accepted.hash)
+        });
+        self.schedule_now() < outdated.until && record == outdated.record
+    }
+
     /// Queued Commits/Welcomes of the conversation for `recipient`, to send ahead of an
     /// application message (none while delivery is held in tests).
     pub(super) async fn deliveries_ahead(
@@ -584,10 +693,13 @@ impl Manager {
             _ => {}
         }
         let own = self.local()?.keys.peer_id();
+        // An account that refused kind 17 is not asked again before its back-off ends.
         let sessions: Vec<Session> = self
             .mls_sessions()
             .into_iter()
-            .filter(|s| s.grant.peer == peer || s.grant.peer == own)
+            .filter(|s| {
+                (s.grant.peer == peer || s.grant.peer == own) && !self.outdated_now(s.grant.peer)
+            })
             .collect();
         if sessions.is_empty() {
             self.messages.mls.phases.insert(
@@ -691,6 +803,7 @@ impl Manager {
         let sessions: Vec<Session> = asked
             .iter()
             .filter_map(|installation| self.mls_session_for(*installation))
+            .filter(|s| !self.outdated_now(s.grant.peer))
             .collect();
         if sessions.is_empty() {
             self.idle(conversation);
@@ -1248,13 +1361,27 @@ impl Manager {
             task,
             answer,
         } = event;
-        // A device answering a kind 17 request with the M4 refusal has not updated yet; any
-        // proper answer from the account means it has.
-        match &answer {
-            Answer::Reply(Err(ErrorCode::UnsupportedMessageVersion)) => {
-                self.messages.mls.outdated.insert(answered);
+        // A device answering a kind 17 request with the M4 refusal has not updated yet; so has
+        // one that just closed the stream or connection, if its account never showed MLS. Any
+        // proper answer from the account means it has updated.
+        let own = self.local().ok().map(|local| local.keys.peer_id());
+        match (&answer, task_conversation(&task)) {
+            (Answer::Reply(Err(ErrorCode::UnsupportedMessageVersion)), _)
+                if Some(answered) != own =>
+            {
+                self.mark_outdated(answered);
             }
-            Answer::Reply(Ok(_)) => {
+            (Answer::Reply(Err(ErrorCode::PeerNotConnected)), Some(conversation))
+                if Some(answered) != own =>
+            {
+                if let Some(request) = self.ready().ok().filter(|r| r.ticket == ticket)
+                    && let Ok(false) = self.peer_speaks_mls(conversation, answered, request).await
+                {
+                    self.mark_outdated(answered);
+                }
+            }
+            (Answer::Reply(Ok(_)), _) => {
+                self.messages.mls.spoke.insert(answered);
                 self.messages.mls.outdated.remove(&answered);
             }
             _ => {}
@@ -1390,6 +1517,11 @@ impl Manager {
         // The M4-peer fixture answers like a released M4 app.
         #[cfg(all(feature = "test-hooks", debug_assertions))]
         if self.messages.mls.m4_peer {
+            // A released M4 app takes kind 17 for no account frame it knows: the error ends
+            // the stream reader, which closes the connection.
+            if self.messages.mls.m4_close {
+                return Err(unavailable(ErrorCode::InvalidMessage));
+            }
             return Ok(Frame::Reject(RejectReason::UnsupportedVersion)
                 .envelope()
                 .to_vec());
@@ -1549,6 +1681,9 @@ impl Manager {
                         self.messages.mls.missing.remove(&conversation);
                     }
                 }
+                if sender == peer && matches!(outcome, Outcome::Ack | Outcome::Adopted) {
+                    self.peer_spoke(conversation, sender, request).await?;
+                }
                 let reply = match outcome {
                     Outcome::Failed { class, epoch } => MlsReply::DecryptFailed { class, epoch },
                     Outcome::Rejoin { epoch } => MlsReply::DecryptFailed {
@@ -1622,6 +1757,9 @@ impl Manager {
                     }
                     _ => {}
                 }
+                if sender == peer && matches!(outcome, Outcome::Ack | Outcome::Joined) {
+                    self.peer_spoke(conversation, sender, request).await?;
+                }
                 self.after_outcome(conversation, peer, outcome, request)
                     .await;
                 match outcome {
@@ -1634,6 +1772,21 @@ impl Manager {
             // Answered by `receive_app`.
             MlsFrame::App { .. } => MlsReply::Busy,
         })
+    }
+
+    /// The conversation's peer account just spoke MLS (an accepted Commit or Welcome): kept for
+    /// the downgrade guard (`mls_peer`, never cleared) and as evidence it is no M4 app.
+    async fn peer_spoke(
+        &mut self,
+        conversation: ConversationId,
+        peer: PeerId,
+        request: Request,
+    ) -> Result<(), CoreError> {
+        self.messages.mls.spoke.insert(peer);
+        self.messages.mls.outdated.remove(&peer);
+        self.group_db(conversation, GroupOp::PeerSpokeMls { mark: true }, request)
+            .await
+            .map(|_| ())
     }
 
     /// A received application message (spec 5.2): opened and stored in one transaction. `None`
@@ -1660,8 +1813,21 @@ impl Manager {
             ciphertext,
             self.services.clock.wall_ms(),
         );
-        match self.message_db(op, request).await {
+        let result = self.message_db(op, request).await;
+        if result.is_ok() {
+            self.messages.mls.spoke.insert(sender);
+            self.messages.mls.outdated.remove(&sender);
+        }
+        match result {
             Ok(MessageDbReply::Opened(reply)) => Ok(Some(reply)),
+            Ok(MessageDbReply::OpenedText(reply, _key)) => {
+                // The keyed response checkpoint of tests: the Ack that stores this text.
+                #[cfg(all(feature = "test-hooks", debug_assertions))]
+                {
+                    self.messages.ack_key = Some(_key);
+                }
+                Ok(Some(reply))
+            }
             Ok(MessageDbReply::Rejected) => Ok(None),
             Ok(_) => Err(unavailable(ErrorCode::InvalidMessage)),
             // The MLS sender is not the authenticated device, or the message conflicts.

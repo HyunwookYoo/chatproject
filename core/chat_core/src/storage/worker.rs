@@ -83,8 +83,9 @@ impl Worker {
         } else {
             None
         };
+        // A received MLS ciphertext learns its message only once opened; it moves the clock too.
         #[cfg(all(feature="test-hooks",debug_assertions))]
-        let clock=if key.is_some() {self.message_clock.take()} else {None};
+        let clock=if key.is_some() || op.opens_app() {self.message_clock.take()} else {None};
         let result = self.operation(|c| {
             let (_, state) = migration::load_validated(c, &db_id)?.ok_or_else(|| {
                 CoreError::new(ErrorCode::AccountRestricted, "active_account_required")

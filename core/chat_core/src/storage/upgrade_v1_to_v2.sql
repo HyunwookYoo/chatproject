@@ -39,6 +39,13 @@ CREATE TABLE mls_hold (
     PRIMARY KEY(conversation,body_hash)
 ) STRICT;
 
+-- Conversations whose peer account has spoken MLS to this device (an accepted App, Commit or
+-- Welcome). Never cleared, not even when the group is dropped or rejoined: the downgrade guard.
+CREATE TABLE mls_peer (
+    conversation BLOB PRIMARY KEY NOT NULL CHECK(length(conversation)=32),
+    FOREIGN KEY(conversation) REFERENCES conversation(id)
+) STRICT;
+
 -- storage_meta: only the schema_version CHECK changes, so the table is rebuilt.
 CREATE TABLE storage_meta_v2 (
     singleton INTEGER PRIMARY KEY NOT NULL CHECK(singleton = 1),

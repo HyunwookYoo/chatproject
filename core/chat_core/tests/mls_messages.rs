@@ -3,136 +3,7 @@
 #![allow(dead_code, unused_imports)]
 //! Task 8: messages and read receipts travel as MLS application messages (kind 17), with
 //! recovery from decrypt failures and the transition from M4 peers.
-include!("support/mls_network.rs");
-
-use chat_core::storage_fixture::{
-    Fixture as SqlFixture, MessageKey, MessageView, mls_commit_from_wire, mls_detached_key_package,
-};
-
-/// Text that must never appear in any frame on the network.
-const SENTINEL: &str = "sentinel-plaintext-7c1f";
-
-/// The kind of an account envelope `[1, kind, inner]`.
-fn kind(frame: &[u8]) -> u8 {
-    assert_eq!(frame[..2], [0x83, 0x01], "not an account envelope");
-    frame[2]
-}
-/// Whether the frame is an M4 kind 16 text (codec 1 plaintext).
-fn is_plaintext_text(frame: &[u8]) -> bool {
-    if kind(frame) != 16 {
-        return false;
-    }
-    let mut d = minicbor::Decoder::new(frame);
-    d.array().unwrap();
-    d.u8().unwrap();
-    d.u8().unwrap();
-    let inner = d.bytes().unwrap();
-    matches!(
-        chat_core::storage_fixture::decode_message(inner),
-        Ok(chat_core::storage_fixture::MessageFrame::Text(_))
-    )
-}
-fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack.windows(needle.len()).any(|w| w == needle)
-}
-async fn frames(f: &Fixture) -> Vec<Vec<u8>> {
-    f.account.message_test_sent_frames().await.unwrap()
-}
-/// The MLS ciphertexts of the `App` frames `f` sent, in order.
-async fn app_ciphertexts(f: &Fixture) -> Vec<Vec<u8>> {
-    frames(f)
-        .await
-        .iter()
-        .filter_map(|frame| mls_app_from_wire(frame).map(|(_, ct)| ct))
-        .collect()
-}
-
-/// A1 and B1, contacts of each other, with an authenticated session.
-async fn setup(b_devices: &[u8]) -> (Fixture, Fixture, Arc<Backend>, ConversationId) {
-    let (ra, rb) = (record(A, &[A1], 0), record(B, b_devices, 0));
-    let net = backend(&[(A, ra.clone()), (B, rb.clone())]);
-    let a1 = device(A, A1, &ra, &net).await;
-    let b1 = device(B, B1, &rb, &net).await;
-    link(&a1, &b1).await;
-    befriend(&a1, &b1).await;
-    befriend(&b1, &a1).await;
-    a1.account.connect_account(b1.peer).await.unwrap();
-    let conv = conversation(&a1, &b1).await;
-    conversation(&b1, &a1).await;
-    (a1, b1, net, conv)
-}
-
-async fn send(from: &Fixture, to: &Fixture, n: u8, body: &str) -> MessageView {
-    from.account
-        .messages()
-        .send_text(to.peer, MessageId([n; 16]), body.into())
-        .await
-        .unwrap()
-}
-async fn page(f: &Fixture, conv: ConversationId) -> Vec<MessageView> {
-    f.account
-        .messages()
-        .load_messages(conv, None, 50)
-        .await
-        .unwrap()
-        .items
-}
-async fn message(f: &Fixture, key: MessageKey) -> Option<MessageView> {
-    page(f, key.conversation)
-        .await
-        .into_iter()
-        .find(|m| m.key == key)
-}
-async fn delivery(f: &Fixture, key: MessageKey) -> DeliveryState {
-    message(f, key).await.unwrap().state
-}
-async fn outbox(f: &Fixture, key: MessageKey) -> chat_core::storage_fixture::MlsOutbox {
-    f.account
-        .storage_test_fixture()
-        .mls_outbox(key)
-        .await
-        .unwrap()
-}
-async fn receipt_jobs(f: &Fixture) -> u64 {
-    f.account
-        .storage_test_fixture()
-        .message_counts()
-        .await
-        .unwrap()
-        .2
-}
-
-/// A and B share a group (made by `ensure_group`, both on the same epoch).
-async fn grouped(a: &Fixture, b: &Fixture, conv: ConversationId) {
-    ensure(a, b.peer).await;
-    settle!(
-        [a, b],
-        agreed(a, b, conv).await && state(a, conv).await.deliveries.is_empty()
-    );
-}
-
-/// `n` own Commits on `a` (adding and removing B's never-online device B2 in turn), each
-/// delivered to B1 before the next.
-async fn commits(a: &Fixture, b: &Fixture, conv: ConversationId, n: usize) {
-    let messages = a.account.storage_test_fixture().messages().await.unwrap();
-    let b2 = derive_device(Secret32::from([B2; 32]))
-        .unwrap()
-        .installation_id();
-    for i in 0..n {
-        let (add, remove) = if i % 2 == 0 {
-            (vec![mls_detached_key_package(b.peer, [B2; 32])], vec![])
-        } else {
-            (vec![], vec![b2])
-        };
-        let epoch = messages
-            .mls_commit(conv, b.peer, add, remove, NOW * 1000)
-            .await
-            .unwrap()
-            .expect("an own Commit");
-        settle!([a, b], state(b, conv).await.group_epoch == Some(epoch));
-        settle!([a, b], !state(a, conv).await.own_commit_unacked.unwrap());
-    }
-}
+include!("support/mls_messaging.rs");
 
 #[tokio::test]
 async fn send_reaches_peer_encrypted_and_shows_delivered() {
@@ -450,57 +321,6 @@ async fn upgraded_outbox_delivers_with_same_msg_id() {
     assert!(!frames(&a1).await.iter().any(|f| is_plaintext_text(f)));
 }
 
-/// Stops a device's core and returns its data directory.
-fn stop(f: Fixture) -> tempfile::TempDir {
-    let Fixture {
-        _sql,
-        _dir,
-        slot,
-        account,
-        ..
-    } = f;
-    let observer = account.storage_test_fixture();
-    drop(slot);
-    drop(account);
-    drop(_sql);
-    assert_eq!(observer.live_connections(), 0);
-    _dir
-}
-
-/// Starts a core on an existing data directory (the account `A`).
-async fn start(dir: tempfile::TempDir, backend: Arc<Backend>) -> Fixture {
-    let slot = CoreSlot::new();
-    let bus = EventBus::new();
-    slot.start(
-        CoreConfig {
-            data_dir: dir.path().into(),
-        },
-        &bus,
-    )
-    .unwrap();
-    slot.network().unwrap().configure_local(None).await.unwrap();
-    let clock = Arc::new(FakeClock::new(NOW, 0));
-    let account = slot
-        .open_account_with_services(
-            support::protector(),
-            AccountServices::new(backend, clock.clone()),
-        )
-        .unwrap();
-    lifecycle_idle_handle(&account).await;
-    account.snapshot().await.unwrap();
-    let f = Fixture {
-        _sql: sql_store::Store::from_fixture(account.storage_test_fixture()),
-        _dir: dir,
-        slot,
-        bus,
-        account,
-        peer: peer_of(A),
-        clock,
-    };
-    online(&f).await;
-    f
-}
-
 #[tokio::test]
 async fn no_codec1_frame_is_ever_sent() {
     let (a1, b1, _net, conv) = setup(&[B1, B2]).await;
@@ -630,6 +450,7 @@ async fn retry_after_reencrypt_cap_starts_over() {
     // The user's Retry starts the re-encryption count over and makes it due again.
     let view = a1.account.messages().retry_send(sent.key).await.unwrap();
     assert_eq!(view.state, DeliveryState::Queued);
+    assert_eq!(outbox(&a1, sent.key).await.reencrypts, 0);
     settle!(
         [&a1, &b1],
         delivery(&a1, sent.key).await == DeliveryState::Delivered
@@ -668,41 +489,117 @@ async fn text_m4_would_refuse_fails_for_good_and_moves_the_ratchet() {
     assert_eq!(after.processed_mls, before.processed_mls + 1);
 }
 
-async fn lifecycle_idle_handle(account: &AccountHandle) {
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while account.lifecycle_status() == 1 {
-            tokio::task::yield_now().await;
+#[tokio::test]
+async fn closing_m4_peer_marks_waiting_without_churn() {
+    let (a1, b1, _net, _conv) = setup(&[B1]).await;
+    // A released M4 app closes the connection on any kind 17 frame.
+    b1.account.message_test_m4_peer_closing(true).await.unwrap();
+    let sent = send(&a1, &b1, 1, SENTINEL).await;
+    settle!([&a1, &b1], outbox(&a1, sent.key).await.waiting_peer_update);
+    let kind17 = |frames: Vec<Vec<u8>>| frames.iter().filter(|f| kind(f) == 17).count();
+    let asked = kind17(frames(&a1).await);
+    assert!(asked >= 1);
+    // A simulated minute: the M4 app's own texts keep arriving, and A does not ask it again.
+    let texts = [
+        send(&b1, &a1, 2, "from the M4 app").await,
+        send(&b1, &a1, 3, "again from the M4 app").await,
+    ];
+    for _ in 0..60 {
+        for f in [&a1, &b1] {
+            f.clock.advance_monotonic_ms(1_000);
         }
-    })
-    .await
-    .unwrap();
-    assert_eq!(account.lifecycle_status(), 0);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(kind17(frames(&a1).await), asked, "no kind 17 churn");
+    for text in &texts {
+        assert_eq!(
+            message(&a1, text.key).await.map(|m| m.body),
+            Some(text.body.clone()),
+            "the M4 app's text arrived"
+        );
+    }
+    let row = outbox(&a1, sent.key).await;
+    assert!(row.waiting_peer_update);
+    assert_eq!(row.codec, Some(3));
+    assert_eq!(delivery(&a1, sent.key).await, DeliveryState::Queued);
+    assert!(message(&b1, sent.key).await.is_none());
+    for frame in frames(&a1).await {
+        assert!(!is_plaintext_text(&frame));
+        assert!(!contains(&frame, SENTINEL.as_bytes()));
+    }
 }
-async fn online(f: &Fixture) {
-    f.slot
-        .network()
-        .unwrap()
-        .execute(NetworkOp::Start)
+
+#[tokio::test]
+async fn rejected_text_replay_is_not_delivered() {
+    let (a1, b1, _net, conv) = setup(&[B1]).await;
+    grouped(&a1, &b1, conv).await;
+    a1.account.message_test_hold_scheduler(true).await.unwrap();
+    // A text B refuses (lamport far ahead), whose answer is lost after it was written.
+    a1.account
+        .storage_test_fixture()
+        .set_message_lamport(conv, 5_000_000)
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            let NetworkReply::Info(info) = f
-                .slot
-                .network()
-                .unwrap()
-                .execute(NetworkOp::Info)
-                .await
-                .unwrap()
-            else {
-                panic!()
-            };
-            if info.state == NetworkState::Online {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
+    let sent = send(&a1, &b1, 1, "refused").await;
+    let mut pause = b1
+        .account
+        .message_test_pause(chat_core::account::MessagePoint::Response)
+        .await
+        .unwrap();
+    let account = a1.account.clone();
+    let key = sent.key;
+    let task = tokio::spawn(async move {
+        account
+            .message_test_attempt(key, false, MessageMutation::None)
+            .await
+    });
+    pause.wait_entered().await;
+    let refused = state(&b1, conv).await.processed_mls;
+    // A gives up waiting (the answer is lost); the text was sent but is not delivered.
+    assert!(task.await.unwrap().is_err());
+    pause.release();
+    assert_ne!(delivery(&a1, sent.key).await, DeliveryState::Delivered);
+    assert_ne!(delivery(&a1, sent.key).await, DeliveryState::Failed);
+    // The same ciphertext again: B answers it as before (refused), never as stored.
+    let _ = a1.account.connect_account(b1.peer).await;
+    let error = a1
+        .account
+        .message_test_attempt(sent.key, false, MessageMutation::None)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::InvalidMessage);
+    assert_eq!(delivery(&a1, sent.key).await, DeliveryState::Failed);
+    let cts = app_ciphertexts(&a1).await;
+    assert_eq!(cts.len(), 2);
+    assert_eq!(cts[0], cts[1], "a retry resends the same ciphertext");
+    assert!(message(&b1, sent.key).await.is_none());
+    assert_eq!(state(&b1, conv).await.processed_mls, refused);
+}
+
+#[tokio::test]
+async fn downgrade_guard_survives_rejoin() {
+    let (a1, b1, _net, conv) = setup(&[B1]).await;
+    b1.account.connect_account(a1.peer).await.unwrap();
+    let first = send(&b1, &a1, 1, "over mls").await;
+    settle!(
+        [&a1, &b1],
+        delivery(&b1, first.key).await == DeliveryState::Delivered
+    );
+    assert!(state(&a1, conv).await.peer_spoke);
+    // A leaves its group to rejoin: the group row (and its peer_mls) is gone or new.
+    assert!(a1.account.mls_test_rejoin(b1.peer).await.unwrap());
+    assert_ne!(state(&a1, conv).await.peer_mls, Some(true));
+    assert!(state(&a1, conv).await.peer_spoke, "kept across the rejoin");
+    // A plaintext text from B is still refused.
+    b1.account.message_test_m4_peer(true).await.unwrap();
+    b1.account.message_test_hold_scheduler(true).await.unwrap();
+    let second = send(&b1, &a1, 2, "plaintext after the rejoin").await;
+    let _ = b1.account.connect_account(a1.peer).await;
+    let error = b1
+        .account
+        .message_test_attempt(second.key, false, MessageMutation::None)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::UnsupportedMessageVersion);
+    assert!(message(&a1, second.key).await.is_none());
 }
