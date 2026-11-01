@@ -4,8 +4,10 @@
 //! blanket `dead_code` allowance until they land.
 #![allow(dead_code)]
 
+pub(crate) mod group;
 pub(crate) mod identity;
 pub(crate) mod kv;
+pub(crate) mod payload;
 
 use openmls_rust_crypto::RustCrypto;
 use openmls_traits::OpenMlsProvider;
