@@ -243,6 +243,9 @@ pub(crate) enum Opened {
     },
     /// A Commit was applied; the group is now at `epoch`.
     Commit { epoch: u64 },
+    /// An authenticated application message whose plaintext cannot be decoded into a
+    /// `ChatMessage`. The ratchet has advanced; the caller acknowledges and drops it.
+    Undecodable { sender: InstallationId },
 }
 
 impl std::fmt::Debug for Opened {
@@ -255,6 +258,10 @@ impl std::fmt::Debug for Opened {
                 .field("message", message)
                 .finish(),
             Self::Commit { epoch } => f.debug_struct("Commit").field("epoch", epoch).finish(),
+            Self::Undecodable { sender } => f
+                .debug_struct("Undecodable")
+                .field("sender", sender)
+                .finish(),
         }
     }
 }
@@ -325,15 +332,22 @@ pub(crate) fn open(
     match processed.into_content() {
         ProcessedMessageContent::ApplicationMessage(application) => {
             let plaintext = Zeroizing::new(application.into_bytes());
-            let message = ChatMessage::decode_padded(&plaintext).map_err(|_| fail(CLASS_OTHER))?;
             let installation = BasicCredential::try_from(sender)
                 .ok()
                 .and_then(|basic| MlsCredential::decode(basic.identity()).ok())
                 .map(|credential| credential.installation)
                 .ok_or(fail(CLASS_OTHER))?;
-            Ok(Opened::Application {
-                sender: installation,
-                message,
+            // The message already decrypted and authenticated, so a payload that does not
+            // parse is not a decrypt failure: reporting one would make the sender re-encrypt
+            // the same plaintext forever.
+            Ok(match ChatMessage::decode_padded(&plaintext) {
+                Ok(message) => Opened::Application {
+                    sender: installation,
+                    message,
+                },
+                Err(_) => Opened::Undecodable {
+                    sender: installation,
+                },
             })
         }
         ProcessedMessageContent::StagedCommitMessage(staged) => {
@@ -548,6 +562,107 @@ mod tests {
         // A device cannot open the message it sealed itself (OwnPrivateMessage).
         assert_eq!(a.open(&gid, &ct).unwrap_err().class, CLASS_OTHER);
         assert_eq!(b.open(&gid, &ct2).unwrap_err().class, CLASS_OTHER);
+    }
+
+    /// Seals `plaintext` as-is, bypassing `ChatMessage` encoding.
+    fn seal_raw(party: &Party, group_id: &[u8], plaintext: &[u8]) -> Vec<u8> {
+        let mut group = MlsGroup::load(party.provider.storage(), &GroupId::from_slice(group_id))
+            .unwrap()
+            .unwrap();
+        group
+            .create_message(&party.provider, &party.signer, plaintext)
+            .unwrap()
+            .tls_serialize_detached()
+            .unwrap()
+    }
+
+    /// `head` followed by a zero pad (a 3-byte-header byte string) filling a 1 KiB bucket.
+    fn bucket_of(head: Vec<u8>) -> Vec<u8> {
+        let pad = 1_024 - head.len() - 3;
+        let mut out = head;
+        out.extend_from_slice(&[0x59, (pad >> 8) as u8, pad as u8]);
+        out.resize(1_024, 0);
+        out
+    }
+
+    /// The CBOR head of a payload: `[version, id, 1, prev, 2, <content>]`, content written by `content`.
+    fn head(version: u64, content: impl FnOnce(&mut minicbor::Encoder<Vec<u8>>)) -> Vec<u8> {
+        let mut e = minicbor::Encoder::new(Vec::new());
+        e.array(7)
+            .unwrap()
+            .u64(version)
+            .unwrap()
+            .bytes(&[7; 16])
+            .unwrap()
+            .u64(1)
+            .unwrap()
+            .bytes(&[8; 32])
+            .unwrap()
+            .u64(2)
+            .unwrap();
+        content(&mut e);
+        e.into_writer()
+    }
+
+    #[test]
+    fn undecodable_payload_is_not_a_decrypt_failure() {
+        let (a, b, gid) = pair();
+        let text = |e: &mut minicbor::Encoder<Vec<u8>>| {
+            e.array(2).unwrap().u64(1).unwrap().str("hi").unwrap();
+        };
+        let receipt = |kind: u8, count: usize| {
+            move |e: &mut minicbor::Encoder<Vec<u8>>| {
+                e.array(3)
+                    .unwrap()
+                    .u64(2)
+                    .unwrap()
+                    .u8(kind)
+                    .unwrap()
+                    .array(count as u64)
+                    .unwrap();
+                for _ in 0..count {
+                    e.bytes(&[9; 16]).unwrap();
+                }
+            }
+        };
+        let plaintexts = [
+            ("version 2", bucket_of(head(2, text))),
+            ("unknown receipt kind", bucket_of(head(1, receipt(9, 1)))),
+            ("51 receipt targets", bucket_of(head(1, receipt(1, 51)))),
+            (
+                "receipt item count",
+                bucket_of(head(1, |e| {
+                    e.array(2).unwrap().u64(2).unwrap().u8(1).unwrap();
+                })),
+            ),
+            (
+                "text item count",
+                bucket_of(head(1, |e| {
+                    e.array(3)
+                        .unwrap()
+                        .u64(1)
+                        .unwrap()
+                        .str("a")
+                        .unwrap()
+                        .str("b")
+                        .unwrap();
+                })),
+            ),
+            ("not a bucket length", vec![0; 100]),
+            ("empty", Vec::new()),
+        ];
+        for (name, plaintext) in plaintexts {
+            let ct = seal_raw(&a, &gid, &plaintext);
+            match b.open(&gid, &ct) {
+                Ok(Opened::Undecodable { sender }) => {
+                    assert_eq!(sender, a.installation(), "{name}")
+                }
+                other => panic!("{name}: expected Undecodable, got {other:?}"),
+            }
+        }
+        // The ratchet moved on, and the conversation still works.
+        let ct = a.seal(&gid, &chat(3));
+        assert_eq!(opened(&b, &gid, &ct), chat(3));
     }
 
     #[test]
