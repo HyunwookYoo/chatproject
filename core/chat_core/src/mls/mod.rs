@@ -8,6 +8,8 @@ pub(crate) mod group;
 pub(crate) mod identity;
 pub(crate) mod kv;
 pub(crate) mod membership;
+#[cfg(feature = "nse")]
+pub mod nse;
 pub(crate) mod payload;
 pub(crate) mod wire;
 

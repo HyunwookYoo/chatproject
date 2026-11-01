@@ -10,8 +10,7 @@ publish = false
 crate-type = ["staticlib", "lib"]
 
 [dependencies]
-openmls = "=0.9.0"
-openmls_rust_crypto = "=0.6.0"
+chat_core = { path = "../chat_core", features = ["nse"] }
 thiserror = "2"
 uniffi = "=0.32.2"
 

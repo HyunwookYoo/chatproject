@@ -14,12 +14,12 @@ fn main() {
     let fixture = nse_fixture::build(200, k, credential_bytes);
     fs::create_dir_all(&out).unwrap();
     let state_path = out.join("nse_state.bin");
-    fs::write(&state_path, &fixture.state).unwrap();
+    fs::write(&state_path, &fixture.snapshot).unwrap();
 
     // Self-check through the same entry point the NSE calls.
     for (seq, ct) in fixture.ciphertexts.iter().enumerate() {
         let outcome = chat_nse::probe_decrypt(state_path.to_string_lossy().into_owned(), ct.clone()).unwrap();
-        assert_eq!(outcome.plaintext_len, 1024);
+        assert_eq!(outcome.plaintext_len, 800);
         println!(
             "seq {seq}: ciphertext {} B, base64 {} B, load {} us, decrypt {} us",
             ct.len(),
@@ -30,5 +30,5 @@ fn main() {
     }
     let lines: Vec<String> = fixture.ciphertexts.iter().map(|ct| STANDARD.encode(ct)).collect();
     fs::write(out.join("ciphertexts.txt"), lines.join("\n") + "\n").unwrap();
-    println!("state {} B", fixture.state.len());
+    println!("state {} B", fixture.snapshot.len());
 }

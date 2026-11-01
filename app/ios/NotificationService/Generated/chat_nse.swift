@@ -560,31 +560,37 @@ fileprivate struct FfiConverterData: FfiConverterRustBuffer {
 
 
 public struct ProbeOutcome: Equatable, Hashable {
+    /**
+     * Bytes of the message text.
+     */
     public var plaintextLen: UInt32
     /**
-     * Up to 48 bytes of the plaintext, lossy UTF-8, for the notification body.
+     * Up to 48 bytes of the text, for the notification body.
      */
     public var preview: String
     /**
-     * Read + decode the state file + `MlsGroup::load`.
+     * Reading the state file.
      */
     public var loadMicros: UInt64
     /**
-     * TLS decode + `process_message`.
+     * Decoding the snapshot, loading the group, TLS decode and `process_message`.
      */
     public var decryptMicros: UInt64
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(plaintextLen: UInt32, 
+    public init(
         /**
-         * Up to 48 bytes of the plaintext, lossy UTF-8, for the notification body.
+         * Bytes of the message text.
+         */plaintextLen: UInt32, 
+        /**
+         * Up to 48 bytes of the text, for the notification body.
          */preview: String, 
         /**
-         * Read + decode the state file + `MlsGroup::load`.
+         * Reading the state file.
          */loadMicros: UInt64, 
         /**
-         * TLS decode + `process_message`.
+         * Decoding the snapshot, loading the group, TLS decode and `process_message`.
          */decryptMicros: UInt64) {
         self.plaintextLen = plaintextLen
         self.preview = preview
@@ -745,9 +751,8 @@ public func FfiConverterTypeNseError_lower(_ value: NseError) -> RustBuffer {
     return FfiConverterTypeNseError.lower(value)
 }
 /**
- * Reads the state file (see [`state`]) into a fresh provider, loads its group and
- * decrypts one `MlsMessageOut` wire encoding of a `PrivateMessage`. Rust streams the
- * file itself, so Swift never holds the state or copies it across the FFI.
+ * Reads the state file (a `chat_core::mls::nse::export_snapshot` snapshot) and decrypts one
+ * `MlsMessageOut` wire encoding of a `PrivateMessage` against it.
  */
 public func probeDecrypt(statePath: String, ciphertext: Data)throws  -> ProbeOutcome  {
     return try  FfiConverterTypeProbeOutcome_lift(try rustCallWithError(FfiConverterTypeNseError_lift) {
@@ -774,7 +779,7 @@ private let initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
-    if (uniffi_chat_nse_checksum_func_probe_decrypt() != 55939) {
+    if (uniffi_chat_nse_checksum_func_probe_decrypt() != 19322) {
         return InitializationResult.apiChecksumMismatch
     }
 

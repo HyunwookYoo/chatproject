@@ -160,7 +160,7 @@ pub(crate) struct KvStore {
     state: RwLock<State>,
 }
 
-fn storage_error(e: rusqlite::Error) -> CoreError {
+pub(super) fn storage_error(e: rusqlite::Error) -> CoreError {
     if let rusqlite::Error::SqliteFailure(code, _) = e
         && code.code == rusqlite::ErrorCode::DiskFull
     {
@@ -192,6 +192,31 @@ impl KvStore {
         Ok(KvStore {
             state: RwLock::new(state),
         })
+    }
+
+    /// A store over rows that were read elsewhere (the notification extension's snapshot), with
+    /// nothing marked dirty. Values are checked like `load` checks them.
+    pub(crate) fn from_rows<'a>(rows: impl IntoIterator<Item = (&'a [u8], &'a [u8])>) -> R<KvStore> {
+        let mut state = State::default();
+        for (key, value) in rows {
+            if key.is_empty() || key.len() > MAX_KEY_BYTES || value.first() != Some(&FORMAT) {
+                return Err(corrupt());
+            }
+            state.rows.insert(key.to_vec(), value.to_vec());
+        }
+        Ok(KvStore {
+            state: RwLock::new(state),
+        })
+    }
+
+    /// Every loaded row (the conversation's and the global ones) in key order.
+    pub(crate) fn rows(&self) -> R<Vec<(Vec<u8>, Vec<u8>)>> {
+        let state = self.state.read().map_err(|_| corrupt())?;
+        Ok(state
+            .rows
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect())
     }
 
     /// Writes only the keys changed since `load`/the last flush (upsert or delete) into `tx`

@@ -700,8 +700,7 @@ dependencies = [
 name = "chat_nse"
 version = "0.1.0"
 dependencies = [
- "openmls",
- "openmls_rust_crypto",
+ "chat_core",
  "tempfile",
  "thiserror 2.0.21",
  "uniffi",
@@ -3440,10 +3439,8 @@ name = "nse_fixture"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "chat_core",
  "chat_nse",
- "openmls",
- "openmls_basic_credential",
- "openmls_rust_crypto",
  "tempfile",
 ]
 

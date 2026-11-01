@@ -6,6 +6,10 @@ pub mod error;
 pub mod event;
 pub mod runtime;
 pub mod message;
+// Only `mls::nse` is public, and only for the notification extension.
+#[cfg(feature = "nse")]
+pub mod mls;
+#[cfg(not(feature = "nse"))]
 mod mls;
 mod storage;
 pub mod transport;

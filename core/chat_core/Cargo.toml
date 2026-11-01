@@ -44,6 +44,10 @@ tokio = { version = "1", features = ["test-util"] }
 [features]
 default = []
 test-hooks = ["dep:tokio-tungstenite", "dep:serde_json"]
+# Read-only MLS decrypt for the iOS notification extension (`mls::nse`). Nothing else of `mls` is public.
+nse = []
+# Adds `mls::nse::fixture` (builds a group and a snapshot through an in-memory database); for tools and tests only.
+nse-fixture = ["nse"]
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "=0.61.2", features = ["Win32_Storage_FileSystem"] }
