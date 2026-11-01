@@ -20,6 +20,7 @@ env:
   RUST_TOOLCHAIN: 1.92.0
   # cargokit (app/rust_builder) builds with this toolchain. Must equal RUST_TOOLCHAIN.
   CARGOKIT_TOOLCHAIN: 1.92.0
+  CARGOKIT_VERBOSE: '1'
 
 jobs:
   workflows:
@@ -42,6 +43,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
+      - name: SQL build prerequisites
+        if: runner.os == 'Linux'
+        run: |
+          perl -v
+          make --version
+          cc --version
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -50,13 +57,35 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - run: cargo test --workspace
+      - run: cargo test --workspace --locked
+      - name: Verify pinned SQLCipher native source
+        run: |
+          sqlcipher_source=( "${CARGO_HOME:-$HOME/.cargo}"/registry/src/*/libsqlite3-sys-0.38.2/sqlcipher/sqlite3.c )
+          test "${#sqlcipher_source[@]}" -eq 1
+          python tools/ci/check_sqlcipher.py --manifest Cargo.lock --source "${sqlcipher_source[0]}"
+      # The iOS OS-DNS adapter also runs on the host with loopback-only fixtures.
+      - run: cargo test --manifest-path vendor/iroh-dns/Cargo.toml --locked --lib dns::ios::tests --features tls-ring
+      # Keep feature-unified controller builds out of the ordinary/Release checks.
+      - run: cargo test --locked -p chat_core --features test-hooks
+      - run: cargo test --locked -p chat_ffi --features test-hooks
+      - run: cargo test --locked -p chat_node --features harness
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy -p chat_core --features test-hooks --all-targets -- -D warnings
+      - run: cargo clippy -p chat_ffi --features test-hooks --all-targets -- -D warnings
 
   bindings:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-26]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
+      - name: SQL build prerequisites
+        if: runner.os == 'Linux'
+        run: |
+          perl -v
+          make --version
+          cc --version
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -71,9 +100,11 @@ jobs:
           flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: stable
       - run: cargo install flutter_rust_bridge_codegen --version 2.11.1 --locked
+      - run: cargo install cargo-expand --version 1.0.126 --locked
       - name: Regenerate
         run: |
           (cd app && flutter pub get)
+          bash tools/gen_bindings.sh
           bash tools/gen_bindings.sh
       - name: Generated files match the commit
         run: |
@@ -81,7 +112,7 @@ jobs:
           if [ -n "$changes" ]; then
             echo "::error::Generated bindings differ from the commit. Run tools/gen_bindings.sh and commit the result."
             echo "$changes"
-            git --no-pager diff --stat
+            git --no-pager diff
             exit 1
           fi
 
@@ -100,18 +131,23 @@ jobs:
         working-directory: app
         run: |
           flutter pub get
-          flutter analyze
+          flutter analyze --fatal-infos
           flutter test
       - name: Device tool tests
         working-directory: tools/e2e
         run: |
           dart pub get
-          dart analyze
+          dart analyze --fatal-infos
           dart test
+      - name: Python runtime fixtures with Dart present
+        run: |
+          dart --packages=tools/e2e/.dart_tool/package_config.json analyze tools/ci/release_smoke.dart
+          python3 -m unittest discover -s tools/ci -p 'test_cargokit_toolchain.py' -v
+          python3 -m unittest discover -s tools/ci -p 'test_release_smoke.py' -v
 
   windows:
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
     defaults:
       run:
         working-directory: app
@@ -127,13 +163,82 @@ jobs:
           flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: stable
       - run: flutter pub get
-      - run: flutter test integration_test/core_test.dart -d windows
-      - run: flutter build windows --release
+      - name: Windows core storage regressions
+        working-directory: .
+        run: cargo test --locked -p chat_core
+      - name: Host node for desktop integration
+        working-directory: .
+        run: cargo build --locked -p chat_node --features harness
+      - name: Turn on Peek, which Windows Server ships turned off
+        run: |
+          # With Peek off, DwmSetIconicLivePreviewBitmap fails with ERROR_NOT_SUPPORTED, so the
+          # privacy integration test only ever reaches its fail-closed path.
+          if (-not (Test-Path HKCU:\Software\Microsoft\Windows\DWM)) { New-Item -Path HKCU:\Software\Microsoft\Windows\DWM | Out-Null }
+          Set-ItemProperty -Path HKCU:\Software\Microsoft\Windows\DWM -Name EnableAeroPeek -Type DWord -Value 1
+      - name: Every Windows integration file in a fresh Flutter process
+        run: |
+          # Flutter 3.44.6 closes DesktopDevice's log reader after the first file.
+          foreach ($test in Get-ChildItem integration_test -Filter '*_test.dart' | Where-Object { $_.Name -notin @('account_storage_test.dart', 'message_test.dart', 'release_contract_test.dart') } | Sort-Object Name) {
+            flutter test $test.FullName -d windows
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+      - name: Native account storage across Windows processes
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP ('account-' + [Guid]::NewGuid().ToString('N'))
+          foreach ($phase in @('write', 'read', 'locked', 'missing', 'read')) {
+            flutter test integration_test/account_storage_test.dart -d windows "--dart-define=ACCOUNT_STORAGE_PHASE=$phase" "--dart-define=ACCOUNT_STORAGE_ROOT=$root"
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+      - name: Native message storage across Windows processes
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP ('message-' + [Guid]::NewGuid().ToString('N'))
+          foreach ($phase in @('write', 'read')) {
+            flutter test integration_test/message_test.dart -d windows "--dart-define=MESSAGE_TEST_PHASE=$phase" "--dart-define=MESSAGE_TEST_ROOT=$root"
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+      - name: Ordinary Release build and pinned native toolchain
+        run: |
+          if ($env:CARGOKIT_TOOLCHAIN -ne '1.92.0') { throw 'Missing pinned toolchain' }
+          flutter build windows --release --target lib/main.dart -v *> "$env:RUNNER_TEMP/windows-release.log"
+          if ($LASTEXITCODE -ne 0) { Get-Content "$env:RUNNER_TEMP/windows-release.log"; exit $LASTEXITCODE }
+          if (!(Select-String -Path "$env:RUNNER_TEMP/windows-release.log" -SimpleMatch 'Running command rustup run 1.92.0 cargo build')) { throw 'Native toolchain proof missing' }
+      - name: Ordinary Release marker and account welcome smoke
+        working-directory: .
+        run: |
+          Push-Location tools/e2e
+          dart pub get --enforce-lockfile
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Pop-Location
+          Copy-Item -Recurse app/build/windows/x64/runner/Release "$env:RUNNER_TEMP/windows-ordinary"
+          python tools/ci/check_release_hooks.py "$env:RUNNER_TEMP/windows-ordinary"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          dart --packages=tools/e2e/.dart_tool/package_config.json tools/ci/release_smoke.dart --platform windows --artifact "$env:RUNNER_TEMP/windows-ordinary"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Dedicated actual Release contract
+        run: |
+          $nonce = [Guid]::NewGuid().ToString('N')
+          flutter build windows --release --target integration_test/release_contract_test.dart "--dart-define=RELEASE_CONTRACT_NONCE=$nonce" *> "$env:RUNNER_TEMP/windows-contract.log"
+          if ($LASTEXITCODE -ne 0) { Get-Content "$env:RUNNER_TEMP/windows-contract.log"; exit $LASTEXITCODE }
+          Copy-Item -Recurse build/windows/x64/runner/Release "$env:RUNNER_TEMP/windows-contract"
+          Push-Location ..
+          python tools/ci/check_release_hooks.py "$env:RUNNER_TEMP/windows-contract"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          dart --packages=tools/e2e/.dart_tool/package_config.json tools/ci/release_smoke.dart --platform windows --artifact "$env:RUNNER_TEMP/windows-contract" --contract-nonce $nonce
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Pop-Location
 
   android:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
+      - name: SQL build prerequisites
+        if: runner.os == 'Linux'
+        run: |
+          perl -v
+          make --version
+          cc --version
+      - name: Set job-owned Gradle home
+        run: echo "GRADLE_USER_HOME=$RUNNER_TEMP/chatproject-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$GITHUB_JOB" >> "$GITHUB_ENV"
       - name: Free disk space
         run: |
           # The emulator image and AVD need room. Never touch /usr/local/lib/android
@@ -177,10 +282,35 @@ jobs:
         run: |
           # The default step shell is `bash -e` without pipefail; tee would hide a failed build.
           set -o pipefail
+          python3 -u ../tools/ci/sample_android_release_resources.py &
+          resource_probe_pid=$!
+          trap 'build_status=$?; trap - EXIT; kill "$resource_probe_pid" 2>/dev/null || :; wait "$resource_probe_pid" 2>/dev/null || :; exit "$build_status"' EXIT
           flutter pub get
-          flutter build apk --release 2>&1 | tee "$RUNNER_TEMP/apk.log"
+          test "$CARGOKIT_TOOLCHAIN" = '1.92.0'
+          flutter build apk --release --target lib/main.dart -v 2>&1 | tee "$RUNNER_TEMP/apk.log"
           # The vendored cargokit patch (CARGOKIT_TOOLCHAIN) must still be in effect.
           grep -q "Running command rustup run ${CARGOKIT_TOOLCHAIN} cargo build" "$RUNNER_TEMP/apk.log"
+          cp build/app/outputs/flutter-apk/app-release.apk "$RUNNER_TEMP/ordinary-release.apk"
+          nonce="$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
+          echo "RELEASE_CONTRACT_NONCE=$nonce" >> "$GITHUB_ENV"
+          flutter build apk --release --target-platform android-x64 --target integration_test/release_contract_test.dart "--dart-define=RELEASE_CONTRACT_NONCE=$nonce"
+          cp build/app/outputs/flutter-apk/app-release.apk "$RUNNER_TEMP/contract-release.apk"
+          ./android/gradlew -p android --stop
+      - name: Release native markers and tool packages
+        run: |
+          python3 tools/ci/check_release_hooks.py "$RUNNER_TEMP/ordinary-release.apk"
+          python3 tools/ci/check_release_hooks.py "$RUNNER_TEMP/contract-release.apk"
+          (cd tools/e2e && dart pub get --enforce-lockfile)
+      - name: Canonical emulator configuration
+        id: avd
+        run: |
+          python3 - <<'PY'
+          import json, os
+          config = json.load(open('tools/e2e/avd_config.json'))['ci']
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              for key, value in config.items():
+                  print(f'{key}={value}', file=output)
+          PY
       - name: AVD cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: avd-cache
@@ -188,14 +318,14 @@ jobs:
           path: |
             ~/.android/avd/*
             ~/.android/adb*
-          key: avd-api36-google_apis-x86_64
+          key: ordinary-avd-${{ runner.os }}-${{ hashFiles('tools/e2e/avd_config.json') }}
       - name: Create AVD snapshot for the cache
         if: steps.avd-cache.outputs.cache-hit != 'true'
         uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
         with:
-          api-level: 36
-          target: google_apis
-          arch: x86_64
+          api-level: ${{ steps.avd.outputs.api }}
+          target: ${{ steps.avd.outputs.flavor }}
+          arch: ${{ steps.avd.outputs.abi }}
           force-avd-creation: false
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           disable-animations: false
@@ -203,14 +333,28 @@ jobs:
       - name: Integration tests on the emulator
         uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
         with:
-          api-level: 36
-          target: google_apis
-          arch: x86_64
+          api-level: ${{ steps.avd.outputs.api }}
+          target: ${{ steps.avd.outputs.flavor }}
+          arch: ${{ steps.avd.outputs.abi }}
           force-avd-creation: false
           emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           disable-animations: true
-          working-directory: app
-          script: flutter test integration_test -d emulator-5554
+          script: |
+            set -eo pipefail
+            (cd app && flutter build apk --debug --target-platform android-x64 --target lib/main.dart && ./android/gradlew -p android :app:assembleDebugAndroidTest -Ptarget-platform=android-x64 -Ptarget="$PWD/lib/main.dart")
+            sha256sum app/build/app/outputs/flutter-apk/app-debug.apk app/build/app/outputs/apk/androidTest/debug/app-debug-androidTest.apk
+            unzip -p app/build/app/outputs/flutter-apk/app-debug.apk lib/x86_64/libchat_ffi.so | sha256sum
+            adb -s emulator-5554 install -r app/build/app/outputs/flutter-apk/app-debug.apk
+            adb -s emulator-5554 install -r app/build/app/outputs/apk/androidTest/debug/app-debug-androidTest.apk
+            adb -s emulator-5554 shell am instrument -w -r -e class dev.chatproject.chat_app.AccountKeyStoreTest dev.chatproject.chat_app.test/androidx.test.runner.AndroidJUnitRunner | tee "$RUNNER_TEMP/native-worker.log"
+            python3 tools/ci/check_workflows.py --android-instrumentation "$RUNNER_TEMP/native-worker.log" full
+            # android-emulator-runner runs each script line in its own `sh -c`, so every loop must fit on one line.
+            set -e; for phase in write read; do adb -s emulator-5554 shell am instrument -w -r -e class dev.chatproject.chat_app.AccountKeyStoreTest#restartPersistence -e accountPhase "$phase" dev.chatproject.chat_app.test/androidx.test.runner.AndroidJUnitRunner | tee "$RUNNER_TEMP/native-restart-$phase.log"; python3 tools/ci/check_workflows.py --android-instrumentation "$RUNNER_TEMP/native-restart-$phase.log" "$phase"; done
+            set -e; for test in app/integration_test/*_test.dart; do case "$test" in *account_storage_test.dart|*message_test.dart|*release_contract_test.dart) continue ;; esac; (cd app && flutter test "${test#app/}" -d emulator-5554); done
+            set -e; for phase in write read locked missing read; do (cd app && flutter test integration_test/account_storage_test.dart -d emulator-5554 --no-uninstall --dart-define=ACCOUNT_STORAGE_PHASE="$phase" --dart-define=ACCOUNT_STORAGE_ROOT=/data/user/0/dev.chatproject.chat_app/files/ci-account-storage); done
+            set -e; for phase in write read; do (cd app && flutter test integration_test/message_test.dart -d emulator-5554 --no-uninstall --dart-define=MESSAGE_TEST_PHASE="$phase" --dart-define=MESSAGE_TEST_ROOT=/data/user/0/dev.chatproject.chat_app/no_backup/ci-message-storage); done
+            dart --packages=tools/e2e/.dart_tool/package_config.json tools/ci/release_smoke.dart --platform android --artifact "$RUNNER_TEMP/ordinary-release.apk" --serial emulator-5554
+            dart --packages=tools/e2e/.dart_tool/package_config.json tools/ci/release_smoke.dart --platform android --artifact "$RUNNER_TEMP/contract-release.apk" --serial emulator-5554 --contract-nonce "$RELEASE_CONTRACT_NONCE"
 
   ios:
     runs-on: macos-26
@@ -278,7 +422,11 @@ jobs:
         working-directory: app
         timeout-minutes: 15
         continue-on-error: true
-        run: flutter test integration_test/core_test.dart -d "${{ steps.sim.outputs.udid }}"
+        run: |
+          set -o pipefail
+          test "$CARGOKIT_TOOLCHAIN" = '1.92.0'
+          flutter test integration_test/core_test.dart -d "${{ steps.sim.outputs.udid }}" -v 2>&1 | tee "$RUNNER_TEMP/ios-debug.log"
+          grep -q "Running command rustup run ${CARGOKIT_TOOLCHAIN} cargo build" "$RUNNER_TEMP/ios-debug.log"
       - name: Integration tests on the simulator, second attempt
         id: tests2
         if: steps.tests.outcome != 'success'
@@ -303,6 +451,22 @@ jobs:
           pkill -f "log stream" || true
           xcrun simctl terminate "${{ steps.sim.outputs.udid }}" dev.chatproject.chatapp || true
           flutter test -v integration_test/core_test.dart -d "${{ steps.sim.outputs.udid }}"
+      - name: Account and privacy native simulator integration
+        working-directory: app
+        run: |
+          flutter test integration_test/account_test.dart -d "${{ steps.sim.outputs.udid }}" --no-uninstall
+          flutter test integration_test/account_privacy_test.dart -d "${{ steps.sim.outputs.udid }}" --no-uninstall
+          container="$(xcrun simctl get_app_container '${{ steps.sim.outputs.udid }}' dev.chatproject.chatapp data)"
+          for phase in write read locked missing read lifecycle; do
+            flutter test integration_test/account_storage_test.dart -d "${{ steps.sim.outputs.udid }}" --no-uninstall --dart-define=ACCOUNT_STORAGE_PHASE="$phase" --dart-define=ACCOUNT_STORAGE_ROOT="$container/Library/Application Support/ci-account-storage"
+          done
+      - name: Native message storage across simulator processes
+        working-directory: app
+        run: |
+          container="$(xcrun simctl get_app_container '${{ steps.sim.outputs.udid }}' dev.chatproject.chatapp data)"
+          for phase in write read; do
+            flutter test integration_test/message_test.dart -d "${{ steps.sim.outputs.udid }}" --no-uninstall --dart-define=MESSAGE_TEST_PHASE="$phase" --dart-define=MESSAGE_TEST_ROOT="$container/Library/Application Support/ci-message-storage"
+          done
       - name: Check the app and its extension (test build)
         run: bash tools/ci/check_ios_app.sh app/build/ios/iphonesimulator/Runner.app
       - name: Simulator diagnostics
@@ -359,6 +523,11 @@ jobs:
         working-directory: app
         run: |
           flutter pub get
-          flutter build ios --release --no-codesign
+          set -o pipefail
+          test "$CARGOKIT_TOOLCHAIN" = '1.92.0'
+          flutter build ios --release --no-codesign -v 2>&1 | tee "$RUNNER_TEMP/ios-release.log"
+          grep -q "Running command rustup run ${CARGOKIT_TOOLCHAIN} cargo build" "$RUNNER_TEMP/ios-release.log"
       - name: Check the app and its extension (device build)
+        env:
+          CHECK_RELEASE_HOOKS: '1'
         run: bash tools/ci/check_ios_app.sh app/build/ios/iphoneos/Runner.app

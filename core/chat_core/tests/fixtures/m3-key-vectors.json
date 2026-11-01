@@ -1,0 +1,28 @@
+{
+  "source": "https://raw.githubusercontent.com/trezor/python-mnemonic/master/vectors.json",
+  "derivation": "Independent Python stdlib HMAC-SHA256 RFC5869 and cryptography 50.0.2 Ed25519; no BIP39 PBKDF2",
+  "recovery": [
+    {
+      "entropy_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+      "words": "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art",
+      "identity_seed_hex": "3c5a13c879ac3255f7e9259772c0f6f0e8d8cac255d81a9ee81078da74fd6a01",
+      "identity_public_hex": "4b3d8b88512b99fb6e34d554c84ffeaa1a8e80e9d29b2b476e86343606d13236",
+      "peer_id": "jm6yxccrfom7w3ru2vkmqt76vini5ahj2knswr3oqy2dmbwrgi3a"
+    },
+    {
+      "entropy_hex": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "words": "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo vote",
+      "identity_seed_hex": "e51f68742fc7d862fa2d17511f03c1aba2eb28ea2834aa8e9bc081eaea89c36f",
+      "identity_public_hex": "85a73fbfbc942bb5b8b85f2774e83c67941f0e9c9e2ddd2be9a8ab56df623bb4",
+      "peer_id": "qwtt7p54sqv3lofyl4txj2b4m6kb6du4tyw52k7jvcvvnx3cho2a"
+    }
+  ],
+  "device": {
+    "seed_hex": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "transport_seed_hex": "5a57439114b6680ab0d408ea9a8c121f44b9808dfdbfd0038a305d91ef2e7d1c",
+    "installation_seed_hex": "074f0dc1fc5fe8dea217a5a8016f56d861d96d6e283ee85b30aa407ce10587c1",
+    "transport_public_hex": "9ad209f9766aedd07a7f49d4afbd69d2bdba8f8fc3afb825cc7beb5556efea35",
+    "installation_public_hex": "6330556de456a59e7fb51a70d2545e6ad2d094c6af378a1f08725226cfe56726",
+    "installation_id": "mmyfk3pek2sz475vdjynevc6nljnbfggv43yuhyiojjcnt7fm4ta"
+  }
+}

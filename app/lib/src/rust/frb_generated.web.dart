@@ -6,7 +6,9 @@
 // Static analysis wrongly picks the IO variant, thus ignore this
 // ignore_for_file: argument_type_not_assignable
 
+import 'api/account.dart';
 import 'api/chat.dart';
+import 'api/message.dart';
 import 'dart:async';
 import 'dart:convert';
 import 'frb_generated.dart';
@@ -30,13 +32,76 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   String dco_decode_String(dynamic raw);
 
   @protected
+  AccountPhase dco_decode_account_phase(dynamic raw);
+
+  @protected
+  AccountView dco_decode_account_view(dynamic raw);
+
+  @protected
+  BlockReason dco_decode_block_reason(dynamic raw);
+
+  @protected
   bool dco_decode_bool(dynamic raw);
+
+  @protected
+  AccountView dco_decode_box_account_view(dynamic raw);
+
+  @protected
+  BlockReason dco_decode_box_autoadd_block_reason(dynamic raw);
 
   @protected
   bool dco_decode_box_autoadd_bool(dynamic raw);
 
   @protected
+  ConversationCursor dco_decode_box_autoadd_conversation_cursor(dynamic raw);
+
+  @protected
+  DeviceKind dco_decode_box_autoadd_device_kind(dynamic raw);
+
+  @protected
+  ErrorCode dco_decode_box_autoadd_error_code(dynamic raw);
+
+  @protected
+  MessageCursor dco_decode_box_autoadd_message_cursor(dynamic raw);
+
+  @protected
+  MessageKey dco_decode_box_autoadd_message_key(dynamic raw);
+
+  @protected
+  MessageView dco_decode_box_autoadd_message_view(dynamic raw);
+
+  @protected
+  NetworkInfo dco_decode_box_autoadd_network_info(dynamic raw);
+
+  @protected
+  PairView dco_decode_box_autoadd_pair_view(dynamic raw);
+
+  @protected
+  PeerInfo dco_decode_box_autoadd_peer_info(dynamic raw);
+
+  @protected
+  RecordView dco_decode_box_autoadd_record_view(dynamic raw);
+
+  @protected
+  BigInt dco_decode_box_autoadd_u_64(dynamic raw);
+
+  @protected
+  CandidateInfo dco_decode_candidate_info(dynamic raw);
+
+  @protected
   ChatEvent dco_decode_chat_event(dynamic raw);
+
+  @protected
+  ContactView dco_decode_contact_view(dynamic raw);
+
+  @protected
+  ConversationCursor dco_decode_conversation_cursor(dynamic raw);
+
+  @protected
+  ConversationPage dco_decode_conversation_page(dynamic raw);
+
+  @protected
+  ConversationView dco_decode_conversation_view(dynamic raw);
 
   @protected
   CoreError dco_decode_core_error(dynamic raw);
@@ -45,19 +110,177 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   CoreInfo dco_decode_core_info(dynamic raw);
 
   @protected
+  DeliveryState dco_decode_delivery_state(dynamic raw);
+
+  @protected
+  DeviceKind dco_decode_device_kind(dynamic raw);
+
+  @protected
+  DeviceView dco_decode_device_view(dynamic raw);
+
+  @protected
   ErrorCode dco_decode_error_code(dynamic raw);
 
   @protected
   int dco_decode_i_32(dynamic raw);
 
   @protected
+  InvitePreview dco_decode_invite_preview(dynamic raw);
+
+  @protected
+  List<String> dco_decode_list_String(dynamic raw);
+
+  @protected
+  List<ContactView> dco_decode_list_contact_view(dynamic raw);
+
+  @protected
+  List<ConversationView> dco_decode_list_conversation_view(dynamic raw);
+
+  @protected
+  List<DeviceView> dco_decode_list_device_view(dynamic raw);
+
+  @protected
+  List<Uint8List> dco_decode_list_list_prim_u_8_strict(dynamic raw);
+
+  @protected
+  List<MessageKey> dco_decode_list_message_key(dynamic raw);
+
+  @protected
+  List<MessageView> dco_decode_list_message_view(dynamic raw);
+
+  @protected
+  List<PairResumeView> dco_decode_list_pair_resume_view(dynamic raw);
+
+  @protected
+  List<PeerInfo> dco_decode_list_peer_info(dynamic raw);
+
+  @protected
+  List<int> dco_decode_list_prim_u_8_loose(dynamic raw);
+
+  @protected
   Uint8List dco_decode_list_prim_u_8_strict(dynamic raw);
+
+  @protected
+  List<PublishIntent> dco_decode_list_publish_intent(dynamic raw);
+
+  @protected
+  List<RemoteRecordView> dco_decode_list_remote_record_view(dynamic raw);
+
+  @protected
+  List<RevocationView> dco_decode_list_revocation_view(dynamic raw);
+
+  @protected
+  MessageCursor dco_decode_message_cursor(dynamic raw);
+
+  @protected
+  MessageKey dco_decode_message_key(dynamic raw);
+
+  @protected
+  MessagePage dco_decode_message_page(dynamic raw);
+
+  @protected
+  MessageView dco_decode_message_view(dynamic raw);
+
+  @protected
+  NetworkInfo dco_decode_network_info(dynamic raw);
+
+  @protected
+  NetworkState dco_decode_network_state(dynamic raw);
+
+  @protected
+  String? dco_decode_opt_String(dynamic raw);
+
+  @protected
+  BlockReason? dco_decode_opt_box_autoadd_block_reason(dynamic raw);
 
   @protected
   bool? dco_decode_opt_box_autoadd_bool(dynamic raw);
 
   @protected
+  ConversationCursor? dco_decode_opt_box_autoadd_conversation_cursor(
+    dynamic raw,
+  );
+
+  @protected
+  DeviceKind? dco_decode_opt_box_autoadd_device_kind(dynamic raw);
+
+  @protected
+  ErrorCode? dco_decode_opt_box_autoadd_error_code(dynamic raw);
+
+  @protected
+  MessageCursor? dco_decode_opt_box_autoadd_message_cursor(dynamic raw);
+
+  @protected
+  MessageView? dco_decode_opt_box_autoadd_message_view(dynamic raw);
+
+  @protected
+  PairView? dco_decode_opt_box_autoadd_pair_view(dynamic raw);
+
+  @protected
+  RecordView? dco_decode_opt_box_autoadd_record_view(dynamic raw);
+
+  @protected
+  BigInt? dco_decode_opt_box_autoadd_u_64(dynamic raw);
+
+  @protected
+  Uint8List? dco_decode_opt_list_prim_u_8_strict(dynamic raw);
+
+  @protected
+  PairDirection dco_decode_pair_direction(dynamic raw);
+
+  @protected
+  PairDisplay dco_decode_pair_display(dynamic raw);
+
+  @protected
+  PairPhase dco_decode_pair_phase(dynamic raw);
+
+  @protected
+  PairResumeView dco_decode_pair_resume_view(dynamic raw);
+
+  @protected
+  PairRole dco_decode_pair_role(dynamic raw);
+
+  @protected
+  PairView dco_decode_pair_view(dynamic raw);
+
+  @protected
+  PeerInfo dco_decode_peer_info(dynamic raw);
+
+  @protected
+  PeerPath dco_decode_peer_path(dynamic raw);
+
+  @protected
+  PeerPhase dco_decode_peer_phase(dynamic raw);
+
+  @protected
+  PublicationState dco_decode_publication_state(dynamic raw);
+
+  @protected
+  PublicationView dco_decode_publication_view(dynamic raw);
+
+  @protected
+  PublishIntent dco_decode_publish_intent(dynamic raw);
+
+  @protected
+  RecordView dco_decode_record_view(dynamic raw);
+
+  @protected
+  RecoveryDisplay dco_decode_recovery_display(dynamic raw);
+
+  @protected
+  RemoteRecordView dco_decode_remote_record_view(dynamic raw);
+
+  @protected
+  RevocationView dco_decode_revocation_view(dynamic raw);
+
+  @protected
+  SafetyDisplay dco_decode_safety_display(dynamic raw);
+
+  @protected
   int dco_decode_u_32(dynamic raw);
+
+  @protected
+  BigInt dco_decode_u_64(dynamic raw);
 
   @protected
   int dco_decode_u_8(dynamic raw);
@@ -77,13 +300,82 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   String sse_decode_String(SseDeserializer deserializer);
 
   @protected
+  AccountPhase sse_decode_account_phase(SseDeserializer deserializer);
+
+  @protected
+  AccountView sse_decode_account_view(SseDeserializer deserializer);
+
+  @protected
+  BlockReason sse_decode_block_reason(SseDeserializer deserializer);
+
+  @protected
   bool sse_decode_bool(SseDeserializer deserializer);
+
+  @protected
+  AccountView sse_decode_box_account_view(SseDeserializer deserializer);
+
+  @protected
+  BlockReason sse_decode_box_autoadd_block_reason(SseDeserializer deserializer);
 
   @protected
   bool sse_decode_box_autoadd_bool(SseDeserializer deserializer);
 
   @protected
+  ConversationCursor sse_decode_box_autoadd_conversation_cursor(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  DeviceKind sse_decode_box_autoadd_device_kind(SseDeserializer deserializer);
+
+  @protected
+  ErrorCode sse_decode_box_autoadd_error_code(SseDeserializer deserializer);
+
+  @protected
+  MessageCursor sse_decode_box_autoadd_message_cursor(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  MessageKey sse_decode_box_autoadd_message_key(SseDeserializer deserializer);
+
+  @protected
+  MessageView sse_decode_box_autoadd_message_view(SseDeserializer deserializer);
+
+  @protected
+  NetworkInfo sse_decode_box_autoadd_network_info(SseDeserializer deserializer);
+
+  @protected
+  PairView sse_decode_box_autoadd_pair_view(SseDeserializer deserializer);
+
+  @protected
+  PeerInfo sse_decode_box_autoadd_peer_info(SseDeserializer deserializer);
+
+  @protected
+  RecordView sse_decode_box_autoadd_record_view(SseDeserializer deserializer);
+
+  @protected
+  BigInt sse_decode_box_autoadd_u_64(SseDeserializer deserializer);
+
+  @protected
+  CandidateInfo sse_decode_candidate_info(SseDeserializer deserializer);
+
+  @protected
   ChatEvent sse_decode_chat_event(SseDeserializer deserializer);
+
+  @protected
+  ContactView sse_decode_contact_view(SseDeserializer deserializer);
+
+  @protected
+  ConversationCursor sse_decode_conversation_cursor(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  ConversationPage sse_decode_conversation_page(SseDeserializer deserializer);
+
+  @protected
+  ConversationView sse_decode_conversation_view(SseDeserializer deserializer);
 
   @protected
   CoreError sse_decode_core_error(SseDeserializer deserializer);
@@ -92,19 +384,201 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   CoreInfo sse_decode_core_info(SseDeserializer deserializer);
 
   @protected
+  DeliveryState sse_decode_delivery_state(SseDeserializer deserializer);
+
+  @protected
+  DeviceKind sse_decode_device_kind(SseDeserializer deserializer);
+
+  @protected
+  DeviceView sse_decode_device_view(SseDeserializer deserializer);
+
+  @protected
   ErrorCode sse_decode_error_code(SseDeserializer deserializer);
 
   @protected
   int sse_decode_i_32(SseDeserializer deserializer);
 
   @protected
+  InvitePreview sse_decode_invite_preview(SseDeserializer deserializer);
+
+  @protected
+  List<String> sse_decode_list_String(SseDeserializer deserializer);
+
+  @protected
+  List<ContactView> sse_decode_list_contact_view(SseDeserializer deserializer);
+
+  @protected
+  List<ConversationView> sse_decode_list_conversation_view(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  List<DeviceView> sse_decode_list_device_view(SseDeserializer deserializer);
+
+  @protected
+  List<Uint8List> sse_decode_list_list_prim_u_8_strict(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  List<MessageKey> sse_decode_list_message_key(SseDeserializer deserializer);
+
+  @protected
+  List<MessageView> sse_decode_list_message_view(SseDeserializer deserializer);
+
+  @protected
+  List<PairResumeView> sse_decode_list_pair_resume_view(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  List<PeerInfo> sse_decode_list_peer_info(SseDeserializer deserializer);
+
+  @protected
+  List<int> sse_decode_list_prim_u_8_loose(SseDeserializer deserializer);
+
+  @protected
   Uint8List sse_decode_list_prim_u_8_strict(SseDeserializer deserializer);
+
+  @protected
+  List<PublishIntent> sse_decode_list_publish_intent(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  List<RemoteRecordView> sse_decode_list_remote_record_view(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  List<RevocationView> sse_decode_list_revocation_view(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  MessageCursor sse_decode_message_cursor(SseDeserializer deserializer);
+
+  @protected
+  MessageKey sse_decode_message_key(SseDeserializer deserializer);
+
+  @protected
+  MessagePage sse_decode_message_page(SseDeserializer deserializer);
+
+  @protected
+  MessageView sse_decode_message_view(SseDeserializer deserializer);
+
+  @protected
+  NetworkInfo sse_decode_network_info(SseDeserializer deserializer);
+
+  @protected
+  NetworkState sse_decode_network_state(SseDeserializer deserializer);
+
+  @protected
+  String? sse_decode_opt_String(SseDeserializer deserializer);
+
+  @protected
+  BlockReason? sse_decode_opt_box_autoadd_block_reason(
+    SseDeserializer deserializer,
+  );
 
   @protected
   bool? sse_decode_opt_box_autoadd_bool(SseDeserializer deserializer);
 
   @protected
+  ConversationCursor? sse_decode_opt_box_autoadd_conversation_cursor(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  DeviceKind? sse_decode_opt_box_autoadd_device_kind(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  ErrorCode? sse_decode_opt_box_autoadd_error_code(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  MessageCursor? sse_decode_opt_box_autoadd_message_cursor(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  MessageView? sse_decode_opt_box_autoadd_message_view(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  PairView? sse_decode_opt_box_autoadd_pair_view(SseDeserializer deserializer);
+
+  @protected
+  RecordView? sse_decode_opt_box_autoadd_record_view(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  BigInt? sse_decode_opt_box_autoadd_u_64(SseDeserializer deserializer);
+
+  @protected
+  Uint8List? sse_decode_opt_list_prim_u_8_strict(SseDeserializer deserializer);
+
+  @protected
+  PairDirection sse_decode_pair_direction(SseDeserializer deserializer);
+
+  @protected
+  PairDisplay sse_decode_pair_display(SseDeserializer deserializer);
+
+  @protected
+  PairPhase sse_decode_pair_phase(SseDeserializer deserializer);
+
+  @protected
+  PairResumeView sse_decode_pair_resume_view(SseDeserializer deserializer);
+
+  @protected
+  PairRole sse_decode_pair_role(SseDeserializer deserializer);
+
+  @protected
+  PairView sse_decode_pair_view(SseDeserializer deserializer);
+
+  @protected
+  PeerInfo sse_decode_peer_info(SseDeserializer deserializer);
+
+  @protected
+  PeerPath sse_decode_peer_path(SseDeserializer deserializer);
+
+  @protected
+  PeerPhase sse_decode_peer_phase(SseDeserializer deserializer);
+
+  @protected
+  PublicationState sse_decode_publication_state(SseDeserializer deserializer);
+
+  @protected
+  PublicationView sse_decode_publication_view(SseDeserializer deserializer);
+
+  @protected
+  PublishIntent sse_decode_publish_intent(SseDeserializer deserializer);
+
+  @protected
+  RecordView sse_decode_record_view(SseDeserializer deserializer);
+
+  @protected
+  RecoveryDisplay sse_decode_recovery_display(SseDeserializer deserializer);
+
+  @protected
+  RemoteRecordView sse_decode_remote_record_view(SseDeserializer deserializer);
+
+  @protected
+  RevocationView sse_decode_revocation_view(SseDeserializer deserializer);
+
+  @protected
+  SafetyDisplay sse_decode_safety_display(SseDeserializer deserializer);
+
+  @protected
   int sse_decode_u_32(SseDeserializer deserializer);
+
+  @protected
+  BigInt sse_decode_u_64(SseDeserializer deserializer);
 
   @protected
   int sse_decode_u_8(SseDeserializer deserializer);
@@ -128,13 +602,118 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_String(String self, SseSerializer serializer);
 
   @protected
+  void sse_encode_account_phase(AccountPhase self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_account_view(AccountView self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_block_reason(BlockReason self, SseSerializer serializer);
+
+  @protected
   void sse_encode_bool(bool self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_box_account_view(AccountView self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_box_autoadd_block_reason(
+    BlockReason self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_box_autoadd_bool(bool self, SseSerializer serializer);
 
   @protected
+  void sse_encode_box_autoadd_conversation_cursor(
+    ConversationCursor self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_box_autoadd_device_kind(
+    DeviceKind self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_box_autoadd_error_code(
+    ErrorCode self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_box_autoadd_message_cursor(
+    MessageCursor self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_box_autoadd_message_key(
+    MessageKey self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_box_autoadd_message_view(
+    MessageView self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_box_autoadd_network_info(
+    NetworkInfo self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_box_autoadd_pair_view(
+    PairView self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_box_autoadd_peer_info(
+    PeerInfo self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_box_autoadd_record_view(
+    RecordView self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_box_autoadd_u_64(BigInt self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_candidate_info(CandidateInfo self, SseSerializer serializer);
+
+  @protected
   void sse_encode_chat_event(ChatEvent self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_contact_view(ContactView self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_conversation_cursor(
+    ConversationCursor self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_conversation_page(
+    ConversationPage self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_conversation_view(
+    ConversationView self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_core_error(CoreError self, SseSerializer serializer);
@@ -143,10 +722,73 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_core_info(CoreInfo self, SseSerializer serializer);
 
   @protected
+  void sse_encode_delivery_state(DeliveryState self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_device_kind(DeviceKind self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_device_view(DeviceView self, SseSerializer serializer);
+
+  @protected
   void sse_encode_error_code(ErrorCode self, SseSerializer serializer);
 
   @protected
   void sse_encode_i_32(int self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_invite_preview(InvitePreview self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_list_String(List<String> self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_list_contact_view(
+    List<ContactView> self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_list_conversation_view(
+    List<ConversationView> self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_list_device_view(
+    List<DeviceView> self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_list_list_prim_u_8_strict(
+    List<Uint8List> self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_list_message_key(
+    List<MessageKey> self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_list_message_view(
+    List<MessageView> self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_list_pair_resume_view(
+    List<PairResumeView> self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_list_peer_info(List<PeerInfo> self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_list_prim_u_8_loose(List<int> self, SseSerializer serializer);
 
   @protected
   void sse_encode_list_prim_u_8_strict(
@@ -155,10 +797,178 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_list_publish_intent(
+    List<PublishIntent> self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_list_remote_record_view(
+    List<RemoteRecordView> self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_list_revocation_view(
+    List<RevocationView> self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_message_cursor(MessageCursor self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_message_key(MessageKey self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_message_page(MessagePage self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_message_view(MessageView self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_network_info(NetworkInfo self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_network_state(NetworkState self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_opt_String(String? self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_opt_box_autoadd_block_reason(
+    BlockReason? self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_opt_box_autoadd_bool(bool? self, SseSerializer serializer);
 
   @protected
+  void sse_encode_opt_box_autoadd_conversation_cursor(
+    ConversationCursor? self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_opt_box_autoadd_device_kind(
+    DeviceKind? self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_opt_box_autoadd_error_code(
+    ErrorCode? self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_opt_box_autoadd_message_cursor(
+    MessageCursor? self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_opt_box_autoadd_message_view(
+    MessageView? self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_opt_box_autoadd_pair_view(
+    PairView? self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_opt_box_autoadd_record_view(
+    RecordView? self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_opt_box_autoadd_u_64(BigInt? self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_opt_list_prim_u_8_strict(
+    Uint8List? self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_pair_direction(PairDirection self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_pair_display(PairDisplay self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_pair_phase(PairPhase self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_pair_resume_view(
+    PairResumeView self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_pair_role(PairRole self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_pair_view(PairView self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_peer_info(PeerInfo self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_peer_path(PeerPath self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_peer_phase(PeerPhase self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_publication_state(
+    PublicationState self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_publication_view(
+    PublicationView self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_publish_intent(PublishIntent self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_record_view(RecordView self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_recovery_display(
+    RecoveryDisplay self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_remote_record_view(
+    RemoteRecordView self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_revocation_view(
+    RevocationView self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_safety_display(SafetyDisplay self, SseSerializer serializer);
+
+  @protected
   void sse_encode_u_32(int self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_u_64(BigInt self, SseSerializer serializer);
 
   @protected
   void sse_encode_u_8(int self, SseSerializer serializer);

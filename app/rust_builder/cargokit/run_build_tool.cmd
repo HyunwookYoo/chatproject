@@ -74,18 +74,26 @@ If %ERRORLEVEL% neq 0 (
 )
 
 REM There is no CUR_PACKAGE_INFO it was renamed in previous step to %PREV_PACKAGE_INFO%
-REM which means  we need to do pub get and precompile
-if not exist "%PRECOMPILED%" (
-    echo Running pub get in "%cd%"
-    "%DART%" pub get --no-precompile
-    "%DART%" compile kernel bin/build_tool_runner.dart
-)
+REM which means we need to do pub get and precompile.
+if exist "%PRECOMPILED%" goto run_precompiled
 
+echo Running pub get in "%cd%"
+call :prepare_kernel
+if %ERRORLEVEL% neq 0 exit /b %ERRORLEVEL%
+
+:run_precompiled
 "%DART%" "%PRECOMPILED%" %*
+set "CARGOKIT_BUILD_EXIT=%ERRORLEVEL%"
 
-REM 253 means invalid snapshot version.
-If %ERRORLEVEL% equ 253 (
-    "%DART%" pub get --no-precompile
-    "%DART%" compile kernel bin/build_tool_runner.dart
-    "%DART%" "%PRECOMPILED%" %*
-)
+REM 253 means invalid snapshot version. Recompile and retry once only.
+if %CARGOKIT_BUILD_EXIT% neq 253 exit /b %CARGOKIT_BUILD_EXIT%
+call :prepare_kernel
+if %ERRORLEVEL% neq 0 exit /b %ERRORLEVEL%
+"%DART%" "%PRECOMPILED%" %*
+exit /b %ERRORLEVEL%
+
+:prepare_kernel
+"%DART%" pub get --no-precompile
+if %ERRORLEVEL% neq 0 exit /b %ERRORLEVEL%
+"%DART%" compile kernel bin/build_tool_runner.dart
+exit /b %ERRORLEVEL%

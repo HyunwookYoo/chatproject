@@ -61,6 +61,17 @@ void main() {
     expect(find.text('코어를 시작하지 못했어요 · invalidConfig'), findsOneWidget);
   });
 
+  testWidgets('stream failure and completion have their own visible status', (tester) async {
+    final core = await pumpHome(tester);
+    core.controller.addError(StateError('stream failed'), StackTrace.current);
+    await tester.pumpAndSettle();
+    expect(find.textContaining('이벤트를 받지 못했어요'), findsOneWidget);
+    expect(find.textContaining('코어를 시작하지 못했어요'), findsNothing);
+    unawaited(core.controller.close());
+    await tester.pumpAndSettle();
+    expect(find.textContaining('이벤트 스트림이 종료됐어요'), findsOneWidget);
+  });
+
   test('connection labels', () {
     expect(connectionLabel(const ChatEvent_ConnectionState(directPeers: 0, mailboxOk: false)), '연결 없음');
     expect(connectionLabel(const ChatEvent_ConnectionState(directPeers: 0, mailboxOk: true)), '메일박스 연결됨');

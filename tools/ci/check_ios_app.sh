@@ -82,6 +82,35 @@ grep -q frb_get_rust_content_hash "$work/chat_ffi.syms" \
   || fail "chat_ffi lost its flutter_rust_bridge symbols in this build"
 echo "chat_ffi exports frb_get_rust_content_hash"
 
+# These SystemConfiguration families are public on macOS but SPI on iOS.
+# Check final imports: force-loading Rust can retain otherwise-unused dependency code.
+nm -u "$ffi" > "$work/chat_ffi.imports" \
+  || fail "cannot read the imported symbols of chat_ffi.framework"
+if grep -Eq '(^|[[:space:]])_(SCDynamicStore|SCPreferences|SCNetworkInterface|SCNetworkService|SCNetworkSet|kSC)' "$work/chat_ffi.imports"; then
+  fail "chat_ffi imports macOS-only SystemConfiguration APIs on iOS"
+fi
+otool -L "$ffi" > "$work/chat_ffi.links" \
+  || fail "cannot read the linked libraries of chat_ffi.framework"
+grep -Eq '^[[:space:]]+/System/Library/Frameworks/Network\.framework/Network([[:space:]]|$)' "$work/chat_ffi.links" \
+  || fail "chat_ffi must link the public Network.framework"
+echo "chat_ffi uses public Network.framework without macOS-only SystemConfiguration imports"
+# Static provider evidence complements, but never replaces, the native SQL query.
+# SQLCipher 4.14's CommonCrypto provider calls CCHmacInit/Update/Final, never CCHmac itself.
+grep -Eq '(^|[[:space:]])_CCHmacInit([[:space:]]|$)' "$work/chat_ffi.imports" \
+  || fail "chat_ffi must import the SQLCipher CommonCrypto provider"
+if grep -Eq '/libsqlite3([.][0-9]+)*[.]dylib([[:space:]]|$)' "$work/chat_ffi.links"; then
+  fail "chat_ffi links ordinary SQLite instead of only the bundled SQLCipher engine"
+fi
+echo "CommonCrypto import present; SQL runtime and lifecycle handle closure require native tests"
+
+
+# The simulator integration build deliberately contains Debug controllers.
+# Device Release and signed exports must scan all native app/extension members.
+if [ "$signed" = true ] || [ "${CHECK_RELEASE_HOOKS:-0}" = 1 ]; then
+  python3 "$(dirname "$0")/check_release_hooks.py" "$app" \
+    || fail "Release app contains test hooks or is missing native artifacts"
+fi
+
 if [ "$signed" = true ]; then
   # codesign has warned since macOS 12 that the `--entitlements :-` form is deprecated and will stop
   # working, so ask for XML with --xml. Its stderr holds `Executable=<path>` and warnings, no secrets;

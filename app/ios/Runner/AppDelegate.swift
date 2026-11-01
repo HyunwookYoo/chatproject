@@ -4,6 +4,18 @@ import UserNotifications
 
 @main
 @objc class AppDelegate: FlutterAppDelegate, FlutterImplicitEngineDelegate {
+  static var invitationChannel: FlutterMethodChannel?
+  static var pendingInvitation: String?
+  static func receiveInvitation(_ url: URL) {
+    let text = url.absoluteString
+    guard text.hasPrefix("chatproject:identity-invite/") else { return }
+    pendingInvitation = text
+    invitationChannel?.invokeMethod("identityInvite", arguments: text) { result in
+      if result as? Bool == true, pendingInvitation == text {
+        pendingInvitation = nil
+      }
+    }
+  }
   /// Hex APNs device token for the M1b probe screen, set once iOS registers the app.
   private var apnsToken: String?
   /// Why iOS could not register the app, for the probe screen: TestFlight has no console to read it from.
@@ -15,12 +27,35 @@ import UserNotifications
     _ application: UIApplication,
     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
   ) -> Bool {
+    // Before the Flutter engine starts, so Dart cannot open account storage without the Keychain.
+    _ = cp_key_register(cpKeyProtect, cpKeyUnprotect, cpKeyDelete)
     return super.application(application, didFinishLaunchingWithOptions: launchOptions)
   }
 
   func didInitializeImplicitFlutterEngine(_ engineBridge: FlutterImplicitEngineBridge) {
     GeneratedPluginRegistrant.register(with: engineBridge.pluginRegistry)
     guard let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "ChatProbe") else { return }
+    let accountChannel = FlutterMethodChannel(name: "chat_app/account_storage", binaryMessenger: registrar.messenger())
+    Self.invitationChannel = accountChannel
+    accountChannel.setMethodCallHandler { call, result in
+      switch call.method {
+      case "takeIdentityInvite":
+        result(Self.pendingInvitation)
+        Self.pendingInvitation = nil
+      case "storageRoot":
+        do {
+          let args = call.arguments as? [String: Any]
+          result(try AccountStorage.root(existing: args?["existing"] as? String))
+        } catch { result(FlutterError(code: "storage_unavailable", message: "계정 저장 공간을 열 수 없어요.", details: nil)) }
+      case "setSensitiveScreen":
+        guard let sensitive = call.arguments as? Bool else {
+          result(FlutterError(code: "invalid_argument", message: nil, details: nil)); return
+        }
+        SceneDelegate.setSensitiveScreen(sensitive)
+        result(nil)
+      default: result(FlutterMethodNotImplemented)
+      }
+    }
     let channel = FlutterMethodChannel(name: "chat_app/ios_probe", binaryMessenger: registrar.messenger())
     channel.setMethodCallHandler { [weak self] call, result in
       switch call.method {

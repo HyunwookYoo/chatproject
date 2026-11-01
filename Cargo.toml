@@ -1,5 +1,15 @@
 [workspace]
 resolver = "3"
-members = ["core/chat_core", "core/chat_nse", "app/rust", "tools/uniffi-bindgen", "tools/nse_fixture"]
+members = ["core/chat_core", "core/chat_nse", "app/rust", "tools/uniffi-bindgen", "tools/nse_fixture", "tools/chat_node"]
 # Spikes are separate experiments with their own Cargo.lock.
-exclude = ["spikes/a-connectivity", "spikes/b-mls-memory", "spikes/c-push/apns-probe"]
+exclude = ["spikes/a-connectivity", "spikes/b-mls-memory", "spikes/c-push/apns-probe", "vendor/iroh-dns", "vendor/netwatch"]
+
+[patch.crates-io]
+iroh-dns = { path = "vendor/iroh-dns" }
+netwatch = { path = "vendor/netwatch" }
+
+[profile.test.package.curve25519-dalek]
+opt-level = 3
+
+[profile.test.package.ed25519-dalek]
+opt-level = 3

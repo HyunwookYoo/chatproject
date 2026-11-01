@@ -1,6 +1,6 @@
 # M2 iroh Transport Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. 실행 방식은 사용자가 계획을 검토한 뒤 선택한다.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. 승인 후 실행된 계획이며 현재 상태는 아래 검증 기록을 따른다.
 
 **Goal:** Windows·Android·iOS 전경에서 개발용 문자열을 주고받고, 연결 경로와 복귀를 실제 기기 및 격리된 자동 시험으로 확인한다.
 
@@ -8,9 +8,9 @@
 
 **Tech Stack:** Rust 1.92.0, Flutter 3.44.6, FRB 2.11.1, UniFFI 0.32.2, iroh/iroh-relay 1.3.0, Mainline lookup 0.6.0, iroh-tickets 1.0.0, Tokio, Dart의 HttpServer/WebSocket.
 
-**Spec:** [승인된 M2 설계](../specs/2026-10-12-m2-iroh-transport-design.md). 승인 날짜는 한국 시간 2026-10-13이다. 이 계획은 아직 실행하지 않았다. 아래 PASS는 실행 시 기대 결과이며 현재 검증 결과가 아니다.
+**Spec:** [승인된 M2 설계](../specs/2026-10-12-m2-iroh-transport-design.md). 승인 날짜는 한국 시간 2026-10-13이다. 아래 작업별 PASS는 계획 당시 기대 결과이며 실제 실행 판정은 [현재 검증 결과](../results/2026-10-16-m2-transport.md)를 따른다.
 
-**Status:** 설계 승인 완료. 이 구현 계획은 사용자 검토와 실행 방식 선택을 기다린다.
+**Status (2026-10-17):** Tasks1–12/Task13 코드 지적 수정·7a 두 야간 확인 뒤 exact06d 일반 CI9/9로 native 게이트를 확인했으며 Task14는 진행 중이다. 과거7a90분 취소 원인은 미확정이다. 일반 EE Phase A의 ID-only/DNS·새 본문과 실제 재시작/newID/수동새ticket·새 본문은 확인했으나 과거 DHT 원인·신뢰성 한계는 남는다. B 두 진단/추정 RTT와 v3 단일521/676 ms를 별도 보존하며 v3 반복은 종료했다. 승인된 signed TestFlight build2·iPhone 짧은 양방향 부분 관찰은 확보했다. 엄격500 ms 수용 판단, iPhone 전경 증거 한계/LAN 거절·복구, signed chat_ffi 직접 Rust 실행 로그, 최종 전체 검토·통합은 남는다. global networkTimeout은 원인 미귀속 관찰이며 수정 주장·새 수용 조건으로 삼지 않는다. 폰 released·소유 v3/ordinary Windows 협력 종료 뒤 추가 상태를 가정하지 않는다. [현재 결과](../results/2026-10-16-m2-transport.md)와 [39개 대조표](2026-10-13-m2-carry-forward.md)를 참조한다. M2 완료 선언이 아니다.
 
 ## Global Constraints
 
@@ -720,4 +720,4 @@ env:
 
 ## 계획 자체 검토 기록
 
-이 절은 구현 완료 체크가 아니다. 승인 설계 각 절과 M1a28개/M1b11개를 위 표로 대조했다. 14개 작업에 Files/Interfaces와 실패→구현→성공 단계를 넣고 링크·코드 fence·미정 표식을 검사했다. 검토 중 수정한 항목은 Local integration test의 feature 조건, control-ready를 기다리는 비동기 bootstrap, core instance별 순번 보존, Release 자동 시험의 공용망 부작용 제거, 동일 시계의 실제 연결 측정값이다. codegen 실제 출력도 `flutter_rust_bridge_codegen 2.11.1`로 확인했다. 구현·시험 코드는 아직 실행하지 않았다. 현재 계획의 남은 실행 의존성은 M1b 기준 통합, 사용자의 계획 검토와 실행 방식 선택, 실제 기기와 macOS/CI 실행 환경이다.
+이 절은 구현 완료 체크가 아니다. 승인 설계 각 절과 M1a28개/M1b11개를 위 표로 대조했다. 14개 작업에 Files/Interfaces와 실패→구현→성공 단계를 넣고 링크·코드 fence·미정 표식을 검사했다. 검토 중 수정한 항목은 Local integration test의 feature 조건, control-ready를 기다리는 비동기 bootstrap, core instance별 순번 보존, Release 자동 시험의 공용망 부작용 제거, 동일 시계의 실제 연결 측정값이다. codegen 실제 출력도 `flutter_rust_bridge_codegen 2.11.1`로 확인했다. 이 문단의 검토는 계획 작성 시점의 기록이다. 이후 구현·실행 결과와 잔여 의존성은 문서 머리의 2026-10-17 상태 및 연결된 결과/인계 문서를 따른다. 계획 승인과 코드 지적 수정은 전체 브랜치 최종 검토·실제 기기 검증의 완료를 뜻하지 않는다.

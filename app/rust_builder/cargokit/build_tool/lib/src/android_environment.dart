@@ -150,13 +150,17 @@ class AndroidEnvironment {
     final toolTempDir =
         Platform.environment['CARGOKIT_TOOL_TEMP_DIR'] ?? targetTempDir;
 
+    // Unix make shells interpret Windows backslashes as escapes.
+    String makeToolPath(String value) =>
+        Platform.isWindows ? value.replaceAll('\\', '/') : value;
+
     return {
-      arKey: arValue,
-      ccKey: ccValue,
+      arKey: makeToolPath(arValue),
+      ccKey: makeToolPath(ccValue),
       cfFlagsKey: cFlagsValue,
-      cxxKey: cxxValue,
+      cxxKey: makeToolPath(cxxValue),
       cxxFlagsKey: cxxFlagsValue,
-      ranlibKey: ranlibValue,
+      ranlibKey: makeToolPath(ranlibValue),
       rustFlagsKey: rustFlagsValue,
       linkerKey: selfPath,
       // Recognized by main() so we know when we're acting as a wrapper

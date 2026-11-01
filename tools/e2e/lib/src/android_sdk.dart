@@ -1,4 +1,6 @@
 import 'dart:io';
+import 'dart:convert';
+import 'dart:isolate';
 
 import 'package:path/path.dart' as p;
 
@@ -22,6 +24,26 @@ class AndroidSdk {
 
   String get adb => p.join(root, 'platform-tools', windows ? 'adb.exe' : 'adb');
   String get emulator => p.join(root, 'emulator', windows ? 'emulator.exe' : 'emulator');
+  String get avdmanager => p.join(root, 'cmdline-tools', 'latest', 'bin', windows ? 'avdmanager.bat' : 'avdmanager');
+  String systemImage(AvdConfig config) => p.join(root, 'system-images', 'android-${config.api}', config.flavor, config.abi);
+}
+
+/// The checked-in image selection is shared by creation and config validation.
+class AvdConfig {
+  AvdConfig({required this.api, required this.flavor, required this.abi});
+
+  factory AvdConfig.load({bool? ci}) {
+    final source = Isolate.resolvePackageUriSync(Uri.parse('package:chat_e2e/src/android_sdk.dart'))!;
+    final file = File.fromUri(source.resolve('../../avd_config.json'));
+    final profile = (ci ?? Platform.environment['CI'] == 'true') ? 'ci' : 'local';
+    final data = (jsonDecode(file.readAsStringSync()) as Map<String, dynamic>)[profile] as Map<String, dynamic>;
+    return AvdConfig(api: data['api'] as int, flavor: data['flavor'] as String, abi: data['abi'] as String);
+  }
+
+  final int api;
+  final String flavor;
+  final String abi;
+  String get package => 'system-images;android-$api;$flavor;$abi';
 }
 
 /// Folder that holds `<name>.avd` folders: ANDROID_AVD_HOME, ANDROID_USER_HOME/avd,

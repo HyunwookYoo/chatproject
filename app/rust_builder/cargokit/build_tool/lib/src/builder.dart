@@ -137,10 +137,13 @@ class RustBuilder {
 
   /// ChatProject: CARGOKIT_TOOLCHAIN pins the toolchain to rust-toolchain.toml's channel.
   /// Upstream cargokit always builds with `stable` unless cargokit.yaml says otherwise.
-  String get _toolchain =>
-      Platform.environment['CARGOKIT_TOOLCHAIN'] ??
-      _buildOptions?.toolchain.name ??
-      'stable';
+  String get _toolchain {
+    final override = Platform.environment['CARGOKIT_TOOLCHAIN'];
+    if (override != null && override.isEmpty) {
+      throw StateError('CARGOKIT_TOOLCHAIN must not be empty');
+    }
+    return override ?? _buildOptions?.toolchain.name ?? 'stable';
+  }
 
   /// Returns the path of directory containing build artifacts.
   Future<String> build() async {
@@ -153,6 +156,7 @@ class RustBuilder {
         _toolchain,
         'cargo',
         'build',
+        '--locked',
         ...extraArgs,
         '--manifest-path',
         manifestPath,

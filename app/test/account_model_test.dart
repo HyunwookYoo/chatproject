@@ -1,0 +1,264 @@
+import 'dart:async';
+import 'dart:typed_data';
+import 'package:chat_app/account/account_client.dart';
+import 'package:chat_app/account/account_model.dart';
+import 'package:chat_app/src/rust/api/account.dart' as account;
+import 'package:chat_app/src/rust/api/chat.dart' as rust;
+import 'package:flutter/foundation.dart' show debugPrint;
+import 'package:flutter_test/flutter_test.dart';
+
+account.AccountView view(
+  BigInt revision, {
+  account.AccountPhase phase = account.AccountPhase.unconfigured,
+}) => account.AccountView(
+  revision: revision,
+  phase: phase,
+  devices: [],
+  contacts: [],
+  remoteRecords: [],
+  publishIntents: [],
+  publication: account.PublicationView(
+    canRepublishAccepted: false,
+    state: account.PublicationState.localBlocked,
+    observedSeq: BigInt.zero,
+    allocatedSeq: BigInt.zero,
+    tombstones: [],
+    pendingCount: 0,
+    pendingNotifications: [],
+  ),
+  disclosurePossible: false,
+  pendingPairTransactions: [],
+  pairResumes: [],
+  pendingImportRequiresRemoteRevoke: false,
+);
+
+class FakeAccountClient implements AccountClient {
+  final controller = StreamController<rust.ChatEvent>.broadcast(sync: true);
+  Future<account.AccountView>? delayed;
+  final secret = Completer<account.RecoveryDisplay>();
+  int begins = 0;
+  final republishedHashes = <List<int>>[];
+  Completer<void>? republishWait;
+  @override
+  Future<void> republishAcceptedRecord(List<int> acceptedHash) async {
+    republishedHashes.add(List.of(acceptedHash));
+    await republishWait?.future;
+    if (commandError != null) throw commandError!;
+  }
+
+  Object? openError;
+  Object? commandError;
+  @override
+  Future<account.CandidateInfo> prepareCandidate() async {
+    throw commandError!;
+  }
+
+  @override
+  Future<account.AccountView> retryOpen() => snapshot();
+  @override
+  Stream<rust.ChatEvent> events() => controller.stream;
+  @override
+  Future<void> openAccount() async {
+    if (openError != null) throw openError!;
+  }
+
+  @override
+  Future<account.AccountView> snapshot() =>
+      delayed ?? Future.value(view(BigInt.one));
+  @override
+  Future<account.RecoveryDisplay> beginCreate() {
+    begins++;
+    return secret.future;
+  }
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
+
+void main() {
+  test(
+    'republish command is once-only while busy and late close never succeeds',
+    () async {
+      final client = FakeAccountClient()..republishWait = Completer<void>();
+      final model = AccountModel(client);
+      await model.open();
+      final hash = List<int>.filled(32, 7);
+      final pending = model.republishAcceptedRecord(hash);
+      expect(model.busy, isTrue);
+      expect(await model.republishAcceptedRecord(hash), isFalse);
+      expect(client.republishedHashes, [hash]);
+      await model.close();
+      client.republishWait!.complete();
+      expect(await pending, isFalse);
+      expect(await model.republishAcceptedRecord(hash), isFalse);
+      expect(client.republishedHashes, [hash]);
+      await client.controller.close();
+    },
+  );
+  test(
+    'republish ACK preserves the projection and error is not success',
+    () async {
+      final client = FakeAccountClient();
+      final model = AccountModel(client);
+      await model.open();
+      final before = model.snapshot;
+      final hash = List<int>.filled(32, 7);
+      expect(await model.republishAcceptedRecord(hash), isTrue);
+      expect(model.snapshot, same(before));
+      expect(client.republishedHashes, [hash]);
+      client.commandError = const rust.CoreError(
+        code: rust.ErrorCode.recordConflict,
+        detail: 'PUBLIC_STALE_HASH',
+      );
+      expect(await model.republishAcceptedRecord(hash), isFalse);
+      expect(model.errorCode, rust.ErrorCode.recordConflict);
+      expect(model.snapshot, same(before));
+      expect(model.busy, isFalse);
+      await model.close();
+      await client.controller.close();
+    },
+  );
+
+  test('command failure logs only the CoreError code', () async {
+    final messages = <String?>[];
+    final previousDebugPrint = debugPrint;
+    debugPrint = (message, {wrapWidth}) => messages.add(message);
+    addTearDown(() => debugPrint = previousDebugPrint);
+    final client = FakeAccountClient()
+      ..commandError = const rust.CoreError(
+        code: rust.ErrorCode.transportFailed,
+        detail: 'private-core-error-sentinel',
+      );
+    final model = AccountModel(client);
+    addTearDown(() async {
+      await model.close();
+      await client.controller.close();
+    });
+    await model.open();
+
+    expect(await model.prepareCandidate(), isNull);
+
+    expect(model.errorCode, rust.ErrorCode.transportFailed);
+    expect(model.error, '계정 작업을 완료할 수 없어요. 다시 시도해 주세요.');
+    expect(model.snapshot!.phase, account.AccountPhase.unconfigured);
+    expect(model.busy, isFalse);
+    expect(messages, ['ChatProject account operation failed: transportFailed']);
+    expect(messages.join(), isNot(contains('private-core-error-sentinel')));
+  });
+  test('unknown command failure logs only the fallback code', () async {
+    final messages = <String?>[];
+    final previousDebugPrint = debugPrint;
+    debugPrint = (message, {wrapWidth}) => messages.add(message);
+    addTearDown(() => debugPrint = previousDebugPrint);
+    final client = FakeAccountClient()
+      ..commandError = Exception('private-unknown-error-sentinel');
+    final model = AccountModel(client);
+    addTearDown(() async {
+      await model.close();
+      await client.controller.close();
+    });
+    await model.open();
+
+    expect(await model.prepareCandidate(), isNull);
+
+    expect(model.errorCode, rust.ErrorCode.notAvailable);
+    expect(model.error, '이 기기에서 계정 보호 기능을 사용할 수 없어요.');
+    expect(model.snapshot!.phase, account.AccountPhase.unconfigured);
+    expect(model.busy, isFalse);
+    expect(messages, ['ChatProject account operation failed: notAvailable']);
+    expect(messages.join(), isNot(contains('private-unknown-error-sentinel')));
+  });
+  test(
+    'clearing a flow invalidates its pending secret response and suppresses duplicate taps',
+    () async {
+      final client = FakeAccountClient();
+      final model = AccountModel(client);
+      await model.open();
+      final pending = model.beginCreate();
+      expect(await model.beginCreate(), isNull);
+      expect(client.begins, 1);
+      model.clearSecrets();
+      client.secret.complete(
+        account.RecoveryDisplay(
+          flow: Uint8List(16),
+          words: ['private fixture'],
+          positions: Uint8List.fromList([1, 2, 3]),
+        ),
+      );
+      expect(await pending, isNull);
+      expect(model.recoveryDisplay, isNull);
+      await model.close();
+      await client.controller.close();
+    },
+  );
+  test(
+    'explicit retry can restore an unchanged authoritative revision after a local locked error',
+    () async {
+      final client = FakeAccountClient()
+        ..commandError = const rust.CoreError(
+          code: rust.ErrorCode.storageLocked,
+          detail: 'private status',
+        );
+      final model = AccountModel(client);
+      await model.open();
+      await model.prepareCandidate();
+      expect(model.snapshot!.phase, account.AccountPhase.locked);
+      await model.retry();
+      expect(model.snapshot!.phase, account.AccountPhase.unconfigured);
+      expect(model.errorCode, isNull);
+      await model.close();
+      await client.controller.close();
+    },
+  );
+  test('subscribe_before_snapshot_keeps_newer_event', () async {
+    final client = FakeAccountClient();
+    final delayed = Completer<account.AccountView>();
+    client.delayed = delayed.future;
+    final model = AccountModel(client);
+    final opening = model.open();
+    expect(client.controller.hasListener, isTrue);
+    client.controller.add(
+      rust.ChatEvent.accountChanged(
+        revision: BigInt.from(9),
+        view: view(BigInt.from(9), phase: account.AccountPhase.active),
+      ),
+    );
+    delayed.complete(view(BigInt.from(8)));
+    await opening;
+    expect(model.snapshot!.revision, BigInt.from(9));
+    expect(model.snapshot!.phase, account.AccountPhase.active);
+    await model.close();
+    await client.controller.close();
+  });
+  test('duplicate_revision_no_rollback', () async {
+    final client = FakeAccountClient();
+    final model = AccountModel(client);
+    await model.open();
+    final revision = (BigInt.one << 63) + BigInt.from(17);
+    model.applySnapshot(view(revision, phase: account.AccountPhase.active));
+    model.applySnapshot(view(revision));
+    model.applySnapshot(view(revision - BigInt.one));
+    expect(model.snapshot!.revision, revision);
+    expect(model.snapshot!.phase, account.AccountPhase.active);
+    await model.close();
+    await client.controller.close();
+  });
+  test('closed_flow_ignores_late_secret_reply', () async {
+    final client = FakeAccountClient();
+    final model = AccountModel(client);
+    await model.open();
+    final pending = model.beginCreate();
+    await model.close();
+    client.secret.complete(
+      account.RecoveryDisplay(
+        flow: Uint8List(16),
+        words: ['fixture private words'],
+        positions: Uint8List.fromList([1, 2, 3]),
+      ),
+    );
+    expect(await pending, isNull);
+    expect(model.recoveryDisplay, isNull);
+    expect(client.controller.hasListener, isFalse);
+    await client.controller.close();
+  });
+}

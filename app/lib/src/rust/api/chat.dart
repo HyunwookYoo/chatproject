@@ -4,11 +4,13 @@
 // ignore_for_file: invalid_use_of_internal_member, unused_import, unnecessary_import
 
 import '../frb_generated.dart';
+import 'account.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 import 'package:freezed_annotation/freezed_annotation.dart' hide protected;
 part 'chat.freezed.dart';
 
-// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `assert_receiver_is_total_eq`, `clone`, `clone`, `eq`, `eq`, `fmt`, `fmt`, `fmt`
+// These functions are ignored because they are not marked as `pub`: `done_reply`, `network_info_reply`, `run_network`, `unexpected_network_reply`
+// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`
 
 String coreVersion() => RustLib.instance.api.crateApiChatCoreVersion();
 
@@ -16,13 +18,60 @@ String coreVersion() => RustLib.instance.api.crateApiChatCoreVersion();
 Future<CoreInfo> coreStart({required String dataDir}) =>
     RustLib.instance.api.crateApiChatCoreStart(dataDir: dataDir);
 
+Future<NetworkInfo> networkStart() =>
+    RustLib.instance.api.crateApiChatNetworkStart();
+
+Future<NetworkInfo> networkInfo() =>
+    RustLib.instance.api.crateApiChatNetworkInfo();
+
+Future<PeerInfo> connectPeer({required String target}) =>
+    RustLib.instance.api.crateApiChatConnectPeer(target: target);
+
+Future<void> sendProbeText({required String peerId, required String text}) =>
+    RustLib.instance.api.crateApiChatSendProbeText(peerId: peerId, text: text);
+
+Future<void> disconnectPeer({required String peerId}) =>
+    RustLib.instance.api.crateApiChatDisconnectPeer(peerId: peerId);
+
+Future<void> networkStop() => RustLib.instance.api.crateApiChatNetworkStop();
+
 /// The single event stream of the UI (design 12.2 rule 1).
 Stream<ChatEvent> events() => RustLib.instance.api.crateApiChatEvents();
+
+/// Debug control startup waits until this core has an isolated Local profile.
+Future<void> testHooksStart({
+  required String controlUrl,
+  required String name,
+}) => RustLib.instance.api.crateApiChatTestHooksStart(
+  controlUrl: controlUrl,
+  name: name,
+);
 
 @freezed
 sealed class ChatEvent with _$ChatEvent {
   const ChatEvent._();
 
+  const factory ChatEvent.messagesChanged({
+    required BigInt revision,
+    required Uint8List conversation,
+  }) = ChatEvent_MessagesChanged;
+  const factory ChatEvent.messageStateChanged({
+    required BigInt revision,
+    required MessageKey key,
+    required DeliveryState state,
+    required bool cancelRequested,
+  }) = ChatEvent_MessageStateChanged;
+  const factory ChatEvent.accountChanged({
+    required BigInt revision,
+    required AccountView view,
+  }) = ChatEvent_AccountChanged;
+  const factory ChatEvent.accountAuthChanged({
+    required String peerId,
+    required String installationId,
+    required bool ready,
+  }) = ChatEvent_AccountAuthChanged;
+  const factory ChatEvent.accountCacheUsed({required String peerId}) =
+      ChatEvent_AccountCacheUsed;
   const factory ChatEvent.connectionState({
     required int directPeers,
     required bool mailboxOk,
@@ -32,6 +81,16 @@ sealed class ChatEvent with _$ChatEvent {
     required ErrorCode code,
     required String detail,
   }) = ChatEvent_Error;
+  const factory ChatEvent.networkChanged({required NetworkInfo info}) =
+      ChatEvent_NetworkChanged;
+  const factory ChatEvent.peerChanged({
+    required BigInt revision,
+    required PeerInfo peer,
+  }) = ChatEvent_PeerChanged;
+  const factory ChatEvent.probeTextReceived({
+    required String peerId,
+    required String text,
+  }) = ChatEvent_ProbeTextReceived;
 }
 
 class CoreError implements FrbException {
@@ -70,4 +129,157 @@ class CoreInfo {
           instanceId == other.instanceId;
 }
 
-enum ErrorCode { invalidConfig, alreadyStartedDifferentConfig }
+enum DeliveryState {
+  queued,
+  sentDirect,
+  delivered,
+  read,
+  blocked,
+  failed,
+  cancelled,
+}
+
+enum ErrorCode {
+  invalidConfig,
+  alreadyStartedDifferentConfig,
+  coreNotStarted,
+  networkNotStarted,
+  invalidPeerAddress,
+  selfConnection,
+  peerNotConnected,
+  messageTooLarge,
+  busy,
+  networkTimeout,
+  transportFailed,
+  notAvailable,
+  invalidRecovery,
+  storageLocked,
+  storageMissing,
+  storageCorrupt,
+  storageFull,
+  accountExists,
+  writerBusy,
+  invalidInvite,
+  inviteExpired,
+  deviceLimit,
+  pairMismatch,
+  pairExpired,
+  recordConflict,
+  recordUnavailable,
+  authFailed,
+  accountRestricted,
+  pairHistoryFull,
+  invalidMessage,
+  messageConflict,
+  messageNotFound,
+  contactRequired,
+  unsupportedMessageVersion,
+  storageUncertain,
+}
+
+class MessageKey {
+  final Uint8List conversation;
+  final Uint8List sender;
+  final Uint8List installation;
+  final Uint8List id;
+
+  const MessageKey({
+    required this.conversation,
+    required this.sender,
+    required this.installation,
+    required this.id,
+  });
+
+  @override
+  int get hashCode =>
+      conversation.hashCode ^
+      sender.hashCode ^
+      installation.hashCode ^
+      id.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is MessageKey &&
+          runtimeType == other.runtimeType &&
+          conversation == other.conversation &&
+          sender == other.sender &&
+          installation == other.installation &&
+          id == other.id;
+}
+
+class NetworkInfo {
+  final BigInt revision;
+  final NetworkState state;
+  final String? endpointId;
+  final String? ticket;
+  final List<PeerInfo> peers;
+
+  const NetworkInfo({
+    required this.revision,
+    required this.state,
+    this.endpointId,
+    this.ticket,
+    required this.peers,
+  });
+
+  @override
+  int get hashCode =>
+      revision.hashCode ^
+      state.hashCode ^
+      endpointId.hashCode ^
+      ticket.hashCode ^
+      peers.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is NetworkInfo &&
+          runtimeType == other.runtimeType &&
+          revision == other.revision &&
+          state == other.state &&
+          endpointId == other.endpointId &&
+          ticket == other.ticket &&
+          peers == other.peers;
+}
+
+enum NetworkState { stopped, starting, online, failed }
+
+class PeerInfo {
+  final String peerId;
+  final PeerPhase phase;
+  final PeerPath path;
+  final BigInt? connectMs;
+  final BigInt? directMs;
+
+  const PeerInfo({
+    required this.peerId,
+    required this.phase,
+    required this.path,
+    this.connectMs,
+    this.directMs,
+  });
+
+  @override
+  int get hashCode =>
+      peerId.hashCode ^
+      phase.hashCode ^
+      path.hashCode ^
+      connectMs.hashCode ^
+      directMs.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is PeerInfo &&
+          runtimeType == other.runtimeType &&
+          peerId == other.peerId &&
+          phase == other.phase &&
+          path == other.path &&
+          connectMs == other.connectMs &&
+          directMs == other.directMs;
+}
+
+enum PeerPath { unknown, relay, direct }
+
+enum PeerPhase { connecting, connected, reconnecting, disconnected }
