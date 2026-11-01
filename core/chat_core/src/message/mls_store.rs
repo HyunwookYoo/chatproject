@@ -35,6 +35,11 @@ type R<T> = Result<T, CoreError>;
 pub(super) type Fault = Option<crate::storage::worker::CommitFault>;
 #[cfg(not(all(feature = "test-hooks", debug_assertions)))]
 pub(super) type Fault = ();
+/// No injected fault, in either build.
+#[cfg(all(feature = "test-hooks", debug_assertions))]
+pub(super) const NO_FAULT: Fault = None;
+#[cfg(not(all(feature = "test-hooks", debug_assertions)))]
+pub(super) const NO_FAULT: Fault = ();
 pub(super) fn finish(tx: Transaction<'_>, fault: Fault) -> R<()> {
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     return commit(tx, fault);
@@ -1266,7 +1271,7 @@ mod tests {
                 conversation,
                 ciphertext.clone(),
                 5,
-                Fault::default(),
+                NO_FAULT,
             )
             .unwrap()
         };

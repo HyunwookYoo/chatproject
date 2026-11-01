@@ -2,7 +2,7 @@
 //! conversation's group, the per-installation Commit/Welcome delivery queue (`mls_delivery`) and
 //! the holds for devices missing from a cached record (`mls_hold`). Like the rest of
 //! `mls_store`, every operation is one SQL transaction carrying the MLS state it changed.
-use super::mls_store::{Fault, GLOBAL, MAX_FRAME, finish};
+use super::mls_store::{Fault, GLOBAL, MAX_FRAME, NO_FAULT, finish};
 use super::store::{Identity, MessageDbReply, bytes, ensure_conversation, integer, invalid, uint};
 use super::types::*;
 use crate::account::{
@@ -1747,7 +1747,6 @@ fn reprocess_one(
         now,
         wall,
     };
-    let no_fault = Fault::default();
     match (tag, MlsFrame::decode(&body[HOLD_HEADER..])?) {
         (
             HOLD_WELCOME,
@@ -1769,7 +1768,7 @@ fn reprocess_one(
                 rejoin: None,
                 joined_with: None,
             },
-            no_fault,
+            NO_FAULT,
         ),
         (
             HOLD_COMMIT,
@@ -1786,7 +1785,7 @@ fn reprocess_one(
             arrival,
             epoch,
             &commit,
-            no_fault,
+            NO_FAULT,
         ),
         (
             HOLD_JOIN_REQUEST,
@@ -1803,7 +1802,7 @@ fn reprocess_one(
                     conversation,
                     arrival,
                     &key_package,
-                    no_fault,
+                    NO_FAULT,
                 )? {
                     Committed::Done { .. } => Outcome::Ack,
                     Committed::Held(lookup) => Outcome::Held(lookup),
