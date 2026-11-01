@@ -57,6 +57,46 @@ pub(crate) fn group_installations(p: &MlsProvider, group_id: &[u8]) -> R<Vec<Ins
         .collect()
 }
 
+/// The epoch the stored group is at.
+pub(crate) fn epoch_of(p: &MlsProvider, group_id: &[u8]) -> R<u64> {
+    Ok(load_group(p, group_id)?.epoch().as_u64())
+}
+
+/// The group's epoch authenticator: equal on two devices only when they are on the same branch
+/// of the same epoch.
+pub(crate) fn epoch_authenticator(p: &MlsProvider, group_id: &[u8]) -> R<Vec<u8>> {
+    Ok(load_group(p, group_id)?
+        .epoch_authenticator()
+        .as_slice()
+        .to_vec())
+}
+
+fn protocol_message(message: &[u8]) -> Option<ProtocolMessage> {
+    if message.len() > MAX_MLS_MESSAGE_BYTES {
+        return None;
+    }
+    MlsMessageIn::tls_deserialize_exact(message)
+        .ok()?
+        .try_into_protocol_message()
+        .ok()
+}
+
+/// The group an MLS protocol message (TLS) belongs to, read without processing it.
+pub(crate) fn message_group_id(message: &[u8]) -> Option<Vec<u8>> {
+    protocol_message(message).map(|protocol| protocol.group_id().to_vec())
+}
+
+/// What an MLS protocol message (TLS) carries: `"commit"`, `"proposal"`, `"application"`, or
+/// `"unknown"` when it does not parse as one.
+pub(crate) fn content_kind(message: &[u8]) -> &'static str {
+    match protocol_message(message).map(|protocol| protocol.content_type()) {
+        Some(ContentType::Commit) => "commit",
+        Some(ContentType::Proposal) => "proposal",
+        Some(ContentType::Application) => "application",
+        None => "unknown",
+    }
+}
+
 /// Binary snapshot of the conversation's group state, for `restore_snapshot`.
 pub(crate) fn snapshot(p: &MlsProvider) -> R<Vec<u8>> {
     p.storage().snapshot()

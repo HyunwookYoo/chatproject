@@ -21,6 +21,7 @@ pub use record::{
     IdentityRecord, MAX_ACCOUNT_PACKET_BYTES, RECORD_LIFETIME_SECONDS, RECORD_TTL_SECONDS,
     RecordDevice, parse_record, record_hash, record_packet,
 };
+pub(crate) use record::parse_stored_record;
 
 pub use keys::{
     AccountKeys, DeviceKeys, decode_recovery, derive_account, derive_device, encode_recovery,
@@ -30,7 +31,9 @@ pub use types::{DeviceKind, FlowId, Generation, InstallationId, PeerId, Secret32
 
 mod manager;
 pub use creation::RecoveryDisplay;
-pub use manager::{AccountHandle, AccountPhase, AccountView, CandidateInfo, PublishIntent};
+pub use manager::{
+    AccountHandle, AccountPhase, AccountView, CandidateInfo, GroupState, PublishIntent,
+};
 
 mod invite;
 mod contacts;

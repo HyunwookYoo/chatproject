@@ -4,7 +4,7 @@ pub use crate::account::storage::migration_fixtures::{
 };
 pub use crate::message::mls_store::{MlsOutbox, MlsState};
 pub use crate::message::store::MessageFacts;
-use crate::message::mls_store::{GroupOp, GroupReply};
+use crate::message::mls_group::{Committed, GroupOp, GroupReply, Outcome};
 use crate::message::store::{FixtureOp, MessageDbOp, MessageDbReply, MessageRepo};
 pub use crate::message::types::*;
 pub use crate::storage::migration::MigrationStage;
@@ -66,7 +66,10 @@ impl Messages {
         members: Vec<Vec<u8>>,
         now: u64,
     ) -> Result<MlsCreated, CoreError> {
-        let op = MessageDbOp::MlsGroupOp(conversation, GroupOp::Create { peer, members, now });
+        let op = MessageDbOp::MlsGroupOp(
+            conversation,
+            GroupOp::Create { peer, members, rejoin: None, now },
+        );
         match self.mls(op).await? {
             MessageDbReply::Group(GroupReply::Created { group_id, first_commit_hash, commit, welcome }) => {
                 Ok(MlsCreated { group_id, first_commit_hash, commit, welcome })
@@ -82,9 +85,45 @@ impl Messages {
         first_commit_hash: [u8; 32],
         now: u64,
     ) -> Result<u64, CoreError> {
-        let op = MessageDbOp::MlsGroupOp(conversation, GroupOp::Join { peer, welcome, first_commit_hash, now });
+        let op = MessageDbOp::MlsGroupOp(
+            conversation,
+            GroupOp::Join {
+                peer,
+                sender_peer: peer,
+                sender_install: crate::account::InstallationId([0; 32]),
+                welcome,
+                first_commit_hash,
+                rejoin: None,
+                joined_with: None,
+                now,
+            },
+        );
         match self.mls(op).await? {
-            MessageDbReply::Group(GroupReply::Joined { epoch }) => Ok(epoch),
+            MessageDbReply::Group(GroupReply::Outcome(Outcome::Joined)) => {}
+            MessageDbReply::Group(GroupReply::Outcome(_)) => {
+                return Err(CoreError::new(ErrorCode::Busy, "fixture_not_joined"));
+            }
+            _ => unreachable!(),
+        }
+        match self.mls(MessageDbOp::MlsGroupOp(conversation, GroupOp::Info)).await? {
+            MessageDbReply::Group(GroupReply::Info(Some(info))) => Ok(info.epoch),
+            _ => unreachable!(),
+        }
+    }
+    /// One own Commit (the group protocol's `sync_members` step) with the given KeyPackages and
+    /// removals; `None` when the group refuses a new Commit (an own one is unacknowledged).
+    pub async fn mls_commit(
+        &self,
+        conversation: ConversationId,
+        peer: crate::account::PeerId,
+        add: Vec<Vec<u8>>,
+        remove: Vec<crate::account::InstallationId>,
+        now: u64,
+    ) -> Result<Option<u64>, CoreError> {
+        let op = MessageDbOp::MlsGroupOp(conversation, GroupOp::Commit { peer, add, remove, now });
+        match self.mls(op).await? {
+            MessageDbReply::Group(GroupReply::Committed(Committed::Done { epoch })) => Ok(Some(epoch)),
+            MessageDbReply::Group(GroupReply::Committed(_)) => Ok(None),
             _ => unreachable!(),
         }
     }
@@ -401,6 +440,22 @@ pub struct MlsCreated {
     pub commit: Vec<u8>,
     pub welcome: Vec<u8>,
 }
+/// A valid KeyPackage of the installation derived from `device_seed` for account `peer`, whose
+/// private keys are thrown away: it can be added to a group but that device never joins.
+pub fn mls_detached_key_package(peer: crate::account::PeerId, device_seed: [u8; 32]) -> Vec<u8> {
+    let device = crate::account::derive_device(crate::account::Secret32::from(device_seed)).unwrap();
+    let connection = rusqlite::Connection::open_in_memory().unwrap();
+    connection.execute_batch(include_str!("schema.sql")).unwrap();
+    let provider = crate::mls::MlsProvider::new(
+        crate::mls::kv::KvStore::load(&connection, [0; 32]).unwrap(),
+    );
+    crate::mls::group::new_key_package(
+        &provider,
+        &crate::mls::identity::mls_signer(&device),
+        &crate::mls::identity::MlsCredential::issue(peer, &device),
+    )
+    .unwrap()
+}
 /// The conversation and ciphertext inside a kind 17 `App` frame (the complete envelope).
 pub fn mls_app_from_wire(wire: &[u8]) -> Option<(ConversationId, Vec<u8>)> {
     let inner = crate::account::auth::payload(wire, 17).ok()?;
@@ -511,6 +566,12 @@ impl Fixture {
         let (tx, rx) = oneshot::channel();
         self.handle.0.test(TestOp::Message(FixtureOp::MlsOutboxCap(cap, tx))).await;
         rx.await.unwrap();
+    }
+    /// Lets the next own Commit of the conversation be made before the last one is acknowledged.
+    pub async fn mls_clear_commit_flag(&self, conversation: ConversationId) -> Result<(), CoreError> {
+        let (tx, rx) = oneshot::channel();
+        self.handle.0.test(TestOp::Message(FixtureOp::MlsClearCommitFlag(conversation, tx))).await;
+        rx.await.unwrap()
     }
     pub async fn due_hint(&self, now: u64) -> Result<bool, CoreError> {
         self.handle.0.due_hint(now).await

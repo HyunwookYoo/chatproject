@@ -162,6 +162,7 @@ pub(crate) enum Input {
     MessageAttempt(super::manager::messages::AttemptResult),
     MessageLookup(crate::message::types::MessageKey,u64,Result<super::Lookup,CoreError>),
     MessageProof(super::manager::messages::ProofResult),
+    Mls(super::manager::mls::MlsEvent),
     Incoming(Connection),
     Control {
         connection: Connection,

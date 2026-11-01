@@ -15,6 +15,7 @@ CREATE TABLE mls_conversation (
     rejoin_count INTEGER NOT NULL CHECK(rejoin_count>=0),
     rejoin_after_ms INTEGER NOT NULL CHECK(rejoin_after_ms>=0),
     peer_mls INTEGER NOT NULL CHECK(peer_mls IN (0,1)),
+    last_commit_hash BLOB CHECK(last_commit_hash IS NULL OR length(last_commit_hash)=32),
     FOREIGN KEY(conversation) REFERENCES conversation(id)
 ) STRICT;
 

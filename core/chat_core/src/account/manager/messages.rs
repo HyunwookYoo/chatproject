@@ -45,6 +45,8 @@ pub(super) struct Runtime {
     acquiring: BTreeMap<MessageKey, Acquisition>,
     scheduler: Option<crate::message::scheduler::Scheduler>,
     recovered: bool,
+    /// MLS group lifecycle state (`manager/mls.rs`).
+    pub(super) mls: super::mls::Runtime,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     writes: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
@@ -495,7 +497,14 @@ impl Manager {
     fn message_repo(&self) -> Result<MessageRepo, CoreError> {
         Ok(MessageRepo::new(self.store.clone(), self.local()?))
     }
-    fn message_session(
+    /// The scheduler's clock (wall time at start plus monotonic progress), for retry times.
+    pub(super) fn schedule_now(&self) -> u64 {
+        self.messages
+            .scheduler
+            .as_ref()
+            .map_or_else(|| self.services.clock.wall_ms(), |s| s.now_ms())
+    }
+    pub(super) fn message_session(
         &self,
         conn: &iroh::endpoint::Connection,
         request: Request,
@@ -582,7 +591,7 @@ impl Manager {
                 .fetch_max((request.ticket << 2) | 2, Ordering::AcqRel);
         }
     }
-    async fn message_db(
+    pub(super) async fn message_db(
         &mut self,
         op: MessageDbOp,
         request: Request,
@@ -1227,6 +1236,8 @@ impl Manager {
         Ok(())
     }
     pub(super) async fn poll_messages(&mut self) {
+        // MLS group upkeep and its Commit/Welcome deliveries share this tick.
+        self.poll_mls().await;
         #[cfg(all(feature = "test-hooks", debug_assertions))]
         if self.messages.scheduler_held {
             return;

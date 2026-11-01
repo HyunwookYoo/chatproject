@@ -6,6 +6,7 @@
 //! A `KvStore` is loaded per operation and `flush`ed into the operation's transaction only on
 //! success. `flush` clears its dirty set before the caller commits, so after any failure the
 //! store (and its provider) is dropped; the next operation loads a fresh one.
+use super::mls_group::{check_own, group_row, signer_of, sql};
 use super::store::{
     Identity, MessageDbReply, bump, bytes, commit, conflict, ensure_conversation, find, integer,
     invalid, missing, uint,
@@ -14,7 +15,6 @@ use super::types::*;
 use crate::mls::{
     MlsProvider,
     group::{self, OpenFailure, Opened},
-    identity::{MlsCredential, mls_signer, verify_leaf},
     kv::KvStore,
     payload::{ChatMessage, Content},
     wire::{MlsFrame, MlsReply},
@@ -31,10 +31,10 @@ use sha2::{Digest, Sha256};
 type R<T> = Result<T, CoreError>;
 /// The injected commit fault of test-hook builds; nothing in production builds.
 #[cfg(all(feature = "test-hooks", debug_assertions))]
-type Fault = Option<crate::storage::worker::CommitFault>;
+pub(super) type Fault = Option<crate::storage::worker::CommitFault>;
 #[cfg(not(all(feature = "test-hooks", debug_assertions)))]
-type Fault = ();
-fn finish(tx: Transaction<'_>, fault: Fault) -> R<()> {
+pub(super) type Fault = ();
+pub(super) fn finish(tx: Transaction<'_>, fault: Fault) -> R<()> {
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     return commit(tx, fault);
     #[cfg(not(all(feature = "test-hooks", debug_assertions)))]
@@ -45,9 +45,9 @@ fn finish(tx: Transaction<'_>, fault: Fault) -> R<()> {
 }
 
 /// Rows of group-independent labels (KeyPackages, signature keys) live in this scope.
-const GLOBAL: [u8; 32] = [0; 32];
+pub(super) const GLOBAL: [u8; 32] = [0; 32];
 /// Largest complete frame (M4 transport limit).
-const MAX_FRAME: usize = 61_440;
+pub(super) const MAX_FRAME: usize = 61_440;
 /// A message that was re-encrypted this many times is given up on.
 const REENCRYPT_CAP: u64 = 3;
 const TEXT_LIMIT: usize = 16_384;
@@ -88,247 +88,6 @@ fn wire_ciphertext_hash(wire: &[u8]) -> R<[u8; 32]> {
         MlsFrame::App { ciphertext, .. } => Ok(Sha256::digest(&ciphertext).into()),
         _ => Err(invalid()),
     }
-}
-
-/// Changes to a conversation's group. Task 7 drives these from the group protocol; the
-/// variants it needs beyond the ones implemented here answer `NotAvailable` until then.
-pub(crate) enum GroupOp {
-    /// A fresh KeyPackage for this installation (its private keys go to the global scope).
-    NewKeyPackage,
-    /// Creates the group for the conversation and adds `members` (peer KeyPackages).
-    Create {
-        peer: PeerId,
-        members: Vec<Vec<u8>>,
-        now: u64,
-    },
-    /// Joins through a Welcome from `peer`.
-    Join {
-        peer: PeerId,
-        welcome: Vec<u8>,
-        first_commit_hash: [u8; 32],
-        now: u64,
-    },
-    /// Not available until Task 7.
-    ApplyCommit { commit: Vec<u8>, now: u64 },
-    /// Not available until Task 7.
-    RestorePrevious,
-    /// Forgets the group: its `mls_conversation` row and every `mls_kv` row of the conversation.
-    Drop,
-}
-
-pub(crate) enum GroupReply {
-    KeyPackage(Vec<u8>),
-    Created {
-        group_id: Vec<u8>,
-        first_commit_hash: [u8; 32],
-        commit: Vec<u8>,
-        welcome: Vec<u8>,
-    },
-    Joined {
-        epoch: u64,
-    },
-    Done,
-}
-
-fn not_available() -> CoreError {
-    CoreError::new(ErrorCode::NotAvailable, "mls_operation_not_available")
-}
-fn group_exists() -> CoreError {
-    CoreError::new(ErrorCode::Busy, "mls_group_exists")
-}
-fn auth_failed() -> CoreError {
-    CoreError::new(ErrorCode::AuthFailed, "mls_leaf_not_trusted")
-}
-
-struct GroupRow {
-    group_id: Vec<u8>,
-    epoch: u64,
-}
-fn group_row(c: &Connection, conversation: ConversationId) -> R<Option<GroupRow>> {
-    c.query_row(
-        "SELECT group_id,epoch FROM mls_conversation WHERE conversation=?1",
-        params![conversation.0.as_slice()],
-        |r| {
-            Ok(GroupRow {
-                group_id: r.get(0)?,
-                epoch: uint(r, 1)?,
-            })
-        },
-    )
-    .optional()
-    .map_err(super::store::sql_error)
-}
-fn sql(e: rusqlite::Error) -> CoreError {
-    super::store::sql_error(e)
-}
-
-fn signer_of(local: &LocalAccount) -> (SignatureKeyPair, MlsCredential) {
-    (
-        mls_signer(&local.device),
-        MlsCredential::issue(local.keys.peer_id(), &local.device),
-    )
-}
-
-/// Checks an MLS leaf against the account record this device holds for the leaf's peer: its own
-/// accepted record, or the cached record of the conversation's peer. Anyone else is refused.
-fn leaf_verifier<'a>(local: &'a LocalAccount, peer: PeerId) -> impl Fn(&[u8], &[u8]) -> R<()> + 'a {
-    move |credential, signature_key| {
-        let decoded = MlsCredential::decode(credential).map_err(|_| auth_failed())?;
-        let record = if decoded.peer == local.keys.peer_id() {
-            local.records.accepted.as_ref().map(|r| &r.record)
-        } else if decoded.peer == peer {
-            local
-                .remote
-                .iter()
-                .find(|r| r.peer == peer)
-                .map(|r| &r.accepted.record)
-        } else {
-            None
-        }
-        .ok_or_else(auth_failed)?;
-        verify_leaf(credential, signature_key, decoded.peer, record).map(|_| ())
-    }
-}
-
-fn check_own(identity: Identity, key: MessageKey) -> R<()> {
-    if key.sender != identity.peer || key.installation != identity.installation {
-        return Err(invalid());
-    }
-    Ok(())
-}
-
-pub(super) fn group_op(
-    c: &mut Connection,
-    identity: Identity,
-    local: &LocalAccount,
-    conversation: ConversationId,
-    op: GroupOp,
-    fault: Fault,
-) -> R<MessageDbReply> {
-    let (signer, credential) = signer_of(local);
-    match op {
-        GroupOp::NewKeyPackage => {
-            let tx = c.transaction().map_err(sql)?;
-            let provider = MlsProvider::new(KvStore::load(&tx, GLOBAL)?);
-            let key_package = group::new_key_package(&provider, &signer, &credential)?;
-            provider.storage().flush(&tx, GLOBAL)?;
-            finish(tx, fault)?;
-            Ok(MessageDbReply::Group(GroupReply::KeyPackage(key_package)))
-        }
-        GroupOp::Create {
-            peer,
-            members,
-            now: _,
-        } => {
-            if super::store::conversation_id(identity.peer, peer)? != conversation {
-                return Err(invalid());
-            }
-            let tx = c.transaction().map_err(sql)?;
-            if group_row(&tx, conversation)?.is_some() {
-                return Err(group_exists());
-            }
-            ensure_conversation(&tx, conversation, peer)?;
-            let provider = MlsProvider::new(KvStore::load(&tx, conversation.0)?);
-            let verify = leaf_verifier(local, peer);
-            let created = group::create_group(
-                &provider,
-                &signer,
-                &credential,
-                conversation,
-                &members,
-                &verify,
-            )?;
-            provider.storage().flush(&tx, conversation.0)?;
-            // `create_group` merges exactly one Commit, so the new group is at epoch 1.
-            insert_group_row(
-                &tx,
-                conversation,
-                &created.group_id,
-                created.first_commit_hash,
-                1,
-                false,
-            )?;
-            finish(tx, fault)?;
-            Ok(MessageDbReply::Group(GroupReply::Created {
-                group_id: created.group_id,
-                first_commit_hash: created.first_commit_hash,
-                commit: created.commit,
-                welcome: created.welcome,
-            }))
-        }
-        GroupOp::Join {
-            peer,
-            welcome,
-            first_commit_hash,
-            now: _,
-        } => {
-            if super::store::conversation_id(identity.peer, peer)? != conversation {
-                return Err(invalid());
-            }
-            let tx = c.transaction().map_err(sql)?;
-            if group_row(&tx, conversation)?.is_some() {
-                return Err(group_exists());
-            }
-            ensure_conversation(&tx, conversation, peer)?;
-            let provider = MlsProvider::new(KvStore::load(&tx, conversation.0)?);
-            let verify = leaf_verifier(local, peer);
-            // Joining consumes the KeyPackage in the in-memory store: on any error the provider
-            // and transaction are dropped, so the stored KeyPackage stays usable.
-            let joined = group::join(&provider, &welcome, &verify)?;
-            provider.storage().flush(&tx, conversation.0)?;
-            insert_group_row(
-                &tx,
-                conversation,
-                &joined.group_id,
-                first_commit_hash,
-                joined.epoch,
-                true,
-            )?;
-            finish(tx, fault)?;
-            Ok(MessageDbReply::Group(GroupReply::Joined {
-                epoch: joined.epoch,
-            }))
-        }
-        GroupOp::Drop => {
-            let tx = c.transaction().map_err(sql)?;
-            tx.execute(
-                "DELETE FROM mls_kv WHERE scope=?1",
-                params![conversation.0.as_slice()],
-            )
-            .map_err(sql)?;
-            tx.execute(
-                "DELETE FROM mls_conversation WHERE conversation=?1",
-                params![conversation.0.as_slice()],
-            )
-            .map_err(sql)?;
-            finish(tx, fault)?;
-            Ok(MessageDbReply::Group(GroupReply::Done))
-        }
-        // Task 7 (membership protocol).
-        GroupOp::ApplyCommit { .. } | GroupOp::RestorePrevious => Err(not_available()),
-    }
-}
-
-fn insert_group_row(
-    tx: &Transaction<'_>,
-    conversation: ConversationId,
-    group_id: &[u8],
-    first_commit_hash: [u8; 32],
-    epoch: u64,
-    peer_mls: bool,
-) -> R<()> {
-    tx.execute(
-        "INSERT INTO mls_conversation(conversation,group_id,first_commit_hash,epoch,previous_epoch_snapshot,own_commit_unacked,rejoin_count,rejoin_after_ms,peer_mls) VALUES(?1,?2,?3,?4,NULL,0,0,0,?5)",
-        params![
-            conversation.0.as_slice(),
-            group_id,
-            first_commit_hash.as_slice(),
-            integer(epoch)?,
-            peer_mls
-        ],
-    )
-    .map_err(sql)?;
-    Ok(())
 }
 
 struct Outgoing {
@@ -856,6 +615,19 @@ pub struct MlsState {
     pub open_calls: u64,
     pub group_epoch: Option<u64>,
     pub peer_mls: Option<bool>,
+    pub group_id: Option<Vec<u8>>,
+    pub first_commit_hash: Option<[u8; 32]>,
+    pub last_commit_hash: Option<[u8; 32]>,
+    pub own_commit_unacked: Option<bool>,
+    pub rejoin_count: Option<u32>,
+    /// Installations holding a leaf in the stored group.
+    pub members: Vec<InstallationId>,
+    /// Equal on two devices only when they share the same branch of the same epoch.
+    pub epoch_authenticator: Option<Vec<u8>>,
+    /// Queued deliveries of the conversation: recipient, kind (1 Commit, 2 Welcome), epoch.
+    pub deliveries: Vec<(InstallationId, u8, u64)>,
+    /// Held Commits/Welcomes of the conversation.
+    pub holds: u64,
 }
 
 #[cfg(all(feature = "test-hooks", debug_assertions))]
@@ -923,22 +695,84 @@ pub(super) fn fixture_state(c: &Connection, conversation: ConversationId) -> R<M
             uint(r, 0)
         })
         .map_err(sql)?;
-    let group = c
+    type Group = (u64, bool, Vec<u8>, [u8; 32], Option<Vec<u8>>, bool, u64);
+    let group: Option<Group> = c
         .query_row(
-            "SELECT epoch,peer_mls FROM mls_conversation WHERE conversation=?1",
+            "SELECT epoch,peer_mls,group_id,first_commit_hash,last_commit_hash,own_commit_unacked,rejoin_count FROM mls_conversation WHERE conversation=?1",
             params![conversation.0.as_slice()],
-            |r| Ok((uint(r, 0)?, r.get::<_, bool>(1)?)),
+            |r| {
+                Ok((
+                    uint(r, 0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    bytes(r, 3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    uint(r, 6)?,
+                ))
+            },
         )
         .optional()
+        .map_err(sql)?;
+    let (members, epoch_authenticator) = match &group {
+        Some(g) => {
+            let provider = MlsProvider::new(KvStore::load(c, conversation.0)?);
+            (
+                crate::mls::membership::group_installations(&provider, &g.2)?,
+                Some(crate::mls::membership::epoch_authenticator(
+                    &provider, &g.2,
+                )?),
+            )
+        }
+        None => (Vec::new(), None),
+    };
+    let deliveries = c
+        .prepare("SELECT recipient_install,kind,epoch FROM mls_delivery WHERE conversation=?1 ORDER BY recipient_install,epoch,kind")
+        .map_err(sql)?
+        .query_map(params![conversation.0.as_slice()], |r| {
+            Ok((InstallationId(bytes(r, 0)?), r.get(1)?, uint(r, 2)?))
+        })
+        .map_err(sql)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(sql)?;
+    let holds = c
+        .query_row(
+            "SELECT count(*) FROM mls_hold WHERE conversation=?1",
+            params![conversation.0.as_slice()],
+            |r| uint(r, 0),
+        )
         .map_err(sql)?;
     Ok(MlsState {
         kv_digest: digest.finalize().into(),
         kv_rows: rows,
         processed_mls,
         open_calls: OPEN_CALLS.with(|n| n.get()),
-        group_epoch: group.map(|g| g.0),
-        peer_mls: group.map(|g| g.1),
+        group_epoch: group.as_ref().map(|g| g.0),
+        peer_mls: group.as_ref().map(|g| g.1),
+        group_id: group.as_ref().map(|g| g.2.clone()),
+        first_commit_hash: group.as_ref().map(|g| g.3),
+        last_commit_hash: group
+            .as_ref()
+            .and_then(|g| g.4.clone())
+            .and_then(|h| h.try_into().ok()),
+        own_commit_unacked: group.as_ref().map(|g| g.5),
+        rejoin_count: group.as_ref().map(|g| g.6 as u32),
+        members,
+        epoch_authenticator,
+        deliveries,
+        holds,
     })
+}
+
+/// Test-only: lets the next own Commit be made although the last one is unacknowledged.
+#[cfg(all(feature = "test-hooks", debug_assertions))]
+pub(super) fn fixture_clear_commit_flag(c: &Connection, conversation: ConversationId) -> R<()> {
+    c.execute(
+        "UPDATE mls_conversation SET own_commit_unacked=0 WHERE conversation=?1",
+        params![conversation.0.as_slice()],
+    )
+    .map_err(sql)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -946,6 +780,7 @@ mod tests {
     use super::*;
     use crate::account::{Secret32, derive_device};
     use crate::message::store::conversation_id;
+    use crate::mls::identity::{MlsCredential, mls_signer};
     use openmls::prelude::{GroupId, MlsGroup, tls_codec::Serialize as _};
 
     fn database() -> Connection {
@@ -1015,13 +850,14 @@ mod tests {
             )
             .unwrap();
             b.storage().flush(&tx, conversation.0).unwrap();
-            insert_group_row(
-                &tx,
-                conversation,
-                &joined.group_id,
-                created.first_commit_hash,
-                joined.epoch,
-                true,
+            tx.execute(
+                "INSERT INTO mls_conversation(conversation,group_id,first_commit_hash,epoch,own_commit_unacked,rejoin_count,rejoin_after_ms,peer_mls) VALUES(?1,?2,?3,?4,0,0,0,1)",
+                params![
+                    conversation.0.as_slice(),
+                    joined.group_id,
+                    created.first_commit_hash.as_slice(),
+                    joined.epoch as i64
+                ],
             )
             .unwrap();
             tx.commit().unwrap();

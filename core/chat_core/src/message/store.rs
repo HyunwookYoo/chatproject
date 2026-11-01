@@ -51,7 +51,7 @@ pub(crate) enum MessageDbOp {
     /// ciphertext, now.
     OpenApp(PeerId, InstallationId, ConversationId, Vec<u8>, u64),
     MarkWaitingPeerUpdate(MessageKey, bool),
-    MlsGroupOp(ConversationId, super::mls_store::GroupOp),
+    MlsGroupOp(ConversationId, super::mls_group::GroupOp),
     Messages(ConversationId, Option<MessageCursor>, u32),
     Conversations(Option<ConversationCursor>, u32),
 }
@@ -280,7 +280,9 @@ pub(crate) fn execute(
                 MessageDbOp::Open(local, peer) => Some(conversation_id(*local, *peer)?),
                 MessageDbOp::ReleasePeer(peer, _) => Some(conversation_id(identity.peer, *peer)?),
                 MessageDbOp::MarkRead(id, _, _) => Some(*id),
-                MessageDbOp::SealPending(id, _) | MessageDbOp::MlsGroupOp(id, _) => Some(*id),
+                MessageDbOp::SealPending(id, _) => Some(*id),
+                // Group operations that span conversations (deliveries, holds) pass a zero id.
+                MessageDbOp::MlsGroupOp(id, _) => (id.0 != [0; 32]).then_some(*id),
                 MessageDbOp::OpenApp(_, _, id, _, _) => Some(*id),
                 _ => key.map(|k| k.conversation),
             };
@@ -528,7 +530,7 @@ pub(crate) fn execute(
         MessageDbOp::Reencrypt(key, now) => super::mls_store::reencrypt(c, identity, local, key, now, mls_fault!(fault)),
         MessageDbOp::OpenApp(peer, install, id, ciphertext, now) => super::mls_store::open_app(c, identity, peer, install, id, ciphertext, now, mls_fault!(fault)),
         MessageDbOp::MarkWaitingPeerUpdate(key, waiting) => super::mls_store::mark_waiting(c, identity, key, waiting, mls_fault!(fault)),
-        MessageDbOp::MlsGroupOp(id, op) => super::mls_store::group_op(c, identity, local, id, op, mls_fault!(fault)),
+        MessageDbOp::MlsGroupOp(id, op) => super::mls_group::group_op(c, identity, local, id, op, mls_fault!(fault)),
         MessageDbOp::Messages(id, before, n) => {
             let take = limit(n)?;
             let (lamport, install, msg) = match before {
@@ -735,6 +737,7 @@ pub(crate) enum FixtureOp {
     MlsOutbox(MessageKey, tokio::sync::oneshot::Sender<R<super::mls_store::MlsOutbox>>),
     MlsState(ConversationId, tokio::sync::oneshot::Sender<R<super::mls_store::MlsState>>),
     MlsOutboxCap(Option<u64>, tokio::sync::oneshot::Sender<()>),
+    MlsClearCommitFlag(ConversationId, tokio::sync::oneshot::Sender<R<()>>),
 }
 #[cfg(all(feature = "test-hooks", debug_assertions))]
 pub(crate) fn fixture(c: &mut Connection, op: FixtureOp) {
@@ -807,6 +810,9 @@ pub(crate) fn fixture(c: &mut Connection, op: FixtureOp) {
         }
         FixtureOp::MlsState(id, reply) => {
             let _ = reply.send(super::mls_store::fixture_state(c, id));
+        }
+        FixtureOp::MlsClearCommitFlag(id, reply) => {
+            let _ = reply.send(super::mls_store::fixture_clear_commit_flag(c, id));
         }
         FixtureOp::Delivered(key, reply) => {
             let result = (|| {
@@ -910,7 +916,7 @@ pub(crate) enum MessageDbReply {
     Count(u64),
     /// The reply to send for a received MLS ciphertext.
     Opened(crate::mls::wire::MlsReply),
-    Group(super::mls_store::GroupReply),
+    Group(super::mls_group::GroupReply),
     Conversation(ConversationView),
     Message(MessageView),
     Messages(MessagePage),
@@ -1006,7 +1012,8 @@ impl MessageDbOp {
     pub(crate) fn faultable(&self, identity: Identity) -> R<bool> {
         Ok(match self {
             Self::Observed(op) => return op.faultable(identity),
-            Self::SealPending(..) | Self::OpenApp(..) | Self::MlsGroupOp(..) => true,
+            Self::SealPending(..) | Self::OpenApp(..) => true,
+            Self::MlsGroupOp(_, op) => op.writes(),
             _ => self.key(identity)?.is_some(),
         })
     }
