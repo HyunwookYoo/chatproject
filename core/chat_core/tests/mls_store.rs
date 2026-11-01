@@ -419,27 +419,16 @@ async fn promoted_m4_outbox_seals_with_same_id_and_lamport() {
 #[tokio::test]
 async fn seal_never_produces_codec1() {
     let (a, b, conversation) = linked().await;
-    // An M4 plaintext job that has not been promoted is not sealed, and stays what it was.
-    let legacy =
-        a.m.enqueue(b.peer, id(9), "legacy plaintext job".into(), NOW)
+    // A new message is queued awaiting encryption (codec 3), never as an M4 plaintext job.
+    let one =
+        a.m.enqueue(b.peer, id(1), "one".into(), NOW)
             .await
             .unwrap()
             .key;
-    let before = a.f.mls_outbox(legacy).await.unwrap();
-    assert_eq!(before.codec, Some(1));
-    assert_eq!(
-        a.m.mls_seal(legacy, NOW).await.unwrap_err().code,
-        ErrorCode::InvalidMessage
-    );
-    assert_eq!(
-        a.m.mls_seal_pending(conversation, NOW).await.unwrap(),
-        Some(0)
-    );
-    let after = a.f.mls_outbox(legacy).await.unwrap();
-    assert_eq!((after.codec, &after.wire), (Some(1), &before.wire));
+    let queued = a.f.mls_outbox(one).await.unwrap();
+    assert_eq!((queued.codec, queued.wire.len()), (Some(3), 0));
 
     // Everything that is sealed ends up as codec 2, however it gets there.
-    let one = send(&a, &b, 1, "one").await;
     let two = send(&a, &b, 2, "two").await;
     a.m.mls_seal(one, NOW).await.unwrap().unwrap();
     assert_eq!(
@@ -459,8 +448,31 @@ async fn seal_never_produces_codec1() {
         ErrorCode::InvalidMessage
     );
     assert_eq!(a.f.mls_outbox(three).await.unwrap().codec, Some(3));
-    // The legacy job never changed through any of it.
-    assert_eq!(a.f.mls_outbox(legacy).await.unwrap().codec, Some(1));
+
+    // And the schema itself has no place for an M4 plaintext job any more.
+    let c = rusqlite::Connection::open_in_memory().unwrap();
+    c.execute_batch(include_str!("../src/storage/schema.sql"))
+        .unwrap();
+    // Only the codec check is under test here, not the reference to a message row.
+    c.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+    let insert = "INSERT INTO outbox(conversation,sender_peer,sender_install,msg_id,codec,wire,attempts,retry_delay_ms,next_retry_at_ms,dispatch_state) VALUES(zeroblob(32),zeroblob(32),zeroblob(32),?1,?2,X'01',0,1000,0,0)";
+    for codec in [0, 1, 4] {
+        assert!(
+            c.execute(
+                insert,
+                rusqlite::params![[codec as u8; 16].as_slice(), codec]
+            )
+            .is_err(),
+            "outbox codec {codec} accepted"
+        );
+    }
+    for codec in [2, 3] {
+        c.execute(
+            insert,
+            rusqlite::params![[codec as u8; 16].as_slice(), codec],
+        )
+        .unwrap();
+    }
 }
 
 #[tokio::test]
@@ -669,6 +681,8 @@ async fn sealing_keeps_the_m4_hash_so_old_receipts_still_apply() {
             .await
             .unwrap()
             .key;
+    // As the M4 app did: its plaintext frame went out (the M4-peer fixture's wire).
+    a.m.m4_encode(key).await.unwrap();
     a.m.prepare_attempt(key, b.install, 2_000_000)
         .await
         .unwrap();
@@ -784,23 +798,51 @@ async fn reencrypt_waits_for_an_attempt_and_a_failed_message_stays_failed() {
 }
 
 #[tokio::test]
-async fn due_never_returns_rows_waiting_for_encryption() {
+async fn due_hands_out_rows_waiting_for_encryption() {
     let (a, b, _) = linked().await;
-    // An M4 plaintext job is due as before.
+    // A queued message awaits encryption; it is due all the same: the actor seals it (or asks
+    // for the group) when it comes up, so it is never stranded.
     let view =
-        a.m.enqueue(b.peer, id(1), "plaintext job".into(), NOW)
+        a.m.enqueue(b.peer, id(1), "waiting for its seal".into(), NOW)
             .await
             .unwrap();
+    assert_eq!(a.f.mls_outbox(view.key).await.unwrap().codec, Some(3));
     assert_eq!(a.m.due_keys(10).await.unwrap(), [view.key]);
     assert!(a.f.due_hint(10).await.unwrap());
-
-    // Promoted, it waits for encryption: not handed out, and no scheduling hint.
-    a.f.mls_promote_outbox(view.key).await.unwrap();
-    assert!(a.m.due_keys(10).await.unwrap().is_empty());
-    assert!(!a.f.due_hint(10).await.unwrap());
 
     // Sealed, it is due.
     a.m.mls_seal(view.key, NOW).await.unwrap().unwrap();
     assert_eq!(a.m.due_keys(10).await.unwrap(), [view.key]);
     assert!(a.f.due_hint(10).await.unwrap());
+}
+
+#[tokio::test]
+async fn enqueue_reserves_the_sealed_size() {
+    let (a, b, conversation) = linked().await;
+    // A one-byte text pads to the 1 KiB bucket; sealed, its frame stays within the 2 KiB the
+    // queue reserves for it, so the cap is checked against what sealing will need.
+    a.f.mls_outbox_cap(Some(3_000)).await;
+    let first =
+        a.m.enqueue(b.peer, id(1), "x".into(), NOW)
+            .await
+            .unwrap()
+            .key;
+    assert_eq!(
+        a.m.enqueue(b.peer, id(2), "y".into(), NOW)
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::StorageFull,
+        "a second reservation would pass the cap although no wire is stored yet"
+    );
+    assert_eq!(a.f.message_facts(first).await.unwrap().quota_bytes, 0);
+    // Sealing within the reservation never finds the queue full.
+    a.m.mls_seal(first, NOW).await.unwrap().unwrap();
+    let frame = a.f.mls_outbox(first).await.unwrap().wire.len() as u64;
+    assert!((1_024..=2_048).contains(&frame), "{frame} B");
+    assert_eq!(
+        a.m.mls_seal_pending(conversation, NOW).await.unwrap(),
+        Some(0)
+    );
+    a.f.mls_outbox_cap(None).await;
 }

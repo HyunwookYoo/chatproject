@@ -5,9 +5,14 @@ use crate::account::{
     connection::{Registry, Session},
 };
 use crate::message::{
+    mls_group::{Delivery, DueDelivery},
     store::{MessageDbOp, MessageDbReply, MessageRepo, PrepareToken, conversation_id},
-    types::{BlockReason, MessageKey},
+    types::{BlockReason, ConversationId, MessageKey},
     wire::{self, Frame, ReceiptFrame, RejectReason},
+};
+use crate::mls::{
+    group::CLASS_NO_GROUP,
+    wire::{MlsFrame, MlsReply},
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -22,6 +27,14 @@ pub(crate) enum AttemptOutcome {
     Written,
     Receipt(ReceiptFrame),
     ReceiptApplied(ReceiptFrame),
+    /// The recipient stored the sealed `App` frame: a kind 17 `Ack` of exactly the ciphertext
+    /// sent (the M5 counterpart of an M4 `Receipt`).
+    Acked,
+    /// The recipient could not open the `App` frame: failure class and its epoch.
+    DecryptFailed(u8, u64),
+    /// The recipient answered the kind 17 frame with the M4 `Reject(UnsupportedVersion)`: it
+    /// has not updated yet. The message waits (`waiting_peer_update`), it does not fail.
+    PeerUpdateRequired,
     Transient(ErrorCode),
     Blocked(BlockReason),
     Permanent(ErrorCode),
@@ -30,6 +43,10 @@ pub(crate) struct AttemptResult {
     pub key: MessageKey,
     pub lease: SessionLease,
     pub outcome: AttemptOutcome,
+    /// The Commits/Welcomes sent ahead of the `App` frame, and how each ended.
+    pub ahead: Vec<(DueDelivery, Delivery)>,
+    /// The `(conversation, recipient)` this attempt reserved for those deliveries.
+    pub reserved: Option<(ConversationId, InstallationId)>,
 }
 struct Pending {
     peer: PeerId,
@@ -67,6 +84,8 @@ pub(super) struct Runtime {
     write_pause: Option<TestPause>,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     scheduler_held: bool,
+    /// Messages whose re-encryption found an attempt in flight: re-encrypted once it settles.
+    reencrypt_after: std::collections::BTreeSet<MessageKey>,
 }
 #[cfg(all(feature = "test-hooks", debug_assertions))]
 struct TestPause {
@@ -246,18 +265,81 @@ struct NetworkAttempt {
     pause: Option<TestPause>,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     mutation: MessageMutation,
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    frames: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    reserved: Option<(ConversationId, InstallationId)>,
+}
+/// SHA-256 of the MLS ciphertext of a kind 17 `App` frame; `None` for any other frame (an M4
+/// receipt, or the M4-peer fixture's text).
+fn app_ciphertext_hash(wire: &[u8]) -> Option<[u8; 32]> {
+    let inner = auth::payload(wire, 17).ok()?;
+    match MlsFrame::decode(&inner).ok()? {
+        MlsFrame::App { ciphertext, .. } => Some(Sha256::digest(&ciphertext).into()),
+        _ => None,
+    }
+}
+/// The answer to an `App` frame: kind 17, or the M4 kind 16 `Reject` (an M4 recipient, or a
+/// text the recipient refuses the way M4 would).
+fn app_outcome(body: &[u8], sent: [u8; 32]) -> Result<AttemptOutcome, ErrorCode> {
+    if let Ok(inner) = auth::payload(body, 17) {
+        return Ok(
+            match MlsReply::decode(&inner).map_err(|_| ErrorCode::InvalidMessage)? {
+                MlsReply::Ack { ct_hash } if ct_hash == sent => AttemptOutcome::Acked,
+                MlsReply::DecryptFailed { class, epoch } => {
+                    AttemptOutcome::DecryptFailed(class, epoch)
+                }
+                MlsReply::Busy => AttemptOutcome::Transient(ErrorCode::Busy),
+                MlsReply::ContactRequired => AttemptOutcome::Blocked(BlockReason::ContactRequired),
+                _ => return Err(ErrorCode::InvalidMessage),
+            },
+        );
+    }
+    let inner = auth::payload(body, 16).map_err(|_| ErrorCode::InvalidMessage)?;
+    match wire::decode(&inner).map_err(|_| ErrorCode::InvalidMessage)? {
+        Frame::Reject(RejectReason::UnsupportedVersion) => Ok(AttemptOutcome::PeerUpdateRequired),
+        Frame::Reject(reason) => Ok(reject_outcome(reason)),
+        _ => Err(ErrorCode::InvalidMessage),
+    }
+}
+fn reject_outcome(reason: RejectReason) -> AttemptOutcome {
+    match reason {
+        RejectReason::ContactRequired => AttemptOutcome::Blocked(BlockReason::ContactRequired),
+        RejectReason::StorageUnavailable => AttemptOutcome::Transient(ErrorCode::StorageFull),
+        RejectReason::UnsupportedVersion => {
+            AttemptOutcome::Permanent(ErrorCode::UnsupportedMessageVersion)
+        }
+        RejectReason::InvalidMessage => AttemptOutcome::Permanent(ErrorCode::InvalidMessage),
+    }
 }
 impl NetworkAttempt {
     async fn dispatch_once(self, job: Dispatch, lease: SessionLease) -> AttemptResult {
         #[cfg(all(feature = "test-hooks", debug_assertions))]
         let mut pause = self.pause;
         let mut written = false;
+        let mut ahead = Vec::new();
+        let sent_hash = app_ciphertext_hash(&job.wire);
         let work = async {
             if job.ticket != lease.ticket
                 || job.peer != lease.session.grant.peer
                 || !self.authority.permits(&lease)
             {
                 return Err(ErrorCode::AccountRestricted);
+            }
+            // The group state the recipient needs comes first, over this same session, each
+            // delivery answered before the next; the message waits for all of them.
+            for delivery in job.ahead {
+                if !self.authority.permits(&lease) {
+                    return Err(ErrorCode::AccountRestricted);
+                }
+                #[cfg(all(feature = "test-hooks", debug_assertions))]
+                self.frames.lock().unwrap().push(delivery.body.clone());
+                let outcome = super::mls::delivery_outcome(
+                    &super::mls::exchange(&lease.session, &delivery.body).await,
+                );
+                ahead.push((delivery, outcome));
+                if outcome == Delivery::Retry {
+                    return Err(ErrorCode::Busy);
+                }
             }
             let (mut send, mut recv) = lease
                 .session
@@ -280,7 +362,10 @@ impl NetworkAttempt {
                 return Err(ErrorCode::AccountRestricted);
             }
             #[cfg(all(feature = "test-hooks", debug_assertions))]
-            self.writes.fetch_add(1, Ordering::SeqCst);
+            {
+                self.writes.fetch_add(1, Ordering::SeqCst);
+                self.frames.lock().unwrap().push(wire.to_vec());
+            }
             auth::write_frame(&mut send, &wire)
                 .await
                 .map_err(|_| ErrorCode::TransportFailed)?;
@@ -292,24 +377,14 @@ impl NetworkAttempt {
             if !self.authority.permits(&lease) {
                 return Err(ErrorCode::AccountRestricted);
             }
+            if let Some(sent) = sent_hash {
+                return app_outcome(&body, sent);
+            }
             let inner = auth::payload(&body, 16).map_err(|_| ErrorCode::InvalidMessage)?;
             match wire::decode(&inner).map_err(|_| ErrorCode::InvalidMessage)? {
                 Frame::Receipt(r) => Ok(AttemptOutcome::Receipt(r)),
                 Frame::ReceiptApplied(r) => Ok(AttemptOutcome::ReceiptApplied(r)),
-                Frame::Reject(r) => Ok(match r {
-                    RejectReason::ContactRequired => {
-                        AttemptOutcome::Blocked(BlockReason::ContactRequired)
-                    }
-                    RejectReason::StorageUnavailable => {
-                        AttemptOutcome::Transient(ErrorCode::StorageFull)
-                    }
-                    RejectReason::UnsupportedVersion => {
-                        AttemptOutcome::Permanent(ErrorCode::UnsupportedMessageVersion)
-                    }
-                    RejectReason::InvalidMessage => {
-                        AttemptOutcome::Permanent(ErrorCode::InvalidMessage)
-                    }
-                }),
+                Frame::Reject(r) => Ok(reject_outcome(r)),
                 _ => Err(ErrorCode::InvalidMessage),
             }
         };
@@ -324,11 +399,17 @@ impl NetworkAttempt {
             key: job.key,
             lease,
             outcome,
+            ahead,
+            reserved: self.reserved,
         }
     }
 }
 #[cfg(all(feature = "test-hooks", debug_assertions))]
 fn mutate(wire: Zeroizing<Vec<u8>>, mutation: MessageMutation) -> Zeroizing<Vec<u8>> {
+    // Mutations rewrite kind 16 frames; anything else (an MLS `App` frame) goes out unchanged.
+    if matches!(mutation, MessageMutation::None) {
+        return wire;
+    }
     let mut inner = Zeroizing::new(auth::payload(&wire, 16).unwrap());
     match mutation {
         MessageMutation::None => return wire,
@@ -757,6 +838,30 @@ impl Manager {
             {
                 return Err(unavailable(ErrorCode::Busy));
             }
+            #[cfg(all(feature = "test-hooks", debug_assertions))]
+            let m4 = self.messages.mls.m4_peer;
+            #[cfg(not(all(feature = "test-hooks", debug_assertions)))]
+            let m4 = false;
+            // A text is sent sealed (spec 5.1): a row awaiting encryption is sealed first, in
+            // the conversation's group; without one the group is asked for and the message
+            // waits. There is no plaintext fallback. (The M4-peer fixture of test-hook builds
+            // sends its plaintext frame instead, as a released M4 app does.)
+            if !receipt {
+                if m4 {
+                    #[cfg(all(feature = "test-hooks", debug_assertions))]
+                    self.message_db(MessageDbOp::M4Encode(key), request).await?;
+                } else if let MessageDbReply::NeedGroup(conversation) = self
+                    .message_db(
+                        MessageDbOp::Seal(key, self.services.clock.wall_ms()),
+                        request,
+                    )
+                    .await?
+                {
+                    self.wait_for_group(key, false, conversation, peer, request)
+                        .await?;
+                    return Err(unavailable(ErrorCode::NotAvailable));
+                }
+            }
             let session = self
                 .auth
                 .registry
@@ -773,13 +878,30 @@ impl Manager {
                 })
                 .cloned()
                 .ok_or_else(|| unavailable(ErrorCode::AccountRestricted))?;
+            // Commits/Welcomes this recipient still lacks go ahead of the message, over the
+            // same session; while another delivery to it is under way the message waits.
+            let recipient = session.grant.installation;
+            let ahead = if m4 {
+                Vec::new()
+            } else {
+                if self
+                    .messages
+                    .mls
+                    .inflight
+                    .contains(&(key.conversation, recipient))
+                {
+                    return Err(unavailable(ErrorCode::Busy));
+                }
+                self.deliveries_ahead(key.conversation, recipient, request)
+                    .await?
+            };
             let (token, transition) = PrepareToken::new();
             if !receipt {
                 self.messages
                     .unlaunched
                     .insert(key, (request.ticket, token, peer));
             }
-            let MessageDbReply::Prepared(wire, receipt) = self
+            let prepared = self
                 .message_db(
                     MessageDbOp::Prepare(
                         key,
@@ -794,9 +916,16 @@ impl Manager {
                     ),
                     request,
                 )
-                .await?
-            else {
-                unreachable!()
+                .await?;
+            let (wire, receipt) = match prepared {
+                MessageDbReply::Prepared(wire, receipt) => (wire, receipt),
+                // A receipt for a message received over MLS, and no group to seal it in.
+                MessageDbReply::NeedGroup(conversation) => {
+                    self.wait_for_group(key, true, conversation, peer, request)
+                        .await?;
+                    return Err(unavailable(ErrorCode::NotAvailable));
+                }
+                _ => unreachable!(),
             };
             #[cfg(all(feature = "test-hooks", debug_assertions))]
             if let Some(pause) = self.messages.prelaunch_pause.take() {
@@ -814,7 +943,14 @@ impl Manager {
                 } else { None },
                 #[cfg(all(feature = "test-hooks", debug_assertions))]
                 mutation,
+                #[cfg(all(feature = "test-hooks", debug_assertions))]
+                frames: self.messages.mls.frames.clone(),
+                reserved: (!ahead.is_empty()).then_some((key.conversation, recipient)),
             };
+            // Nothing below can fail: the reservation is released by the attempt's result.
+            if let Some(reserved) = attempt.reserved {
+                self.messages.mls.inflight.insert(reserved);
+            }
             Ok((
                 peer,
                 receipt,
@@ -823,6 +959,7 @@ impl Manager {
                     peer,
                     wire,
                     ticket: request.ticket,
+                    ahead,
                 },
                 SessionLease {
                     session,
@@ -871,7 +1008,17 @@ impl Manager {
             }
         }
     }
-    pub(super) async fn message_attempt_result(&mut self, result: AttemptResult) {
+    pub(super) async fn message_attempt_result(&mut self, mut result: AttemptResult) {
+        // The deliveries this attempt carried are no longer under way, whatever else holds.
+        if let Some(reserved) = result.reserved.take() {
+            self.messages.mls.inflight.remove(&reserved);
+        }
+        let ahead = std::mem::take(&mut result.ahead);
+        if !ahead.is_empty()
+            && let Ok(request) = self.ready()
+        {
+            let _ = self.settle_ahead(ahead, request).await;
+        }
         let Some(pending) = self.messages.pending.get(&result.key) else {
             return;
         };
@@ -905,6 +1052,7 @@ impl Manager {
                                 AttemptOutcome::Written
                                     | AttemptOutcome::Receipt(_)
                                     | AttemptOutcome::ReceiptApplied(_)
+                                    | AttemptOutcome::Acked
                             ),
                         ),
                         request,
@@ -926,6 +1074,44 @@ impl Manager {
                 }
                 AttemptOutcome::Receipt(_) | AttemptOutcome::ReceiptApplied(_) => {
                     return Err(unavailable(ErrorCode::InvalidMessage));
+                }
+                // The recipient stored the sealed text: delivered.
+                AttemptOutcome::Acked if pending.receipt.is_none() => MessageDbOp::MlsAcked(
+                    result.key,
+                    result.lease.session.grant.installation,
+                    self.services.clock.wall_ms(),
+                ),
+                // The sender of the message stored the sealed receipt: the job is done.
+                AttemptOutcome::Acked => {
+                    MessageDbOp::Applied(pending.receipt.clone().unwrap(), pending.peer)
+                }
+                AttemptOutcome::DecryptFailed(class, epoch) => {
+                    if pending.receipt.is_none() {
+                        self.message_db(
+                            MessageDbOp::AttemptOutcome(result.key, None, None, false),
+                            request,
+                        )
+                        .await?;
+                        self.after_decrypt_failed(result.key, pending.peer, class, epoch, request)
+                            .await?;
+                    }
+                    // A receipt is sealed afresh on its next attempt anyway.
+                    return Err(unavailable(ErrorCode::NotAvailable));
+                }
+                AttemptOutcome::PeerUpdateRequired => {
+                    if pending.receipt.is_none() {
+                        self.message_db(
+                            MessageDbOp::MarkWaitingPeerUpdate(result.key, true),
+                            request,
+                        )
+                        .await?;
+                        self.message_db(
+                            MessageDbOp::AttemptOutcome(result.key, None, None, false),
+                            request,
+                        )
+                        .await?;
+                    }
+                    return Err(unavailable(ErrorCode::UnsupportedMessageVersion));
                 }
                 AttemptOutcome::Blocked(reason) => {
                     if pending.receipt.is_none() {
@@ -1008,7 +1194,87 @@ impl Manager {
         };
         if !settled {
             self.messages.pending.insert(result.key, pending);
+        } else if self.messages.reencrypt_after.remove(&result.key)
+            && let Ok(request) = self.ready()
+        {
+            let _ = self.reencrypt(result.key, pending.peer, request).await;
         }
+    }
+
+    /// The recipient could not open a sent text (spec 6): it is sealed again in the current
+    /// epoch and is due at once. Its next attempt carries any Commit or Welcome still queued
+    /// for that recipient ahead of it over the same session, so a missing Commit (class 2) is
+    /// sent again right before the new ciphertext. A recipient without the group (class 4)
+    /// cannot open any ciphertext until its Welcome arrives, and a recipient already past this
+    /// device's epoch (`epoch` is the recipient's) means this device still lacks a Commit: in
+    /// both cases a new ciphertext cannot help yet, so the message keeps its back-off and the
+    /// re-encryption budget (3) is not spent.
+    async fn after_decrypt_failed(
+        &mut self,
+        key: MessageKey,
+        peer: PeerId,
+        class: u8,
+        epoch: u64,
+        request: Request,
+    ) -> Result<(), CoreError> {
+        if class == CLASS_NO_GROUP
+            || self
+                .group_epoch(key.conversation, request)
+                .await?
+                .is_some_and(|own| own < epoch)
+        {
+            return Ok(());
+        }
+        self.reencrypt(key, peer, request).await
+    }
+
+    /// `Reencrypt`, or, while an attempt of the message is in flight, once it settles.
+    async fn reencrypt(
+        &mut self,
+        key: MessageKey,
+        peer: PeerId,
+        request: Request,
+    ) -> Result<(), CoreError> {
+        let now = self.schedule_now();
+        match self
+            .message_db(MessageDbOp::Reencrypt(key, now), request)
+            .await
+        {
+            Ok(MessageDbReply::NeedGroup(conversation)) => {
+                self.ensure_group(conversation, peer).await?;
+                Ok(())
+            }
+            Ok(_) => Ok(()),
+            Err(error) if error.code == ErrorCode::Busy => {
+                self.messages.reencrypt_after.insert(key);
+                Ok(())
+            }
+            // Delivered or cancelled meanwhile: nothing to send again.
+            Err(error) if error.code == ErrorCode::MessageNotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// A message (or an MLS receipt) cannot be sealed yet: the conversation has no group.
+    /// `ensure_group` asks for one; the job backs off meanwhile. A peer known to run M4 still
+    /// marks a text as waiting for its update.
+    async fn wait_for_group(
+        &mut self,
+        key: MessageKey,
+        receipt: bool,
+        conversation: ConversationId,
+        peer: PeerId,
+        request: Request,
+    ) -> Result<(), CoreError> {
+        self.ensure_group(conversation, peer).await?;
+        if !receipt && self.messages.mls.outdated.contains(&peer) {
+            self.message_db(MessageDbOp::MarkWaitingPeerUpdate(key, true), request)
+                .await?;
+        }
+        let now = self.schedule_now();
+        self.message_db(MessageDbOp::Defer(key, receipt, now), request)
+            .await?;
+        Ok(())
     }
 }
 

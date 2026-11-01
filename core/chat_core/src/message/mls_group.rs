@@ -106,6 +106,10 @@ pub(crate) enum GroupOp {
         now: u64,
         recipients: Vec<InstallationId>,
     },
+    /// Every queued delivery of the conversation to `recipient`, in the order it must get them
+    /// (whatever their retry time): sent ahead of an application message to that recipient so
+    /// it holds the group state the message needs.
+    Pending { recipient: InstallationId },
     /// The result of one delivery attempt.
     Delivered {
         recipient: InstallationId,
@@ -140,6 +144,7 @@ impl GroupOp {
             Self::Info
                 | Self::Plan { .. }
                 | Self::DueDeliveries { .. }
+                | Self::Pending { .. }
                 | Self::HoldPeers
                 | Self::Groups
         )
@@ -661,6 +666,9 @@ pub(super) fn group_op(
         GroupOp::DueDeliveries { now, recipients } => {
             GroupReply::Due(due_deliveries(c, now, &recipients)?)
         }
+        GroupOp::Pending { recipient } => {
+            GroupReply::Due(pending_deliveries(c, conversation, recipient)?)
+        }
         GroupOp::Delivered {
             recipient,
             kind,
@@ -1053,28 +1061,25 @@ fn apply(
     }
     let provider = MlsProvider::new(KvStore::load(&tx, conversation.0)?);
     let before = membership::group_installations(&provider, &row.group_id)?;
-    match membership::apply_commit(&provider, &row.group_id, commit, &verify) {
-        Ok(applied) => {
-            if applied.self_removed {
-                forget(&tx, conversation)?;
-                finish(tx, fault)?;
-                return Ok(Outcome::Removed);
-            }
-            settle_applied(
-                &tx,
-                &provider,
-                conversation,
-                &row,
-                &before,
-                applied,
-                hash,
-                arrival.sender_peer != identity.peer,
-                None,
-            )?;
+    if let Ok(applied) = membership::apply_commit(&provider, &row.group_id, commit, &verify) {
+        if applied.self_removed {
+            forget(&tx, conversation)?;
             finish(tx, fault)?;
-            return Ok(Outcome::Ack);
+            return Ok(Outcome::Removed);
         }
-        Err(_) => {}
+        settle_applied(
+            &tx,
+            &provider,
+            conversation,
+            &row,
+            &before,
+            applied,
+            hash,
+            arrival.sender_peer != identity.peer,
+            None,
+        )?;
+        finish(tx, fault)?;
+        return Ok(Outcome::Ack);
     }
     if let Some(lookup) = vetting.held() {
         drop(provider);
@@ -1402,6 +1407,38 @@ fn due_deliveries(c: &Connection, now: u64, recipients: &[InstallationId]) -> R<
             body: r.get(4)?,
         })
     })
+    .map_err(sql)?
+    .collect::<Result<_, _>>()
+    .map_err(sql)
+}
+
+/// At most this many queued deliveries go ahead of one application message.
+const PENDING_LIMIT: i64 = 8;
+
+fn pending_deliveries(
+    c: &Connection,
+    conversation: ConversationId,
+    recipient: InstallationId,
+) -> R<Vec<DueDelivery>> {
+    let mut q = c
+        .prepare("SELECT kind,epoch,body FROM mls_delivery WHERE conversation=?1 AND recipient_install=?2 ORDER BY epoch,kind DESC LIMIT ?3")
+        .map_err(sql)?;
+    q.query_map(
+        params![
+            conversation.0.as_slice(),
+            recipient.0.as_slice(),
+            PENDING_LIMIT
+        ],
+        |r| {
+            Ok(DueDelivery {
+                conversation,
+                recipient,
+                kind: r.get(0)?,
+                epoch: uint(r, 1)?,
+                body: r.get(2)?,
+            })
+        },
+    )
     .map_err(sql)?
     .collect::<Result<_, _>>()
     .map_err(sql)

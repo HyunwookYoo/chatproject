@@ -55,7 +55,7 @@ CREATE TABLE outbox (
     sender_peer BLOB NOT NULL CHECK(length(sender_peer)=32),
     sender_install BLOB NOT NULL CHECK(length(sender_install)=32),
     msg_id BLOB NOT NULL CHECK(length(msg_id)=16),
-    codec INTEGER NOT NULL CHECK(codec IN (1,2,3)),
+    codec INTEGER NOT NULL CHECK(codec IN (2,3)),
     wire BLOB NOT NULL CHECK(length(wire)<=61440 AND (codec=3 OR length(wire)>=1)),
     attempts INTEGER NOT NULL CHECK(attempts BETWEEN 0 AND 4294967295),
     retry_delay_ms INTEGER NOT NULL CHECK(retry_delay_ms BETWEEN 0 AND 300000),

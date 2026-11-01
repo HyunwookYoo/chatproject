@@ -8,10 +8,11 @@
 //! store (and its provider) is dropped; the next operation loads a fresh one.
 use super::mls_group::{check_own, group_row, signer_of, sql};
 use super::store::{
-    Identity, MessageDbReply, bump, bytes, commit, conflict, ensure_conversation, find, integer,
-    invalid, missing, uint,
+    Identity, MessageDbReply, bump, bytes, commit, ensure_conversation, find, integer, invalid,
+    missing, receipt_for, schedule_retry, target, uint,
 };
 use super::types::*;
+use super::wire::ReceiptKind;
 use crate::mls::{
     MlsProvider,
     group::{self, OpenFailure, Opened},
@@ -53,13 +54,49 @@ const REENCRYPT_CAP: u64 = 3;
 const TEXT_LIMIT: usize = 16_384;
 /// The outbox holds at most this many wire bytes (M4 rule), sealed frames included.
 const OUTBOX_BYTES: u64 = 128 * 1024 * 1024;
+/// Upper bound of what sealing adds to a padded plaintext bucket (MLS framing, AEAD tag,
+/// signature, kind 17 frame): the largest bucket plus this is the frame limit.
+const SEAL_OVERHEAD: usize = MAX_FRAME - crate::mls::payload::MAX_BUCKET;
+/// CBOR bytes of a text `ChatMessage` other than its body (array, version, msg_id, lamport,
+/// prev_hash, sent_at, content header, body string header), at their largest.
+const TEXT_HEAD: usize = 76;
+
+/// Outbox bytes a row awaiting encryption (codec 3) reserves: the frame its body will seal to,
+/// at most (the bucket it pads to plus `SEAL_OVERHEAD`). Accounting this at enqueue time keeps
+/// a later seal from finding the outbox full.
+pub(super) fn reserved_bytes(body_len: usize) -> u64 {
+    let bucket = crate::mls::payload::BUCKETS
+        .into_iter()
+        .find(|bucket| *bucket > body_len + TEXT_HEAD)
+        .unwrap_or(crate::mls::payload::MAX_BUCKET);
+    (bucket + SEAL_OVERHEAD).min(MAX_FRAME) as u64
+}
+
+/// `(rows, bytes)` of the outbox for its 10,000 row / 128 MiB caps: a sealed row counts its
+/// frame, a row awaiting encryption what `reserved_bytes` reserves for it.
+pub(super) fn outbox_usage(c: &Connection) -> R<(u64, u64)> {
+    let mut reserve = String::from("CASE");
+    for bucket in crate::mls::payload::BUCKETS {
+        reserve.push_str(&format!(
+            " WHEN length(CAST(m.body AS BLOB))+{TEXT_HEAD}<{bucket} THEN {}",
+            (bucket + SEAL_OVERHEAD).min(MAX_FRAME)
+        ));
+    }
+    reserve.push_str(&format!(" ELSE {MAX_FRAME} END"));
+    c.query_row(
+        &format!("SELECT count(*),coalesce(sum(CASE WHEN o.codec=3 THEN {reserve} ELSE length(o.wire) END),0) FROM outbox o JOIN message m USING(conversation,sender_peer,sender_install,msg_id)"),
+        [],
+        |r| Ok((uint(r, 0)?, uint(r, 1)?)),
+    )
+    .map_err(sql)
+}
 
 #[cfg(all(feature = "test-hooks", debug_assertions))]
 thread_local! {
     /// Lowered outbox byte cap for tests, per storage writer thread.
     static OUTBOX_CAP: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
-fn outbox_cap() -> u64 {
+pub(super) fn outbox_cap() -> u64 {
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     if let Some(cap) = OUTBOX_CAP.with(|c| c.get()) {
         return cap;
@@ -122,6 +159,7 @@ fn load_outgoing(tx: &Transaction<'_>, key: MessageKey) -> R<Outgoing> {
 
 /// Seals `message`, remembers the ciphertext hash (so this device recognises it if it comes
 /// back) and returns the hash and the complete kind 17 frame.
+#[allow(clippy::too_many_arguments)]
 fn seal_one(
     tx: &Transaction<'_>,
     provider: &MlsProvider,
@@ -268,6 +306,12 @@ pub(super) fn seal_pending(
         )?;
         check_outbox_cap(&tx, outgoing.wire.len() as u64, frame.len() as u64)?;
         store_sealed(&tx, key, &frame)?;
+        // A row that waited for the group (backing off meanwhile) can go out now.
+        tx.execute(
+            "UPDATE outbox SET next_retry_at_ms=min(next_retry_at_ms,?5) WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",
+            params![key.conversation.0.as_slice(), key.sender.0.as_slice(), key.installation.0.as_slice(), key.id.0.as_slice(), integer(now)?],
+        )
+        .map_err(sql)?;
     }
     provider.storage().flush(&tx, conversation.0)?;
     finish(tx, fault)?;
@@ -388,6 +432,192 @@ pub(super) fn mark_waiting(
     Ok(MessageDbReply::Done)
 }
 
+/// Whether a received message came over MLS (its payload hash is a remembered MLS ciphertext
+/// hash of its sender), so its receipts go back over MLS too. Messages received from an M4
+/// peer (codec 1) keep the M4 kind 16 `Receipt`.
+pub(super) fn received_over_mls(c: &Connection, key: MessageKey) -> R<bool> {
+    c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM message m JOIN processed_ct p ON p.codec=2 AND p.sender_peer=m.sender_peer AND p.sender_install=m.sender_install AND p.hash=m.payload_hash WHERE m.conversation=?1 AND m.sender_peer=?2 AND m.sender_install=?3 AND m.msg_id=?4 AND m.outgoing=0)",
+        params![key.conversation.0.as_slice(), key.sender.0.as_slice(), key.installation.0.as_slice(), key.id.0.as_slice()],
+        |r| r.get(0),
+    )
+    .map_err(sql)
+}
+
+/// The `Prepare` of a receipt job for a message received over MLS: the receipt (`Read` after
+/// `mark_read`) is sealed as an MLS `Content::Receipt` for the message, in the same
+/// transaction that moves the job's retry time, and sent as a kind 17 `App` frame. Each attempt
+/// seals afresh (a receipt has no outbox row to keep a ciphertext in); the receiver applies a
+/// receipt idempotently. The returned `ReceiptFrame` names the job the `Ack` settles.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn prepare_receipt(
+    c: &mut Connection,
+    identity: Identity,
+    local: &LocalAccount,
+    key: MessageKey,
+    receiver: InstallationId,
+    wall: u64,
+    now: u64,
+    fault: Fault,
+) -> R<MessageDbReply> {
+    target(c, identity, key, true)?;
+    if receiver != key.installation {
+        return Err(invalid());
+    }
+    let tx = c.transaction().map_err(sql)?;
+    let kind: u64 = tx
+        .query_row(
+            "SELECT kind FROM receipt_job WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4 AND recipient_install=?5 ORDER BY kind DESC LIMIT 1",
+            params![key.conversation.0.as_slice(), key.sender.0.as_slice(), key.installation.0.as_slice(), key.id.0.as_slice(), identity.installation.0.as_slice()],
+            |r| uint(r, 0),
+        )
+        .optional()
+        .map_err(sql)?
+        .ok_or_else(missing)?;
+    let receipt = receipt_for(
+        &tx,
+        key,
+        identity.installation,
+        if kind == 2 {
+            ReceiptKind::Read
+        } else {
+            ReceiptKind::Delivered
+        },
+    )?;
+    let Some(group) = group_row(&tx, key.conversation)? else {
+        return Ok(MessageDbReply::NeedGroup(key.conversation));
+    };
+    let (lamport, prev): (u64, Vec<u8>) = tx
+        .query_row(
+            "SELECT lamport_max,local_prev_hash FROM conversation WHERE id=?1",
+            params![key.conversation.0.as_slice()],
+            |r| Ok((uint(r, 0)?, r.get(1)?)),
+        )
+        .map_err(sql)?;
+    schedule_retry(&tx, key, true, now)?;
+    // A receipt is not a message of its own: an id derived from what it acknowledges.
+    let mut id = Sha256::new();
+    id.update(b"ChatProject/m5/receipt-id/v1");
+    id.update(key.conversation.0);
+    id.update(key.sender.0);
+    id.update(key.installation.0);
+    id.update(key.id.0);
+    id.update([kind as u8]);
+    id.update(wall.to_be_bytes());
+    let id: [u8; 32] = id.finalize().into();
+    let message = ChatMessage {
+        msg_id: MessageId(id[..16].try_into().map_err(|_| invalid())?),
+        lamport,
+        prev_hash: prev.try_into().map_err(|_| invalid())?,
+        sent_at_ms: wall,
+        content: Content::Receipt {
+            kind: receipt.kind,
+            targets: vec![key.id],
+        },
+    };
+    let provider = MlsProvider::new(KvStore::load(&tx, key.conversation.0)?);
+    let (signer, _) = signer_of(local);
+    let (_, frame) = seal_one(
+        &tx,
+        &provider,
+        &signer,
+        identity,
+        key,
+        &group.group_id,
+        &message,
+        wall,
+    )?;
+    provider.storage().flush(&tx, key.conversation.0)?;
+    finish(tx, fault)?;
+    Ok(MessageDbReply::Prepared(
+        zeroize::Zeroizing::new(frame),
+        Some(receipt),
+    ))
+}
+
+/// The synchronous `Ack` of a sent `App` frame: the recipient stored the message (spec: the
+/// same meaning as an M4 `Receipt`), so it is `Delivered` and leaves the outbox. The recipient
+/// must be one this message was prepared for. Never undoes `Read`.
+pub(super) fn acked(
+    c: &mut Connection,
+    identity: Identity,
+    key: MessageKey,
+    recipient: InstallationId,
+    now: u64,
+    fault: Fault,
+) -> R<MessageDbReply> {
+    check_own(identity, key)?;
+    let tx = c.transaction().map_err(sql)?;
+    let message = find(&tx, key)?.ok_or_else(missing)?;
+    let raw: Vec<u8> = tx
+        .query_row(
+            "SELECT attempted_receivers FROM message WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",
+            params![key.conversation.0.as_slice(), key.sender.0.as_slice(), key.installation.0.as_slice(), key.id.0.as_slice()],
+            |r| r.get(0),
+        )
+        .map_err(sql)?;
+    if !message.outgoing || !super::store::receivers(&raw)?.contains(&recipient) {
+        return Err(invalid());
+    }
+    let changed = tx
+        .execute(
+            "UPDATE message SET delivered_at_ms=?5 WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4 AND delivered_at_ms IS NULL",
+            params![key.conversation.0.as_slice(), key.sender.0.as_slice(), key.installation.0.as_slice(), key.id.0.as_slice(), integer(now)?],
+        )
+        .map_err(sql)?;
+    tx.execute(
+        "DELETE FROM outbox WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",
+        params![key.conversation.0.as_slice(), key.sender.0.as_slice(), key.installation.0.as_slice(), key.id.0.as_slice()],
+    )
+    .map_err(sql)?;
+    if changed > 0 {
+        let revision = bump(&tx)?;
+        tx.execute(
+            "UPDATE conversation SET change_revision=?2 WHERE id=?1",
+            params![key.conversation.0.as_slice(), integer(revision)?],
+        )
+        .map_err(sql)?;
+    }
+    finish(tx, fault)?;
+    Ok(MessageDbReply::Done)
+}
+
+/// Test-hook builds only: the M4-peer fixture (a core that speaks only kind 16) puts the
+/// canonical M4 text frame of a row awaiting encryption into its `wire`, so its `Prepare` sends
+/// that plaintext frame the way a released M4 app does. Production builds have no such path.
+#[cfg(all(feature = "test-hooks", debug_assertions))]
+pub(super) fn m4_encode(
+    c: &mut Connection,
+    identity: Identity,
+    key: MessageKey,
+) -> R<MessageDbReply> {
+    check_own(identity, key)?;
+    let Some(message) = find(c, key)? else {
+        return Err(missing());
+    };
+    let prev: Vec<u8> = c
+        .query_row(
+            "SELECT prev_hash FROM message WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",
+            params![key.conversation.0.as_slice(), key.sender.0.as_slice(), key.installation.0.as_slice(), key.id.0.as_slice()],
+            |r| r.get(0),
+        )
+        .map_err(sql)?;
+    let (wire, _) = super::wire::TextFrame {
+        key,
+        lamport: message.lamport,
+        prev_hash: prev.try_into().map_err(|_| invalid())?,
+        sent_at_ms: message.sent_at_ms,
+        body: message.body,
+    }
+    .encode();
+    c.execute(
+        "UPDATE outbox SET wire=?5 WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4 AND codec=3 AND wire=X''",
+        params![key.conversation.0.as_slice(), key.sender.0.as_slice(), key.installation.0.as_slice(), key.id.0.as_slice(), wire.as_slice()],
+    )
+    .map_err(sql)?;
+    Ok(MessageDbReply::Done)
+}
+
 #[cfg(all(feature = "test-hooks", debug_assertions))]
 thread_local! {
     /// How often the MLS engine's `open` ran on this (the storage writer) thread.
@@ -414,9 +644,13 @@ fn decrypt_failed(class: u8, epoch: u64) -> MessageDbReply {
 /// * the device's own ciphertext coming back, or one already in `processed_ct`, is acknowledged
 ///   without opening (a replay would only fail with secret reuse);
 /// * a ciphertext that cannot be opened changes nothing and answers `DecryptFailed`;
-/// * a decrypted message that carries nothing storable (undecodable, not text, out of range)
-///   still advances the ratchet and is acknowledged, so its sender stops retrying;
+/// * an undecodable plaintext or unknown content still advances the ratchet and is
+///   acknowledged, so its sender stops retrying;
+/// * a `Receipt` is applied to this device's sent messages and acknowledged;
+/// * a text M4 would refuse advances the ratchet but stores nothing and is `Rejected` (the
+///   sender gives the message up, as for an M4 `Reject`);
 /// * the same message id again (a re-encrypted resend) stores nothing new.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn open_app(
     c: &mut Connection,
     identity: Identity,
@@ -471,16 +705,26 @@ pub(super) fn open_app(
         // A Commit is applied through the group protocol (with its members vetted), never here.
         Opened::Commit { .. } => return Ok(decrypt_failed(group::CLASS_OTHER, group.epoch)),
     };
+    let mut stored = Stored::Yes;
     if let Some(message) = message {
-        store_text(
-            &tx,
-            sender_peer,
-            sender_install,
-            conversation,
-            &message,
-            &ct_hash,
-            now,
-        )?;
+        stored = match &message.content {
+            Content::Text { body } => store_text(
+                &tx,
+                sender_peer,
+                sender_install,
+                conversation,
+                &message,
+                body,
+                &ct_hash,
+                now,
+            )?,
+            Content::Receipt { kind, targets } => {
+                apply_receipt(&tx, identity, conversation, *kind, targets, now)?;
+                Stored::Yes
+            }
+            // Content this version does not know is dropped (spec 5.1 `Custom` fallback).
+            Content::Custom { .. } => Stored::Yes,
+        };
     }
     tx.execute(
         "INSERT INTO processed_ct VALUES(2,?1,?2,?3,?4)",
@@ -499,25 +743,94 @@ pub(super) fn open_app(
     .map_err(sql)?;
     provider.storage().flush(&tx, conversation.0)?;
     finish(tx, fault)?;
-    Ok(ack)
+    Ok(match stored {
+        Stored::Yes => ack,
+        Stored::Rejected => MessageDbReply::Rejected,
+    })
+}
+
+/// Whether a decrypted application message was taken (stored, already stored, or nothing to
+/// store) or refused the way M4 refuses a text frame.
+enum Stored {
+    Yes,
+    Rejected,
+}
+
+/// Applies a received MLS `Receipt` to this device's own sent messages (M4 `apply_receipt`
+/// rules): `Read` implies delivered, neither is ever undone, and a delivered message leaves the
+/// outbox. Targets that are not this device's sent messages are ignored.
+fn apply_receipt(
+    tx: &Transaction<'_>,
+    identity: Identity,
+    conversation: ConversationId,
+    kind: ReceiptKind,
+    targets: &[MessageId],
+    now: i64,
+) -> R<()> {
+    let read = kind == ReceiptKind::Read;
+    let mut changed = 0;
+    for id in targets {
+        let key = params![
+            conversation.0.as_slice(),
+            identity.peer.0.as_slice(),
+            identity.installation.0.as_slice(),
+            id.0.as_slice()
+        ];
+        let outgoing: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM message WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4 AND outgoing=1)",
+                key,
+                |r| r.get(0),
+            )
+            .map_err(sql)?;
+        if !outgoing {
+            continue;
+        }
+        changed += tx
+            .execute(
+                "UPDATE message SET delivered_at_ms=coalesce(delivered_at_ms,?5),read_at_ms=CASE WHEN ?6 THEN coalesce(read_at_ms,?5) ELSE read_at_ms END WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4 AND (delivered_at_ms IS NULL OR (?6 AND read_at_ms IS NULL))",
+                params![
+                    conversation.0.as_slice(),
+                    identity.peer.0.as_slice(),
+                    identity.installation.0.as_slice(),
+                    id.0.as_slice(),
+                    now,
+                    read
+                ],
+            )
+            .map_err(sql)?;
+        tx.execute(
+            "DELETE FROM outbox WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",
+            key,
+        )
+        .map_err(sql)?;
+    }
+    if changed > 0 {
+        let revision = bump(tx)?;
+        tx.execute(
+            "UPDATE conversation SET change_revision=?2 WHERE id=?1",
+            params![conversation.0.as_slice(), integer(revision)?],
+        )
+        .map_err(sql)?;
+    }
+    Ok(())
 }
 
 /// Stores a received text the way M4 `receive` does (same sender/conversation rules, idempotent
-/// on the logical key and body, a different body is a conflict). Content that can never be stored
-/// (not text, out of range) is skipped without error, so the caller still acknowledges it.
+/// on the logical key and body). What M4 would refuse (an empty or too long body, an
+/// out-of-range lamport or time, a different body or position for a known id) is `Rejected`:
+/// nothing is stored, but the ratchet still moves, and the sender is told it failed for good.
+#[allow(clippy::too_many_arguments)]
 fn store_text(
     tx: &Transaction<'_>,
     sender_peer: PeerId,
     sender_install: InstallationId,
     conversation: ConversationId,
     message: &ChatMessage,
+    body: &str,
     ct_hash: &[u8; 32],
     now: i64,
-) -> R<()> {
-    let Content::Text { body } = &message.content else {
-        // Receipts and other content are applied by the message protocol (Task 8).
-        return Ok(());
-    };
+) -> R<Stored> {
     let key = MessageKey {
         conversation,
         sender: sender_peer,
@@ -529,16 +842,16 @@ fn store_text(
         i64::try_from(message.sent_at_ms),
     );
     let (Ok(lamport), Ok(sent_at)) = (lamport, sent_at) else {
-        return Ok(());
+        return Ok(Stored::Rejected);
     };
     if body.is_empty() || body.len() > TEXT_LIMIT {
-        return Ok(());
+        return Ok(Stored::Rejected);
     }
     if let Some(existing) = find(tx, key)? {
         if existing.outgoing || existing.body != *body {
-            return Err(conflict());
+            return Ok(Stored::Rejected);
         }
-        return Ok(());
+        return Ok(Stored::Yes);
     }
     let maximum: Option<u64> = tx
         .query_row(
@@ -554,7 +867,7 @@ fn store_text(
             .saturating_add(1_000_000)
             .min(i64::MAX as u64)
     {
-        return Ok(());
+        return Ok(Stored::Rejected);
     }
     let collision: bool = tx
         .query_row(
@@ -564,7 +877,7 @@ fn store_text(
         )
         .map_err(sql)?;
     if collision {
-        return Err(conflict());
+        return Ok(Stored::Rejected);
     }
     ensure_conversation(tx, conversation, sender_peer)?;
     tx.execute(
@@ -589,7 +902,7 @@ fn store_text(
         params![conversation.0.as_slice(), lamport, integer(revision)?],
     )
     .map_err(sql)?;
-    Ok(())
+    Ok(Stored::Yes)
 }
 
 // ---- test-hooks fixtures -------------------------------------------------------------------
@@ -639,7 +952,8 @@ pub(super) fn fixture_outbox_cap(cap: Option<u64>) {
 pub(super) fn fixture_promote(c: &Connection, key: MessageKey) -> R<()> {
     let changed = c
         .execute(
-            "UPDATE outbox SET codec=3,wire=X'' WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4 AND codec=1",
+            // Rows are enqueued awaiting encryption already; this only clears a test wire.
+            "UPDATE outbox SET codec=3,wire=X'' WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4 AND codec=3",
             params![key.conversation.0.as_slice(), key.sender.0.as_slice(), key.installation.0.as_slice(), key.id.0.as_slice()],
         )
         .map_err(sql)?;

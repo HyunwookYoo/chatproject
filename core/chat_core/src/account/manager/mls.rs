@@ -25,9 +25,10 @@ use crate::account::{
     Lookup, auth,
     connection::{Input, Session},
 };
-use crate::message::mls_group::{Committed, Delivery, GroupOp, GroupReply, Outcome};
+use crate::message::mls_group::{Committed, Delivery, DueDelivery, GroupOp, GroupReply, Outcome};
 use crate::message::store::{MessageDbOp, MessageDbReply, conversation_id};
 use crate::message::types::ConversationId;
+use crate::message::wire::{Frame, RejectReason};
 use crate::mls::{
     group::{CLASS_FUTURE_EPOCH, CLASS_OTHER, inspect_key_package},
     identity::MlsCredential,
@@ -109,7 +110,7 @@ pub(crate) struct Runtime {
     sync: BTreeMap<ConversationId, (PeerId, u64)>,
     collecting: BTreeMap<ConversationId, Collect>,
     /// One delivery per recipient of a conversation at a time, in epoch order.
-    inflight: BTreeSet<(ConversationId, InstallationId)>,
+    pub(super) inflight: BTreeSet<(ConversationId, InstallationId)>,
     /// `(rejoin_count, rejoin_after_ms)` of a conversation that left its group to rejoin, for
     /// the group it joins or creates next.
     rejoins: BTreeMap<ConversationId, (u32, u64)>,
@@ -126,8 +127,17 @@ pub(crate) struct Runtime {
     missing: BTreeMap<ConversationId, (u64, u64)>,
     /// Hash of the device lists and ready sessions seen by the last poll.
     fingerprint: Option<[u8; 32]>,
+    /// Accounts with a device that answered a kind 17 request with the M4 `Reject
+    /// (UnsupportedVersion)`: messages for them wait for that update (`waiting_peer_update`).
+    pub(super) outdated: BTreeSet<PeerId>,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
-    hold_delivery: bool,
+    pub(super) hold_delivery: bool,
+    /// The M4-peer fixture: this core behaves like a released M4 app (kind 16 only).
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    pub(super) m4_peer: bool,
+    /// Every kind 16/17 request frame this actor sent (group requests and message attempts).
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    pub(super) frames: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     sent: Vec<String>,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
@@ -174,12 +184,15 @@ enum Answer {
 /// The answer to one kind 17 request, or one record lookup, this actor started.
 pub(crate) struct MlsEvent {
     ticket: u64,
+    /// The account of the device that answered (the looked-up account for a lookup).
+    peer: PeerId,
     task: Task,
     answer: Answer,
 }
 
-/// One request/response exchange on an authenticated session.
-async fn exchange(session: &Session, body: &[u8]) -> Result<MlsReply, ErrorCode> {
+/// One request/response exchange on an authenticated session. A released M4 app answers any
+/// kind 17 request with its kind 16 `Reject(UnsupportedVersion)`: `UnsupportedMessageVersion`.
+pub(super) async fn exchange(session: &Session, body: &[u8]) -> Result<MlsReply, ErrorCode> {
     let work = async {
         if session.conn.close_reason().is_some() {
             return Err(ErrorCode::TransportFailed);
@@ -196,6 +209,14 @@ async fn exchange(session: &Session, body: &[u8]) -> Result<MlsReply, ErrorCode>
         let reply = auth::read_frame(&mut recv, 61_440)
             .await
             .map_err(|_| ErrorCode::TransportFailed)?;
+        if let Ok(inner) = auth::payload(&reply, 16) {
+            return Err(match crate::message::wire::decode(&inner) {
+                Ok(Frame::Reject(RejectReason::UnsupportedVersion)) => {
+                    ErrorCode::UnsupportedMessageVersion
+                }
+                _ => ErrorCode::InvalidMessage,
+            });
+        }
         let inner = auth::payload(&reply, 17).map_err(|_| ErrorCode::InvalidMessage)?;
         MlsReply::decode(&inner).map_err(|_| ErrorCode::InvalidMessage)
     };
@@ -206,6 +227,21 @@ async fn exchange(session: &Session, body: &[u8]) -> Result<MlsReply, ErrorCode>
 
 fn sha256(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
+}
+
+/// What a Commit/Welcome delivery attempt's answer means for its queued row.
+pub(super) fn delivery_outcome(result: &Result<MlsReply, ErrorCode>) -> Delivery {
+    match result {
+        Ok(MlsReply::Ack { .. }) => Delivery::Acked,
+        // An earlier Commit is still on its way to the recipient: send this again.
+        Ok(MlsReply::DecryptFailed {
+            class: CLASS_FUTURE_EPOCH,
+            ..
+        }) => Delivery::Retry,
+        // Refused, or settled as a fork on the other side: resending cannot help.
+        Ok(MlsReply::DecryptFailed { .. }) => Delivery::Settled,
+        _ => Delivery::Retry,
+    }
 }
 
 /// What a sent kind 17 frame is, for the test hook: the op, and for Commits and application
@@ -238,6 +274,8 @@ pub(crate) enum MlsTest {
     Held,
     Rejoined,
     Query(PeerId),
+    M4Peer(bool),
+    Frames,
 }
 #[cfg(all(feature = "test-hooks", debug_assertions))]
 pub(crate) enum MlsTestReply {
@@ -247,6 +285,7 @@ pub(crate) enum MlsTestReply {
     Sent(Vec<String>),
     Count(u64),
     Answers(Vec<(InstallationId, bool)>),
+    Frames(Vec<Vec<u8>>),
 }
 
 #[cfg(all(feature = "test-hooks", debug_assertions))]
@@ -304,6 +343,19 @@ impl AccountHandle {
             _ => unreachable!(),
         }
     }
+    /// The M4-peer fixture: from now on this core behaves like a released M4 app. It sends its
+    /// queued texts as kind 16 plaintext frames, answers every kind 17 request with the M4
+    /// `Reject(UnsupportedVersion)`, and keeps no MLS group. `false` is the update to M5.
+    pub async fn message_test_m4_peer(&self, m4: bool) -> Result<(), CoreError> {
+        self.mls_test(MlsTest::M4Peer(m4)).await.map(|_| ())
+    }
+    /// Every kind 16/17 request frame this core sent so far (complete envelopes).
+    pub async fn message_test_sent_frames(&self) -> Result<Vec<Vec<u8>>, CoreError> {
+        match self.mls_test(MlsTest::Frames).await? {
+            MlsTestReply::Frames(frames) => Ok(frames),
+            _ => unreachable!(),
+        }
+    }
 }
 
 impl Manager {
@@ -324,6 +376,13 @@ impl Manager {
                 MlsTestReply::Done
             }
             MlsTest::Sent => MlsTestReply::Sent(self.messages.mls.sent.clone()),
+            MlsTest::M4Peer(m4) => {
+                self.messages.mls.m4_peer = m4;
+                MlsTestReply::Done
+            }
+            MlsTest::Frames => {
+                MlsTestReply::Frames(self.messages.mls.frames.lock().unwrap().clone())
+            }
             MlsTest::Held => MlsTestReply::Count(self.messages.mls.held),
             MlsTest::Rejoined => MlsTestReply::Count(self.messages.mls.rejoined),
             MlsTest::Query(peer) => {
@@ -390,7 +449,10 @@ impl Manager {
 
     fn launch(&mut self, session: &Session, body: Vec<u8>, task: Task, request: Request) {
         #[cfg(all(feature = "test-hooks", debug_assertions))]
-        self.messages.mls.sent.push(label(&body));
+        {
+            self.messages.mls.sent.push(label(&body));
+            self.messages.mls.frames.lock().unwrap().push(body.clone());
+        }
         let mailbox = self.auth.send.clone();
         let session = session.clone();
         let ticket = request.ticket;
@@ -399,11 +461,66 @@ impl Manager {
             let _ = mailbox
                 .send(Input::Mls(MlsEvent {
                     ticket,
+                    peer: session.grant.peer,
                     task,
                     answer,
                 }))
                 .await;
         });
+    }
+
+    /// Records how the Commits/Welcomes sent ahead of an application message ended (the
+    /// message attempt carried them over its session, `manager/messages.rs`).
+    pub(super) async fn settle_ahead(
+        &mut self,
+        deliveries: Vec<(DueDelivery, Delivery)>,
+        request: Request,
+    ) -> Result<(), CoreError> {
+        for (delivery, outcome) in deliveries {
+            let now = self.schedule_now();
+            let op = GroupOp::Delivered {
+                recipient: delivery.recipient,
+                kind: delivery.kind,
+                epoch: delivery.epoch,
+                outcome,
+                now,
+            };
+            self.group_db(delivery.conversation, op, request).await?;
+        }
+        Ok(())
+    }
+
+    /// The epoch of the conversation's group on this device, if it has one.
+    pub(super) async fn group_epoch(
+        &mut self,
+        conversation: ConversationId,
+        request: Request,
+    ) -> Result<Option<u64>, CoreError> {
+        match self.group_db(conversation, GroupOp::Info, request).await? {
+            GroupReply::Info(info) => Ok(info.map(|info| info.epoch)),
+            _ => Err(unavailable(ErrorCode::InvalidMessage)),
+        }
+    }
+
+    /// Queued Commits/Welcomes of the conversation for `recipient`, to send ahead of an
+    /// application message (none while delivery is held in tests).
+    pub(super) async fn deliveries_ahead(
+        &mut self,
+        conversation: ConversationId,
+        recipient: InstallationId,
+        request: Request,
+    ) -> Result<Vec<DueDelivery>, CoreError> {
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        if self.messages.mls.hold_delivery {
+            return Ok(Vec::new());
+        }
+        match self
+            .group_db(conversation, GroupOp::Pending { recipient }, request)
+            .await?
+        {
+            GroupReply::Due(rows) => Ok(rows),
+            _ => Err(unavailable(ErrorCode::InvalidMessage)),
+        }
     }
 
     /// The peer of a conversation a request may concern: the sending account itself when it is
@@ -657,7 +774,8 @@ impl Manager {
         mls.wanted.remove(&conversation);
         mls.rejoins.remove(&conversation);
         mls.sync.insert(conversation, (peer, 0));
-        let now = self.services.clock.wall_ms();
+        // Rows that backed off while waiting for the group become due at this time.
+        let now = self.schedule_now();
         let _ = self
             .message_db(MessageDbOp::SealPending(conversation, now), request)
             .await;
@@ -884,6 +1002,7 @@ impl Manager {
             let _ = mailbox
                 .send(Input::Mls(MlsEvent {
                     ticket,
+                    peer,
                     task: Task::Lookup { peer },
                     answer: Answer::Lookup(lookup),
                 }))
@@ -1073,6 +1192,11 @@ impl Manager {
         if self.local().is_err() {
             return;
         }
+        // The M4-peer fixture keeps no group.
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        if self.messages.mls.m4_peer {
+            return;
+        }
         // A changed device list or a new session may change who belongs in each group.
         let fingerprint = self.mls_fingerprint();
         if self.messages.mls.fingerprint != Some(fingerprint) {
@@ -1120,9 +1244,21 @@ impl Manager {
     pub(super) async fn mls_event(&mut self, event: MlsEvent) {
         let MlsEvent {
             ticket,
+            peer: answered,
             task,
             answer,
         } = event;
+        // A device answering a kind 17 request with the M4 refusal has not updated yet; any
+        // proper answer from the account means it has.
+        match &answer {
+            Answer::Reply(Err(ErrorCode::UnsupportedMessageVersion)) => {
+                self.messages.mls.outdated.insert(answered);
+            }
+            Answer::Reply(Ok(_)) => {
+                self.messages.mls.outdated.remove(&answered);
+            }
+            _ => {}
+        }
         match task {
             Task::Lookup { peer } => {
                 self.messages.mls.looking.remove(&peer);
@@ -1227,17 +1363,7 @@ impl Manager {
                 kind,
                 epoch,
             } => {
-                let outcome = match result {
-                    Ok(MlsReply::Ack { .. }) => Delivery::Acked,
-                    // An earlier Commit is still on its way to the recipient: send this again.
-                    Ok(MlsReply::DecryptFailed {
-                        class: CLASS_FUTURE_EPOCH,
-                        ..
-                    }) => Delivery::Retry,
-                    // Refused, or settled as a fork on the other side: resending cannot help.
-                    Ok(MlsReply::DecryptFailed { .. }) => Delivery::Settled,
-                    _ => Delivery::Retry,
-                };
+                let outcome = delivery_outcome(&result);
                 let now = self.schedule_now();
                 let op = GroupOp::Delivered {
                     recipient,
@@ -1261,7 +1387,39 @@ impl Manager {
         request: Request,
     ) -> Result<Vec<u8>, CoreError> {
         let session = self.message_session(conn, request)?;
+        // The M4-peer fixture answers like a released M4 app.
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        if self.messages.mls.m4_peer {
+            return Ok(Frame::Reject(RejectReason::UnsupportedVersion)
+                .envelope()
+                .to_vec());
+        }
         let reply = match MlsFrame::decode(inner) {
+            Ok(MlsFrame::App {
+                conversation,
+                ciphertext,
+            }) => match self
+                .receive_app(&session, conversation, ciphertext, request)
+                .await
+            {
+                Ok(Some(reply)) => reply,
+                // A text M4 would refuse: the M4 refusal, which the sender takes as final.
+                Ok(None) => {
+                    self.message_session(conn, request)?;
+                    return Ok(Frame::Reject(RejectReason::InvalidMessage)
+                        .envelope()
+                        .to_vec());
+                }
+                Err(error)
+                    if matches!(
+                        error.code,
+                        ErrorCode::AccountRestricted | ErrorCode::StorageLocked
+                    ) =>
+                {
+                    return Err(error);
+                }
+                Err(_) => MlsReply::Busy,
+            },
             Ok(frame) => match self.mls_request(&session, frame, request).await {
                 Ok(reply) => reply,
                 Err(error)
@@ -1473,11 +1631,49 @@ impl Manager {
                     _ => MlsReply::Ack { ct_hash },
                 }
             }
-            // Application messages are the message protocol's (Task 8).
-            MlsFrame::App { .. } => MlsReply::DecryptFailed {
-                class: CLASS_OTHER,
-                epoch: 0,
-            },
+            // Answered by `receive_app`.
+            MlsFrame::App { .. } => MlsReply::Busy,
         })
+    }
+
+    /// A received application message (spec 5.2): opened and stored in one transaction. `None`
+    /// when it carried a text M4 would refuse (nothing stored; the ratchet still moved).
+    async fn receive_app(
+        &mut self,
+        session: &Session,
+        conversation: ConversationId,
+        ciphertext: Vec<u8>,
+        request: Request,
+    ) -> Result<Option<MlsReply>, CoreError> {
+        let sender = session.grant.peer;
+        // Application messages come from the conversation's peer account (this account's
+        // other devices send none in 1:1, spec 4.4a).
+        if sender == self.local()?.keys.peer_id()
+            || self.conversation_peer(conversation, sender) != Some(sender)
+        {
+            return Ok(Some(MlsReply::ContactRequired));
+        }
+        let op = MessageDbOp::OpenApp(
+            sender,
+            session.grant.installation,
+            conversation,
+            ciphertext,
+            self.services.clock.wall_ms(),
+        );
+        match self.message_db(op, request).await {
+            Ok(MessageDbReply::Opened(reply)) => Ok(Some(reply)),
+            Ok(MessageDbReply::Rejected) => Ok(None),
+            Ok(_) => Err(unavailable(ErrorCode::InvalidMessage)),
+            // The MLS sender is not the authenticated device, or the message conflicts.
+            Err(error)
+                if matches!(
+                    error.code,
+                    ErrorCode::InvalidMessage | ErrorCode::MessageConflict
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
     }
 }

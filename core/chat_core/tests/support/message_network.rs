@@ -293,6 +293,10 @@ async fn pair() -> (Fixture, Fixture, Arc<Backend>) {
     }
     let a = Fixture::new(1, 11, &a, backend.clone()).await;
     let b = Fixture::new(2, 12, &b, backend.clone()).await;
+    // The M4 network tests exercise the kind 16 protocol, which M5 keeps for M4 peers: both
+    // cores are the M4-peer fixture (kind 16 only). M5 messaging is tested in `mls_*.rs`.
+    a.account.message_test_m4_peer(true).await.unwrap();
+    b.account.message_test_m4_peer(true).await.unwrap();
     a.route(&b).await;
     b.route(&a).await;
     (a, b, backend)
@@ -302,11 +306,8 @@ async fn pair() -> (Fixture, Fixture, Arc<Backend>) {
 mod sql_store;
 use chat_core::storage_fixture::{BlockReason, DeliveryState, MessageId, MessageMutation};
 async fn enqueue(a: &Fixture, b: &Fixture) -> chat_core::storage_fixture::MessageView {
-    a.account
-        .storage_test_fixture()
-        .messages()
-        .await
-        .unwrap()
+    let messages = a.account.storage_test_fixture().messages().await.unwrap();
+    let view = messages
         .enqueue(
             b.peer,
             MessageId([9; 16]),
@@ -314,7 +315,10 @@ async fn enqueue(a: &Fixture, b: &Fixture) -> chat_core::storage_fixture::Messag
             NOW * 1000,
         )
         .await
-        .unwrap()
+        .unwrap();
+    // The M4-peer fixture (`pair`) queues its plaintext frame with the text, as M4 did.
+    messages.m4_encode(view.key).await.unwrap();
+    view
 }
 async fn contacts(a: &Fixture, b: &Fixture) {
     let invite = b.account.create_invite(None).await.unwrap();

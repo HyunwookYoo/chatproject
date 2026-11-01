@@ -209,6 +209,8 @@ impl Messages {
         let op = MessageDbOp::OpenApp(sender, installation, conversation, ciphertext, now);
         match self.mls(op).await? {
             MessageDbReply::Opened(reply) => Ok(reply),
+            // Answered with the M4 `Reject(InvalidMessage)` on the wire.
+            MessageDbReply::Rejected => Err(CoreError::new(ErrorCode::InvalidMessage, "mls_text_rejected")),
             _ => unreachable!(),
         }
     }
@@ -257,6 +259,14 @@ impl Messages {
     pub async fn due_keys(&self, now: u64) -> Result<Vec<MessageKey>, CoreError> {
         match self.mls(MessageDbOp::Due(now, vec![], [None, None])).await? {
             MessageDbReply::Due(text, _, _) => Ok(text.into_iter().map(|d| d.key).collect()),
+            _ => unreachable!(),
+        }
+    }
+    /// The M4-peer fixture's plaintext frame for a row awaiting encryption (what a released M4
+    /// app queued), so an M4-style `Prepare` can send it.
+    pub async fn m4_encode(&self, key: MessageKey) -> Result<(), CoreError> {
+        match self.mls(MessageDbOp::M4Encode(key)).await? {
+            MessageDbReply::Done => Ok(()),
             _ => unreachable!(),
         }
     }
@@ -362,7 +372,7 @@ CREATE TABLE outbox_v1 (
         REFERENCES message(conversation,sender_peer,sender_install,msg_id)
 ) STRICT;
 INSERT INTO outbox_v1
-    SELECT conversation,sender_peer,sender_install,msg_id,codec,wire,attempts,
+    SELECT conversation,sender_peer,sender_install,msg_id,1,wire,attempts,
            retry_delay_ms,next_retry_at_ms,dispatch_state FROM outbox;
 DROP TABLE outbox;
 ALTER TABLE outbox_v1 RENAME TO outbox;
@@ -740,16 +750,47 @@ impl Fixture {
         })
     }
     /// Rewrite a closed, migrated store into the exact M4 (schema v1) shape: the four MLS tables
-    /// and the v2 outbox columns go away, `user_version` and `schema_version` return to 1.
-    /// Only valid while every outbox row is still codec 1.
+    /// and the v2 outbox columns go away, `user_version` and `schema_version` return to 1, and
+    /// every queued row becomes the M4 plaintext job (codec 1) with the canonical text frame an
+    /// M4 app would have queued for it. Only valid while no row is sealed (codec 2).
     pub fn downgrade_to_v1(root: &Path, p: Arc<dyn KeyProtector>) -> Result<(), CoreError> {
         crate::storage::migration::with_raw_connection(root, &*p, |c| {
             let tx = c.transaction().map_err(probe_error)?;
             let other: i64 = tx
-                .query_row("SELECT count(*) FROM outbox WHERE codec<>1", [], |r| r.get(0))
+                .query_row("SELECT count(*) FROM outbox WHERE codec<>3", [], |r| r.get(0))
                 .map_err(probe_error)?;
             if other != 0 {
                 return Err(CoreError::new(ErrorCode::InvalidMessage, "fixture_not_downgradable"));
+            }
+            type Row = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, i64, Vec<u8>, i64, String);
+            let rows: Vec<Row> = tx
+                .prepare("SELECT m.conversation,m.sender_peer,m.sender_install,m.msg_id,m.lamport,m.prev_hash,m.sent_at_ms,m.body FROM outbox o JOIN message m USING(conversation,sender_peer,sender_install,msg_id)")
+                .map_err(probe_error)?
+                .query_map([], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?))
+                })
+                .map_err(probe_error)?
+                .collect::<Result<_, _>>()
+                .map_err(probe_error)?;
+            let bad = |_| CoreError::new(ErrorCode::InvalidMessage, "fixture_not_downgradable");
+            for (conversation, sender, install, id, lamport, prev, sent_at, body) in rows {
+                let frame = crate::message::wire::TextFrame {
+                    key: MessageKey {
+                        conversation: ConversationId(conversation.clone().try_into().map_err(bad)?),
+                        sender: crate::account::PeerId(sender.clone().try_into().map_err(bad)?),
+                        installation: crate::account::InstallationId(install.clone().try_into().map_err(bad)?),
+                        id: MessageId(id.clone().try_into().map_err(bad)?),
+                    },
+                    lamport: lamport as u64,
+                    prev_hash: prev.try_into().map_err(bad)?,
+                    sent_at_ms: sent_at as u64,
+                    body,
+                };
+                tx.execute(
+                    "UPDATE outbox SET wire=?5 WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",
+                    rusqlite::params![conversation, sender, install, id, frame.encode().0.as_slice()],
+                )
+                .map_err(probe_error)?;
             }
             tx.execute_batch(V1_DOWNGRADE).map_err(probe_error)?;
             tx.pragma_update(None, "user_version", 1).map_err(probe_error)?;
