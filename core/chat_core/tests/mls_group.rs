@@ -938,3 +938,225 @@ async fn no_proposals_are_sent() {
         "{frames:?}"
     );
 }
+
+// Task 9 (spec 4.4a): a Welcome from this account's own device authorizes the contact.
+
+/// B3 is a device of B that is never online.
+const B3: u8 = 16;
+
+/// A is `[A1, A2]` and B is `[B1]`. A1 and B1 are contacts of each other and share a session.
+/// A2 is A's phone: it has no contact at all, and is linked to A1 and B1.
+async fn phone_setup() -> (Fixture, Fixture, Fixture, Arc<Backend>, ConversationId) {
+    let (ra, rb) = (record(A, &[A1, A2], 0), record(B, &[B1], 0));
+    let net = backend(&[(A, ra.clone()), (B, rb.clone())]);
+    let a1 = device(A, A1, &ra, &net).await;
+    let a2 = device(A, A2, &ra, &net).await;
+    let b1 = device(B, B1, &rb, &net).await;
+    link(&a1, &b1).await;
+    link(&a1, &a2).await;
+    link(&a2, &b1).await;
+    befriend(&a1, &b1).await;
+    befriend(&b1, &a1).await;
+    a1.account.connect_account(b1.peer).await.unwrap();
+    a1.account.connect_account(a1.peer).await.unwrap();
+    a2.account.connect_account(a2.peer).await.unwrap();
+    let conv = conversation(&a1, &b1).await;
+    conversation(&b1, &a1).await;
+    assert!(a2.account.contacts().await.unwrap().is_empty());
+    (a1, a2, b1, net, conv)
+}
+
+async fn contact_of(f: &Fixture, peer: PeerId) -> Option<chat_core::account::ContactView> {
+    f.account
+        .contacts()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|c| c.peer_id == peer)
+}
+
+async fn sent_labels(f: &Fixture) -> Vec<String> {
+    f.account.mls_test_sent_frames().await.unwrap()
+}
+
+/// Lets `devices` run for `rounds` more seconds of back-off time.
+async fn idle(devices: &[&Fixture], rounds: usize) {
+    for _ in 0..rounds {
+        for d in devices {
+            d.clock.advance_monotonic_ms(1_000);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+async fn own_device_welcome_adds_contact_and_joins() {
+    let (a1, a2, b1, _net, conv) = phone_setup().await;
+    let (i1, i2, ib) = (
+        installation(&a1).await,
+        installation(&a2).await,
+        installation(&b1).await,
+    );
+    ensure(&a1, b1.peer).await;
+    settle!(
+        [&a1, &a2, &b1],
+        agreed(&a1, &a2, conv).await
+            && agreed(&a1, &b1, conv).await
+            && contact_of(&a2, b1.peer).await.is_some()
+            && state(&a1, conv).await.deliveries.is_empty()
+    );
+    // The phone joined the conversation and got B as a contact without being asked.
+    assert_eq!(
+        sorted(state(&a2, conv).await.members),
+        sorted(vec![i1, i2, ib])
+    );
+    let contacts = a2.account.contacts().await.unwrap();
+    assert_eq!(contacts.len(), 1);
+    assert_eq!(contacts[0].peer_id, b1.peer);
+    assert!(acked(&talk(&a2, &b1, conv, 1).await));
+    assert!(acked(&talk(&b1, &a2, conv, 2).await));
+}
+
+#[tokio::test]
+async fn auto_contact_does_not_copy_safety_verification() {
+    let (a1, a2, b1, _net, conv) = phone_setup().await;
+    // A1 knows B by name and has checked B's safety number.
+    a1.account
+        .confirm_safety(b1.peer, chat_core::account::safety_digest(a1.peer, b1.peer))
+        .await
+        .unwrap();
+    let before = contact_of(&a1, b1.peer).await.unwrap();
+    assert!(before.verified && before.alias == "remote");
+    ensure(&a1, b1.peer).await;
+    settle!(
+        [&a1, &a2, &b1],
+        agreed(&a1, &a2, conv).await && contact_of(&a2, b1.peer).await.is_some()
+    );
+    let made = contact_of(&a2, b1.peer).await.unwrap();
+    assert_eq!(made.alias, "");
+    assert!(!made.verified, "safety verification is never copied");
+    assert!(!made.new_device);
+    // The other device's contact is untouched.
+    let after = contact_of(&a1, b1.peer).await.unwrap();
+    assert!(after.verified && after.alias == "remote");
+}
+
+#[tokio::test]
+async fn peer_welcome_without_contact_is_held_as_contact_required() {
+    // A1 and B1 share a group; A2 (no contact) is not reachable by A1.
+    let (ra, rb) = (record(A, &[A1, A2], 0), record(B, &[B1], 0));
+    let net = backend(&[(A, ra.clone()), (B, rb.clone())]);
+    let a1 = device(A, A1, &ra, &net).await;
+    let a2 = device(A, A2, &ra, &net).await;
+    let b1 = device(B, B1, &rb, &net).await;
+    link(&a1, &b1).await;
+    link(&a2, &b1).await;
+    befriend(&a1, &b1).await;
+    befriend(&b1, &a1).await;
+    a1.account.connect_account(b1.peer).await.unwrap();
+    let conv = conversation(&a1, &b1).await;
+    ensure(&a1, b1.peer).await;
+    settle!(
+        [&a1, &b1],
+        agreed(&a1, &b1, conv).await && state(&a1, conv).await.deliveries.is_empty()
+    );
+    // B1 adds A2 to the group: the Welcome comes from B's device, not from one of mine.
+    a2.account.connect_account(b1.peer).await.unwrap();
+    b1.account.mls_test_hold_delivery(true).await.unwrap();
+    let key_package = a2
+        .account
+        .storage_test_fixture()
+        .messages()
+        .await
+        .unwrap()
+        .mls_key_package()
+        .await
+        .unwrap();
+    let epoch = b1
+        .account
+        .storage_test_fixture()
+        .messages()
+        .await
+        .unwrap()
+        .mls_commit(conv, a1.peer, vec![key_package], vec![], NOW * 1000)
+        .await
+        .unwrap()
+        .expect("an own Commit");
+    let i2 = installation(&a2).await;
+    assert!(state(&b1, conv).await.deliveries.contains(&(i2, 2, epoch)));
+    b1.account.mls_test_hold_delivery(false).await.unwrap();
+    settle!(
+        [&a1, &a2, &b1],
+        sent_labels(&b1).await.iter().any(|f| f == "welcome")
+    );
+    idle(&[&a1, &a2, &b1], 30).await;
+    // A2 answered ContactRequired: nothing kept, no contact, and B1 keeps the Welcome queued.
+    assert_eq!(state(&a2, conv).await.group_epoch, None);
+    assert!(a2.account.contacts().await.unwrap().is_empty());
+    assert!(state(&b1, conv).await.deliveries.contains(&(i2, 2, epoch)));
+}
+
+#[tokio::test]
+async fn own_device_welcome_with_unverified_peer_leaf_is_rejected() {
+    let (a1, a2, b1, net, conv) = phone_setup().await;
+    a1.account.mls_test_hold_delivery(true).await.unwrap();
+    ensure(&a1, b1.peer).await;
+    settle!(
+        [&a1],
+        state(&a1, conv).await.deliveries.len() == 2
+            && state(&a1, conv).await.group_epoch.is_some()
+    );
+    // B's list no longer names B1 (published after A1 made the group, before A2 looks).
+    publish(&net, B, &record(B, &[B3], 1));
+    a1.account.mls_test_hold_delivery(false).await.unwrap();
+    settle!(
+        [&a1, &a2, &b1],
+        sent_labels(&a2).await.iter().any(|f| f == "group_query")
+            && a2
+                .view()
+                .await
+                .remote_records
+                .iter()
+                .any(|r| r.peer == b1.peer)
+    );
+    idle(&[&a1, &a2, &b1], 30).await;
+    // The leaf of B1 does not check out against B's record: nothing was kept.
+    assert_eq!(state(&a2, conv).await.group_epoch, None);
+    assert!(a2.account.contacts().await.unwrap().is_empty());
+    let i2 = installation(&a2).await;
+    assert!(state(&a1, conv).await.deliveries.iter().any(|d| d.0 == i2));
+}
+
+#[tokio::test]
+async fn auto_contact_receives_the_peers_messages() {
+    let (a1, a2, b1, _net, conv) = phone_setup().await;
+    ensure(&a1, b1.peer).await;
+    settle!(
+        [&a1, &a2, &b1],
+        agreed(&a1, &a2, conv).await
+            && agreed(&a1, &b1, conv).await
+            && contact_of(&a2, b1.peer).await.is_some()
+            && state(&a1, conv).await.deliveries.is_empty()
+    );
+    // Only the phone is left for B to reach. B's text arrives through the contact rule of
+    // the receive path, not through a store-level call.
+    drop(a1);
+    a2.account.connect_account(b1.peer).await.unwrap();
+    let sent = b1
+        .account
+        .messages()
+        .send_text(a2.peer, MessageId([5; 16]), "hello phone".into())
+        .await
+        .unwrap();
+    settle!(
+        [&a2, &b1],
+        a2.account
+            .messages()
+            .load_messages(conv, None, 50)
+            .await
+            .unwrap()
+            .items
+            .iter()
+            .any(|m| m.key == sent.key && m.body == "hello phone")
+    );
+}

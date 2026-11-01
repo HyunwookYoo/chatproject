@@ -25,7 +25,9 @@ use crate::account::{
     Lookup, auth,
     connection::{Input, Session},
 };
-use crate::message::mls_group::{Committed, Delivery, DueDelivery, GroupOp, GroupReply, Outcome};
+use crate::message::mls_group::{
+    Committed, Delivery, DueDelivery, GroupOp, GroupReply, Outcome, OwnWelcome,
+};
 use crate::message::store::{MessageDbOp, MessageDbReply, conversation_id};
 use crate::message::types::ConversationId;
 use crate::message::wire::{Frame, RejectReason};
@@ -169,6 +171,14 @@ pub(crate) struct Outdated {
     /// A newer record this account was already asked once about within the back-off: a record
     /// change buys one request, never repeated ones.
     asked: Option<[u8; 32]>,
+}
+
+/// Who a received Welcome is from (`welcome_peer`).
+enum WelcomeFrom {
+    /// The conversation's peer, a local contact (or this account's device, for that contact).
+    Contact(PeerId),
+    /// A device of this account, for a conversation with someone who is not a contact.
+    OwnDevice,
 }
 
 #[derive(Clone, Copy)]
@@ -663,13 +673,76 @@ impl Manager {
         }
     }
 
-    /// Whether a Welcome for `conversation` from `sender` may be joined, and the peer it is
-    /// with. Until Task 9 this is the contact rule of every other request: a Welcome for a
-    /// conversation with someone who is not a local contact is answered `ContactRequired`.
-    /// Task 9 extends this one function for Welcomes from this account's own devices (spec
-    /// 4.4a).
-    fn welcome_peer(&self, conversation: ConversationId, sender: PeerId) -> Option<PeerId> {
-        self.conversation_peer(conversation, sender)
+    /// Whether a Welcome for `conversation` from `sender` may be joined, and who it is from: a
+    /// local contact (the contact rule of every other request), or, spec 4.4a, one of this
+    /// account's own devices, whose Welcome may also bring in a conversation with someone who is
+    /// not a contact yet (`own_welcome_peer` decides that). A Welcome from the other account's
+    /// devices without a contact is answered `ContactRequired`.
+    fn welcome_peer(&self, conversation: ConversationId, sender: PeerId) -> Option<WelcomeFrom> {
+        if let Some(peer) = self.conversation_peer(conversation, sender) {
+            return Some(WelcomeFrom::Contact(peer));
+        }
+        let own = self.local().ok()?.keys.peer_id();
+        (sender == own).then_some(WelcomeFrom::OwnDevice)
+    }
+
+    /// Spec 4.4a: a Welcome from this account's own device for a conversation with an account
+    /// that is not a contact. Vetted first (nothing kept; the sending device is a leaf checked
+    /// against this account's record, every peer leaf against the peer's record), then the
+    /// contact is added (empty alias, no safety verification, no known device). The join comes
+    /// after this: a crash in between leaves a contact without a group, which the sender's
+    /// resent Welcome (unacknowledged, KeyPackage unused) joins through the contact rule; the
+    /// other order could leave a group whose peer's messages this device refuses. `Err(reply)`
+    /// is what the sender gets instead.
+    async fn own_welcome_peer(
+        &mut self,
+        conversation: ConversationId,
+        welcome: &[u8],
+        sender_install: InstallationId,
+        request: Request,
+    ) -> Result<Result<PeerId, MlsReply>, CoreError> {
+        let op = GroupOp::OwnWelcome {
+            sender_install,
+            welcome: welcome.to_vec(),
+        };
+        let GroupReply::OwnWelcome(vetted) = self.group_db(conversation, op, request).await? else {
+            return Ok(Err(MlsReply::Busy));
+        };
+        let peer = match vetted {
+            OwnWelcome::Refused => return Ok(Err(MlsReply::ContactRequired)),
+            OwnWelcome::Held(lookup) => {
+                // The record is looked up in a spawned task; the sender's next attempt is vetted
+                // with it.
+                let now = self.schedule_now();
+                let mls = &mut self.messages.mls;
+                if mls.lookups.get(&lookup).is_none_or(|at| now >= *at)
+                    && !mls.looking.contains(&lookup)
+                {
+                    mls.lookups
+                        .insert(lookup, now.saturating_add(LOOKUP_RETRY_MS));
+                    self.start_lookup(lookup, request);
+                }
+                return Ok(Err(MlsReply::Busy));
+            }
+            OwnWelcome::Peer(peer) => peer,
+        };
+        let local = self.local()?;
+        if !local.contacts.iter().any(|c| c.peer == peer) {
+            if local.contacts.len() >= 1000 {
+                return Ok(Err(MlsReply::ContactRequired));
+            }
+            let mut contacts = local.contacts.clone();
+            contacts.push(crate::account::contacts::Contact {
+                peer,
+                alias: String::new(),
+                verified_digest: None,
+                known_installation: None,
+                new_device: false,
+            });
+            contacts.sort_by_key(|c| c.peer);
+            self.commit_contacts(contacts, request).await?;
+        }
+        Ok(Ok(peer))
     }
 
     fn mls_trusted(&self, sender: PeerId) -> bool {
@@ -1725,7 +1798,7 @@ impl Manager {
                 welcome,
                 sender_install,
             } => {
-                let Some(peer) = self.welcome_peer(conversation, sender) else {
+                let Some(from) = self.welcome_peer(conversation, sender) else {
                     return Ok(MlsReply::ContactRequired);
                 };
                 if sender_install != session.grant.installation {
@@ -1754,6 +1827,25 @@ impl Manager {
                         self.launch(session, body, task, request);
                     }
                     return Ok(MlsReply::Busy);
+                };
+                let peer = match from {
+                    WelcomeFrom::Contact(peer) => peer,
+                    WelcomeFrom::OwnDevice => match self
+                        .own_welcome_peer(conversation, &welcome, sender_install, request)
+                        .await?
+                    {
+                        Ok(peer) => peer,
+                        Err(reply) => {
+                            // Waiting for a record: the learned hash is still good next time.
+                            if reply == MlsReply::Busy {
+                                self.messages
+                                    .mls
+                                    .known
+                                    .insert((conversation, sender_install), first_commit_hash);
+                            }
+                            return Ok(reply);
+                        }
+                    },
                 };
                 let op = GroupOp::Join {
                     peer,

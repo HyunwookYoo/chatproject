@@ -71,6 +71,13 @@ pub(crate) enum GroupOp {
         now: u64,
         wall: u64,
     },
+    /// Whether a Welcome from this account's own device `sender_install` may bring in a
+    /// conversation with someone who is not a contact (spec 4.4a). Read only: the Welcome is
+    /// staged in memory and nothing is kept, so the KeyPackage stays usable for the real join.
+    OwnWelcome {
+        sender_install: InstallationId,
+        welcome: Vec<u8>,
+    },
     /// A `JoinRequest` from `sender_peer`'s installation named in `key_package`: an Add (and
     /// Remove of its old leaf) Commit. A device missing from the record is held and looked up.
     JoinRequest {
@@ -147,6 +154,7 @@ impl GroupOp {
         !matches!(
             self,
             Self::Info
+                | Self::OwnWelcome { .. }
                 | Self::Plan { .. }
                 | Self::DueDeliveries { .. }
                 | Self::Pending { .. }
@@ -219,6 +227,17 @@ pub(crate) enum Committed {
     Held(PeerId),
 }
 
+/// What vetting a Welcome from this account's own device decided (spec 4.4a).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OwnWelcome {
+    /// Every leaf checks out: the group is with this peer, whose account is the contact to add.
+    Peer(PeerId),
+    /// A device of the account is missing from the record this device has: look it up again.
+    Held(PeerId),
+    /// Not a conversation this account's device may bring in.
+    Refused,
+}
+
 pub(crate) enum GroupReply {
     KeyPackage(Vec<u8>),
     Created {
@@ -229,6 +248,7 @@ pub(crate) enum GroupReply {
     },
     Info(Option<GroupInfo>),
     Outcome(Outcome),
+    OwnWelcome(OwnWelcome),
     Plan(Option<Plan>),
     Committed(Committed),
     /// The stored `(rejoin_count, rejoin_after_ms)` after the rejoin, or `None` when refused.
@@ -598,6 +618,17 @@ pub(super) fn group_op(
             },
             fault,
         )?),
+        GroupOp::OwnWelcome {
+            sender_install,
+            welcome,
+        } => GroupReply::OwnWelcome(vet_own_welcome(
+            c,
+            identity,
+            local,
+            conversation,
+            sender_install,
+            &welcome,
+        )?),
         GroupOp::ApplyCommit {
             peer,
             sender_peer,
@@ -924,6 +955,77 @@ fn hold(
     .map_err(sql)?;
     tx.commit().map_err(sql)?;
     Ok(true)
+}
+
+/// Spec 4.4a: whether a Welcome from `sender_install`, a device of this account, may bring in a
+/// conversation with an account that is not a contact. Nothing is kept. The Welcome is staged
+/// in memory to read its leaves; then every leaf is checked the way a join checks it (`Vetting`):
+/// this account's leaves against its own record, the peer's against the record of exactly that
+/// peer (Ruling 6). The peer is whoever else has leaves in the group, and the conversation must
+/// be the one between the two accounts. The sending device must be one of the group's leaves.
+fn vet_own_welcome(
+    c: &Connection,
+    identity: Identity,
+    local: &LocalAccount,
+    conversation: ConversationId,
+    sender_install: InstallationId,
+    welcome: &[u8],
+) -> R<OwnWelcome> {
+    let leaves = std::cell::RefCell::new(Vec::<(Vec<u8>, Vec<u8>)>::new());
+    let provider = MlsProvider::new(KvStore::load(c, conversation.0)?);
+    let collect = |credential: &[u8], key: &[u8]| {
+        leaves
+            .borrow_mut()
+            .push((credential.to_vec(), key.to_vec()));
+        Ok(())
+    };
+    // The provider is dropped without being flushed.
+    if group::join(&provider, welcome, &collect).is_err() {
+        return Ok(OwnWelcome::Refused);
+    }
+    let leaves = leaves.into_inner();
+    let mut peers = Vec::new();
+    for (credential, _) in &leaves {
+        let Ok(decoded) = MlsCredential::decode(credential) else {
+            return Ok(OwnWelcome::Refused);
+        };
+        if decoded.peer != identity.peer && !peers.contains(&decoded.peer) {
+            peers.push(decoded.peer);
+        }
+    }
+    let [peer] = peers[..] else {
+        return Ok(OwnWelcome::Refused);
+    };
+    if check_conversation(identity, peer, conversation).is_err() {
+        return Ok(OwnWelcome::Refused);
+    }
+    let records = match records(local, peer) {
+        Ok(records) => records,
+        Err(error) if error.code == ErrorCode::RecordUnavailable => {
+            return Ok(OwnWelcome::Held(peer));
+        }
+        Err(error) => return Err(error),
+    };
+    let vetting = Vetting::new(&records);
+    let mut verified = true;
+    let mut sender_leaf = false;
+    for (credential, key) in &leaves {
+        if vetting.check(credential, key).is_err() {
+            verified = false;
+        } else if MlsCredential::decode(credential)
+            .is_ok_and(|d| d.peer == identity.peer && d.installation == sender_install)
+        {
+            sender_leaf = true;
+        }
+    }
+    if !verified {
+        return Ok(vetting.held().map_or(OwnWelcome::Refused, OwnWelcome::Held));
+    }
+    Ok(if sender_leaf {
+        OwnWelcome::Peer(peer)
+    } else {
+        OwnWelcome::Refused
+    })
 }
 
 fn join(
