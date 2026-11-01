@@ -127,6 +127,9 @@ fn decrypt_failed(reply: &MlsReply) -> (u8, u64) {
 /// Two devices that already share a group: B made a KeyPackage, A created the group and B joined.
 async fn linked_pair(a: Side) -> (Side, Side, ConversationId) {
     let b = Side::new(B, A).await;
+    link(a, b).await
+}
+async fn link(a: Side, b: Side) -> (Side, Side, ConversationId) {
     let conversation = a.m.open_dm(a.peer, b.peer).await.unwrap().id;
     assert_eq!(b.m.open_dm(b.peer, a.peer).await.unwrap().id, conversation);
     let key_package = b.m.mls_key_package().await.unwrap();
@@ -653,4 +656,151 @@ async fn an_uncertain_seal_is_settled_against_the_stored_row() {
 }
 fn hash_of(bytes: &[u8]) -> [u8; 32] {
     hash(bytes)
+}
+
+#[tokio::test]
+async fn sealing_keeps_the_m4_hash_so_old_receipts_still_apply() {
+    // A message attempted under M4, then promoted by the update and sealed: the receipt the
+    // peer's pre-update app sends for the canonical M4 text hash must still apply.
+    let a = Side::new(A, B).await;
+    let b = Side::new(B, A).await;
+    let key =
+        a.m.enqueue(b.peer, id(5), "attempted before the update".into(), 1_000)
+            .await
+            .unwrap()
+            .key;
+    a.m.prepare_attempt(key, b.install, 2_000_000)
+        .await
+        .unwrap();
+    a.m.settle_attempt(key, true).await.unwrap();
+    let canonical = a.f.message_facts(key).await.unwrap().hash;
+    let a = a.reopen(true).await;
+    assert_eq!(a.f.mls_outbox(key).await.unwrap().codec, Some(3));
+
+    let (a, b, conversation) = link(a, b).await;
+    assert_eq!(
+        a.m.mls_seal_pending(conversation, NOW).await.unwrap(),
+        Some(1)
+    );
+    a.m.mls_reencrypt(key, NOW).await.unwrap();
+    assert_eq!(a.f.message_facts(key).await.unwrap().hash, canonical);
+
+    a.m.apply_delivered_receipt(key, canonical, b.install, b.peer, 2_000_001)
+        .await
+        .unwrap();
+    let page = a.m.load_messages(conversation, None, 50).await.unwrap();
+    assert_eq!(page.items[0].state, DeliveryState::Delivered);
+}
+
+#[tokio::test]
+async fn sealing_respects_the_outbox_byte_cap() {
+    let (a, b, conversation) = linked().await;
+    let first = send(&a, &b, 1, "first").await;
+    let second = send(&a, &b, 2, "second").await;
+    let third = send(&a, &b, 3, "third").await;
+    a.m.mls_seal(first, NOW).await.unwrap().unwrap();
+    let frame = a.f.mls_outbox(first).await.unwrap().wire.len() as u64;
+    let digest = a.f.mls_state(conversation).await.unwrap().kv_digest;
+    let processed = a.f.mls_state(conversation).await.unwrap().processed_mls;
+
+    // One more frame does not fit: nothing is written and the ratchet did not move.
+    a.f.mls_outbox_cap(Some(frame + 10)).await;
+    assert_eq!(
+        a.m.mls_seal(second, NOW).await.unwrap_err().code,
+        ErrorCode::StorageFull
+    );
+    // The batch is atomic: the first of two rows would fit, but then neither is sealed.
+    a.f.mls_outbox_cap(Some(2 * frame + 10)).await;
+    assert_eq!(
+        a.m.mls_seal_pending(conversation, NOW)
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::StorageFull
+    );
+    // Sealing again must not grow the outbox either.
+    a.f.mls_outbox_cap(Some(frame - 1)).await;
+    assert_eq!(
+        a.m.mls_reencrypt(first, NOW).await.unwrap_err().code,
+        ErrorCode::StorageFull
+    );
+    for key in [second, third] {
+        let facts = a.f.mls_outbox(key).await.unwrap();
+        assert_eq!((facts.codec, facts.wire.len()), (Some(3), 0));
+    }
+    assert_eq!(a.f.mls_outbox(first).await.unwrap().reencrypts, 0);
+    let state = a.f.mls_state(conversation).await.unwrap();
+    assert_eq!((state.kv_digest, state.processed_mls), (digest, processed));
+
+    // With room again everything goes through.
+    a.f.mls_outbox_cap(None).await;
+    assert_eq!(
+        a.m.mls_seal_pending(conversation, NOW).await.unwrap(),
+        Some(2)
+    );
+    a.m.mls_reencrypt(first, NOW).await.unwrap();
+}
+
+#[tokio::test]
+async fn reencrypt_waits_for_an_attempt_and_a_failed_message_stays_failed() {
+    let (a, b, conversation) = linked().await;
+    let key = send(&a, &b, 1, "being sent").await;
+    a.m.mls_seal(key, NOW).await.unwrap().unwrap();
+    let state = |a: &Side| {
+        let m = a.m.clone();
+        async move { m.load_messages(conversation, None, 50).await.unwrap().items[0].state }
+    };
+
+    // An attempt is in flight: re-encrypting now would race its outcome.
+    a.m.prepare_attempt(key, b.install, 2_000_000)
+        .await
+        .unwrap();
+    let before = a.f.mls_outbox(key).await.unwrap();
+    assert_eq!(before.dispatch_state, 1);
+    let digest = a.f.mls_state(conversation).await.unwrap().kv_digest;
+    assert_eq!(
+        a.m.mls_reencrypt(key, NOW).await.unwrap_err().code,
+        ErrorCode::Busy
+    );
+    let after = a.f.mls_outbox(key).await.unwrap();
+    assert_eq!(
+        (after.reencrypts, after.wire, after.dispatch_state),
+        (0, before.wire, 1)
+    );
+    assert_eq!(a.f.mls_state(conversation).await.unwrap().kv_digest, digest);
+
+    // Once settled it can be re-encrypted until it is given up on.
+    a.m.settle_attempt(key, false).await.unwrap();
+    for n in 1..=3 {
+        a.m.mls_reencrypt(key, NOW + n).await.unwrap();
+    }
+    assert_eq!(state(&a).await, DeliveryState::Failed);
+
+    // A late attempt outcome cannot revive the failed message.
+    a.m.settle_attempt(key, true).await.unwrap();
+    assert_eq!(state(&a).await, DeliveryState::Failed);
+    let facts = a.f.mls_outbox(key).await.unwrap();
+    assert_eq!((facts.reencrypts, facts.dispatch_state), (3, 2));
+}
+
+#[tokio::test]
+async fn due_never_returns_rows_waiting_for_encryption() {
+    let (a, b, _) = linked().await;
+    // An M4 plaintext job is due as before.
+    let view =
+        a.m.enqueue(b.peer, id(1), "plaintext job".into(), NOW)
+            .await
+            .unwrap();
+    assert_eq!(a.m.due_keys(10).await.unwrap(), [view.key]);
+    assert!(a.f.due_hint(10).await.unwrap());
+
+    // Promoted, it waits for encryption: not handed out, and no scheduling hint.
+    a.f.mls_promote_outbox(view.key).await.unwrap();
+    assert!(a.m.due_keys(10).await.unwrap().is_empty());
+    assert!(!a.f.due_hint(10).await.unwrap());
+
+    // Sealed, it is due.
+    a.m.mls_seal(view.key, NOW).await.unwrap().unwrap();
+    assert_eq!(a.m.due_keys(10).await.unwrap(), [view.key]);
+    assert!(a.f.due_hint(10).await.unwrap());
 }

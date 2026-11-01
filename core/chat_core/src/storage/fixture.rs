@@ -131,6 +131,54 @@ impl Messages {
             _ => unreachable!(),
         }
     }
+    /// The ordinary M4 `Prepare` of an attempt to `receiver` (marks it in flight).
+    pub async fn prepare_attempt(
+        &self,
+        key: MessageKey,
+        receiver: crate::account::InstallationId,
+        now: u64,
+    ) -> Result<(), CoreError> {
+        let (_token, transition) = crate::message::store::PrepareToken::new();
+        let op = MessageDbOp::Prepare(key, receiver, false, now, now, transition);
+        match self.mls(op).await? {
+            MessageDbReply::Prepared(..) => Ok(()),
+            _ => unreachable!(),
+        }
+    }
+    /// The recorded outcome of a prepared attempt: bytes written (`SentDirect`) or not.
+    pub async fn settle_attempt(&self, key: MessageKey, written: bool) -> Result<(), CoreError> {
+        match self.mls(MessageDbOp::AttemptOutcome(key, None, None, written)).await? {
+            MessageDbReply::Done => Ok(()),
+            _ => unreachable!(),
+        }
+    }
+    /// An M4 `Delivered` receipt from `recipient` for the canonical M4 text hash.
+    pub async fn apply_delivered_receipt(
+        &self,
+        key: MessageKey,
+        text_hash: [u8; 32],
+        recipient: crate::account::InstallationId,
+        peer: crate::account::PeerId,
+        now: u64,
+    ) -> Result<(), CoreError> {
+        let receipt = crate::message::wire::ReceiptFrame {
+            kind: crate::message::wire::ReceiptKind::Delivered,
+            key,
+            text_hash,
+            recipient,
+        };
+        match self.mls(MessageDbOp::ApplyReceipt(receipt, peer, now)).await? {
+            MessageDbReply::Receipt(_) => Ok(()),
+            _ => unreachable!(),
+        }
+    }
+    /// Keys of the outgoing messages the scheduler's `Due` would hand out now.
+    pub async fn due_keys(&self, now: u64) -> Result<Vec<MessageKey>, CoreError> {
+        match self.mls(MessageDbOp::Due(now, vec![], [None, None])).await? {
+            MessageDbReply::Due(text, _, _) => Ok(text.into_iter().map(|d| d.key).collect()),
+            _ => unreachable!(),
+        }
+    }
     pub async fn mls_mark_waiting(&self, key: MessageKey, waiting: bool) -> Result<(), CoreError> {
         match self.mls(MessageDbOp::MarkWaitingPeerUpdate(key, waiting)).await? {
             MessageDbReply::Done => Ok(()),
@@ -457,6 +505,15 @@ impl Fixture {
         let (tx, rx) = oneshot::channel();
         self.handle.0.test(TestOp::Message(FixtureOp::MlsOutbox(key, tx))).await;
         rx.await.unwrap()
+    }
+    /// Lowers (or with `None` restores) the outbox byte cap that sealing enforces.
+    pub async fn mls_outbox_cap(&self, cap: Option<u64>) {
+        let (tx, rx) = oneshot::channel();
+        self.handle.0.test(TestOp::Message(FixtureOp::MlsOutboxCap(cap, tx))).await;
+        rx.await.unwrap();
+    }
+    pub async fn due_hint(&self, now: u64) -> Result<bool, CoreError> {
+        self.handle.0.due_hint(now).await
     }
     pub async fn mls_state(&self, conversation: ConversationId) -> Result<MlsState, CoreError> {
         let (tx, rx) = oneshot::channel();

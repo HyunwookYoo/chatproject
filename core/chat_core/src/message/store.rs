@@ -654,8 +654,9 @@ pub(crate) fn reconcile(c: &mut Connection, pending: PendingMessage) -> R<()> {
         let (prev,hash,wire):(Vec<u8>,Vec<u8>,Option<Vec<u8>>)=c.query_row("SELECT m.prev_hash,m.payload_hash,o.wire FROM message m LEFT JOIN outbox o USING(conversation,sender_peer,sender_install,msg_id) WHERE m.conversation=?1 AND m.sender_peer=?2 AND m.sender_install=?3 AND m.msg_id=?4",params![key.conversation.0.as_slice(),key.sender.0.as_slice(),key.installation.0.as_slice(),key.id.0.as_slice()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(sql_error)?;
         let raw:Vec<u8>=c.query_row("SELECT attempted_receivers FROM message WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",params![key.conversation.0.as_slice(),key.sender.0.as_slice(),key.installation.0.as_slice(),key.id.0.as_slice()],|r|r.get(0)).map_err(sql_error)?;
         receivers(&raw)?;
-        // An MLS row (outbox codec 2/3, or a payload hash that is a remembered MLS ciphertext
-        // hash) is not an M4 frame: its hash and wire are not the canonical M4 encoding.
+        // An MLS row (outbox codec 2/3, or a received row whose payload hash is the remembered
+        // MLS ciphertext hash) is not an M4 frame: its wire is not the canonical M4 encoding. A
+        // promoted M4 row keeps its canonical payload hash even after it is sealed.
         let mls:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM outbox WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4 AND codec IN (2,3)) OR EXISTS(SELECT 1 FROM processed_ct WHERE codec=2 AND sender_peer=?2 AND sender_install=?3 AND hash=?5)",params![key.conversation.0.as_slice(),key.sender.0.as_slice(),key.installation.0.as_slice(),key.id.0.as_slice(),hash.as_slice()],|r|r.get(0)).map_err(sql_error)?;
         if !m.outgoing {
             let processed:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM processed_ct WHERE codec IN (1,2) AND sender_peer=?1 AND sender_install=?2 AND hash=?3)",params![key.sender.0.as_slice(),key.installation.0.as_slice(),hash.as_slice()],|r|r.get(0)).map_err(sql_error)?;
@@ -733,6 +734,7 @@ pub(crate) enum FixtureOp {
     MlsPromote(MessageKey, tokio::sync::oneshot::Sender<R<()>>),
     MlsOutbox(MessageKey, tokio::sync::oneshot::Sender<R<super::mls_store::MlsOutbox>>),
     MlsState(ConversationId, tokio::sync::oneshot::Sender<R<super::mls_store::MlsState>>),
+    MlsOutboxCap(Option<u64>, tokio::sync::oneshot::Sender<()>),
 }
 #[cfg(all(feature = "test-hooks", debug_assertions))]
 pub(crate) fn fixture(c: &mut Connection, op: FixtureOp) {
@@ -798,6 +800,10 @@ pub(crate) fn fixture(c: &mut Connection, op: FixtureOp) {
         }
         FixtureOp::MlsOutbox(key, reply) => {
             let _ = reply.send(super::mls_store::fixture_outbox(c, key));
+        }
+        FixtureOp::MlsOutboxCap(cap, reply) => {
+            super::mls_store::fixture_outbox_cap(cap);
+            let _ = reply.send(());
         }
         FixtureOp::MlsState(id, reply) => {
             let _ = reply.send(super::mls_store::fixture_state(c, id));
@@ -1345,7 +1351,9 @@ fn attempt_outcome(
     >,
 ) -> R<MessageDbReply> {
     let tx = c.transaction().map_err(sql_error)?;
-    let exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM outbox WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4)",params![k.conversation.0.as_slice(),k.sender.0.as_slice(),k.installation.0.as_slice(),k.id.0.as_slice()],|r|r.get(0)).map_err(sql_error)?;
+    // A message given up on after too many re-encryptions (reencrypts reached 3) stays failed
+    // until the user's Retry; a late attempt outcome must not revive it.
+    let exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM outbox WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4 AND reencrypts<3)",params![k.conversation.0.as_slice(),k.sender.0.as_slice(),k.installation.0.as_slice(),k.id.0.as_slice()],|r|r.get(0)).map_err(sql_error)?;
     if exists {
         let reason = block.map(|b| match b {
             BlockReason::Account => 1,
@@ -1544,7 +1552,8 @@ fn due_sql(receipt: bool, seek: DueSeek) -> String {
     let (table, index, state) = if receipt {
         ("receipt_job", "receipt_due", "")
     } else {
-        ("outbox", "outbox_due", "AND j.dispatch_state=0")
+        // Codec 3 rows wait for encryption and have nothing to send yet.
+        ("outbox", "outbox_due", "AND j.dispatch_state=0 AND j.codec<>3")
     };
     let after = match seek {
         DueSeek::Start => "",
@@ -1625,7 +1634,7 @@ fn scan_due(c: &Connection, receipt: bool, now: u64, cursor: Option<DueCursor>) 
 // Advisory scheduling presence only: never returns keys, bodies or authority.
 pub(crate) fn due_hint(c: &Connection, now: u64) -> R<bool> {
     c.query_row(
-        "SELECT EXISTS(SELECT 1 FROM outbox INDEXED BY outbox_due WHERE dispatch_state=0 AND next_retry_at_ms<=?1 LIMIT 1) OR EXISTS(SELECT 1 FROM receipt_job INDEXED BY receipt_due WHERE next_retry_at_ms<=?1 LIMIT 1)",
+        "SELECT EXISTS(SELECT 1 FROM outbox INDEXED BY outbox_due WHERE dispatch_state=0 AND codec<>3 AND next_retry_at_ms<=?1 LIMIT 1) OR EXISTS(SELECT 1 FROM receipt_job INDEXED BY receipt_due WHERE next_retry_at_ms<=?1 LIMIT 1)",
         params![integer(now)?], |r| r.get(0),
     ).map_err(sql_error)
 }

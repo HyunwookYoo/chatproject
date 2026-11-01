@@ -51,6 +51,44 @@ const MAX_FRAME: usize = 61_440;
 /// A message that was re-encrypted this many times is given up on.
 const REENCRYPT_CAP: u64 = 3;
 const TEXT_LIMIT: usize = 16_384;
+/// The outbox holds at most this many wire bytes (M4 rule), sealed frames included.
+const OUTBOX_BYTES: u64 = 128 * 1024 * 1024;
+
+#[cfg(all(feature = "test-hooks", debug_assertions))]
+thread_local! {
+    /// Lowered outbox byte cap for tests, per storage writer thread.
+    static OUTBOX_CAP: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+fn outbox_cap() -> u64 {
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    if let Some(cap) = OUTBOX_CAP.with(|c| c.get()) {
+        return cap;
+    }
+    OUTBOX_BYTES
+}
+/// Replacing `old_len` wire bytes of one row by `new_len` must keep the whole outbox within the
+/// cap. Checked inside the sealing transaction, so a refusal writes nothing.
+fn check_outbox_cap(tx: &Transaction<'_>, old_len: u64, new_len: u64) -> R<()> {
+    let total: u64 = tx
+        .query_row(
+            "SELECT coalesce(sum(length(wire)),0) FROM outbox",
+            [],
+            |r| uint(r, 0),
+        )
+        .map_err(sql)?;
+    if total.saturating_sub(old_len).saturating_add(new_len) > outbox_cap() {
+        return Err(CoreError::new(ErrorCode::StorageFull, "message_queue_full"));
+    }
+    Ok(())
+}
+/// SHA-256 of the MLS ciphertext inside a stored kind 17 `App` frame.
+fn wire_ciphertext_hash(wire: &[u8]) -> R<[u8; 32]> {
+    let inner = crate::account::auth::payload(wire, 17).map_err(|_| invalid())?;
+    match MlsFrame::decode(&inner).map_err(|_| invalid())? {
+        MlsFrame::App { ciphertext, .. } => Ok(Sha256::digest(&ciphertext).into()),
+        _ => Err(invalid()),
+    }
+}
 
 /// Changes to a conversation's group. Task 7 drives these from the group protocol; the
 /// variants it needs beyond the ones implemented here answer `NotAvailable` until then.
@@ -296,15 +334,19 @@ fn insert_group_row(
 struct Outgoing {
     codec: i64,
     reencrypts: u64,
+    dispatch_state: u64,
+    wire: Vec<u8>,
     message: ChatMessage,
 }
 fn load_outgoing(tx: &Transaction<'_>, key: MessageKey) -> R<Outgoing> {
     tx.query_row(
-        "SELECT o.codec,o.reencrypts,m.lamport,m.prev_hash,m.sent_at_ms,m.body FROM message m JOIN outbox o USING(conversation,sender_peer,sender_install,msg_id) WHERE m.conversation=?1 AND m.sender_peer=?2 AND m.sender_install=?3 AND m.msg_id=?4 AND m.outgoing=1 AND m.cancel_requested=0",
+        "SELECT o.codec,o.reencrypts,m.lamport,m.prev_hash,m.sent_at_ms,m.body,o.dispatch_state,o.wire FROM message m JOIN outbox o USING(conversation,sender_peer,sender_install,msg_id) WHERE m.conversation=?1 AND m.sender_peer=?2 AND m.sender_install=?3 AND m.msg_id=?4 AND m.outgoing=1 AND m.cancel_requested=0",
         params![key.conversation.0.as_slice(), key.sender.0.as_slice(), key.installation.0.as_slice(), key.id.0.as_slice()],
         |r| Ok(Outgoing {
             codec: r.get(0)?,
             reencrypts: uint(r, 1)?,
+            dispatch_state: uint(r, 6)?,
+            wire: r.get(7)?,
             message: ChatMessage {
                 msg_id: key.id,
                 lamport: uint(r, 2)?,
@@ -372,14 +414,9 @@ pub(super) fn seal(
         3 => {}
         // Already sealed: report the ciphertext it carries, never seal twice.
         2 => {
-            let hash: [u8; 32] = tx
-                .query_row(
-                    "SELECT payload_hash FROM message WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",
-                    params![key.conversation.0.as_slice(), key.sender.0.as_slice(), key.installation.0.as_slice(), key.id.0.as_slice()],
-                    |r| bytes(r, 0),
-                )
-                .map_err(sql)?;
-            return Ok(MessageDbReply::Sealed { ct_hash: hash });
+            return Ok(MessageDbReply::Sealed {
+                ct_hash: wire_ciphertext_hash(&outgoing.wire)?,
+            });
         }
         _ => return Err(invalid()),
     }
@@ -398,30 +435,27 @@ pub(super) fn seal(
         &outgoing.message,
         now,
     )?;
-    store_sealed(&tx, key, &frame, &hash)?;
+    check_outbox_cap(&tx, outgoing.wire.len() as u64, frame.len() as u64)?;
+    store_sealed(&tx, key, &frame)?;
     provider.storage().flush(&tx, key.conversation.0)?;
     finish(tx, fault)?;
     Ok(MessageDbReply::Sealed { ct_hash: hash })
 }
 
-fn store_sealed(tx: &Transaction<'_>, key: MessageKey, frame: &[u8], hash: &[u8; 32]) -> R<()> {
+/// Never touches `message.payload_hash`: for a promoted M4 row it is the canonical M4 text hash
+/// that M4 receipts are checked against. The own ciphertext hash lives in `processed_ct`.
+fn store_sealed(tx: &Transaction<'_>, key: MessageKey, frame: &[u8]) -> R<()> {
     tx.execute(
         "UPDATE outbox SET codec=2,wire=?5,waiting_peer_update=0 WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",
         params![key.conversation.0.as_slice(), key.sender.0.as_slice(), key.installation.0.as_slice(), key.id.0.as_slice(), frame],
     )
     .map_err(sql)?;
-    set_payload_hash(tx, key, hash)
-}
-fn set_payload_hash(tx: &Transaction<'_>, key: MessageKey, hash: &[u8; 32]) -> R<()> {
-    tx.execute(
-        "UPDATE message SET payload_hash=?5 WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",
-        params![key.conversation.0.as_slice(), key.sender.0.as_slice(), key.installation.0.as_slice(), key.id.0.as_slice(), hash.as_slice()],
-    )
-    .map_err(sql)?;
     Ok(())
 }
 
-/// Seals every waiting (codec 3) row of the conversation in lamport order, one transaction.
+/// Seals every waiting (codec 3) row of the conversation in lamport order, in one transaction:
+/// the batch is atomic. If any row would push the outbox over its byte cap the whole batch fails
+/// with `StorageFull` and nothing (rows, ratchet, markers) is written.
 pub(super) fn seal_pending(
     c: &mut Connection,
     identity: Identity,
@@ -463,7 +497,7 @@ pub(super) fn seal_pending(
             id: MessageId(*id),
         };
         let outgoing = load_outgoing(&tx, key)?;
-        let (hash, frame) = seal_one(
+        let (_, frame) = seal_one(
             &tx,
             &provider,
             &signer,
@@ -473,7 +507,8 @@ pub(super) fn seal_pending(
             &outgoing.message,
             now,
         )?;
-        store_sealed(&tx, key, &frame, &hash)?;
+        check_outbox_cap(&tx, outgoing.wire.len() as u64, frame.len() as u64)?;
+        store_sealed(&tx, key, &frame)?;
     }
     provider.storage().flush(&tx, conversation.0)?;
     finish(tx, fault)?;
@@ -497,6 +532,11 @@ pub(super) fn reencrypt(
     if outgoing.codec != 2 {
         return Err(invalid());
     }
+    // An attempt is in flight: its outcome has not been recorded yet, and a new ciphertext
+    // (or giving the message up) must not race it.
+    if outgoing.dispatch_state == 1 {
+        return Err(CoreError::new(ErrorCode::Busy, "message_in_flight"));
+    }
     if outgoing.reencrypts >= REENCRYPT_CAP {
         return Ok(MessageDbReply::Done);
     }
@@ -505,7 +545,7 @@ pub(super) fn reencrypt(
     };
     let provider = MlsProvider::new(KvStore::load(&tx, key.conversation.0)?);
     let (signer, _) = signer_of(local);
-    let (hash, frame) = seal_one(
+    let (_, frame) = seal_one(
         &tx,
         &provider,
         &signer,
@@ -515,6 +555,7 @@ pub(super) fn reencrypt(
         &outgoing.message,
         now,
     )?;
+    check_outbox_cap(&tx, outgoing.wire.len() as u64, frame.len() as u64)?;
     let count = outgoing.reencrypts + 1;
     let capped = count >= REENCRYPT_CAP;
     tx.execute(
@@ -526,7 +567,6 @@ pub(super) fn reencrypt(
         ],
     )
     .map_err(sql)?;
-    set_payload_hash(&tx, key, &hash)?;
     if capped {
         tx.execute(
             "UPDATE message SET outcome=3,failure_code='InvalidMessage' WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",
@@ -816,6 +856,11 @@ pub struct MlsState {
     pub open_calls: u64,
     pub group_epoch: Option<u64>,
     pub peer_mls: Option<bool>,
+}
+
+#[cfg(all(feature = "test-hooks", debug_assertions))]
+pub(super) fn fixture_outbox_cap(cap: Option<u64>) {
+    OUTBOX_CAP.with(|c| c.set(cap));
 }
 
 #[cfg(all(feature = "test-hooks", debug_assertions))]
