@@ -91,6 +91,9 @@ async fn read_only_marks_visible_incoming_ids() {
     let key = visible.items[0].key;
     let before = service.list_conversations(None, 50).await.unwrap();
     assert_eq!(before.items[0].unread, 3);
+    // B's automatic delivery would send `own` and change the conversation
+    // revision that the repeated mark_read below must leave unchanged.
+    b.account.message_test_hold_scheduler(true).await.unwrap();
     let own = b
         .account
         .storage_test_fixture()
@@ -139,6 +142,8 @@ async fn read_only_marks_visible_incoming_ids() {
         service.list_conversations(None, 50).await.unwrap().revision,
         revision
     );
+    // The read receipt is sent automatically.
+    b.account.message_test_hold_scheduler(false).await.unwrap();
     service_state(&a, key, DeliveryState::Read).await;
     for hidden in keys.into_iter().filter(|k| *k != key) {
         service_state(&a, hidden, DeliveryState::Delivered).await;
