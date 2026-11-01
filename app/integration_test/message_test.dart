@@ -152,6 +152,13 @@ void main() {
       }
       await tester.pumpAndSettle();
       expect(model.messages.length, 50);
+      // A late message event can start a refresh, and loadOlder does nothing
+      // while one is in flight.
+      final idleDeadline = DateTime.now().add(const Duration(seconds: 10));
+      while (model.busy && DateTime.now().isBefore(idleDeadline)) {
+        await tester.pump(const Duration(milliseconds: 10));
+      }
+      expect(model.busy, false);
       final loading = model.loadOlder();
       await tester.pumpAndSettle();
       await loading;

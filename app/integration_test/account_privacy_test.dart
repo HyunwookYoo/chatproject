@@ -30,6 +30,13 @@ void main() {
       ),
     );
     await tester.pumpAndSettle();
+    // Activation completes on a platform channel reply, which pumpAndSettle
+    // does not wait for; the placeholder shows until protection is on.
+    final shownDeadline = DateTime.now().add(const Duration(seconds: 10));
+    while (find.text('PUBLIC PRIVACY FIXTURE').evaluate().isEmpty &&
+        DateTime.now().isBefore(shownDeadline)) {
+      await tester.pump(const Duration(milliseconds: 50));
+    }
     lifecycle.dispose();
     if (Platform.isWindows) {
       debugPrint(
