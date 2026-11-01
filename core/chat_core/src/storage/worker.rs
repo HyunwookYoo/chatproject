@@ -78,7 +78,7 @@ impl Worker {
         let pending = self.pending_message.clone();
         let mut reconciled = false;
         #[cfg(all(feature = "test-hooks", debug_assertions))]
-        let fault = if key.is_some() {
+        let fault = if op.faultable(identity)? {
             self.message_fault.take()
         } else {
             None
@@ -111,6 +111,7 @@ impl Worker {
             messages::execute(
                 c,
                 identity,
+                &local,
                 op,
                 #[cfg(all(feature = "test-hooks", debug_assertions))]
                 fault,

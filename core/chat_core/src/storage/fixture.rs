@@ -1,7 +1,11 @@
 //! Debug-only fixtures for the real private worker. No SQL/key controls reach FFI.
-pub use crate::account::storage::migration_fixtures::{assert_account_preserved, migration_states};
+pub use crate::account::storage::migration_fixtures::{
+    MlsAccount, assert_account_preserved, migration_states, mls_account,
+};
+pub use crate::message::mls_store::{MlsOutbox, MlsState};
 pub use crate::message::store::MessageFacts;
-use crate::message::store::{FixtureOp, MessageRepo};
+use crate::message::mls_store::{GroupOp, GroupReply};
+use crate::message::store::{FixtureOp, MessageDbOp, MessageDbReply, MessageRepo};
 pub use crate::message::types::*;
 pub use crate::storage::migration::MigrationStage;
 pub use crate::storage::worker::CommitFault;
@@ -43,6 +47,95 @@ impl Messages {
     }
     pub async fn cancel_send(&self, key: MessageKey) -> Result<MessageView,CoreError> {
         self.0.cancel_send(key).await
+    }
+    async fn mls(&self, op: MessageDbOp) -> Result<MessageDbReply, CoreError> {
+        self.0.operation(op).await
+    }
+    /// A fresh KeyPackage for this installation (kept in the store's global scope).
+    pub async fn mls_key_package(&self) -> Result<Vec<u8>, CoreError> {
+        let op = MessageDbOp::MlsGroupOp(ConversationId([0; 32]), GroupOp::NewKeyPackage);
+        match self.mls(op).await? {
+            MessageDbReply::Group(GroupReply::KeyPackage(bytes)) => Ok(bytes),
+            _ => unreachable!(),
+        }
+    }
+    pub async fn mls_create_group(
+        &self,
+        conversation: ConversationId,
+        peer: crate::account::PeerId,
+        members: Vec<Vec<u8>>,
+        now: u64,
+    ) -> Result<MlsCreated, CoreError> {
+        let op = MessageDbOp::MlsGroupOp(conversation, GroupOp::Create { peer, members, now });
+        match self.mls(op).await? {
+            MessageDbReply::Group(GroupReply::Created { group_id, first_commit_hash, commit, welcome }) => {
+                Ok(MlsCreated { group_id, first_commit_hash, commit, welcome })
+            }
+            _ => unreachable!(),
+        }
+    }
+    pub async fn mls_join_group(
+        &self,
+        conversation: ConversationId,
+        peer: crate::account::PeerId,
+        welcome: Vec<u8>,
+        first_commit_hash: [u8; 32],
+        now: u64,
+    ) -> Result<u64, CoreError> {
+        let op = MessageDbOp::MlsGroupOp(conversation, GroupOp::Join { peer, welcome, first_commit_hash, now });
+        match self.mls(op).await? {
+            MessageDbReply::Group(GroupReply::Joined { epoch }) => Ok(epoch),
+            _ => unreachable!(),
+        }
+    }
+    pub async fn mls_drop_group(&self, conversation: ConversationId) -> Result<(), CoreError> {
+        match self.mls(MessageDbOp::MlsGroupOp(conversation, GroupOp::Drop)).await? {
+            MessageDbReply::Group(GroupReply::Done) => Ok(()),
+            _ => unreachable!(),
+        }
+    }
+    /// The ciphertext hash, or `None` when the conversation has no group yet.
+    pub async fn mls_seal(&self, key: MessageKey, now: u64) -> Result<Option<[u8; 32]>, CoreError> {
+        match self.mls(MessageDbOp::Seal(key, now)).await? {
+            MessageDbReply::Sealed { ct_hash } => Ok(Some(ct_hash)),
+            MessageDbReply::NeedGroup(_) => Ok(None),
+            _ => unreachable!(),
+        }
+    }
+    /// How many rows were sealed, or `None` when the conversation has no group yet.
+    pub async fn mls_seal_pending(&self, conversation: ConversationId, now: u64) -> Result<Option<u64>, CoreError> {
+        match self.mls(MessageDbOp::SealPending(conversation, now)).await? {
+            MessageDbReply::Count(n) => Ok(Some(n)),
+            MessageDbReply::NeedGroup(_) => Ok(None),
+            _ => unreachable!(),
+        }
+    }
+    pub async fn mls_reencrypt(&self, key: MessageKey, now: u64) -> Result<(), CoreError> {
+        match self.mls(MessageDbOp::Reencrypt(key, now)).await? {
+            MessageDbReply::Done => Ok(()),
+            MessageDbReply::NeedGroup(_) => Err(CoreError::new(ErrorCode::NotAvailable, "fixture_no_group")),
+            _ => unreachable!(),
+        }
+    }
+    pub async fn mls_open_app(
+        &self,
+        sender: crate::account::PeerId,
+        installation: crate::account::InstallationId,
+        conversation: ConversationId,
+        ciphertext: Vec<u8>,
+        now: u64,
+    ) -> Result<crate::mls::wire::MlsReply, CoreError> {
+        let op = MessageDbOp::OpenApp(sender, installation, conversation, ciphertext, now);
+        match self.mls(op).await? {
+            MessageDbReply::Opened(reply) => Ok(reply),
+            _ => unreachable!(),
+        }
+    }
+    pub async fn mls_mark_waiting(&self, key: MessageKey, waiting: bool) -> Result<(), CoreError> {
+        match self.mls(MessageDbOp::MarkWaitingPeerUpdate(key, waiting)).await? {
+            MessageDbReply::Done => Ok(()),
+            _ => unreachable!(),
+        }
     }
     pub fn local_peer(&self) -> crate::account::PeerId {
         self.0.local_peer()
@@ -253,6 +346,22 @@ fn probe(c: &rusqlite::Connection) -> Result<DbProbe, CoreError> {
     })
 }
 
+/// What `Messages::mls_create_group` produced for the peer.
+pub struct MlsCreated {
+    pub group_id: Vec<u8>,
+    pub first_commit_hash: [u8; 32],
+    pub commit: Vec<u8>,
+    pub welcome: Vec<u8>,
+}
+/// The conversation and ciphertext inside a kind 17 `App` frame (the complete envelope).
+pub fn mls_app_from_wire(wire: &[u8]) -> Option<(ConversationId, Vec<u8>)> {
+    let inner = crate::account::auth::payload(wire, 17).ok()?;
+    match crate::mls::wire::MlsFrame::decode(&inner).ok()? {
+        crate::mls::wire::MlsFrame::App { conversation, ciphertext } => Some((conversation, ciphertext)),
+        _ => None,
+    }
+}
+
 pub struct Fixture {
     pub handle: Handle,
 }
@@ -336,6 +445,23 @@ impl Fixture {
             ));
         };
         Ok(Messages(MessageRepo::new(self.handle.0.clone(), &local)))
+    }
+    /// Turns an M4 plaintext job (codec 1) into the "awaiting encryption" row (codec 3, no
+    /// wire) that the v1 -> v2 upgrade makes of it.
+    pub async fn mls_promote_outbox(&self, key: MessageKey) -> Result<(), CoreError> {
+        let (tx, rx) = oneshot::channel();
+        self.handle.0.test(TestOp::Message(FixtureOp::MlsPromote(key, tx))).await;
+        rx.await.unwrap()
+    }
+    pub async fn mls_outbox(&self, key: MessageKey) -> Result<MlsOutbox, CoreError> {
+        let (tx, rx) = oneshot::channel();
+        self.handle.0.test(TestOp::Message(FixtureOp::MlsOutbox(key, tx))).await;
+        rx.await.unwrap()
+    }
+    pub async fn mls_state(&self, conversation: ConversationId) -> Result<MlsState, CoreError> {
+        let (tx, rx) = oneshot::channel();
+        self.handle.0.test(TestOp::Message(FixtureOp::MlsState(conversation, tx))).await;
+        rx.await.unwrap()
     }
     pub async fn message_facts(&self, key: MessageKey) -> Result<MessageFacts, CoreError> {
         let (tx, rx) = oneshot::channel();

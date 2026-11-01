@@ -262,3 +262,63 @@ pub fn assert_account_preserved(expected: &StoredPlaintext, actual: &StoredPlain
         expected.payload.as_slice().ct_eq(actual.payload.as_slice())
     ));
 }
+
+/// An active account whose published record lists only its own device, with the other account
+/// as a contact and a current record for it. Both sides of a pair are built from the same two
+/// `(account seed, device seed)` pairs, swapped, so each trusts exactly the other.
+pub struct MlsAccount {
+    pub state: StoredPlaintext,
+    pub peer: PeerId,
+    pub installation: InstallationId,
+}
+
+pub fn mls_account(own: (u8, u8), other: (u8, u8)) -> MlsAccount {
+    let keys = AccountKeys::from_identity(Secret32::from([own.0; 32]));
+    let device = derive_device(Secret32::from([own.1; 32])).unwrap();
+    let remote_keys = AccountKeys::from_identity(Secret32::from([other.0; 32]));
+    let remote_device = derive_device(Secret32::from([other.1; 32])).unwrap();
+    let cert = sign_cert(&keys, &device, DeviceKind::Desktop, 1000).unwrap();
+    let generation = Generation([20; 16]);
+    let (peer, installation) = (keys.peer_id(), device.installation_id());
+    let records = RecordState {
+        generation,
+        accepted: Some(signed(&keys, &device, generation, 10)),
+        conflict: None,
+        observed_seq: 10,
+        allocated_seq: 10,
+        tombstones: vec![],
+        pending: vec![],
+        state: PublicationState::Observed,
+    };
+    let remote = RemoteRecord {
+        peer: remote_keys.peer_id(),
+        accepted: signed(&remote_keys, &remote_device, generation, 10),
+        floor: 10,
+        conflict: None,
+    };
+    let contact = Contact {
+        peer: remote_keys.peer_id(),
+        alias: "mls fixture contact".into(),
+        verified_digest: None,
+        known_installation: Some(remote_device.installation_id()),
+        new_device: false,
+    };
+    let state = AccountState::Active(Box::new(LocalAccount {
+        keys,
+        device,
+        cert,
+        revision: 1,
+        intent: PublishIntent::Replacement,
+        records,
+        remote: vec![remote],
+        contacts: vec![contact],
+        pairs: crate::account::pair::transaction::PairState::default(),
+    }))
+    .encode();
+    assert!(AccountState::decode(&state).is_ok(), "invalid mls fixture");
+    MlsAccount {
+        state,
+        peer,
+        installation,
+    }
+}
