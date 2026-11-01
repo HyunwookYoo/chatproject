@@ -402,3 +402,37 @@ async fn offline_peer_does_not_starve_other_peer() {
             .all(|x| x.state != DeliveryState::Delivered)
     );
 }
+
+#[tokio::test]
+async fn lost_ack_after_restart_is_not_taken_for_an_m4_refusal() {
+    let (a, b, net, conv) = setup(&[B1]).await;
+    grouped(&a, &b, conv).await;
+    // A restarts: what it saw this run is gone, but B's device still holds a leaf in the group.
+    let a = start(stop(a), net).await;
+    link(&a, &b).await;
+    for f in [&a, &b] {
+        f.account.message_test_hold_scheduler(true).await.unwrap();
+    }
+    a.account.connect_account(b.peer).await.unwrap();
+    let m = send(&a, &b, 9, "private text").await;
+    let mut pause = b
+        .account
+        .message_test_pause(MessagePoint::Response)
+        .await
+        .unwrap();
+    let account = a.account.clone();
+    let task = tokio::spawn(async move { attempt_on(&account, m.key).await });
+    pause.wait_entered().await;
+    // B closes the connection without an answer (its record expired before the Ack).
+    b.clock.set_unix_seconds(NOW + 600);
+    pause.release();
+    assert!(task.await.unwrap().is_err());
+    b.clock.set_unix_seconds(NOW);
+    // An M5 peer's lost answer, not an M4 refusal: written, and not waiting for an update.
+    let row = outbox(&a, m.key).await;
+    assert!(!row.waiting_peer_update);
+    assert_eq!(
+        stored_state(&a, m.key).await.unwrap().state,
+        DeliveryState::SentDirect
+    );
+}

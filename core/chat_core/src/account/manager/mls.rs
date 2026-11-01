@@ -166,6 +166,9 @@ pub(crate) struct Outdated {
     backoff: u64,
     /// Its accepted record when it refused; a newer one may come with an updated app.
     record: Option<[u8; 32]>,
+    /// A newer record this account was already asked once about within the back-off: a record
+    /// change buys one request, never repeated ones.
+    asked: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Copy)]
@@ -250,19 +253,6 @@ pub(super) async fn exchange(session: &Session, body: &[u8]) -> Result<MlsReply,
 
 fn sha256(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
-}
-
-/// The conversation a request was about (none for a record lookup or a KeyPackage request
-/// made for no particular conversation).
-fn task_conversation(task: &Task) -> Option<ConversationId> {
-    match *task {
-        Task::Query { conversation, .. }
-        | Task::KeyPackage { conversation, .. }
-        | Task::Join { conversation }
-        | Task::Learn { conversation, .. }
-        | Task::Deliver { conversation, .. } => Some(conversation),
-        Task::Lookup { .. } => None,
-    }
 }
 
 /// What a Commit/Welcome delivery attempt's answer means for its queued row.
@@ -550,18 +540,29 @@ impl Manager {
         }
     }
 
-    /// Whether the account answered kind 17 properly this run, or ever spoke MLS here.
+    /// Whether the account shows it speaks MLS, so a stream it closed is no M4 refusal: it
+    /// answered or sent a kind 17 request this run (`spoke`), it ever spoke MLS here
+    /// (`mls_peer`), or one of its devices holds a leaf in our group with it. Looked up by
+    /// account (its 1:1 conversation with this one), whatever request was refused. Only for
+    /// this decision: the downgrade guard reads `mls_peer` alone.
     pub(super) async fn peer_speaks_mls(
         &mut self,
-        conversation: ConversationId,
         peer: PeerId,
         request: Request,
     ) -> Result<bool, CoreError> {
         if self.messages.mls.spoke.contains(&peer) {
             return Ok(true);
         }
+        let conversation = conversation_id(self.local()?.keys.peer_id(), peer)?;
         match self
-            .group_db(conversation, GroupOp::PeerSpokeMls { mark: false }, request)
+            .group_db(
+                conversation,
+                GroupOp::PeerSpokeMls {
+                    mark: false,
+                    peer: Some(peer),
+                },
+                request,
+            )
             .await?
         {
             GroupReply::Flag(spoke) => Ok(spoke),
@@ -569,19 +570,26 @@ impl Manager {
         }
     }
 
-    /// The account refused kind 17: not asked again before the back-off (doubling from
-    /// `OUTDATED_RETRY_MS`) ends. A second refusal within one back-off does not extend it.
-    pub(super) fn mark_outdated(&mut self, peer: PeerId) {
-        let now = self.schedule_now();
-        let record = self.local().ok().and_then(|local| {
+    /// The account's accepted record hash on this device.
+    fn record_of(&self, peer: PeerId) -> Option<[u8; 32]> {
+        self.local().ok().and_then(|local| {
             local
                 .remote
                 .iter()
                 .find(|r| r.peer == peer)
                 .map(|r| r.accepted.hash)
-        });
+        })
+    }
+
+    /// The account refused kind 17: not asked again before the back-off (doubling from
+    /// `OUTDATED_RETRY_MS`) ends. A second refusal under the same record within one back-off
+    /// does not extend it; a refusal under a newer record (the one re-query a record change
+    /// allows) keeps that record and starts a new, doubled back-off.
+    pub(super) fn mark_outdated(&mut self, peer: PeerId) {
+        let now = self.schedule_now();
+        let record = self.record_of(peer);
         let backoff = match self.messages.mls.outdated.get(&peer) {
-            Some(o) if now < o.until => return,
+            Some(o) if now < o.until && o.record == record => return,
             Some(o) => o.backoff.saturating_mul(2).min(OUTDATED_MAX_MS),
             None => OUTDATED_RETRY_MS,
         };
@@ -591,24 +599,29 @@ impl Manager {
                 until: now.saturating_add(backoff),
                 backoff,
                 record,
+                asked: None,
             },
         );
     }
 
-    /// Whether kind 17 requests to `peer` wait now: it refused within its back-off and its
-    /// record did not change since.
+    /// Whether kind 17 requests to `peer` wait now: it refused within its back-off, and its
+    /// record is the one it refused under, or a newer one it was already asked about once.
     fn outdated_now(&self, peer: PeerId) -> bool {
         let Some(outdated) = self.messages.mls.outdated.get(&peer) else {
             return false;
         };
-        let record = self.local().ok().and_then(|local| {
-            local
-                .remote
-                .iter()
-                .find(|r| r.peer == peer)
-                .map(|r| r.accepted.hash)
-        });
-        self.schedule_now() < outdated.until && record == outdated.record
+        let record = self.record_of(peer);
+        self.schedule_now() < outdated.until
+            && (record == outdated.record || (record.is_some() && record == outdated.asked))
+    }
+
+    /// A kind 17 request goes to an account that refused before (its back-off ended, or its
+    /// record changed): that record's one request is spent.
+    fn note_requery(&mut self, peer: PeerId) {
+        let record = self.record_of(peer);
+        if let Some(outdated) = self.messages.mls.outdated.get_mut(&peer) {
+            outdated.asked = record;
+        }
     }
 
     /// Queued Commits/Welcomes of the conversation for `recipient`, to send ahead of an
@@ -709,6 +722,9 @@ impl Manager {
                 },
             );
             return Ok(GroupState::WaitingForPeer);
+        }
+        for session in &sessions {
+            self.note_requery(session.grant.peer);
         }
         let asked: Vec<InstallationId> = sessions.iter().map(|s| s.grant.installation).collect();
         self.messages.mls.phases.insert(
@@ -1365,17 +1381,13 @@ impl Manager {
         // one that just closed the stream or connection, if its account never showed MLS. Any
         // proper answer from the account means it has updated.
         let own = self.local().ok().map(|local| local.keys.peer_id());
-        match (&answer, task_conversation(&task)) {
-            (Answer::Reply(Err(ErrorCode::UnsupportedMessageVersion)), _)
-                if Some(answered) != own =>
-            {
+        match (&answer, Some(answered) != own) {
+            (Answer::Reply(Err(ErrorCode::UnsupportedMessageVersion)), true) => {
                 self.mark_outdated(answered);
             }
-            (Answer::Reply(Err(ErrorCode::PeerNotConnected)), Some(conversation))
-                if Some(answered) != own =>
-            {
+            (Answer::Reply(Err(ErrorCode::PeerNotConnected)), true) => {
                 if let Some(request) = self.ready().ok().filter(|r| r.ticket == ticket)
-                    && let Ok(false) = self.peer_speaks_mls(conversation, answered, request).await
+                    && let Ok(false) = self.peer_speaks_mls(answered, request).await
                 {
                     self.mark_outdated(answered);
                 }
@@ -1581,6 +1593,15 @@ impl Manager {
     ) -> Result<MlsReply, CoreError> {
         let sender = session.grant.peer;
         let now = self.schedule_now();
+        // An authenticated kind 17 request from another account shows it speaks MLS (for the
+        // M4-refusal decision only; the downgrade guard needs an accepted App/Commit/Welcome).
+        if self
+            .local()
+            .is_ok_and(|local| local.keys.peer_id() != sender)
+        {
+            self.messages.mls.spoke.insert(sender);
+            self.messages.mls.outdated.remove(&sender);
+        }
         Ok(match frame {
             MlsFrame::GroupQuery { conversation } => {
                 if self.conversation_peer(conversation, sender).is_none() {
@@ -1784,9 +1805,11 @@ impl Manager {
     ) -> Result<(), CoreError> {
         self.messages.mls.spoke.insert(peer);
         self.messages.mls.outdated.remove(&peer);
-        self.group_db(conversation, GroupOp::PeerSpokeMls { mark: true }, request)
-            .await
-            .map(|_| ())
+        let op = GroupOp::PeerSpokeMls {
+            mark: true,
+            peer: None,
+        };
+        self.group_db(conversation, op, request).await.map(|_| ())
     }
 
     /// A received application message (spec 5.2): opened and stored in one transaction. `None`

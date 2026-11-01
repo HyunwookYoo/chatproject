@@ -132,8 +132,10 @@ pub(crate) enum GroupOp {
     /// Every conversation with a group, and its peer.
     Groups,
     /// Whether the conversation's peer account ever spoke MLS here (`mls_peer`); with `mark`,
-    /// records that it just did (an accepted Commit or Welcome from it).
-    PeerSpokeMls { mark: bool },
+    /// records that it just did (an accepted Commit or Welcome from it). With `peer`, a leaf of
+    /// one of that account's devices in the conversation's group counts too (evidence for the
+    /// M4-refusal decision, never for the downgrade guard).
+    PeerSpokeMls { mark: bool, peer: Option<PeerId> },
     /// Forgets the group: its row, `mls_kv` rows, deliveries and holds.
     Drop,
 }
@@ -150,7 +152,7 @@ impl GroupOp {
                 | Self::Pending { .. }
                 | Self::HoldPeers
                 | Self::Groups
-                | Self::PeerSpokeMls { mark: false }
+                | Self::PeerSpokeMls { mark: false, .. }
         )
     }
 }
@@ -725,20 +727,20 @@ pub(super) fn group_op(
                     .collect(),
             )
         }
-        GroupOp::PeerSpokeMls { mark } => {
+        GroupOp::PeerSpokeMls { mark, peer } => {
             if mark {
                 let tx = c.transaction().map_err(sql)?;
                 super::mls_store::mark_peer_mls(&tx, conversation)?;
                 finish(tx, fault)?;
             }
-            GroupReply::Flag(
-                c.query_row(
+            let spoke: bool = c
+                .query_row(
                     "SELECT EXISTS(SELECT 1 FROM mls_peer WHERE conversation=?1)",
                     params![conversation.0.as_slice()],
                     |r| r.get(0),
                 )
-                .map_err(sql)?,
-            )
+                .map_err(sql)?;
+            GroupReply::Flag(spoke || peer_has_leaf(c, local, conversation, peer)?)
         }
         GroupOp::Drop => {
             let tx = c.transaction().map_err(sql)?;
@@ -1430,6 +1432,32 @@ fn due_deliveries(c: &Connection, now: u64, recipients: &[InstallationId]) -> R<
     .map_err(sql)?
     .collect::<Result<_, _>>()
     .map_err(sql)
+}
+
+/// Whether one of `peer`'s listed devices holds a leaf in the conversation's group.
+fn peer_has_leaf(
+    c: &Connection,
+    local: &LocalAccount,
+    conversation: ConversationId,
+    peer: Option<PeerId>,
+) -> R<bool> {
+    let Some(peer) = peer else {
+        return Ok(false);
+    };
+    let Some(row) = load_row(c, conversation)? else {
+        return Ok(false);
+    };
+    let Some(record) = local.remote.iter().find(|r| r.peer == peer) else {
+        return Ok(false);
+    };
+    let provider = MlsProvider::new(KvStore::load(c, conversation.0)?);
+    let members = membership::group_installations(&provider, &row.group_id)?;
+    Ok(record
+        .accepted
+        .record
+        .devices
+        .iter()
+        .any(|d| members.contains(&d.installation_id)))
 }
 
 /// At most this many queued deliveries go ahead of one application message.

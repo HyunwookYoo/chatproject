@@ -1062,7 +1062,7 @@ impl Manager {
                 AttemptOutcome::PeerUpdateRequired => self.mark_outdated(pending.peer),
                 AttemptOutcome::NoReply => {
                     if self
-                        .peer_speaks_mls(result.key.conversation, pending.peer, request)
+                        .peer_speaks_mls(pending.peer, request)
                         .await?
                     {
                         result.outcome = AttemptOutcome::Written;

@@ -603,3 +603,65 @@ async fn downgrade_guard_survives_rejoin() {
     assert_eq!(error.code, ErrorCode::UnsupportedMessageVersion);
     assert!(message(&a1, second.key).await.is_none());
 }
+
+#[tokio::test]
+async fn closing_m4_peer_record_change_requeries_at_most_once() {
+    let (a1, b1, net, _conv) = setup(&[B1]).await;
+    b1.account.message_test_m4_peer_closing(true).await.unwrap();
+    let sent = send(&a1, &b1, 1, SENTINEL).await;
+    settle!(
+        [&a1, &b1],
+        outbox(&a1, sent.key).await.waiting_peer_update
+    );
+    let kind17 = |frames: Vec<Vec<u8>>| frames.iter().filter(|f| kind(f) == 17).count();
+    let asked = kind17(frames(&a1).await);
+    // B's record changes (a newer one listing the same device, adopted and republished by B,
+    // still the M4 app), and A takes it.
+    let newer = record(B, &[B1], 1);
+    publish(&net, B, &newer);
+    if b1.account.refresh_record(b1.peer).await.is_err() {
+        b1.account
+            .confirm_record_conflict(chat_core::account::record_hash(&newer))
+            .await
+            .unwrap();
+    }
+    // B publishes the record it settled on.
+    settle!(
+        [&a1, &b1],
+        b1.view().await.publication.pending_count == 0 || {
+            let _ = b1.account.refresh_record(b1.peer).await;
+            false
+        }
+    );
+    let renewed = net.packets.lock().unwrap()[&b1.peer].clone();
+    if a1.account.refresh_record(b1.peer).await.is_err() {
+        a1.account
+            .confirm_remote_record(b1.peer, chat_core::account::record_hash(&renewed))
+            .await
+            .unwrap();
+    }
+    // Taken: asking again finds nothing to review.
+    a1.account.refresh_record(b1.peer).await.unwrap();
+    // A simulated minute: the newer record buys at most one more request, and B's texts arrive.
+    let texts = [
+        send(&b1, &a1, 2, "from the M4 app").await,
+        send(&b1, &a1, 3, "again from the M4 app").await,
+    ];
+    for _ in 0..60 {
+        for f in [&a1, &b1] {
+            f.clock.advance_monotonic_ms(1_000);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let extra = kind17(frames(&a1).await) - asked;
+    assert!(extra <= 1, "{extra} kind 17 requests after the record change");
+    for text in &texts {
+        assert_eq!(
+            message(&a1, text.key).await.map(|m| m.body),
+            Some(text.body.clone()),
+            "the M4 app's text arrived"
+        );
+    }
+    assert!(outbox(&a1, sent.key).await.waiting_peer_update);
+    assert_eq!(delivery(&a1, sent.key).await, DeliveryState::Queued);
+}
