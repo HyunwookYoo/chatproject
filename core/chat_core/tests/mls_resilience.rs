@@ -49,8 +49,9 @@ impl Rng {
     }
 }
 
-/// Where a device's application messages go in 1:1: the other account's devices (a device
-/// sends none to its own account's devices, spec 4.4a).
+/// Where this test network carries a device's application messages: the other account's
+/// devices. The best-effort spec 5.3 copies to the sender's own other devices go through the
+/// actors (`actor_path_two_receiving_devices_seeded`).
 fn recipients(from: usize) -> Vec<usize> {
     if from == DB1 {
         vec![DA1, DA2]
@@ -812,4 +813,302 @@ async fn restart_mid_stream_resumes() {
     for f in &devices {
         assert_eq!(state(f, conv).await.group_epoch, Some(stream.epoch));
     }
+}
+
+// ---- Actor path: one account with two receiving devices (I4) ---------------------------------
+
+/// B3 is a device of B that never runs: its detached KeyPackage is what membership Commits
+/// add and remove.
+const B3: u8 = 16;
+
+/// A = [A1]; B = [B1, B2] (+ B3, never running). B1 and B2 dial A1 and B2 dials B1; A1 dials
+/// nobody. A1 makes the group with B1 and B2. Every device runs its real scheduler.
+async fn two_receivers() -> (Fixture, Fixture, Fixture, Arc<Backend>, ConversationId) {
+    let (ra, rb) = (record(A, &[A1], 0), record(B, &[B1, B2, B3], 0));
+    let net = backend(&[(A, ra.clone()), (B, rb.clone())]);
+    let a1 = device(A, A1, &ra, &net).await;
+    let b1 = device(B, B1, &rb, &net).await;
+    let b2 = device(B, B2, &rb, &net).await;
+    link(&a1, &b1).await;
+    link(&a1, &b2).await;
+    link(&b1, &b2).await;
+    befriend(&a1, &b1).await;
+    befriend(&b1, &a1).await;
+    befriend(&b2, &a1).await;
+    b1.account.connect_account(a1.peer).await.unwrap();
+    b2.account.connect_account(a1.peer).await.unwrap();
+    b2.account.connect_account(b1.peer).await.unwrap();
+    let conv = conversation(&a1, &b1).await;
+    conversation(&b1, &a1).await;
+    conversation(&b2, &a1).await;
+    ensure(&a1, b1.peer).await;
+    settle!(
+        [&a1, &b1, &b2],
+        agreed(&a1, &b1, conv).await
+            && agreed(&a1, &b2, conv).await
+            && state(&a1, conv).await.deliveries.is_empty()
+    );
+    (a1, b1, b2, net, conv)
+}
+
+/// An own Commit by `f` adding or removing B3; not waited for (the next message's attempt or
+/// the delivery poll carries it). False when an own Commit is still unacknowledged.
+async fn commit_b3(f: &Fixture, conv: ConversationId, add: bool) -> bool {
+    let b3 = derive_device(Secret32::from([B3; 32]))
+        .unwrap()
+        .installation_id();
+    let peer = if f.peer == peer_of(A) {
+        peer_of(B)
+    } else {
+        peer_of(A)
+    };
+    let (added, removed) = if add {
+        (vec![mls_detached_key_package(peer_of(B), [B3; 32])], vec![])
+    } else {
+        (vec![], vec![b3])
+    };
+    f.account
+        .storage_test_fixture()
+        .messages()
+        .await
+        .unwrap()
+        .mls_commit(conv, peer, added, removed, NOW * 1000)
+        .await
+        .unwrap()
+        .is_some()
+}
+
+/// Every device at the same epoch, on the same branch, with no own Commit unacknowledged: the
+/// next Commit cannot fork with one still on its way (forks are `mls_group.rs`'s subject).
+async fn quiet(all: [&Fixture; 3], conv: ConversationId) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let mut done = true;
+        for f in all {
+            let s = state(f, conv).await;
+            done &= !s.own_commit_unacked.unwrap() && s.epoch_authenticator.is_some();
+            done &= agreed(all[0], f, conv).await;
+        }
+        if done {
+            return;
+        }
+        if tokio::time::Instant::now() > deadline {
+            for (d, f) in all.iter().enumerate() {
+                let s = state(f, conv).await;
+                eprintln!(
+                    "device {d}: epoch {:?} unacked {:?} members {} auth {:?} deliveries {:?} holds {} rejoins {:?} sent {:?}",
+                    s.group_epoch,
+                    s.own_commit_unacked,
+                    s.members.len(),
+                    s.epoch_authenticator.as_ref().map(|a| a[..4].to_vec()),
+                    s.deliveries.iter().map(|(i, k, e)| (i.0[0], *k, *e)).collect::<Vec<_>>(),
+                    s.holds,
+                    s.rejoin_count,
+                    f.account.mls_test_sent_frames().await.unwrap().iter().rev().take(16).collect::<Vec<_>>()
+                );
+            }
+            // What each queued Commit does at its recipient.
+            let s0 = state(all[0], conv).await;
+            for (to, kind, epoch) in s0.deliveries {
+                if kind != 1 { continue; }
+                let frame = all[0].account.storage_test_fixture().mls_delivery_frame(conv, to, kind, epoch).await.unwrap().unwrap();
+                let (_, e, commit) = mls_commit_from_wire(&frame).unwrap();
+                for f in all {
+                    if installation(f).await == to {
+                        let r = f.account.storage_test_fixture().messages().await.unwrap()
+                            .mls_apply_commit(conv, all[0].peer, all[0].peer, e, commit.clone(), NOW * 1000).await;
+                        eprintln!("apply at {:?}: {:?}", to.0[0], r.map(|o| format!("{o:?}")));
+                    }
+                }
+            }
+            panic!("not quiet");
+        }
+        for f in all {
+            f.clock.advance_monotonic_ms(1_000);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// One own Commit by `committer`, settled on every device before it returns.
+async fn change_epoch(all: [&Fixture; 3], committer: &Fixture, conv: ConversationId, add: bool) {
+    assert!(commit_b3(committer, conv, add).await, "an own Commit");
+    let epoch = state(committer, conv).await.group_epoch;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let mut done = !state(committer, conv).await.own_commit_unacked.unwrap();
+        for f in all {
+            done &= state(f, conv).await.group_epoch == epoch;
+        }
+        if done {
+            return;
+        }
+        if tokio::time::Instant::now() > deadline {
+            for (d, f) in all.iter().enumerate() {
+                let s = state(f, conv).await;
+                eprintln!(
+                    "device {d}: epoch {:?} unacked {:?} members {} deliveries {:?} holds {} sent {:?}",
+                    s.group_epoch,
+                    s.own_commit_unacked,
+                    s.members.len(),
+                    s.deliveries,
+                    s.holds,
+                    f.account.mls_test_sent_frames().await.unwrap().iter().rev().take(12).collect::<Vec<_>>()
+                );
+            }
+            panic!("Commit to {epoch:?} did not settle");
+        }
+        for f in all {
+            f.clock.advance_monotonic_ms(1_000);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// I4: the message path itself (actors, schedulers, session choice, Commits sent ahead of a
+/// message, the spec 5.3 copies, a lost answer, re-encryption after a long delay) between one
+/// account with one device and one with two, both directions, drawn from a fixed seed. Every
+/// message ends Delivered on its sender, each device holds every message once (the sender's
+/// other device as the sender account's own message), and nothing ever shows as failed.
+#[tokio::test]
+async fn actor_path_two_receiving_devices_seeded() {
+    let (a1, b1, b2, _net, conv) = two_receivers().await;
+    let all = [&a1, &b1, &b2];
+    let events: Vec<Arc<Events>> = all
+        .iter()
+        .map(|f| {
+            let events = Arc::new(Events::default());
+            f.bus.subscribe(events.clone());
+            events
+        })
+        .collect();
+    let mut rng = Rng(SEED ^ 0x1405);
+    const MESSAGES: u64 = 24;
+    let late = 3 + rng.below(MESSAGES - 6);
+    let mut b3_in = false;
+    let (mut ahead, mut lost, mut reencrypted) = (0, 0, 0);
+    let mut sent: Vec<(usize, MessageKey, String)> = Vec::new();
+    for n in 0..MESSAGES {
+        let from = match rng.below(10) {
+            0..=5 => 0,
+            6 | 7 => 1,
+            _ => 2,
+        };
+        let sender = all[from];
+        let to = if from == 0 { &b1 } else { &a1 };
+        let body = format!("actor path message {n} from device {from}");
+        eprintln!("message {n} from {from}");
+        if n == late {
+            // Sealed now, sent after the group moved on six epochs: re-encrypted once.
+            sender.account.message_test_hold_scheduler(true).await.unwrap();
+            let view = send(sender, to, 100 + n as u8, &body).await;
+            sender
+                .account
+                .storage_test_fixture()
+                .messages()
+                .await
+                .unwrap()
+                .mls_seal(view.key, NOW * 1000)
+                .await
+                .unwrap()
+                .unwrap();
+            quiet(all, conv).await;
+            for _ in 0..6 {
+                b3_in = !b3_in;
+                change_epoch(all, sender, conv, b3_in).await;
+            }
+            sender.account.message_test_hold_scheduler(false).await.unwrap();
+            settle!(all, delivery(sender, view.key).await == DeliveryState::Delivered);
+            assert_eq!(outbox(sender, view.key).await.codec, None);
+            reencrypted += 1;
+            sent.push((from, view.key, body));
+            continue;
+        }
+        if rng.chance(25) {
+            quiet(all, conv).await;
+            if commit_b3(sender, conv, !b3_in).await {
+                b3_in = !b3_in;
+                ahead += 1;
+            }
+        }
+        // A lost answer (once): A1, the only device of A and so surely the recipient, stores
+        // the text but holds its Ack past the sender's 5 s attempt limit. The attempt ends
+        // written without an answer; the retry sends the same ciphertext and A1 acknowledges
+        // the stored text.
+        let lose = from != 0 && lost == 0 && rng.chance(50);
+        let pause = if lose {
+            Some(
+                a1.account
+                    .message_test_pause(chat_core::account::MessagePoint::Response)
+                    .await
+                    .unwrap(),
+            )
+        } else {
+            None
+        };
+        let view = send(sender, to, 100 + n as u8, &body).await;
+        if let Some(mut pause) = pause {
+            pause.wait_entered().await;
+            tokio::time::sleep(Duration::from_secs(6)).await;
+            assert_eq!(delivery(sender, view.key).await, DeliveryState::SentDirect);
+            pause.release();
+            lost += 1;
+        }
+        settle!(
+            all,
+            matches!(
+                delivery(sender, view.key).await,
+                DeliveryState::Delivered | DeliveryState::Failed
+            )
+        );
+        assert_eq!(delivery(sender, view.key).await, DeliveryState::Delivered);
+        sent.push((from, view.key, body));
+    }
+    // The copies are best effort, but every device is connected: let them land.
+    settle!(all, {
+        let mut done = true;
+        for f in all {
+            done &= everything(f, conv).await.len() == sent.len();
+        }
+        done
+    });
+    for (d, f) in all.iter().enumerate() {
+        let items = everything(f, conv).await;
+        let keys: BTreeSet<MessageKey> = items.iter().map(|m| m.key).collect();
+        assert_eq!(keys.len(), items.len(), "device {d} holds a message twice");
+        for (from, key, body) in &sent {
+            let m = items.iter().find(|m| m.key == *key).unwrap();
+            assert_eq!(&m.body, body);
+            let own_account = (*from == 0) == (d == 0);
+            assert_eq!(m.outgoing, own_account, "device {d}: {key:?}");
+            if *from == d {
+                assert_eq!(m.state, DeliveryState::Delivered);
+            } else if own_account {
+                assert_eq!(m.state, DeliveryState::SentDirect, "a copy shows sent");
+            }
+        }
+    }
+    for (d, events) in events.iter().enumerate() {
+        for event in events.0.lock().unwrap().iter() {
+            match event {
+                CoreEvent::MessageStateChanged { state, .. } => {
+                    assert_ne!(*state, DeliveryState::Failed, "device {d}: {event:?}")
+                }
+                CoreEvent::Error { .. } => panic!("device {d}: {event:?}"),
+                _ => {}
+            }
+        }
+    }
+    let mut epochs = Vec::new();
+    for f in all {
+        epochs.push(state(f, conv).await.group_epoch);
+    }
+    assert!(epochs.windows(2).all(|w| w[0] == w[1]), "{epochs:?}");
+    eprintln!(
+        "actor path: {} messages, {ahead} Commits ahead, {lost} lost answers, {reencrypted} \
+         re-encrypted after six epochs, final epoch {:?}",
+        sent.len(),
+        epochs[0]
+    );
+    assert!(ahead > 0 && lost > 0 && reencrypted == 1);
 }
