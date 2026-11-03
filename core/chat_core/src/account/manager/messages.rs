@@ -314,6 +314,24 @@ fn app_outcome(body: &[u8], sent: [u8; 32]) -> Result<AttemptOutcome, ErrorCode>
         _ => Err(ErrorCode::InvalidMessage),
     }
 }
+/// The session an application message goes out on: the first to an installation that holds a
+/// leaf in the conversation's group and has not refused kind 17, else the first that has not
+/// refused, else the first.
+fn choose_session(
+    candidates: Vec<Session>,
+    members: &[InstallationId],
+    refused: impl Fn(InstallationId) -> bool,
+) -> Option<Session> {
+    let rank = |s: &Session| {
+        let installation = s.grant.installation;
+        match (refused(installation), members.contains(&installation)) {
+            (false, true) => 0,
+            (false, false) => 1,
+            (true, _) => 2,
+        }
+    };
+    candidates.into_iter().min_by_key(rank)
+}
 fn reject_outcome(reason: RejectReason) -> AttemptOutcome {
     match reason {
         RejectReason::ContactRequired => AttemptOutcome::Blocked(BlockReason::ContactRequired),
@@ -886,14 +904,14 @@ impl Manager {
                     return Err(unavailable(ErrorCode::NotAvailable));
                 }
             }
-            let session = self
+            let candidates: Vec<Session> = self
                 .auth
                 .registry
                 .0
                 .lock()
                 .unwrap()
                 .iter()
-                .find(|s| {
+                .filter(|s| {
                     s.grant.peer == peer
                         && (!receipt || s.grant.installation == key.installation)
                         && s.ready
@@ -901,7 +919,17 @@ impl Manager {
                         && s.conn.close_reason().is_none()
                 })
                 .cloned()
-                .ok_or_else(|| unavailable(ErrorCode::AccountRestricted))?;
+                .collect();
+            // A text goes to an installation that holds a leaf in the group and has not refused
+            // kind 17 (an M4 app among the peer's devices); failing that, to one that has not
+            // refused; the receipt goes to the message's sender.
+            let session = if receipt || m4 {
+                candidates.into_iter().next()
+            } else {
+                let members = self.group_members(key.conversation, request).await?;
+                choose_session(candidates, &members, |i| self.outdated_now(i))
+            }
+            .ok_or_else(|| unavailable(ErrorCode::AccountRestricted))?;
             // Commits/Welcomes this recipient still lacks go ahead of the message, over the
             // same session; while another delivery to it is under way the message waits.
             let recipient = session.grant.installation;
@@ -1058,23 +1086,24 @@ impl Manager {
             if request.ticket != result.lease.ticket {
                 return Err(unavailable(ErrorCode::AccountRestricted));
             }
-            // Any kind 17 answer shows the account speaks MLS. An unanswered `App` frame from
-            // an account that never did is the M4 app's refusal (it closes the connection):
-            // the message waits for the update. Otherwise it was written and the answer lost.
+            // Any kind 17 answer shows the installation speaks MLS. An unanswered `App` frame
+            // from an installation that never did is the M4 app's refusal (it closes the
+            // connection): the message waits for the update. Otherwise it was written and the
+            // answer lost.
+            let recipient = result.lease.session.grant.installation;
             match result.outcome {
                 AttemptOutcome::Acked | AttemptOutcome::DecryptFailed(..) => {
-                    self.messages.mls.spoke.insert(pending.peer);
-                    self.messages.mls.outdated.remove(&pending.peer);
+                    self.speaks_mls(recipient);
                 }
-                AttemptOutcome::PeerUpdateRequired => self.mark_outdated(pending.peer),
+                AttemptOutcome::PeerUpdateRequired => self.mark_outdated(pending.peer, recipient),
                 AttemptOutcome::NoReply => {
                     if self
-                        .peer_speaks_mls(pending.peer, request)
+                        .peer_speaks_mls(pending.peer, recipient, request)
                         .await?
                     {
                         result.outcome = AttemptOutcome::Written;
                     } else {
-                        self.mark_outdated(pending.peer);
+                        self.mark_outdated(pending.peer, recipient);
                         if pending.receipt.is_none() {
                             self.message_db(
                                 MessageDbOp::MarkWaitingPeerUpdate(result.key, true),
@@ -1420,7 +1449,7 @@ impl Manager {
         request: Request,
     ) -> Result<(), CoreError> {
         self.ensure_group(conversation, peer).await?;
-        if !receipt && self.messages.mls.outdated.contains_key(&peer) {
+        if !receipt && self.account_outdated(peer) {
             self.message_db(MessageDbOp::MarkWaitingPeerUpdate(key, true), request)
                 .await?;
         }

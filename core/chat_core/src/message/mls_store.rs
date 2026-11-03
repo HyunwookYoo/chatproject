@@ -851,7 +851,7 @@ pub(super) fn open_app(
         params![conversation.0.as_slice()],
     )
     .map_err(sql)?;
-    mark_peer_mls(&tx, conversation)?;
+    mark_peer_mls(&tx, conversation, sender_install)?;
     provider.storage().flush(&tx, conversation.0)?;
     finish(tx, fault)?;
     Ok(match (stored, text) {
@@ -865,12 +865,17 @@ pub(super) fn open_app(
 /// taken): a repeat is refused again, never acknowledged.
 const REJECTED_CT: u8 = 3;
 
-/// Records that the conversation's peer account spoke MLS to this device. Monotonic: kept in
-/// its own table, untouched when the group is dropped or rejoined (the downgrade guard).
-pub(super) fn mark_peer_mls(tx: &Transaction<'_>, conversation: ConversationId) -> R<()> {
+/// Records that `installation` of the conversation's peer account spoke MLS to this device.
+/// Monotonic: kept in its own table, untouched when the group is dropped or rejoined (the
+/// downgrade guard, per installation).
+pub(super) fn mark_peer_mls(
+    tx: &Transaction<'_>,
+    conversation: ConversationId,
+    installation: InstallationId,
+) -> R<()> {
     tx.execute(
-        "INSERT OR IGNORE INTO mls_peer VALUES(?1)",
-        params![conversation.0.as_slice()],
+        "INSERT OR IGNORE INTO mls_peer VALUES(?1,?2)",
+        params![conversation.0.as_slice(), installation.0.as_slice()],
     )
     .map_err(sql)?;
     Ok(())

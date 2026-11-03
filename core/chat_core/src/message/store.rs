@@ -1191,12 +1191,13 @@ fn receive(
     }
     let now = integer(now)?;
     let tx = c.transaction().map_err(sql_error)?;
-    // Downgrade guard: once this account received MLS from the peer, a plaintext text frame
-    // from it is refused (an M4 peer sends nothing else; an M5 peer never sends one).
+    // Downgrade guard: once an installation of the peer sent this device MLS, a plaintext text
+    // frame from that installation is refused (an M4 app sends nothing else; an M5 app never
+    // sends one). The peer's other installations may still run M4 and are not affected.
     let peer_mls: bool = tx
         .query_row(
-            "SELECT EXISTS(SELECT 1 FROM mls_peer WHERE conversation=?1)",
-            params![k.conversation.0.as_slice()],
+            "SELECT EXISTS(SELECT 1 FROM mls_peer WHERE conversation=?1 AND installation=?2)",
+            params![k.conversation.0.as_slice(), k.installation.0.as_slice()],
             |r| r.get(0),
         )
         .map_err(sql_error)?;

@@ -143,10 +143,13 @@ CREATE TABLE mls_hold (
     PRIMARY KEY(conversation,body_hash)
 ) STRICT;
 
--- Conversations whose peer account has spoken MLS to this device (an accepted App, Commit or
--- Welcome). Never cleared, not even when the group is dropped or rejoined: the downgrade guard.
+-- Installations of the conversation's peer account that have spoken MLS to this device (an
+-- accepted App, Commit or Welcome). Never cleared, not even when the group is dropped or
+-- rejoined: the downgrade guard refuses plaintext texts from exactly these installations.
 CREATE TABLE mls_peer (
-    conversation BLOB PRIMARY KEY NOT NULL CHECK(length(conversation)=32),
+    conversation BLOB NOT NULL CHECK(length(conversation)=32),
+    installation BLOB NOT NULL CHECK(length(installation)=32),
+    PRIMARY KEY(conversation,installation),
     FOREIGN KEY(conversation) REFERENCES conversation(id)
 ) STRICT;
 

@@ -123,3 +123,79 @@ async fn lagging_device_recovers_when_a_sender_ran_far_ahead() {
     assert_eq!(stored.len(), 1);
     assert_eq!(stored[0].body, "after the burst");
 }
+
+/// A = [A1]; B = [B1, B2] where B2 still runs the released M4 app (the M4-peer fixture). B2
+/// dials A1 first, so its session is the first of B's in A1's registry. B1 makes the group.
+async fn mixed() -> (Fixture, Fixture, Fixture, Arc<Backend>, ConversationId) {
+    let (ra, rb) = (record(A, &[A1], 0), record(B, &[B1, B2], 0));
+    let net = backend(&[(A, ra.clone()), (B, rb.clone())]);
+    let a1 = device(A, A1, &ra, &net).await;
+    let b1 = device(B, B1, &rb, &net).await;
+    let b2 = device(B, B2, &rb, &net).await;
+    b2.account.message_test_m4_peer(true).await.unwrap();
+    link(&a1, &b1).await;
+    link(&a1, &b2).await;
+    befriend(&a1, &b1).await;
+    befriend(&b1, &a1).await;
+    befriend(&b2, &a1).await;
+    b2.account.connect_account(a1.peer).await.unwrap();
+    b1.account.connect_account(a1.peer).await.unwrap();
+    let conv = conversation(&a1, &b1).await;
+    conversation(&b1, &a1).await;
+    conversation(&b2, &a1).await;
+    ensure(&b1, a1.peer).await;
+    settle!(
+        [&a1, &b1, &b2],
+        agreed(&a1, &b1, conv).await && state(&b1, conv).await.deliveries.is_empty()
+    );
+    (a1, b1, b2, net, conv)
+}
+
+/// I2: one account, one device on M5 and one on M4. A's messages go to the M5 device that is a
+/// group member, not to the M4 device that refuses kind 17 (which must not make the whole
+/// account wait for an update). After B1 spoke MLS, B2's plaintext texts are still taken: the
+/// downgrade guard refuses plaintext only from an installation that itself spoke MLS.
+#[tokio::test]
+async fn m5_and_m4_devices_of_one_peer_account() {
+    let (a1, b1, b2, _net, conv) = mixed().await;
+    let ib2 = installation(&b2).await;
+    // A1's first session to B is B2's, the M4 app.
+    let sent = send(&a1, &b1, 1, "to the device that can read it").await;
+    settle!(
+        [&a1, &b1, &b2],
+        delivery(&a1, sent.key).await == DeliveryState::Delivered
+            || outbox(&a1, sent.key).await.waiting_peer_update
+    );
+    assert_eq!(delivery(&a1, sent.key).await, DeliveryState::Delivered);
+    assert!(message(&b1, sent.key).await.is_some());
+    assert!(!state(&a1, conv).await.members.contains(&ib2));
+    // B1 speaks MLS to A1.
+    let from_b1 = send(&b1, &a1, 2, "over mls").await;
+    settle!(
+        [&a1, &b1, &b2],
+        delivery(&b1, from_b1.key).await == DeliveryState::Delivered
+    );
+    assert_eq!(state(&a1, conv).await.peer_spoke, true);
+    // B2, which never spoke MLS, still gets its M4 text through.
+    let from_b2 = send(&b2, &a1, 3, "from the M4 app").await;
+    settle!(
+        [&a1, &b1, &b2],
+        matches!(
+            delivery(&b2, from_b2.key).await,
+            DeliveryState::Delivered | DeliveryState::Failed
+        )
+    );
+    assert_eq!(delivery(&b2, from_b2.key).await, DeliveryState::Delivered);
+    assert_eq!(
+        message(&a1, from_b2.key).await.unwrap().body,
+        "from the M4 app"
+    );
+    // And A's next message still goes to B1 without waiting for B's "update".
+    let again = send(&a1, &b1, 4, "still to B1").await;
+    settle!(
+        [&a1, &b1, &b2],
+        delivery(&a1, again.key).await == DeliveryState::Delivered
+            || outbox(&a1, again.key).await.waiting_peer_update
+    );
+    assert_eq!(delivery(&a1, again.key).await, DeliveryState::Delivered);
+}
