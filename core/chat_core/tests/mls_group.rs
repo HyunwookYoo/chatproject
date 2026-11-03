@@ -1096,8 +1096,12 @@ async fn peer_welcome_without_contact_is_held_as_contact_required() {
     assert!(state(&b1, conv).await.deliveries.contains(&(i2, 2, epoch)));
 }
 
+/// B's list (as A2 looks it up) no longer names B1: the Welcome's peer leaf is not refused but
+/// held, A2 looks B up and keeps answering `Busy`, and never joins or adds the contact. The
+/// refused cases (forged leaf, third account, sender not a leaf, revoked sender) are in
+/// `message::mls_group::tests::own_device_welcome_verdicts`.
 #[tokio::test]
-async fn own_device_welcome_with_unverified_peer_leaf_is_rejected() {
+async fn own_device_welcome_with_unlisted_peer_leaf_is_held_not_joined() {
     let (a1, a2, b1, net, conv) = phone_setup().await;
     a1.account.mls_test_hold_delivery(true).await.unwrap();
     ensure(&a1, b1.peer).await;
@@ -1159,4 +1163,27 @@ async fn auto_contact_receives_the_peers_messages() {
             .iter()
             .any(|m| m.key == sent.key && m.body == "hello phone")
     );
+}
+
+/// I5: a Welcome from a device this account revoked is refused for good: A2 neither joins nor
+/// adds the contact, however often A1 sends it.
+#[tokio::test]
+async fn own_device_welcome_from_a_revoked_device_is_refused() {
+    let (a1, a2, b1, _net, conv) = phone_setup().await;
+    a1.account.mls_test_hold_delivery(true).await.unwrap();
+    ensure(&a1, b1.peer).await;
+    settle!(
+        [&a1],
+        state(&a1, conv).await.deliveries.len() == 2
+            && state(&a1, conv).await.group_epoch.is_some()
+    );
+    // A2 revokes A1 before A1's Welcome reaches it.
+    a2.account
+        .revoke_device(installation(&a1).await)
+        .await
+        .unwrap();
+    a1.account.mls_test_hold_delivery(false).await.unwrap();
+    idle(&[&a1, &a2, &b1], 30).await;
+    assert_eq!(state(&a2, conv).await.group_epoch, None);
+    assert!(a2.account.contacts().await.unwrap().is_empty());
 }

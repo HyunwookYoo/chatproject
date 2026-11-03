@@ -473,6 +473,8 @@ pub(super) fn signer_of(local: &LocalAccount) -> (SignatureKeyPair, MlsCredentia
 struct Records {
     own_peer: PeerId,
     own: IdentityRecord,
+    /// This account's revoked (tombstoned) installations: refused for good, never held.
+    revoked: Vec<InstallationId>,
     peer: PeerId,
     remote: IdentityRecord,
 }
@@ -480,11 +482,21 @@ fn records(local: &LocalAccount, peer: PeerId) -> R<Records> {
     let own_peer = local.keys.peer_id();
     let signed = local.records.accepted.as_ref().ok_or_else(auth_failed)?;
     let mut own = parse_stored_record(&signed.packet, own_peer)?;
+    let mut revoked: Vec<InstallationId> = local
+        .records
+        .tombstones
+        .iter()
+        .map(|t| t.target_installation)
+        .collect();
     own.devices.retain(|device| {
-        !local.records.tombstones.iter().any(|t| {
+        let gone = local.records.tombstones.iter().any(|t| {
             t.target_installation == device.installation_id
                 || t.target_transport == device.transport_public_key
-        })
+        });
+        if gone {
+            revoked.push(device.installation_id);
+        }
+        !gone
     });
     let cached = local
         .remote
@@ -494,6 +506,7 @@ fn records(local: &LocalAccount, peer: PeerId) -> R<Records> {
     Ok(Records {
         own_peer,
         own,
+        revoked,
         peer,
         remote: parse_stored_record(&cached.accepted.packet, peer)?,
     })
@@ -502,7 +515,8 @@ fn records(local: &LocalAccount, peer: PeerId) -> R<Records> {
 /// The leaf check of one operation. A leaf is checked against the record of the account its
 /// credential names (this device's or the conversation peer's); any other account is refused.
 /// OpenMLS reports only that `verify` said no, so why is kept here (Ruling 10): a device that
-/// is merely missing from a record is held and looked up again, anything else is rejected.
+/// is merely missing from a record is held and looked up again, anything else is rejected. A
+/// device this account revoked is rejected, never held: no lookup can bring it back.
 struct Vetting<'a> {
     records: &'a Records,
     missing: Cell<Option<PeerId>>,
@@ -521,6 +535,9 @@ impl<'a> Vetting<'a> {
             .map_err(|_| auth_failed())
             .and_then(|decoded| {
                 let record = if decoded.peer == self.records.own_peer {
+                    if self.records.revoked.contains(&decoded.installation) {
+                        return Err(auth_failed());
+                    }
                     &self.records.own
                 } else if decoded.peer == self.records.peer {
                     &self.records.remote
@@ -1024,9 +1041,25 @@ fn vet_own_welcome(
     if group::join(&provider, welcome, &collect).is_err() {
         return Ok(OwnWelcome::Refused);
     }
-    let leaves = leaves.into_inner();
+    judge_own_welcome(
+        identity,
+        conversation,
+        sender_install,
+        &leaves.into_inner(),
+        |peer| records(local, peer),
+    )
+}
+
+/// What `vet_own_welcome` decides from the Welcome's leaves (credential, signature key).
+fn judge_own_welcome(
+    identity: Identity,
+    conversation: ConversationId,
+    sender_install: InstallationId,
+    leaves: &[(Vec<u8>, Vec<u8>)],
+    records_of: impl FnOnce(PeerId) -> R<Records>,
+) -> R<OwnWelcome> {
     let mut peers = Vec::new();
-    for (credential, _) in &leaves {
+    for (credential, _) in leaves {
         let Ok(decoded) = MlsCredential::decode(credential) else {
             return Ok(OwnWelcome::Refused);
         };
@@ -1040,7 +1073,7 @@ fn vet_own_welcome(
     if check_conversation(identity, peer, conversation).is_err() {
         return Ok(OwnWelcome::Refused);
     }
-    let records = match records(local, peer) {
+    let records = match records_of(peer) {
         Ok(records) => records,
         Err(error) if error.code == ErrorCode::RecordUnavailable => {
             return Ok(OwnWelcome::Held(peer));
@@ -1050,7 +1083,7 @@ fn vet_own_welcome(
     let vetting = Vetting::new(&records);
     let mut verified = true;
     let mut sender_leaf = false;
-    for (credential, key) in &leaves {
+    for (credential, key) in leaves {
         if vetting.check(credential, key).is_err() {
             verified = false;
         } else if MlsCredential::decode(credential)
@@ -1909,6 +1942,7 @@ mod tests {
         let records = Records {
             own_peer: peer_a,
             own: listing(&[&a]),
+            revoked: vec![],
             peer: peer_c,
             remote: record_c.clone(),
         };
@@ -1922,6 +1956,7 @@ mod tests {
         let records = Records {
             own_peer: peer_a,
             own: listing(&[&a]),
+            revoked: vec![],
             peer: peer_b,
             remote: listing(&[&c]),
         };
@@ -1932,9 +1967,79 @@ mod tests {
         let records = Records {
             own_peer: peer_a,
             own: listing(&[&a]),
+            revoked: vec![],
             peer: peer_b,
             remote: listing(&[&b]),
         };
         assert!(Vetting::new(&records).check(&credential_b, &key_b).is_ok());
+    }
+
+    /// I5 / spec 4.4a: what a Welcome from one of this account's own devices may bring in, for
+    /// a device without the contact. A1 sent it to A2; the group is A1, A2 and B1.
+    #[test]
+    fn own_device_welcome_verdicts() {
+        let (a1, a2, a3, b1, b9, c1) = (
+            device(1),
+            device(2),
+            device(3),
+            device(4),
+            device(5),
+            device(6),
+        );
+        let (peer_a, peer_b, peer_c) = (PeerId([10; 32]), PeerId([20; 32]), PeerId([30; 32]));
+        let identity = Identity {
+            peer: peer_a,
+            installation: a2.installation_id(),
+        };
+        let conversation = super::super::store::conversation_id(peer_a, peer_b).unwrap();
+        let records = |revoked: Vec<InstallationId>, b_lists: &DeviceKeys| Records {
+            own_peer: peer_a,
+            own: listing(&[&a1, &a2, &a3]),
+            revoked,
+            peer: peer_b,
+            remote: listing(&[b_lists]),
+        };
+        let judge = |sender: &DeviceKeys,
+                     leaves: &[(Vec<u8>, Vec<u8>)],
+                     records: R<Records>| {
+            judge_own_welcome(identity, conversation, sender.installation_id(), leaves, |_| {
+                records
+            })
+            .unwrap()
+        };
+        let group = vec![leaf(peer_a, &a1), leaf(peer_a, &a2), leaf(peer_b, &b1)];
+
+        // Every leaf checks out and A1 is one of them: the contact is B.
+        assert_eq!(
+            judge(&a1, &group, Ok(records(vec![], &b1))),
+            OwnWelcome::Peer(peer_b)
+        );
+        // A third account in the group.
+        let mut third = group.clone();
+        third.push(leaf(peer_c, &c1));
+        assert_eq!(judge(&a1, &third, Ok(records(vec![], &b1))), OwnWelcome::Refused);
+        // The device that sent it is not in the group.
+        assert_eq!(judge(&a3, &group, Ok(records(vec![], &b1))), OwnWelcome::Refused);
+        // B1's leaf carries another device's signature key: refused, not held.
+        let mut forged = group.clone();
+        forged[2].1 = mls_signer(&b9).public().to_vec();
+        assert_eq!(judge(&a1, &forged, Ok(records(vec![], &b1))), OwnWelcome::Refused);
+        // B's record (as cached) does not list B1, or is not cached at all: look it up.
+        assert_eq!(
+            judge(&a1, &group, Ok(records(vec![], &b9))),
+            OwnWelcome::Held(peer_b)
+        );
+        let missing = || {
+            Err(CoreError::new(
+                ErrorCode::RecordUnavailable,
+                "mls_peer_record_missing",
+            ))
+        };
+        assert_eq!(judge(&a1, &group, missing()), OwnWelcome::Held(peer_b));
+        // A1 was revoked on this device: refused for good, no lookup and no retry loop.
+        assert_eq!(
+            judge(&a1, &group, Ok(records(vec![a1.installation_id()], &b1))),
+            OwnWelcome::Refused
+        );
     }
 }
