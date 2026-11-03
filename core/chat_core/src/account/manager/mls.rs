@@ -297,28 +297,6 @@ fn recovery_allowed(recent: &mut Vec<u64>, now: u64) -> bool {
     recent.len() < RECOVERY_LIMIT
 }
 
-#[cfg(test)]
-mod recovery_tests {
-    use super::*;
-
-    #[test]
-    fn self_made_epochs_are_limited_per_hour() {
-        let mut recent = Vec::new();
-        for n in 0..RECOVERY_LIMIT as u64 {
-            assert!(recovery_allowed(&mut recent, 1_000 + n));
-            recent.push(1_000 + n);
-        }
-        assert!(!recovery_allowed(&mut recent, 2_000));
-        assert!(!recovery_allowed(
-            &mut recent,
-            1_000 + RECOVERY_WINDOW_MS - 1
-        ));
-        // The oldest one leaves the window: one more is allowed.
-        assert!(recovery_allowed(&mut recent, 1_000 + RECOVERY_WINDOW_MS));
-        assert_eq!(recent.len(), RECOVERY_LIMIT - 1);
-    }
-}
-
 /// What a Commit/Welcome delivery attempt's answer means for its queued row.
 pub(super) fn delivery_outcome(result: &Result<MlsReply, ErrorCode>) -> Delivery {
     match result {
@@ -2184,5 +2162,27 @@ impl Manager {
             }
             Err(error) => Err(error),
         }
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+
+    #[test]
+    fn self_made_epochs_are_limited_per_hour() {
+        let mut recent = Vec::new();
+        for n in 0..RECOVERY_LIMIT as u64 {
+            assert!(recovery_allowed(&mut recent, 1_000 + n));
+            recent.push(1_000 + n);
+        }
+        assert!(!recovery_allowed(&mut recent, 2_000));
+        assert!(!recovery_allowed(
+            &mut recent,
+            1_000 + RECOVERY_WINDOW_MS - 1
+        ));
+        // The oldest one leaves the window: one more is allowed.
+        assert!(recovery_allowed(&mut recent, 1_000 + RECOVERY_WINDOW_MS));
+        assert_eq!(recent.len(), RECOVERY_LIMIT - 1);
     }
 }

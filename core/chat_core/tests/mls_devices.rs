@@ -175,7 +175,7 @@ async fn m5_and_m4_devices_of_one_peer_account() {
         [&a1, &b1, &b2],
         delivery(&b1, from_b1.key).await == DeliveryState::Delivered
     );
-    assert_eq!(state(&a1, conv).await.peer_spoke, true);
+    assert!(state(&a1, conv).await.peer_spoke);
     // B2, which never spoke MLS, still gets its M4 text through.
     let from_b2 = send(&b2, &a1, 3, "from the M4 app").await;
     settle!(
