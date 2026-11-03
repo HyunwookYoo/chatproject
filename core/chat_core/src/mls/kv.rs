@@ -175,11 +175,23 @@ fn corrupt() -> CoreError {
 impl KvStore {
     /// Loads the rows of `scope` plus the global rows. Use `[0; 32]` for global-only work.
     pub(crate) fn load(c: &Connection, scope: [u8; 32]) -> R<KvStore> {
+        Self::load_where(c, scope, true)
+    }
+
+    /// Loads the rows of one conversation `scope` only, without the global rows (KeyPackages
+    /// and their private keys). Enough to seal or open an application message: the signing key
+    /// is passed in, never read from storage. Those rows can only be read, never moved: a
+    /// global-label row written through this store still goes to the global scope on `flush`.
+    pub(crate) fn load_scope(c: &Connection, scope: [u8; 32]) -> R<KvStore> {
+        Self::load_where(c, scope, false)
+    }
+
+    fn load_where(c: &Connection, scope: [u8; 32], global: bool) -> R<KvStore> {
         let mut statement = c
-            .prepare("SELECT key,value FROM mls_kv WHERE scope=?1 OR scope=?2")
+            .prepare("SELECT key,value FROM mls_kv WHERE scope=?1 OR (?3 AND scope=?2)")
             .map_err(storage_error)?;
         let mut rows = statement
-            .query(params![scope.as_slice(), GLOBAL.as_slice()])
+            .query(params![scope.as_slice(), GLOBAL.as_slice(), global])
             .map_err(storage_error)?;
         let mut state = State::default();
         while let Some(row) = rows.next().map_err(storage_error)? {

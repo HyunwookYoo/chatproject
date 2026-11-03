@@ -769,6 +769,9 @@ pub(crate) enum FixtureOp {
     MlsDeliveryFrame(ConversationId, InstallationId, u8, u64, tokio::sync::oneshot::Sender<R<Option<Vec<u8>>>>),
     /// Queues (`Some(body, next_retry_at_ms)`) or deletes (`None`) one delivery row.
     MlsSetDelivery(ConversationId, InstallationId, u8, u64, Option<(Vec<u8>, u64)>, tokio::sync::oneshot::Sender<R<()>>),
+    /// Optionally writes one raw `mls_kv` row into the global scope (key, value as given), then
+    /// lists the labels of every global-scope row.
+    MlsGlobalRows(Option<(Vec<u8>, Vec<u8>)>, tokio::sync::oneshot::Sender<R<Vec<String>>>),
 }
 #[cfg(all(feature = "test-hooks", debug_assertions))]
 pub(crate) fn fixture(c: &mut Connection, op: FixtureOp) {
@@ -855,6 +858,33 @@ pub(crate) fn fixture(c: &mut Connection, op: FixtureOp) {
                 .optional()
                 .map_err(sql_error)
             });
+            let _ = reply.send(result);
+        }
+        FixtureOp::MlsGlobalRows(plant, reply) => {
+            let result = (|| {
+                if let Some((key, value)) = plant {
+                    c.execute(
+                        "INSERT OR REPLACE INTO mls_kv VALUES(zeroblob(32),?1,?2)",
+                        params![key, value],
+                    )
+                    .map_err(sql_error)?;
+                }
+                let mut q = c
+                    .prepare("SELECT key FROM mls_kv WHERE scope=zeroblob(32) ORDER BY rowid")
+                    .map_err(sql_error)?;
+                let keys = q
+                    .query_map([], |r| r.get::<_, Vec<u8>>(0))
+                    .map_err(sql_error)?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(sql_error)?;
+                Ok(keys
+                    .iter()
+                    .map(|key| {
+                        let len = key.first().copied().unwrap_or(0) as usize;
+                        String::from_utf8_lossy(key.get(1..1 + len).unwrap_or_default()).into_owned()
+                    })
+                    .collect())
+            })();
             let _ = reply.send(result);
         }
         FixtureOp::MlsSetDelivery(id, recipient, kind, epoch, row, reply) => {

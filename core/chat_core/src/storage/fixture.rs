@@ -53,7 +53,7 @@ impl Messages {
     }
     /// A fresh KeyPackage for this installation (kept in the store's global scope).
     pub async fn mls_key_package(&self) -> Result<Vec<u8>, CoreError> {
-        let op = MessageDbOp::MlsGroupOp(ConversationId([0; 32]), GroupOp::NewKeyPackage);
+        let op = MessageDbOp::MlsGroupOp(ConversationId([0; 32]), GroupOp::NewKeyPackage { replace: Vec::new() });
         match self.mls(op).await? {
             MessageDbReply::Group(GroupReply::KeyPackage(bytes)) => Ok(bytes),
             _ => unreachable!(),
@@ -733,6 +733,13 @@ impl Fixture {
     ) -> Result<(), CoreError> {
         let (tx, rx) = oneshot::channel();
         self.handle.0.test(TestOp::Message(FixtureOp::MlsSetDelivery(conversation, recipient, kind, epoch, row, tx))).await;
+        rx.await.unwrap()
+    }
+    /// The labels of every global-scope `mls_kv` row (`KeyPackage`, ...), in insertion order,
+    /// after writing `plant` (a raw key and value) there if given.
+    pub async fn mls_global_rows(&self, plant: Option<(Vec<u8>, Vec<u8>)>) -> Result<Vec<String>, CoreError> {
+        let (tx, rx) = oneshot::channel();
+        self.handle.0.test(TestOp::Message(FixtureOp::MlsGlobalRows(plant, tx))).await;
         rx.await.unwrap()
     }
     pub async fn due_hint(&self, now: u64) -> Result<bool, CoreError> {

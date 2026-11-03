@@ -225,7 +225,7 @@ pub(super) fn seal(
     let Some(group) = group_row(&tx, key.conversation)? else {
         return Ok(MessageDbReply::NeedGroup(key.conversation));
     };
-    let provider = MlsProvider::new(KvStore::load(&tx, key.conversation.0)?);
+    let provider = MlsProvider::new(KvStore::load_scope(&tx, key.conversation.0)?);
     let (signer, _) = signer_of(local);
     let (hash, frame) = seal_one(
         &tx,
@@ -289,7 +289,7 @@ pub(super) fn seal_pending(
     if ids.is_empty() {
         return Ok(MessageDbReply::Count(0));
     }
-    let provider = MlsProvider::new(KvStore::load(&tx, conversation.0)?);
+    let provider = MlsProvider::new(KvStore::load_scope(&tx, conversation.0)?);
     let (signer, _) = signer_of(local);
     for id in &ids {
         let key = MessageKey {
@@ -359,7 +359,7 @@ pub(super) fn reencrypt(
     let Some(group) = group_row(&tx, key.conversation)? else {
         return Ok(MessageDbReply::NeedGroup(key.conversation));
     };
-    let provider = MlsProvider::new(KvStore::load(&tx, key.conversation.0)?);
+    let provider = MlsProvider::new(KvStore::load_scope(&tx, key.conversation.0)?);
     let (signer, _) = signer_of(local);
     let (_, frame) = seal_one(
         &tx,
@@ -551,7 +551,7 @@ pub(super) fn prepare_receipt(
             targets: vec![key.id],
         },
     };
-    let provider = MlsProvider::new(KvStore::load(&tx, key.conversation.0)?);
+    let provider = MlsProvider::new(KvStore::load_scope(&tx, key.conversation.0)?);
     let (signer, _) = signer_of(local);
     let (_, frame) = seal_one(
         &tx,
@@ -777,7 +777,7 @@ pub(super) fn open_app(
     let Some(group) = group_row(&tx, conversation)? else {
         return Ok(decrypt_failed(group::CLASS_NO_GROUP, 0));
     };
-    let provider = MlsProvider::new(KvStore::load(&tx, conversation.0)?);
+    let provider = MlsProvider::new(KvStore::load_scope(&tx, conversation.0)?);
     let opened = match open_counted(&provider, &group.group_id, &ciphertext) {
         Ok(opened) => opened,
         // The sender is too far ahead in this epoch: the actor moves the group on (C1).

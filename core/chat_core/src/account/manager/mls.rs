@@ -57,6 +57,11 @@ const MISSING_REJOIN_MS: u64 = 30_000;
 /// `OUTDATED_MAX_MS`, unless its record changes.
 const OUTDATED_RETRY_MS: u64 = 300_000;
 const OUTDATED_MAX_MS: u64 = 3_600_000;
+/// A KeyPackageRequest from one installation is answered at most once per this long (`Busy`
+/// otherwise), and at most `KEY_PACKAGES_PER_ASKER` KeyPackages handed to it are kept; minting
+/// another deletes its oldest. The store keeps at most `KEY_PACKAGES_TOTAL` in all.
+const KEY_PACKAGE_GAP_MS: u64 = 1_000;
+const KEY_PACKAGES_PER_ASKER: usize = 4;
 /// A device moves a conversation's group to a new epoch on its own (an empty Commit, C1) at
 /// most this many times per `RECOVERY_WINDOW_MS`, so a sender cannot make it spin Commits.
 const RECOVERY_LIMIT: usize = 4;
@@ -150,6 +155,11 @@ pub(crate) struct Runtime {
     /// When this device last moved each conversation's group to a new epoch on its own (C1),
     /// within `RECOVERY_WINDOW_MS`.
     recoveries: BTreeMap<ConversationId, Vec<u64>>,
+    /// The KeyPackage sent with each conversation's last `JoinRequest`: deleted when the device
+    /// asks again (it is not going to be used), so a join that keeps failing keeps one.
+    join_key_packages: BTreeMap<ConversationId, Vec<u8>>,
+    /// KeyPackages handed to each asking installation (oldest first) and when it last got one.
+    issued: BTreeMap<InstallationId, (std::collections::VecDeque<Vec<u8>>, u64)>,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     pub(super) hold_delivery: bool,
     /// The M4-peer fixture: this core behaves like a released M4 app (kind 16 only).
@@ -352,6 +362,7 @@ pub(crate) enum MlsTest {
     Rejoined,
     Recovered,
     Query(PeerId),
+    AskKeyPackage(PeerId),
     M4Peer(bool),
     M4Close(bool),
     Frames,
@@ -408,6 +419,17 @@ impl AccountHandle {
     pub async fn mls_test_rejoin_total(&self) -> Result<u64, CoreError> {
         match self.mls_test(MlsTest::Rejoined).await? {
             MlsTestReply::Count(count) => Ok(count),
+            _ => unreachable!(),
+        }
+    }
+    /// Sends a `KeyPackageRequest` to every connected device of `peer` and waits for each (5 s
+    /// limit each): installation, got a KeyPackage.
+    pub async fn mls_test_ask_key_package(
+        &self,
+        peer: PeerId,
+    ) -> Result<Vec<(InstallationId, bool)>, CoreError> {
+        match self.mls_test(MlsTest::AskKeyPackage(peer)).await? {
+            MlsTestReply::Answers(answers) => Ok(answers),
             _ => unreachable!(),
         }
     }
@@ -483,6 +505,18 @@ impl Manager {
             MlsTest::Held => MlsTestReply::Count(self.messages.mls.held),
             MlsTest::Rejoined => MlsTestReply::Count(self.messages.mls.rejoined),
             MlsTest::Recovered => MlsTestReply::Count(self.messages.mls.recovered),
+            MlsTest::AskKeyPackage(peer) => {
+                // Test only: this actor waits on the answers.
+                let body = MlsFrame::KeyPackageRequest.encode().to_vec();
+                let mut answers = Vec::new();
+                for session in self.mls_sessions() {
+                    if session.grant.peer == peer {
+                        let got = matches!(exchange(&session, &body).await, Ok(MlsReply::KeyPackage(_)));
+                        answers.push((session.grant.installation, got));
+                    }
+                }
+                MlsTestReply::Answers(answers)
+            }
             MlsTest::Query(peer) => {
                 // Test only: this actor waits on the answers (the devices asked do not).
                 let conversation = conversation_id(own, peer)?;
@@ -954,13 +988,25 @@ impl Manager {
                 self.idle(conversation);
                 return Ok(());
             };
+            // The KeyPackage of an earlier JoinRequest that led nowhere goes.
+            let replace = self
+                .messages
+                .mls
+                .join_key_packages
+                .remove(&conversation)
+                .into_iter()
+                .collect();
             let GroupReply::KeyPackage(key_package) = self
-                .group_db(NO_CONVERSATION, GroupOp::NewKeyPackage, request)
+                .group_db(NO_CONVERSATION, GroupOp::NewKeyPackage { replace }, request)
                 .await?
             else {
                 self.idle(conversation);
                 return Ok(());
             };
+            self.messages
+                .mls
+                .join_key_packages
+                .insert(conversation, key_package.clone());
             let since = self.schedule_now();
             self.messages
                 .mls
@@ -1785,11 +1831,33 @@ impl Manager {
                 if !self.mls_trusted(sender) {
                     return Ok(MlsReply::ContactRequired);
                 }
+                // Each KeyPackage keeps private keys here until it is used: an installation gets
+                // at most one per `KEY_PACKAGE_GAP_MS`, and only its newest few are kept.
+                let asker = session.grant.installation;
+                let (handed, last) = self
+                    .messages
+                    .mls
+                    .issued
+                    .get(&asker)
+                    .cloned()
+                    .unwrap_or_default();
+                if !handed.is_empty() && now < last.saturating_add(KEY_PACKAGE_GAP_MS) {
+                    return Ok(MlsReply::Busy);
+                }
+                let mut handed = handed;
+                let mut replace = Vec::new();
+                while handed.len() >= KEY_PACKAGES_PER_ASKER {
+                    replace.extend(handed.pop_front());
+                }
                 match self
-                    .group_db(NO_CONVERSATION, GroupOp::NewKeyPackage, request)
+                    .group_db(NO_CONVERSATION, GroupOp::NewKeyPackage { replace }, request)
                     .await?
                 {
-                    GroupReply::KeyPackage(bytes) => MlsReply::KeyPackage(bytes),
+                    GroupReply::KeyPackage(bytes) => {
+                        handed.push_back(bytes.clone());
+                        self.messages.mls.issued.insert(asker, (handed, now));
+                        MlsReply::KeyPackage(bytes)
+                    }
                     _ => MlsReply::Busy,
                 }
             }
@@ -1954,8 +2022,11 @@ impl Manager {
                 match outcome {
                     Outcome::Held(lookup) => self.note_hold(lookup),
                     Outcome::Joined => {
-                        self.messages.mls.joined_with.insert(conversation, ct_hash);
-                        self.messages.mls.missing.remove(&conversation);
+                        let mls = &mut self.messages.mls;
+                        mls.joined_with.insert(conversation, ct_hash);
+                        mls.missing.remove(&conversation);
+                        // Its KeyPackage (if this join was asked for) is used now.
+                        mls.join_key_packages.remove(&conversation);
                     }
                     _ => {}
                 }

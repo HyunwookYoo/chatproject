@@ -331,3 +331,86 @@ async fn idle(devices: &[&Fixture], rounds: usize) {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
+
+async fn key_packages_kept(f: &Fixture) -> usize {
+    f.account
+        .storage_test_fixture()
+        .mls_global_rows(None)
+        .await
+        .unwrap()
+        .iter()
+        .filter(|label| *label == "KeyPackage")
+        .count()
+}
+
+/// I1: a KeyPackageRequest from one installation is answered at most once a second, and only
+/// its newest 4 KeyPackages are kept (each holds private keys until it is used).
+#[tokio::test]
+async fn key_package_requests_are_rate_limited_and_capped() {
+    let (a1, b1, _net, _conv) = setup(&[B1]).await;
+    let ask = || async { a1.account.mls_test_ask_key_package(b1.peer).await.unwrap() };
+    let ib = installation(&b1).await;
+    assert_eq!(ask().await, vec![(ib, true)]);
+    assert_eq!(ask().await, vec![(ib, false)], "too soon: Busy");
+    for _ in 0..10 {
+        b1.clock.advance_monotonic_ms(1_100);
+        assert_eq!(ask().await, vec![(ib, true)]);
+    }
+    assert_eq!(key_packages_kept(&b1).await, 4);
+}
+
+/// I1: a device whose `JoinRequest` keeps being refused asks again and again; each time it
+/// deletes the KeyPackage of the request before, so it never keeps more than one.
+#[tokio::test]
+async fn a_stuck_join_keeps_one_key_package() {
+    let (ra, rb) = (record(A, &[A1, A2], 0), record(B, &[B1, B2], 0));
+    let net = backend(&[(A, ra.clone()), (B, rb.clone())]);
+    let a1 = device(A, A1, &ra, &net).await;
+    let a2 = device(A, A2, &ra, &net).await;
+    let b1 = device(B, B1, &rb, &net).await;
+    link(&a1, &b1).await;
+    link(&a1, &a2).await;
+    befriend(&a1, &b1).await;
+    befriend(&b1, &a1).await;
+    befriend(&a2, &b1).await;
+    a1.account.connect_account(b1.peer).await.unwrap();
+    let conv = conversation(&a1, &b1).await;
+    conversation(&b1, &a1).await;
+    conversation(&a2, &b1).await;
+    grouped(&a1, &b1, conv).await;
+    // A1's own Commit stays unacknowledged: it answers every JoinRequest Busy.
+    a1.account.mls_test_hold_delivery(true).await.unwrap();
+    commits_held(&a1, &b1, conv).await;
+    a2.account.connect_account(a2.peer).await.unwrap();
+    ensure(&a2, b1.peer).await;
+    settle!(
+        [&a1, &a2, &b1],
+        a2.account
+            .mls_test_sent_frames()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|f| *f == "join_request")
+            .count()
+            >= 4
+    );
+    assert_eq!(state(&a2, conv).await.group_epoch, None);
+    assert!(key_packages_kept(&a2).await <= 1);
+}
+
+/// One own Commit on `a` (adding B's never-online B2) whose delivery is held.
+async fn commits_held(a: &Fixture, b: &Fixture, conv: ConversationId) {
+    let messages = a.account.storage_test_fixture().messages().await.unwrap();
+    messages
+        .mls_commit(
+            conv,
+            b.peer,
+            vec![mls_detached_key_package(b.peer, [B2; 32])],
+            vec![],
+            NOW * 1000,
+        )
+        .await
+        .unwrap()
+        .expect("an own Commit");
+    assert_eq!(state(a, conv).await.own_commit_unacked, Some(true));
+}

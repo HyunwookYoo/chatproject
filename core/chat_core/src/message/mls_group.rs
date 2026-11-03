@@ -29,6 +29,9 @@ type R<T> = Result<T, CoreError>;
 pub(crate) const DELIVER_COMMIT: u8 = 1;
 /// `mls_delivery.kind`: a Welcome for a member the Commit added.
 pub(crate) const DELIVER_WELCOME: u8 = 2;
+/// This installation keeps at most this many unused KeyPackages (the private keys of the ones
+/// it handed out); beyond that the oldest are deleted.
+pub(crate) const KEY_PACKAGES_TOTAL: i64 = 64;
 /// Held Commits/Welcomes are capped per conversation and in total; the oldest go first.
 const HOLDS_PER_CONVERSATION: i64 = 32;
 const HOLDS_TOTAL: i64 = 1024;
@@ -43,7 +46,9 @@ const HOLD_HEADER: usize = 97;
 /// for the rejoin limit, which outlives the process.
 pub(crate) enum GroupOp {
     /// A fresh KeyPackage for this installation (its private keys go to the global scope).
-    NewKeyPackage,
+    /// The ones in `replace` (handed out earlier, not to be used) are deleted first, and only
+    /// the newest `KEY_PACKAGES_TOTAL` are kept.
+    NewKeyPackage { replace: Vec<Vec<u8>> },
     /// The group's epoch and first-Commit hash, if the conversation has a group.
     Info,
     /// Creates the group and adds `members` (peer KeyPackages); queues a Welcome for each.
@@ -571,12 +576,21 @@ pub(super) fn group_op(
     fault: Fault,
 ) -> R<MessageDbReply> {
     let reply = match op {
-        GroupOp::NewKeyPackage => {
+        GroupOp::NewKeyPackage { replace } => {
             let (signer, credential) = signer_of(local);
             let tx = c.transaction().map_err(sql)?;
             let provider = MlsProvider::new(KvStore::load(&tx, GLOBAL)?);
+            for old in &replace {
+                group::forget_key_package(&provider, old)?;
+            }
             let key_package = group::new_key_package(&provider, &signer, &credential)?;
             provider.storage().flush(&tx, GLOBAL)?;
+            // A KeyPackage row's key is `[10]"KeyPackage"...`; rowids grow with each insert.
+            tx.execute(
+                "DELETE FROM mls_kv WHERE scope=zeroblob(32) AND substr(key,1,11)=X'0A4B65795061636B616765' AND rowid NOT IN (SELECT rowid FROM mls_kv WHERE scope=zeroblob(32) AND substr(key,1,11)=X'0A4B65795061636B616765' ORDER BY rowid DESC LIMIT ?1)",
+                params![KEY_PACKAGES_TOTAL],
+            )
+            .map_err(sql)?;
             finish(tx, fault)?;
             GroupReply::KeyPackage(key_package)
         }
@@ -1576,7 +1590,7 @@ fn group_members(c: &Connection, conversation: ConversationId) -> R<Vec<Installa
     let Some(row) = load_row(c, conversation)? else {
         return Ok(Vec::new());
     };
-    let provider = MlsProvider::new(KvStore::load(c, conversation.0)?);
+    let provider = MlsProvider::new(KvStore::load_scope(c, conversation.0)?);
     membership::group_installations(&provider, &row.group_id)
 }
 

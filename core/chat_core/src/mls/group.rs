@@ -101,6 +101,17 @@ pub(crate) fn new_key_package(
     Ok(bytes)
 }
 
+/// Deletes this installation's KeyPackage `bytes` (its private keys) from the provider's store,
+/// if it is still there: one that was handed out and will not be used.
+pub(crate) fn forget_key_package(p: &MlsProvider, bytes: &[u8]) -> R<()> {
+    let key_package = parse_key_package(p.crypto(), bytes)?;
+    let hash_ref = key_package
+        .hash_ref(p.crypto())
+        .map_err(|_| invalid("invalid mls key package"))?;
+    openmls_traits::storage::StorageProvider::delete_key_package(p.storage(), &hash_ref)
+        .map_err(|_| invalid("mls key package not deleted"))
+}
+
 fn parse_key_package(crypto: &impl OpenMlsCrypto, bytes: &[u8]) -> R<KeyPackage> {
     if bytes.len() > MAX_KEY_PACKAGE_BYTES {
         return Err(invalid("mls key package too large"));

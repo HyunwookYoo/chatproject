@@ -937,3 +937,103 @@ async fn enqueue_reserves_the_sealed_size() {
     );
     a.f.mls_outbox_cap(None).await;
 }
+
+fn key_packages(labels: &[String]) -> usize {
+    labels.iter().filter(|label| *label == "KeyPackage").count()
+}
+
+/// I1: sealing, opening, re-encrypting and sealing a receipt read only the conversation's own
+/// rows, never the global scope (every KeyPackage's private keys). A global row nothing can
+/// decode makes any operation that loads the global scope fail, so these would fail too.
+#[tokio::test]
+async fn message_ops_never_load_the_global_scope() {
+    let (a, b, conversation) = linked().await;
+    for side in [&a, &b] {
+        side.f
+            .mls_global_rows(Some((b"\x05Bogus".to_vec(), vec![0xFF])))
+            .await
+            .unwrap();
+    }
+    // The control: what does need the global scope cannot run now.
+    assert_eq!(
+        b.m.mls_key_package().await.unwrap_err().code,
+        ErrorCode::StorageCorrupt
+    );
+    let key = send(&a, &b, 1, "scope only").await;
+    a.m.mls_seal(key, NOW).await.unwrap().unwrap();
+    ack(&open(&b, &a, conversation, &ciphertext(&a, key).await).await);
+    a.m.mls_reencrypt(key, NOW).await.unwrap();
+    ack(&open(&b, &a, conversation, &ciphertext(&a, key).await).await);
+    send(&a, &b, 2, "pending").await;
+    assert_eq!(
+        a.m.mls_seal_pending(conversation, NOW).await.unwrap(),
+        Some(1)
+    );
+    b.m.mark_read(conversation, vec![key], NOW).await.unwrap();
+    let receipt = b
+        .m
+        .prepare_receipt_attempt(key, a.install, 2_000_000)
+        .await
+        .unwrap();
+    let (_, ct) = mls_app_from_wire(&receipt).unwrap();
+    ack(&a.m
+        .mls_open_app(b.peer, b.install, conversation, ct, NOW)
+        .await
+        .unwrap());
+}
+
+/// I1: a joined (or dropped) group leaves nothing in the global scope: the KeyPackage it was
+/// joined with is gone with its private keys, and no other private key stays behind there.
+#[tokio::test]
+async fn a_group_leaves_no_private_keys_in_the_global_scope() {
+    let a = Side::new(A, B).await;
+    let b = Side::new(B, A).await;
+    // B handed out one more KeyPackage that nobody used.
+    b.m.mls_key_package().await.unwrap();
+    let (a, b, conversation) = link(a, b).await;
+    assert_eq!(a.f.mls_global_rows(None).await.unwrap(), Vec::<String>::new());
+    assert_eq!(
+        b.f.mls_global_rows(None).await.unwrap(),
+        vec!["KeyPackage".to_string()],
+        "only the unused KeyPackage"
+    );
+    b.m.mls_drop_group(conversation).await.unwrap();
+    assert_eq!(
+        b.f.mls_global_rows(None).await.unwrap(),
+        vec!["KeyPackage".to_string()]
+    );
+}
+
+/// I1: at most 64 unused KeyPackages are kept; the oldest go first.
+#[tokio::test]
+async fn unused_key_packages_are_capped_oldest_first() {
+    let a = Side::new(A, B).await;
+    let mut minted = Vec::new();
+    for _ in 0..70 {
+        minted.push(a.m.mls_key_package().await.unwrap());
+    }
+    assert_eq!(key_packages(&a.f.mls_global_rows(None).await.unwrap()), 64);
+    // The newest still makes a group A can join; the oldest no longer does.
+    let b = Side::new(B, A).await;
+    let conversation = a.m.open_dm(a.peer, b.peer).await.unwrap().id;
+    b.m.open_dm(b.peer, a.peer).await.unwrap();
+    let oldest = b
+        .m
+        .mls_create_group(conversation, a.peer, vec![minted[0].clone()], NOW)
+        .await
+        .unwrap();
+    assert!(
+        a.m.mls_join_group(conversation, b.peer, oldest.welcome, oldest.first_commit_hash, NOW)
+            .await
+            .is_err()
+    );
+    b.m.mls_drop_group(conversation).await.unwrap();
+    let newest = b
+        .m
+        .mls_create_group(conversation, a.peer, vec![minted[69].clone()], NOW)
+        .await
+        .unwrap();
+    a.m.mls_join_group(conversation, b.peer, newest.welcome, newest.first_commit_hash, NOW)
+        .await
+        .unwrap();
+}
