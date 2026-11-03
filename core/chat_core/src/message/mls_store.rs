@@ -710,7 +710,10 @@ fn decrypt_failed(class: u8, epoch: u64) -> MessageDbReply {
 /// * a `Receipt` is applied to this device's sent messages and acknowledged;
 /// * a text M4 would refuse advances the ratchet but stores nothing and is `Rejected` (the
 ///   sender gives the message up, as for an M4 `Reject`);
-/// * the same message id again (a re-encrypted resend) stores nothing new.
+/// * the same message id again (a re-encrypted resend) stores nothing new;
+/// * a copy of a text another device of this account sent (spec 5.3) is stored as that
+///   device's outgoing message, shown sent (`SentDirect`), never unread and never answered with
+///   a receipt; a receipt copy is acknowledged and dropped.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn open_app(
     c: &mut Connection,
@@ -727,7 +730,10 @@ pub(super) fn open_app(
     if sender_install == identity.installation {
         return Ok(ack);
     }
-    if super::store::conversation_id(identity.peer, sender_peer)? != conversation {
+    // A copy from another device of this account: the conversation must have a group here,
+    // which the caller checked is one with a contact.
+    let own = sender_peer == identity.peer;
+    if !own && super::store::conversation_id(identity.peer, sender_peer)? != conversation {
         return Err(invalid());
     }
     let now = integer(now)?;
@@ -823,7 +829,10 @@ pub(super) fn open_app(
                 body,
                 &ct_hash,
                 now,
+                own,
             )?,
+            // A receipt copy is about the other device's own messages, not this one's.
+            Content::Receipt { .. } if own => Stored::Yes,
             Content::Receipt { kind, targets } => {
                 apply_receipt(&tx, identity, conversation, *kind, targets, now)?;
                 Stored::Yes
@@ -846,12 +855,14 @@ pub(super) fn open_app(
         ],
     )
     .map_err(sql)?;
-    tx.execute(
-        "UPDATE mls_conversation SET peer_mls=1 WHERE conversation=?1 AND peer_mls=0",
-        params![conversation.0.as_slice()],
-    )
-    .map_err(sql)?;
-    mark_peer_mls(&tx, conversation, sender_install)?;
+    if !own {
+        tx.execute(
+            "UPDATE mls_conversation SET peer_mls=1 WHERE conversation=?1 AND peer_mls=0",
+            params![conversation.0.as_slice()],
+        )
+        .map_err(sql)?;
+        mark_peer_mls(&tx, conversation, sender_install)?;
+    }
     provider.storage().flush(&tx, conversation.0)?;
     finish(tx, fault)?;
     Ok(match (stored, text) {
@@ -952,6 +963,10 @@ fn apply_receipt(
 /// on the logical key and body). What M4 would refuse (an empty or too long body, an
 /// out-of-range lamport or time, a different body or position for a known id) is `Rejected`:
 /// nothing is stored, but the ratchet still moves, and the sender is told it failed for good.
+///
+/// `own`: the copy of a text another device of this account sent (spec 5.3). It is stored as
+/// that device's outgoing message (same logical key), shown sent (`SentDirect`), not unread;
+/// it never gets a receipt job and is never sent from here (no outbox row).
 #[allow(clippy::too_many_arguments)]
 fn store_text(
     tx: &Transaction<'_>,
@@ -962,6 +977,7 @@ fn store_text(
     body: &str,
     ct_hash: &[u8; 32],
     now: i64,
+    own: bool,
 ) -> R<Stored> {
     let key = MessageKey {
         conversation,
@@ -980,7 +996,7 @@ fn store_text(
         return Ok(Stored::Rejected);
     }
     if let Some(existing) = find(tx, key)? {
-        if existing.outgoing || existing.body != *body {
+        if existing.outgoing != own || existing.body != *body {
             return Ok(Stored::Rejected);
         }
         return Ok(Stored::Yes);
@@ -1011,27 +1027,37 @@ fn store_text(
     if collision {
         return Ok(Stored::Rejected);
     }
-    ensure_conversation(tx, conversation, sender_peer)?;
-    tx.execute(
-        "INSERT INTO message VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,0,0,?9,NULL,0,0,NULL,NULL,X'')",
-        params![
-            conversation.0.as_slice(),
-            sender_peer.0.as_slice(),
-            sender_install.0.as_slice(),
-            key.id.0.as_slice(),
-            lamport,
-            message.prev_hash.as_slice(),
-            ct_hash.as_slice(),
-            sent_at,
-            now,
-            body
-        ],
-    )
-    .map_err(sql)?;
+    let values = params![
+        conversation.0.as_slice(),
+        sender_peer.0.as_slice(),
+        sender_install.0.as_slice(),
+        key.id.0.as_slice(),
+        lamport,
+        message.prev_hash.as_slice(),
+        ct_hash.as_slice(),
+        sent_at,
+        now,
+        body
+    ];
+    if own {
+        // Sent by this account (outgoing, outcome 1 = sent), seen, nothing to deliver from here.
+        tx.execute(
+            "INSERT INTO message VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,1,1,NULL,NULL,1,0,NULL,NULL,X'')",
+            values,
+        )
+        .map_err(sql)?;
+    } else {
+        ensure_conversation(tx, conversation, sender_peer)?;
+        tx.execute(
+            "INSERT INTO message VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,0,0,?9,NULL,0,0,NULL,NULL,X'')",
+            values,
+        )
+        .map_err(sql)?;
+    }
     let revision = bump(tx)?;
     tx.execute(
-        "UPDATE conversation SET lamport_max=max(lamport_max,?2),unread=unread+1,change_revision=?3 WHERE id=?1",
-        params![conversation.0.as_slice(), lamport, integer(revision)?],
+        "UPDATE conversation SET lamport_max=max(lamport_max,?2),unread=unread+?4,change_revision=?3 WHERE id=?1",
+        params![conversation.0.as_slice(), lamport, integer(revision)?, i64::from(!own)],
     )
     .map_err(sql)?;
     Ok(Stored::Yes)

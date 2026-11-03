@@ -281,6 +281,8 @@ struct NetworkAttempt {
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     frames: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
     reserved: Option<(ConversationId, InstallationId)>,
+    /// Sessions that get a copy of an `App` frame the recipient acknowledged (spec 5.3).
+    copies: Vec<Session>,
 }
 /// SHA-256 of the MLS ciphertext of a kind 17 `App` frame; `None` for any other frame (an M4
 /// receipt, or the M4-peer fixture's text).
@@ -349,6 +351,7 @@ impl NetworkAttempt {
         let mut written = false;
         let mut ahead = Vec::new();
         let sent_hash = app_ciphertext_hash(&job.wire);
+        let copy = (sent_hash.is_some() && !self.copies.is_empty()).then(|| job.wire.to_vec());
         let work = async {
             if job.ticket != lease.ticket
                 || job.peer != lease.session.grant.peer
@@ -430,6 +433,28 @@ impl NetworkAttempt {
             Ok(Err(code)) => AttemptOutcome::Transient(code),
             Err(_) => AttemptOutcome::Transient(ErrorCode::NetworkTimeout),
         };
+        // The recipient has it: copies go out on their own and nobody waits for them.
+        if let (AttemptOutcome::Acked, Some(wire)) = (&outcome, copy) {
+            let sessions: Vec<Session> = self
+                .copies
+                .into_iter()
+                .filter(|session| {
+                    self.authority.permits(&SessionLease {
+                        session: session.clone(),
+                        ticket: lease.ticket,
+                    })
+                })
+                .collect();
+            #[cfg(all(feature = "test-hooks", debug_assertions))]
+            for _ in &sessions {
+                self.frames.lock().unwrap().push(wire.clone());
+            }
+            tokio::spawn(async move {
+                for session in sessions {
+                    let _ = super::mls::exchange(&session, &wire).await;
+                }
+            });
+        }
         AttemptResult {
             key: job.key,
             lease,
@@ -923,16 +948,34 @@ impl Manager {
             // A text goes to an installation that holds a leaf in the group and has not refused
             // kind 17 (an M4 app among the peer's devices); failing that, to one that has not
             // refused; the receipt goes to the message's sender.
+            let members = if receipt || m4 {
+                Vec::new()
+            } else {
+                self.group_members(key.conversation, request).await?
+            };
             let session = if receipt || m4 {
                 candidates.into_iter().next()
             } else {
-                let members = self.group_members(key.conversation, request).await?;
                 choose_session(candidates, &members, |i| self.outdated_now(i))
             }
             .ok_or_else(|| unavailable(ErrorCode::AccountRestricted))?;
             // Commits/Welcomes this recipient still lacks go ahead of the message, over the
             // same session; while another delivery to it is under way the message waits.
             let recipient = session.grant.installation;
+            // Spec 5.3: once the recipient has the text, the same ciphertext also goes, best
+            // effort, to the other connected devices of the peer and of this account that hold
+            // a leaf in the group and have not refused kind 17. Their answers change nothing.
+            let own = self.local()?.keys.peer_id();
+            let copies: Vec<Session> = self
+                .mls_sessions()
+                .into_iter()
+                .filter(|s| {
+                    (s.grant.peer == peer || s.grant.peer == own)
+                        && s.grant.installation != recipient
+                        && members.contains(&s.grant.installation)
+                        && !self.outdated_now(s.grant.installation)
+                })
+                .collect();
             let ahead = if m4 {
                 Vec::new()
             } else {
@@ -998,6 +1041,7 @@ impl Manager {
                 #[cfg(all(feature = "test-hooks", debug_assertions))]
                 frames: self.messages.mls.frames.clone(),
                 reserved: (!ahead.is_empty()).then_some((key.conversation, recipient)),
+                copies,
             };
             // Nothing below can fail: the reservation is released by the attempt's result.
             if let Some(reserved) = attempt.reserved {

@@ -518,7 +518,7 @@ impl Manager {
     }
 
     /// Ready, currently authorized sessions to other installations, one per installation.
-    fn mls_sessions(&self) -> Vec<Session> {
+    pub(super) fn mls_sessions(&self) -> Vec<Session> {
         let Ok(local) = self.local() else {
             return Vec::new();
         };
@@ -2049,13 +2049,15 @@ impl Manager {
         request: Request,
     ) -> Result<Option<MlsReply>, CoreError> {
         let sender = session.grant.peer;
-        // Application messages come from the conversation's peer account (this account's
-        // other devices send none in 1:1, spec 4.4a).
-        if sender == self.local()?.keys.peer_id()
-            || self.conversation_peer(conversation, sender) != Some(sender)
-        {
+        // Application messages come from the conversation's peer account, or (spec 5.3) are a
+        // copy of what another device of this account sent in a conversation with a contact.
+        let own = sender == self.local()?.keys.peer_id();
+        let Some(peer) = self
+            .conversation_peer(conversation, sender)
+            .filter(|peer| own || *peer == sender)
+        else {
             return Ok(Some(MlsReply::ContactRequired));
-        }
+        };
         let op = MessageDbOp::OpenApp(
             sender,
             session.grant.installation,
@@ -2064,7 +2066,7 @@ impl Manager {
             self.services.clock.wall_ms(),
         );
         let result = self.message_db(op, request).await;
-        if result.is_ok() {
+        if result.is_ok() && !own {
             self.speaks_mls(session.grant.installation);
         }
         match result {
@@ -2079,7 +2081,7 @@ impl Manager {
             }
             Ok(MessageDbReply::Rejected) => Ok(None),
             Ok(MessageDbReply::FarAhead { epoch }) => Ok(Some(
-                self.move_epoch(conversation, sender, epoch, request).await?,
+                self.move_epoch(conversation, peer, epoch, request).await?,
             )),
             Ok(_) => Err(unavailable(ErrorCode::InvalidMessage)),
             // The MLS sender is not the authenticated device, or the message conflicts.

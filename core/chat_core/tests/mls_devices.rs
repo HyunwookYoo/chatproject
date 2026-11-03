@@ -198,4 +198,136 @@ async fn m5_and_m4_devices_of_one_peer_account() {
             || outbox(&a1, again.key).await.waiting_peer_update
     );
     assert_eq!(delivery(&a1, again.key).await, DeliveryState::Delivered);
+    // B2 holds no leaf and refused kind 17: no copy went to it.
+    assert_eq!(app_ciphertexts(&a1).await.len(), 2);
+}
+
+/// The two seeds ordered by installation id: a dial to the account reaches the first.
+fn ordered(x: u8, y: u8) -> (u8, u8) {
+    let id = |seed: u8| {
+        derive_device(Secret32::from([seed; 32]))
+            .unwrap()
+            .installation_id()
+    };
+    if id(x) < id(y) { (x, y) } else { (y, x) }
+}
+
+/// A = [A1, A2], B = [B1, B2], returned as each account's first and second device by
+/// installation id (`af`, `as`, `bf`, `bs`): a dial to an account reaches its first device.
+/// The sessions come from dials that end there (`bf` and `bs` dial A, `as` dials A and B, `bs`
+/// dials B); `af` dials nobody, so none of its own dials takes them away. `af` and `bf` reach
+/// all three other devices; `as` and `bs` reach the two first devices.
+async fn four() -> (Fixture, Fixture, Fixture, Fixture, Arc<Backend>, ConversationId) {
+    let (ra, rb) = (record(A, &[A1, A2], 0), record(B, &[B1, B2], 0));
+    let net = backend(&[(A, ra.clone()), (B, rb.clone())]);
+    let ((a_first, a_second), (b_first, b_second)) = (ordered(A1, A2), ordered(B1, B2));
+    let af = device(A, a_first, &ra, &net).await;
+    let a_s = device(A, a_second, &ra, &net).await;
+    let bf = device(B, b_first, &rb, &net).await;
+    let bs = device(B, b_second, &rb, &net).await;
+    for (x, y) in [(&af, &bf), (&af, &bs), (&af, &a_s), (&a_s, &bf), (&bf, &bs)] {
+        link(x, y).await;
+    }
+    befriend(&af, &bf).await;
+    befriend(&a_s, &bf).await;
+    befriend(&bf, &af).await;
+    befriend(&bs, &af).await;
+    bf.account.connect_account(af.peer).await.unwrap();
+    bs.account.connect_account(af.peer).await.unwrap();
+    a_s.account.connect_account(af.peer).await.unwrap();
+    bs.account.connect_account(bf.peer).await.unwrap();
+    a_s.account.connect_account(bf.peer).await.unwrap();
+    let conv = conversation(&af, &bf).await;
+    for f in [&a_s, &bf, &bs] {
+        conversation(f, if f.peer == af.peer { &bf } else { &af }).await;
+    }
+    ensure(&af, bf.peer).await;
+    settle!(
+        [&af, &a_s, &bf, &bs],
+        agreed(&af, &a_s, conv).await
+            && agreed(&af, &bf, conv).await
+            && agreed(&af, &bs, conv).await
+            && state(&af, conv).await.deliveries.is_empty()
+    );
+    (af, a_s, bf, bs, net, conv)
+}
+
+async fn unread(f: &Fixture, conv: ConversationId) -> u64 {
+    f.account
+        .messages()
+        .list_conversations(None, 50)
+        .await
+        .unwrap()
+        .items
+        .iter()
+        .find(|c| c.id == conv)
+        .map_or(0, |c| c.unread)
+}
+
+/// I3 (spec 5.3): a text goes to one device of the peer, which makes it Delivered, and the same
+/// ciphertext goes best effort to the peer's other device and to the sender's own other device.
+/// The own copy is the sender account's outgoing message there: shown sent, not unread, never
+/// answered with a receipt. Both directions, two devices per account.
+#[tokio::test]
+async fn texts_reach_the_other_devices_of_both_accounts() {
+    let (af, a_s, bf, bs, _net, conv) = four().await;
+    let all = [&af, &a_s, &bf, &bs];
+    let sent = send(&af, &bf, 1, "to every device").await;
+    settle!(
+        all,
+        delivery(&af, sent.key).await == DeliveryState::Delivered
+            && message(&bf, sent.key).await.is_some()
+            && message(&bs, sent.key).await.is_some()
+            && message(&a_s, sent.key).await.is_some()
+    );
+    for b in [&bf, &bs] {
+        let got = message(b, sent.key).await.unwrap();
+        assert!(!got.outgoing);
+        assert_eq!((got.body.as_str(), got.lamport), ("to every device", sent.lamport));
+        assert_eq!(page(b, conv).await.len(), 1);
+    }
+    let copy = message(&a_s, sent.key).await.unwrap();
+    assert!(copy.outgoing);
+    assert_eq!(copy.state, DeliveryState::SentDirect);
+    assert_eq!((copy.body.as_str(), copy.lamport), ("to every device", sent.lamport));
+    assert_eq!(unread(&a_s, conv).await, 0);
+    assert_eq!(receipt_jobs(&a_s).await, 0);
+    assert!(
+        a_s.account
+            .messages()
+            .mark_read(conv, vec![sent.key])
+            .await
+            .is_err(),
+        "an own message is never read with a receipt"
+    );
+
+    let back = send(&bf, &af, 2, "and back").await;
+    settle!(
+        all,
+        delivery(&bf, back.key).await == DeliveryState::Delivered
+            && message(&af, back.key).await.is_some()
+            && message(&a_s, back.key).await.is_some()
+            && message(&bs, back.key).await.is_some()
+    );
+    for a in [&af, &a_s] {
+        assert!(!message(a, back.key).await.unwrap().outgoing);
+    }
+    let copy = message(&bs, back.key).await.unwrap();
+    assert!(copy.outgoing);
+    assert_eq!(copy.state, DeliveryState::SentDirect);
+    // Copies changed no status: each sender's message is Delivered, A2's copy still sent.
+    idle(&all, 5).await;
+    assert_eq!(delivery(&af, sent.key).await, DeliveryState::Delivered);
+    assert_eq!(delivery(&a_s, sent.key).await, DeliveryState::SentDirect);
+    assert_eq!(page(&a_s, conv).await.len(), 2);
+}
+
+/// Lets `devices` run for `rounds` more seconds of back-off time.
+async fn idle(devices: &[&Fixture], rounds: usize) {
+    for _ in 0..rounds {
+        for d in devices {
+            d.clock.advance_monotonic_ms(1_000);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
