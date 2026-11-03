@@ -96,6 +96,9 @@ pub(super) struct Runtime {
     /// The epoch each message was last sealed again in without counting (at most once per
     /// epoch, so a recipient cannot make this device re-encrypt without end).
     epoch_resealed: BTreeMap<MessageKey, u64>,
+    /// The recipient epoch each message was last answered class 2 from behind (M2): a repeat at
+    /// the same epoch means the Commit carried ahead did not help, and it is counted.
+    behind: BTreeMap<MessageKey, u64>,
     /// The text the `Ack` about to be written stores (keys the response checkpoint).
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     pub(super) ack_key: Option<MessageKey>,
@@ -1205,6 +1208,7 @@ impl Manager {
                 AttemptOutcome::Acked if pending.receipt.is_none() => {
                     self.messages.epoch_resealed.remove(&result.key);
                     self.messages.epoch_waits.remove(&result.key);
+                    self.messages.behind.remove(&result.key);
                     MessageDbOp::MlsAcked(
                         result.key,
                         result.lease.session.grant.installation,
@@ -1342,7 +1346,9 @@ impl Manager {
     ///   arrives: the message keeps its back-off and the re-encryption budget (3) is not spent.
     /// * Class 2 from a recipient behind this device: it lacks a Commit of this device's group
     ///   state, which the next attempt carries ahead of the message over the same session; then
-    ///   this very ciphertext opens. Nothing is re-encrypted (M2).
+    ///   this very ciphertext opens. Nothing is re-encrypted (M2). A repeat at the same
+    ///   recipient epoch means the recipient still lacks it (its delivery settled, or it cannot
+    ///   rejoin): sealed again, counted, so the message can end Failed instead of Queued.
     /// * Class 2 from a recipient ahead of this device: it moved the group to a newer epoch (C1,
     ///   or any Commit not here yet). The message is sealed again, uncounted, once this device
     ///   has that epoch (`poll_epoch_waits`). Class 2 at this device's own epoch: the recipient
@@ -1363,7 +1369,13 @@ impl Manager {
             return Ok(());
         }
         match self.group_epoch(key.conversation, request).await? {
-            Some(own) if class == CLASS_FUTURE_EPOCH && epoch < own => Ok(()),
+            Some(own) if class == CLASS_FUTURE_EPOCH && epoch < own => {
+                if self.messages.behind.insert(key, epoch) == Some(epoch) {
+                    self.reencrypt(key, peer, true, request).await
+                } else {
+                    Ok(())
+                }
+            }
             Some(own) if class == CLASS_FUTURE_EPOCH && epoch > own => {
                 self.messages.epoch_waits.insert(key, (peer, epoch));
                 Ok(())

@@ -182,6 +182,50 @@ async fn missing_commit_is_redelivered_before_message() {
 }
 
 #[tokio::test]
+async fn recipient_that_never_gets_the_missing_commit_fails_the_message() {
+    let (a1, b1, _net, conv) = setup(&[B1, B2]).await;
+    grouped(&a1, &b1, conv).await;
+    // A Commit B never gets: A's deliveries stay held, so no attempt carries it ahead either.
+    a1.account.mls_test_hold_delivery(true).await.unwrap();
+    a1.account.message_test_hold_scheduler(true).await.unwrap();
+    let messages = a1.account.storage_test_fixture().messages().await.unwrap();
+    let epoch = messages
+        .mls_commit(
+            conv,
+            b1.peer,
+            vec![mls_detached_key_package(b1.peer, [B2; 32])],
+            vec![],
+            NOW * 1000,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let sent = send(&a1, &b1, 1, "behind for good").await;
+    // B answers class 2 from the epoch before, every time. The first answer is free (M2); a
+    // repeat at the same epoch spends the budget, so the message ends Failed, not Queued.
+    a1.account.message_test_hold_scheduler(false).await.unwrap();
+    settle!(
+        [&a1],
+        delivery(&a1, sent.key).await == DeliveryState::Failed
+    );
+    assert_eq!(outbox(&a1, sent.key).await.reencrypts, 3);
+    assert_eq!(state(&b1, conv).await.group_epoch, Some(epoch - 1));
+    assert!(message(&b1, sent.key).await.is_none());
+    // The user's Retry still works: once the Commit can travel, the message is delivered.
+    let view = a1.account.messages().retry_send(sent.key).await.unwrap();
+    assert_eq!(view.state, DeliveryState::Queued);
+    a1.account.mls_test_hold_delivery(false).await.unwrap();
+    settle!(
+        [&a1, &b1],
+        delivery(&a1, sent.key).await == DeliveryState::Delivered
+    );
+    assert_eq!(
+        message(&b1, sent.key).await.unwrap().body,
+        "behind for good"
+    );
+}
+
+#[tokio::test]
 async fn m4_peer_keeps_message_waiting_not_failed() {
     let (a1, b1, _net, _conv) = setup(&[B1]).await;
     b1.account.message_test_m4_peer(true).await.unwrap();
