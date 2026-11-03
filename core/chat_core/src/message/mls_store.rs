@@ -585,7 +585,11 @@ pub(super) fn prepare_receipt(
 
 /// The recipient could not open the sealed receipt for received message `key`: it is
 /// forgotten, so the next attempt seals one in the current epoch.
-pub(super) fn reseal_receipt(c: &mut Connection, key: MessageKey, fault: Fault) -> R<MessageDbReply> {
+pub(super) fn reseal_receipt(
+    c: &mut Connection,
+    key: MessageKey,
+    fault: Fault,
+) -> R<MessageDbReply> {
     let tx = c.transaction().map_err(sql)?;
     tx.execute(
         "DELETE FROM mls_receipt WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",

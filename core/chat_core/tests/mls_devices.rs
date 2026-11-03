@@ -217,7 +217,14 @@ fn ordered(x: u8, y: u8) -> (u8, u8) {
 /// The sessions come from dials that end there (`bf` and `bs` dial A, `as` dials A and B, `bs`
 /// dials B); `af` dials nobody, so none of its own dials takes them away. `af` and `bf` reach
 /// all three other devices; `as` and `bs` reach the two first devices.
-async fn four() -> (Fixture, Fixture, Fixture, Fixture, Arc<Backend>, ConversationId) {
+async fn four() -> (
+    Fixture,
+    Fixture,
+    Fixture,
+    Fixture,
+    Arc<Backend>,
+    ConversationId,
+) {
     let (ra, rb) = (record(A, &[A1, A2], 0), record(B, &[B1, B2], 0));
     let net = backend(&[(A, ra.clone()), (B, rb.clone())]);
     let ((a_first, a_second), (b_first, b_second)) = (ordered(A1, A2), ordered(B1, B2));
@@ -283,13 +290,19 @@ async fn texts_reach_the_other_devices_of_both_accounts() {
     for b in [&bf, &bs] {
         let got = message(b, sent.key).await.unwrap();
         assert!(!got.outgoing);
-        assert_eq!((got.body.as_str(), got.lamport), ("to every device", sent.lamport));
+        assert_eq!(
+            (got.body.as_str(), got.lamport),
+            ("to every device", sent.lamport)
+        );
         assert_eq!(page(b, conv).await.len(), 1);
     }
     let copy = message(&a_s, sent.key).await.unwrap();
     assert!(copy.outgoing);
     assert_eq!(copy.state, DeliveryState::SentDirect);
-    assert_eq!((copy.body.as_str(), copy.lamport), ("to every device", sent.lamport));
+    assert_eq!(
+        (copy.body.as_str(), copy.lamport),
+        ("to every device", sent.lamport)
+    );
     assert_eq!(unread(&a_s, conv).await, 0);
     assert_eq!(receipt_jobs(&a_s).await, 0);
     assert!(

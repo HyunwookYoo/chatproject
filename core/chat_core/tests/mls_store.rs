@@ -447,7 +447,10 @@ async fn seal_never_produces_codec1() {
     let digest = a.f.mls_state(conversation).await.unwrap().kv_digest;
     a.m.mls_reencrypt(three, NOW).await.unwrap();
     let facts = a.f.mls_outbox(three).await.unwrap();
-    assert_eq!((facts.codec, facts.wire.len(), facts.reencrypts), (Some(3), 0, 0));
+    assert_eq!(
+        (facts.codec, facts.wire.len(), facts.reencrypts),
+        (Some(3), 0, 0)
+    );
     assert_eq!(a.f.mls_state(conversation).await.unwrap().kv_digest, digest);
 
     // And the schema itself has no place for an M4 plaintext job any more.
@@ -815,10 +818,19 @@ async fn late_decrypt_failure_after_rejoin_reencrypts_nothing() {
     a.m.mls_reencrypt(key, NOW).await.unwrap();
     let facts = a.f.mls_outbox(key).await.unwrap();
     assert_eq!(
-        (facts.codec, facts.wire.len(), facts.reencrypts, facts.dispatch_state),
+        (
+            facts.codec,
+            facts.wire.len(),
+            facts.reencrypts,
+            facts.dispatch_state
+        ),
         (Some(3), 0, 0, 0)
     );
-    let view = a.m.load_messages(conversation, None, 50).await.unwrap().items;
+    let view =
+        a.m.load_messages(conversation, None, 50)
+            .await
+            .unwrap()
+            .items;
     assert_eq!(view[0].state, DeliveryState::Queued);
 }
 
@@ -837,8 +849,14 @@ async fn an_empty_commit_is_one_own_commit_at_a_time() {
     assert_eq!(after.own_commit_unacked, Some(true));
     assert_eq!(after.members, before.members);
     assert!(after.deliveries.contains(&(b.install, 1, next)));
-    assert_eq!(a.m.mls_update(conversation, b.peer, NOW).await.unwrap(), None);
-    assert_eq!(a.f.mls_state(conversation).await.unwrap().group_epoch, Some(next));
+    assert_eq!(
+        a.m.mls_update(conversation, b.peer, NOW).await.unwrap(),
+        None
+    );
+    assert_eq!(
+        a.f.mls_state(conversation).await.unwrap().group_epoch,
+        Some(next)
+    );
 }
 
 /// M4: a receipt is sealed once; its retries resend the same ciphertext (no new generation of
@@ -851,17 +869,15 @@ async fn a_receipt_is_sealed_once_and_resent_as_is() {
     ack(&open(&b, &a, conversation, &ciphertext(&a, key).await).await);
     b.m.mark_read(conversation, vec![key], NOW).await.unwrap();
 
-    let first = b
-        .m
-        .prepare_receipt_attempt(key, a.install, 2_000_000)
-        .await
-        .unwrap();
+    let first =
+        b.m.prepare_receipt_attempt(key, a.install, 2_000_000)
+            .await
+            .unwrap();
     let state = b.f.mls_state(conversation).await.unwrap();
-    let second = b
-        .m
-        .prepare_receipt_attempt(key, a.install, 2_001_000)
-        .await
-        .unwrap();
+    let second =
+        b.m.prepare_receipt_attempt(key, a.install, 2_001_000)
+            .await
+            .unwrap();
     assert!(first == second, "a retry resends the sealed receipt");
     let after = b.f.mls_state(conversation).await.unwrap();
     assert_eq!(
@@ -872,19 +888,23 @@ async fn a_receipt_is_sealed_once_and_resent_as_is() {
 
     // The recipient could not open it: the next attempt seals a new one.
     b.m.reseal_receipt(key).await.unwrap();
-    let third = b
-        .m
-        .prepare_receipt_attempt(key, a.install, 2_002_000)
-        .await
-        .unwrap();
+    let third =
+        b.m.prepare_receipt_attempt(key, a.install, 2_002_000)
+            .await
+            .unwrap();
     assert!(third != first, "sealed again");
     // The sender opens the receipt and its message is read.
     let (_, ct) = mls_app_from_wire(&third).unwrap();
-    ack(&a.m
+    ack(&a
+        .m
         .mls_open_app(b.peer, b.install, conversation, ct, NOW)
         .await
         .unwrap());
-    let view = a.m.load_messages(conversation, None, 50).await.unwrap().items;
+    let view =
+        a.m.load_messages(conversation, None, 50)
+            .await
+            .unwrap()
+            .items;
     assert_eq!(view[0].state, DeliveryState::Read);
 }
 
@@ -970,13 +990,13 @@ async fn message_ops_never_load_the_global_scope() {
         Some(1)
     );
     b.m.mark_read(conversation, vec![key], NOW).await.unwrap();
-    let receipt = b
-        .m
-        .prepare_receipt_attempt(key, a.install, 2_000_000)
-        .await
-        .unwrap();
+    let receipt =
+        b.m.prepare_receipt_attempt(key, a.install, 2_000_000)
+            .await
+            .unwrap();
     let (_, ct) = mls_app_from_wire(&receipt).unwrap();
-    ack(&a.m
+    ack(&a
+        .m
         .mls_open_app(b.peer, b.install, conversation, ct, NOW)
         .await
         .unwrap());
@@ -991,7 +1011,10 @@ async fn a_group_leaves_no_private_keys_in_the_global_scope() {
     // B handed out one more KeyPackage that nobody used.
     b.m.mls_key_package().await.unwrap();
     let (a, b, conversation) = link(a, b).await;
-    assert_eq!(a.f.mls_global_rows(None).await.unwrap(), Vec::<String>::new());
+    assert_eq!(
+        a.f.mls_global_rows(None).await.unwrap(),
+        Vec::<String>::new()
+    );
     assert_eq!(
         b.f.mls_global_rows(None).await.unwrap(),
         vec!["KeyPackage".to_string()],
@@ -1017,23 +1040,33 @@ async fn unused_key_packages_are_capped_oldest_first() {
     let b = Side::new(B, A).await;
     let conversation = a.m.open_dm(a.peer, b.peer).await.unwrap().id;
     b.m.open_dm(b.peer, a.peer).await.unwrap();
-    let oldest = b
-        .m
-        .mls_create_group(conversation, a.peer, vec![minted[0].clone()], NOW)
-        .await
-        .unwrap();
-    assert!(
-        a.m.mls_join_group(conversation, b.peer, oldest.welcome, oldest.first_commit_hash, NOW)
+    let oldest =
+        b.m.mls_create_group(conversation, a.peer, vec![minted[0].clone()], NOW)
             .await
-            .is_err()
+            .unwrap();
+    assert!(
+        a.m.mls_join_group(
+            conversation,
+            b.peer,
+            oldest.welcome,
+            oldest.first_commit_hash,
+            NOW
+        )
+        .await
+        .is_err()
     );
     b.m.mls_drop_group(conversation).await.unwrap();
-    let newest = b
-        .m
-        .mls_create_group(conversation, a.peer, vec![minted[69].clone()], NOW)
-        .await
-        .unwrap();
-    a.m.mls_join_group(conversation, b.peer, newest.welcome, newest.first_commit_hash, NOW)
-        .await
-        .unwrap();
+    let newest =
+        b.m.mls_create_group(conversation, a.peer, vec![minted[69].clone()], NOW)
+            .await
+            .unwrap();
+    a.m.mls_join_group(
+        conversation,
+        b.peer,
+        newest.welcome,
+        newest.first_commit_hash,
+        NOW,
+    )
+    .await
+    .unwrap();
 }

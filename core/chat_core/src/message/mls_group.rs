@@ -1522,16 +1522,15 @@ fn own_commit(
     } else {
         membership::commit_changes(&provider, &signer, &row.group_id, add, remove, &verify)
     };
-    let committed =
-        match made {
-            Ok(committed) => committed,
-            Err(error) => {
-                return match vetting.held() {
-                    Some(lookup) => Ok(Committed::Held(lookup)),
-                    None => Err(error),
-                };
-            }
-        };
+    let committed = match made {
+        Ok(committed) => committed,
+        Err(error) => {
+            return match vetting.held() {
+                Some(lookup) => Ok(Committed::Held(lookup)),
+                None => Err(error),
+            };
+        }
+    };
     provider.storage().flush(&tx, conversation.0)?;
     let hash: [u8; 32] = Sha256::digest(&committed.commit).into();
     // A removed installation gets nothing more (and an installation that rejoins is removed and
@@ -1999,12 +1998,14 @@ mod tests {
             peer: peer_b,
             remote: listing(&[b_lists]),
         };
-        let judge = |sender: &DeviceKeys,
-                     leaves: &[(Vec<u8>, Vec<u8>)],
-                     records: R<Records>| {
-            judge_own_welcome(identity, conversation, sender.installation_id(), leaves, |_| {
-                records
-            })
+        let judge = |sender: &DeviceKeys, leaves: &[(Vec<u8>, Vec<u8>)], records: R<Records>| {
+            judge_own_welcome(
+                identity,
+                conversation,
+                sender.installation_id(),
+                leaves,
+                |_| records,
+            )
             .unwrap()
         };
         let group = vec![leaf(peer_a, &a1), leaf(peer_a, &a2), leaf(peer_b, &b1)];
@@ -2017,13 +2018,22 @@ mod tests {
         // A third account in the group.
         let mut third = group.clone();
         third.push(leaf(peer_c, &c1));
-        assert_eq!(judge(&a1, &third, Ok(records(vec![], &b1))), OwnWelcome::Refused);
+        assert_eq!(
+            judge(&a1, &third, Ok(records(vec![], &b1))),
+            OwnWelcome::Refused
+        );
         // The device that sent it is not in the group.
-        assert_eq!(judge(&a3, &group, Ok(records(vec![], &b1))), OwnWelcome::Refused);
+        assert_eq!(
+            judge(&a3, &group, Ok(records(vec![], &b1))),
+            OwnWelcome::Refused
+        );
         // B1's leaf carries another device's signature key: refused, not held.
         let mut forged = group.clone();
         forged[2].1 = mls_signer(&b9).public().to_vec();
-        assert_eq!(judge(&a1, &forged, Ok(records(vec![], &b1))), OwnWelcome::Refused);
+        assert_eq!(
+            judge(&a1, &forged, Ok(records(vec![], &b1))),
+            OwnWelcome::Refused
+        );
         // B's record (as cached) does not list B1, or is not cached at all: look it up.
         assert_eq!(
             judge(&a1, &group, Ok(records(vec![], &b9))),

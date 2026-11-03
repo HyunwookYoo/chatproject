@@ -901,22 +901,53 @@ async fn quiet(all: [&Fixture; 3], conv: ConversationId) {
                     s.own_commit_unacked,
                     s.members.len(),
                     s.epoch_authenticator.as_ref().map(|a| a[..4].to_vec()),
-                    s.deliveries.iter().map(|(i, k, e)| (i.0[0], *k, *e)).collect::<Vec<_>>(),
+                    s.deliveries
+                        .iter()
+                        .map(|(i, k, e)| (i.0[0], *k, *e))
+                        .collect::<Vec<_>>(),
                     s.holds,
                     s.rejoin_count,
-                    f.account.mls_test_sent_frames().await.unwrap().iter().rev().take(16).collect::<Vec<_>>()
+                    f.account
+                        .mls_test_sent_frames()
+                        .await
+                        .unwrap()
+                        .iter()
+                        .rev()
+                        .take(16)
+                        .collect::<Vec<_>>()
                 );
             }
             // What each queued Commit does at its recipient.
             let s0 = state(all[0], conv).await;
             for (to, kind, epoch) in s0.deliveries {
-                if kind != 1 { continue; }
-                let frame = all[0].account.storage_test_fixture().mls_delivery_frame(conv, to, kind, epoch).await.unwrap().unwrap();
+                if kind != 1 {
+                    continue;
+                }
+                let frame = all[0]
+                    .account
+                    .storage_test_fixture()
+                    .mls_delivery_frame(conv, to, kind, epoch)
+                    .await
+                    .unwrap()
+                    .unwrap();
                 let (_, e, commit) = mls_commit_from_wire(&frame).unwrap();
                 for f in all {
                     if installation(f).await == to {
-                        let r = f.account.storage_test_fixture().messages().await.unwrap()
-                            .mls_apply_commit(conv, all[0].peer, all[0].peer, e, commit.clone(), NOW * 1000).await;
+                        let r = f
+                            .account
+                            .storage_test_fixture()
+                            .messages()
+                            .await
+                            .unwrap()
+                            .mls_apply_commit(
+                                conv,
+                                all[0].peer,
+                                all[0].peer,
+                                e,
+                                commit.clone(),
+                                NOW * 1000,
+                            )
+                            .await;
                         eprintln!("apply at {:?}: {:?}", to.0[0], r.map(|o| format!("{o:?}")));
                     }
                 }
@@ -953,7 +984,14 @@ async fn change_epoch(all: [&Fixture; 3], committer: &Fixture, conv: Conversatio
                     s.members.len(),
                     s.deliveries,
                     s.holds,
-                    f.account.mls_test_sent_frames().await.unwrap().iter().rev().take(12).collect::<Vec<_>>()
+                    f.account
+                        .mls_test_sent_frames()
+                        .await
+                        .unwrap()
+                        .iter()
+                        .rev()
+                        .take(12)
+                        .collect::<Vec<_>>()
                 );
             }
             panic!("Commit to {epoch:?} did not settle");
@@ -1000,7 +1038,11 @@ async fn actor_path_two_receiving_devices_seeded() {
         eprintln!("message {n} from {from}");
         if n == late {
             // Sealed now, sent after the group moved on six epochs: re-encrypted once.
-            sender.account.message_test_hold_scheduler(true).await.unwrap();
+            sender
+                .account
+                .message_test_hold_scheduler(true)
+                .await
+                .unwrap();
             let view = send(sender, to, 100 + n as u8, &body).await;
             sender
                 .account
@@ -1017,8 +1059,15 @@ async fn actor_path_two_receiving_devices_seeded() {
                 b3_in = !b3_in;
                 change_epoch(all, sender, conv, b3_in).await;
             }
-            sender.account.message_test_hold_scheduler(false).await.unwrap();
-            settle!(all, delivery(sender, view.key).await == DeliveryState::Delivered);
+            sender
+                .account
+                .message_test_hold_scheduler(false)
+                .await
+                .unwrap();
+            settle!(
+                all,
+                delivery(sender, view.key).await == DeliveryState::Delivered
+            );
             assert_eq!(outbox(sender, view.key).await.codec, None);
             reencrypted += 1;
             sent.push((from, view.key, body));

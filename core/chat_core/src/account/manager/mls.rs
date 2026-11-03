@@ -309,7 +309,10 @@ mod recovery_tests {
             recent.push(1_000 + n);
         }
         assert!(!recovery_allowed(&mut recent, 2_000));
-        assert!(!recovery_allowed(&mut recent, 1_000 + RECOVERY_WINDOW_MS - 1));
+        assert!(!recovery_allowed(
+            &mut recent,
+            1_000 + RECOVERY_WINDOW_MS - 1
+        ));
         // The oldest one leaves the window: one more is allowed.
         assert!(recovery_allowed(&mut recent, 1_000 + RECOVERY_WINDOW_MS));
         assert_eq!(recent.len(), RECOVERY_LIMIT - 1);
@@ -511,7 +514,8 @@ impl Manager {
                 let mut answers = Vec::new();
                 for session in self.mls_sessions() {
                     if session.grant.peer == peer {
-                        let got = matches!(exchange(&session, &body).await, Ok(MlsReply::KeyPackage(_)));
+                        let got =
+                            matches!(exchange(&session, &body).await, Ok(MlsReply::KeyPackage(_)));
                         answers.push((session.grant.installation, got));
                     }
                 }
@@ -641,7 +645,10 @@ impl Manager {
         conversation: ConversationId,
         request: Request,
     ) -> Result<Vec<InstallationId>, CoreError> {
-        match self.group_db(conversation, GroupOp::Members, request).await? {
+        match self
+            .group_db(conversation, GroupOp::Members, request)
+            .await?
+        {
             GroupReply::Members(members) => Ok(members),
             _ => Err(unavailable(ErrorCode::InvalidMessage)),
         }
@@ -739,7 +746,13 @@ impl Manager {
     /// A kind 17 request goes to an installation that refused before (its back-off ended, or
     /// its record changed): that record's one request is spent.
     fn note_requery(&mut self, installation: InstallationId) {
-        let Some(peer) = self.messages.mls.outdated.get(&installation).map(|o| o.peer) else {
+        let Some(peer) = self
+            .messages
+            .mls
+            .outdated
+            .get(&installation)
+            .map(|o| o.peer)
+        else {
             return;
         };
         let record = self.record_of(peer);
@@ -2069,7 +2082,12 @@ impl Manager {
             class: CLASS_OUT_OF_ORDER,
             epoch,
         };
-        let recent = self.messages.mls.recoveries.entry(conversation).or_default();
+        let recent = self
+            .messages
+            .mls
+            .recoveries
+            .entry(conversation)
+            .or_default();
         if !recovery_allowed(recent, now) {
             return Ok(out_of_order);
         }
