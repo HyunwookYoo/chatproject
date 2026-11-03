@@ -840,6 +840,7 @@ async fn v1_db_upgrades_to_v2_preserving_messages_and_outbox() {
         "mls_delivery",
         "mls_hold",
         "mls_peer",
+        "mls_receipt",
     ] {
         assert!(after.tables.iter().any(|t| t == table), "{table}");
     }

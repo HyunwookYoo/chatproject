@@ -46,6 +46,19 @@ CREATE TABLE mls_peer (
     FOREIGN KEY(conversation) REFERENCES conversation(id)
 ) STRICT;
 
+-- A sealed MLS receipt (`Content::Receipt`) for a received message: its retries resend this
+-- same ciphertext, the way a sealed text's retries resend its outbox wire. Dropped when the job
+-- settles, when the recipient could not open it, and with the group.
+CREATE TABLE mls_receipt (
+    conversation BLOB NOT NULL CHECK(length(conversation)=32),
+    sender_peer BLOB NOT NULL CHECK(length(sender_peer)=32),
+    sender_install BLOB NOT NULL CHECK(length(sender_install)=32),
+    msg_id BLOB NOT NULL CHECK(length(msg_id)=16),
+    kind INTEGER NOT NULL CHECK(kind IN (1,2)),
+    wire BLOB NOT NULL CHECK(length(wire) BETWEEN 1 AND 61440),
+    PRIMARY KEY(conversation,sender_peer,sender_install,msg_id,kind)
+) STRICT;
+
 -- storage_meta: only the schema_version CHECK changes, so the table is rebuilt.
 CREATE TABLE storage_meta_v2 (
     singleton INTEGER PRIMARY KEY NOT NULL CHECK(singleton = 1),

@@ -358,6 +358,8 @@ fn forget(tx: &Transaction<'_>, conversation: ConversationId) -> R<()> {
         "DELETE FROM mls_kv WHERE scope=?1",
         "DELETE FROM mls_delivery WHERE conversation=?1",
         "DELETE FROM mls_hold WHERE conversation=?1",
+        // Receipts sealed in this group: sealed again in the next one.
+        "DELETE FROM mls_receipt WHERE conversation=?1",
         "DELETE FROM mls_conversation WHERE conversation=?1",
     ] {
         tx.execute(statement, params![conversation.0.as_slice()])

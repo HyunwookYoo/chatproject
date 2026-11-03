@@ -169,6 +169,14 @@ impl Messages {
             _ => unreachable!(),
         }
     }
+    /// The store half of a rejoin (spec 4.6): the group is dropped and unacknowledged sent
+    /// messages wait to be sealed again; false when the rejoin limit refuses.
+    pub async fn mls_rejoin_group(&self, conversation: ConversationId, now: u64) -> Result<bool, CoreError> {
+        match self.mls(MessageDbOp::MlsGroupOp(conversation, GroupOp::Rejoin { now })).await? {
+            MessageDbReply::Group(GroupReply::Rejoin(counters)) => Ok(counters.is_some()),
+            _ => unreachable!(),
+        }
+    }
     pub async fn mls_drop_group(&self, conversation: ConversationId) -> Result<(), CoreError> {
         match self.mls(MessageDbOp::MlsGroupOp(conversation, GroupOp::Drop)).await? {
             MessageDbReply::Group(GroupReply::Done) => Ok(()),
@@ -225,6 +233,34 @@ impl Messages {
         let op = MessageDbOp::Prepare(key, receiver, false, now, now, transition);
         match self.mls(op).await? {
             MessageDbReply::Prepared(..) => Ok(()),
+            _ => unreachable!(),
+        }
+    }
+    /// The user saw these received messages (queues their `Read` receipt jobs).
+    pub async fn mark_read(&self, conversation: ConversationId, keys: Vec<MessageKey>, now: u64) -> Result<(), CoreError> {
+        match self.mls(MessageDbOp::MarkRead(conversation, keys, now)).await? {
+            MessageDbReply::Done => Ok(()),
+            _ => unreachable!(),
+        }
+    }
+    /// The `Prepare` of the receipt job for received message `key`: the frame it would send.
+    pub async fn prepare_receipt_attempt(
+        &self,
+        key: MessageKey,
+        receiver: crate::account::InstallationId,
+        now: u64,
+    ) -> Result<Vec<u8>, CoreError> {
+        let (_token, transition) = crate::message::store::PrepareToken::new();
+        let op = MessageDbOp::Prepare(key, receiver, true, now, now, transition);
+        match self.mls(op).await? {
+            MessageDbReply::Prepared(wire, _) => Ok(wire.to_vec()),
+            _ => unreachable!(),
+        }
+    }
+    /// The recipient could not open the sealed receipt for `key`: its next attempt seals again.
+    pub async fn reseal_receipt(&self, key: MessageKey) -> Result<(), CoreError> {
+        match self.mls(MessageDbOp::ResealReceipt(key)).await? {
+            MessageDbReply::Done => Ok(()),
             _ => unreachable!(),
         }
     }
@@ -344,6 +380,7 @@ DROP TABLE mls_conversation;
 DROP TABLE mls_delivery;
 DROP TABLE mls_hold;
 DROP TABLE mls_peer;
+DROP TABLE mls_receipt;
 CREATE TABLE storage_meta_v1 (
     singleton INTEGER PRIMARY KEY NOT NULL CHECK(singleton = 1),
     schema_version INTEGER NOT NULL CHECK(schema_version = 1),

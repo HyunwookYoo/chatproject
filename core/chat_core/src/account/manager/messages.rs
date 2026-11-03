@@ -1140,8 +1140,11 @@ impl Manager {
                         .await?;
                         self.after_decrypt_failed(result.key, pending.peer, class, epoch, request)
                             .await?;
+                    } else {
+                        // The sealed receipt is not resent as is: its next attempt seals again.
+                        self.message_db(MessageDbOp::ResealReceipt(result.key), request)
+                            .await?;
                     }
-                    // A receipt is sealed afresh on its next attempt anyway.
                     return Err(unavailable(ErrorCode::NotAvailable));
                 }
                 AttemptOutcome::PeerUpdateRequired | AttemptOutcome::NoReply => {

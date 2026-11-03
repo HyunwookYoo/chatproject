@@ -441,13 +441,14 @@ async fn seal_never_produces_codec1() {
         assert_eq!(facts.codec, Some(2));
         assert!(!facts.wire.is_empty());
     }
-    // Re-sealing a codec 3 row would be sealing; Reencrypt only works on a sealed row.
+    // Re-sealing a codec 3 row would be sealing: Reencrypt leaves a row awaiting encryption
+    // as it is (it is sealed when its group is there).
     let three = send(&a, &b, 3, "three").await;
-    assert_eq!(
-        a.m.mls_reencrypt(three, NOW).await.unwrap_err().code,
-        ErrorCode::InvalidMessage
-    );
-    assert_eq!(a.f.mls_outbox(three).await.unwrap().codec, Some(3));
+    let digest = a.f.mls_state(conversation).await.unwrap().kv_digest;
+    a.m.mls_reencrypt(three, NOW).await.unwrap();
+    let facts = a.f.mls_outbox(three).await.unwrap();
+    assert_eq!((facts.codec, facts.wire.len(), facts.reencrypts), (Some(3), 0, 0));
+    assert_eq!(a.f.mls_state(conversation).await.unwrap().kv_digest, digest);
 
     // And the schema itself has no place for an M4 plaintext job any more.
     let c = rusqlite::Connection::open_in_memory().unwrap();
@@ -795,6 +796,77 @@ async fn reencrypt_waits_for_an_attempt_and_a_failed_message_stays_failed() {
     assert_eq!(state(&a).await, DeliveryState::Failed);
     let facts = a.f.mls_outbox(key).await.unwrap();
     assert_eq!((facts.reencrypts, facts.dispatch_state), (3, 2));
+}
+
+/// M3: a rejoin while an attempt is in flight returns the row to "awaiting encryption"; the
+/// attempt's late `DecryptFailed` then asks to re-encrypt a row that has no ciphertext. That is
+/// a clean no-op, not an error that strands the job.
+#[tokio::test]
+async fn late_decrypt_failure_after_rejoin_reencrypts_nothing() {
+    let (a, b, conversation) = linked().await;
+    let key = send(&a, &b, 1, "in flight").await;
+    a.m.mls_seal(key, NOW).await.unwrap().unwrap();
+    a.m.prepare_attempt(key, b.install, 2_000_000)
+        .await
+        .unwrap();
+    assert!(a.m.mls_rejoin_group(conversation, NOW).await.unwrap());
+    assert_eq!(a.f.mls_outbox(key).await.unwrap().codec, Some(3));
+    a.m.settle_attempt(key, false).await.unwrap();
+    a.m.mls_reencrypt(key, NOW).await.unwrap();
+    let facts = a.f.mls_outbox(key).await.unwrap();
+    assert_eq!(
+        (facts.codec, facts.wire.len(), facts.reencrypts, facts.dispatch_state),
+        (Some(3), 0, 0, 0)
+    );
+    let view = a.m.load_messages(conversation, None, 50).await.unwrap().items;
+    assert_eq!(view[0].state, DeliveryState::Queued);
+}
+
+/// M4: a receipt is sealed once; its retries resend the same ciphertext (no new generation of
+/// the ratchet per attempt). Only when the recipient could not open it is it sealed again.
+#[tokio::test]
+async fn a_receipt_is_sealed_once_and_resent_as_is() {
+    let (a, b, conversation) = linked().await;
+    let key = send(&a, &b, 1, "read me").await;
+    a.m.mls_seal(key, NOW).await.unwrap().unwrap();
+    ack(&open(&b, &a, conversation, &ciphertext(&a, key).await).await);
+    b.m.mark_read(conversation, vec![key], NOW).await.unwrap();
+
+    let first = b
+        .m
+        .prepare_receipt_attempt(key, a.install, 2_000_000)
+        .await
+        .unwrap();
+    let state = b.f.mls_state(conversation).await.unwrap();
+    let second = b
+        .m
+        .prepare_receipt_attempt(key, a.install, 2_001_000)
+        .await
+        .unwrap();
+    assert!(first == second, "a retry resends the sealed receipt");
+    let after = b.f.mls_state(conversation).await.unwrap();
+    assert_eq!(
+        (after.kv_digest, after.processed_mls),
+        (state.kv_digest, state.processed_mls),
+        "no new seal"
+    );
+
+    // The recipient could not open it: the next attempt seals a new one.
+    b.m.reseal_receipt(key).await.unwrap();
+    let third = b
+        .m
+        .prepare_receipt_attempt(key, a.install, 2_002_000)
+        .await
+        .unwrap();
+    assert!(third != first, "sealed again");
+    // The sender opens the receipt and its message is read.
+    let (_, ct) = mls_app_from_wire(&third).unwrap();
+    ack(&a.m
+        .mls_open_app(b.peer, b.install, conversation, ct, NOW)
+        .await
+        .unwrap());
+    let view = a.m.load_messages(conversation, None, 50).await.unwrap().items;
+    assert_eq!(view[0].state, DeliveryState::Read);
 }
 
 #[tokio::test]

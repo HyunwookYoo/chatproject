@@ -337,8 +337,12 @@ pub(super) fn reencrypt(
     check_own(identity, key)?;
     let tx = c.transaction().map_err(sql)?;
     let outgoing = load_outgoing(&tx, key)?;
-    if outgoing.codec != 2 {
-        return Err(invalid());
+    match outgoing.codec {
+        2 => {}
+        // Back to awaiting encryption (the device left the group the ciphertext was for): it is
+        // sealed afresh in the next group, so a late failure report has nothing to re-encrypt.
+        3 => return Ok(MessageDbReply::Done),
+        _ => return Err(invalid()),
     }
     // An attempt is in flight: its outcome has not been recorded yet, and a new ciphertext
     // (or giving the message up) must not race it.
@@ -500,6 +504,29 @@ pub(super) fn prepare_receipt(
         )
         .map_err(sql)?;
     schedule_retry(&tx, key, true, now)?;
+    let cache = params![
+        key.conversation.0.as_slice(),
+        key.sender.0.as_slice(),
+        key.installation.0.as_slice(),
+        key.id.0.as_slice(),
+        kind as i64
+    ];
+    // Sealed by an earlier attempt: the same ciphertext goes out again (spec 5.3).
+    let sealed: Option<Vec<u8>> = tx
+        .query_row(
+            "SELECT wire FROM mls_receipt WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4 AND kind=?5",
+            cache,
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sql)?;
+    if let Some(frame) = sealed {
+        finish(tx, fault)?;
+        return Ok(MessageDbReply::Prepared(
+            zeroize::Zeroizing::new(frame),
+            Some(receipt),
+        ));
+    }
     // A receipt is not a message of its own: an id derived from what it acknowledges.
     let mut id = Sha256::new();
     id.update(b"ChatProject/m5/receipt-id/v1");
@@ -532,12 +559,37 @@ pub(super) fn prepare_receipt(
         &message,
         wall,
     )?;
+    tx.execute(
+        "INSERT OR REPLACE INTO mls_receipt VALUES(?1,?2,?3,?4,?5,?6)",
+        params![
+            key.conversation.0.as_slice(),
+            key.sender.0.as_slice(),
+            key.installation.0.as_slice(),
+            key.id.0.as_slice(),
+            kind as i64,
+            frame.as_slice()
+        ],
+    )
+    .map_err(sql)?;
     provider.storage().flush(&tx, key.conversation.0)?;
     finish(tx, fault)?;
     Ok(MessageDbReply::Prepared(
         zeroize::Zeroizing::new(frame),
         Some(receipt),
     ))
+}
+
+/// The recipient could not open the sealed receipt for received message `key`: it is
+/// forgotten, so the next attempt seals one in the current epoch.
+pub(super) fn reseal_receipt(c: &mut Connection, key: MessageKey, fault: Fault) -> R<MessageDbReply> {
+    let tx = c.transaction().map_err(sql)?;
+    tx.execute(
+        "DELETE FROM mls_receipt WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",
+        params![key.conversation.0.as_slice(), key.sender.0.as_slice(), key.installation.0.as_slice(), key.id.0.as_slice()],
+    )
+    .map_err(sql)?;
+    finish(tx, fault)?;
+    Ok(MessageDbReply::Done)
 }
 
 /// The synchronous `Ack` of a sent `App` frame: the recipient stored the message (spec: the

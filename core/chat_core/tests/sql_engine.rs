@@ -125,6 +125,7 @@ fn schema_enforces_version_one_bounds() {
             "mls_hold",
             "mls_kv",
             "mls_peer",
+            "mls_receipt",
             "outbox",
             "processed_ct",
             "receipt_job",

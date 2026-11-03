@@ -53,6 +53,9 @@ pub(crate) enum MessageDbOp {
     MarkWaitingPeerUpdate(MessageKey, bool),
     /// The recipient installation `Ack`ed a sent `App` frame: delivered (now).
     MlsAcked(MessageKey, InstallationId, u64),
+    /// The recipient could not open the sealed receipt for a received message: its next
+    /// attempt seals it again.
+    ResealReceipt(MessageKey),
     /// Test-hook builds: the M4-peer fixture's plaintext frame for a row awaiting encryption.
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     M4Encode(MessageKey),
@@ -543,6 +546,7 @@ pub(crate) fn execute(
         MessageDbOp::OpenApp(peer, install, id, ciphertext, now) => super::mls_store::open_app(c, identity, peer, install, id, ciphertext, now, mls_fault!(fault)),
         MessageDbOp::MarkWaitingPeerUpdate(key, waiting) => super::mls_store::mark_waiting(c, identity, key, waiting, mls_fault!(fault)),
         MessageDbOp::MlsAcked(key, recipient, now) => super::mls_store::acked(c, identity, key, recipient, now, mls_fault!(fault)),
+        MessageDbOp::ResealReceipt(key) => super::mls_store::reseal_receipt(c, key, mls_fault!(fault)),
         #[cfg(all(feature = "test-hooks", debug_assertions))]
         MessageDbOp::M4Encode(key) => super::mls_store::m4_encode(c, identity, key),
         MessageDbOp::MlsGroupOp(id, op) => super::mls_group::group_op(c, identity, local, id, op, mls_fault!(fault)),
@@ -1103,7 +1107,7 @@ impl MessageDbOp {
             }),
             Self::Receive(t, _, _, _) => Some(t.key),
             Self::Seal(k, _) | Self::Reencrypt(k, _) | Self::MarkWaitingPeerUpdate(k, _) => Some(*k),
-            Self::MlsAcked(k, _, _) => Some(*k),
+            Self::MlsAcked(k, _, _) | Self::ResealReceipt(k) => Some(*k),
             #[cfg(all(feature="test-hooks",debug_assertions))]
             Self::RejectedPrepare(k,_,_,_) => Some(*k),
             Self::Retry(k, _)
@@ -1435,6 +1439,8 @@ fn applied(
         return Err(invalid());
     }
     tx.execute("DELETE FROM receipt_job WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4 AND recipient_install=?5 AND kind<=?6",params![k.conversation.0.as_slice(),k.sender.0.as_slice(),k.installation.0.as_slice(),k.id.0.as_slice(),r.recipient.0.as_slice(),r.kind.number()]).map_err(sql_error)?;
+    // The sealed MLS receipt of a settled job is not sent again.
+    tx.execute("DELETE FROM mls_receipt WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4 AND kind<=?5",params![k.conversation.0.as_slice(),k.sender.0.as_slice(),k.installation.0.as_slice(),k.id.0.as_slice(),r.kind.number()]).map_err(sql_error)?;
     commit(
         tx,
         #[cfg(all(feature = "test-hooks", debug_assertions))]
