@@ -1381,6 +1381,16 @@ impl Manager {
                 Ok(())
             }
             Some(own) if class == CLASS_FUTURE_EPOCH => {
+                // Sealed again in this epoch here: a wait for it (or an older one) must not seal
+                // (and count) again. A wait for a newer epoch of another device stays.
+                if self
+                    .messages
+                    .epoch_waits
+                    .get(&key)
+                    .is_some_and(|(_, wait)| *wait <= own)
+                {
+                    self.messages.epoch_waits.remove(&key);
+                }
                 self.reseal_in_epoch(key, peer, own, request).await
             }
             Some(own) if own < epoch => Ok(()),
