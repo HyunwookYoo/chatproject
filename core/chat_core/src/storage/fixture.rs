@@ -169,6 +169,14 @@ impl Messages {
             _ => unreachable!(),
         }
     }
+    /// An empty own Commit (path update, C1); `None` while an own Commit is unacknowledged.
+    pub async fn mls_update(&self, conversation: ConversationId, peer: crate::account::PeerId, now: u64) -> Result<Option<u64>, CoreError> {
+        match self.mls(MessageDbOp::MlsGroupOp(conversation, GroupOp::Update { peer, now })).await? {
+            MessageDbReply::Group(GroupReply::Committed(Committed::Done { epoch })) => Ok(Some(epoch)),
+            MessageDbReply::Group(GroupReply::Committed(_)) => Ok(None),
+            _ => unreachable!(),
+        }
+    }
     /// The store half of a rejoin (spec 4.6): the group is dropped and unacknowledged sent
     /// messages wait to be sealed again; false when the rejoin limit refuses.
     pub async fn mls_rejoin_group(&self, conversation: ConversationId, now: u64) -> Result<bool, CoreError> {
@@ -200,7 +208,7 @@ impl Messages {
         }
     }
     pub async fn mls_reencrypt(&self, key: MessageKey, now: u64) -> Result<(), CoreError> {
-        match self.mls(MessageDbOp::Reencrypt(key, now)).await? {
+        match self.mls(MessageDbOp::Reencrypt(key, now, true)).await? {
             MessageDbReply::Done => Ok(()),
             MessageDbReply::NeedGroup(_) => Err(CoreError::new(ErrorCode::NotAvailable, "fixture_no_group")),
             _ => unreachable!(),
@@ -217,6 +225,11 @@ impl Messages {
         let op = MessageDbOp::OpenApp(sender, installation, conversation, ciphertext, now);
         match self.mls(op).await? {
             MessageDbReply::Opened(reply) | MessageDbReply::OpenedText(reply, _) => Ok(reply),
+            // Without the actor no new epoch is made: the sender is told it is out of order.
+            MessageDbReply::FarAhead { epoch } => Ok(crate::mls::wire::MlsReply::DecryptFailed {
+                class: crate::mls::group::CLASS_OUT_OF_ORDER,
+                epoch,
+            }),
             // Answered with the M4 `Reject(InvalidMessage)` on the wire.
             MessageDbReply::Rejected => Err(CoreError::new(ErrorCode::InvalidMessage, "mls_text_rejected")),
             _ => unreachable!(),

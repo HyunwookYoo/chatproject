@@ -168,6 +168,28 @@ pub(crate) fn commit_changes(
     if add_key_packages.is_empty() && remove.is_empty() {
         return Err(invalid("mls commit changes nothing"));
     }
+    commit_with_path(p, signer, group_id, add_key_packages, remove, verify)
+}
+
+/// A Commit with no proposals, only this device's path update: every member moves to a new
+/// epoch with fresh message secrets (each sender's ratchet starts over). How a device that fell
+/// too far behind one sender's ratchet gets back in step (C1).
+pub(crate) fn commit_update(
+    p: &MlsProvider,
+    signer: &SignatureKeyPair,
+    group_id: &[u8],
+) -> R<Committed> {
+    commit_with_path(p, signer, group_id, &[], &[], &|_, _| Ok(()))
+}
+
+fn commit_with_path(
+    p: &MlsProvider,
+    signer: &SignatureKeyPair,
+    group_id: &[u8],
+    add_key_packages: &[Vec<u8>],
+    remove: &[InstallationId],
+    verify: LeafVerifier<'_>,
+) -> R<Committed> {
     let key_packages = add_key_packages
         .iter()
         .map(|bytes| checked_key_package(p, bytes, verify))
@@ -736,6 +758,32 @@ mod tests {
         );
         b1.apply(&gid, &first.commit, &all).unwrap();
         assert_eq!(b1.apply(&gid, &second.commit, &all).unwrap().epoch, 3);
+    }
+
+    /// C1: a member too far behind one sender's ratchet makes an empty Commit (a path update,
+    /// no proposals). Every member applies it, and the sender's next message, sealed in the new
+    /// epoch, opens where the old epoch's never could.
+    #[test]
+    fn empty_commit_restarts_every_sender_ratchet() {
+        let (a1, b1, b2) = (Dev::new(1, 1), Dev::new(2, 2), Dev::new(2, 3));
+        let gid = group_of(&a1, &[&b1, &b2]);
+        let all = verifier(&[&a1, &b1, &b2]);
+        // A1 talks to B1 only, more than `MAX_FORWARD` times.
+        for n in 0..=crate::mls::MAX_FORWARD {
+            let ct = a1.seal(&gid, n as u8);
+            b1.open(&gid, &ct).unwrap();
+        }
+        let ahead = a1.seal(&gid, 1);
+        assert_eq!(b2.open(&gid, &ahead).unwrap_err().far_ahead, Some(1));
+        let update = commit_update(&b2.provider, &b2.signer, &gid).unwrap();
+        assert!(update.welcome.is_none());
+        assert_eq!(update.epoch, 2);
+        assert_eq!(a1.apply(&gid, &update.commit, &all).unwrap().epoch, 2);
+        assert_eq!(b1.apply(&gid, &update.commit, &all).unwrap().epoch, 2);
+        talks(&a1, &b2, &gid, 7);
+        talks(&a1, &b1, &gid, 8);
+        talks(&b2, &a1, &gid, 9);
+        assert_eq!(b2.leaves(&gid), a1.leaves(&gid));
     }
 
     /// A1 and B1 both commit from epoch 1 (each adds a device of its own account).

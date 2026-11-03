@@ -309,10 +309,29 @@ impl std::fmt::Debug for Opened {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct OpenFailure {
     pub class: u8,
+    /// `Some(message epoch)` when the sender's ratchet is more than `MAX_FORWARD` generations
+    /// past what this device has seen of it (OpenMLS `TooDistantInTheFuture`): no resend in that
+    /// epoch can be opened here, only one sealed in a later epoch. `class` stays the wire class
+    /// (out of order); the caller decides what to answer.
+    pub far_ahead: Option<u64>,
 }
 
 pub(super) const fn fail(class: u8) -> OpenFailure {
-    OpenFailure { class }
+    OpenFailure {
+        class,
+        far_ahead: None,
+    }
+}
+
+/// Whether OpenMLS refused the message because its generation is too far ahead of the
+/// sender's ratchet here (not too old, not reused).
+fn too_far_ahead(error: &ProcessMessageError<KvError>) -> bool {
+    matches!(
+        error,
+        ProcessMessageError::ValidationError(ValidationError::UnableToDecrypt(
+            MessageDecryptionError::SecretTreeError(SecretTreeError::TooDistantInTheFuture),
+        ))
+    )
 }
 
 pub(super) fn classify(
@@ -368,9 +387,14 @@ pub(crate) fn open(
         return Err(fail(CLASS_OTHER));
     }
     let (message_epoch, current) = (protocol.epoch().as_u64(), group.epoch().as_u64());
-    let processed = group
-        .process_message(p, protocol)
-        .map_err(|error| fail(classify(&error, message_epoch, current)))?;
+    let processed = group.process_message(p, protocol).map_err(|error| {
+        let class = classify(&error, message_epoch, current);
+        OpenFailure {
+            class,
+            far_ahead: (class == CLASS_OUT_OF_ORDER && too_far_ahead(&error))
+                .then_some(message_epoch),
+        }
+    })?;
     let sender = processed.credential().clone();
     match processed.into_content() {
         ProcessedMessageContent::ApplicationMessage(application) => {
@@ -929,6 +953,30 @@ mod tests {
             b.open(&gid, &sealed[0]).unwrap_err().class,
             CLASS_OUT_OF_ORDER
         );
+    }
+
+    /// C1: a sender more than `MAX_FORWARD` generations ahead is told apart from one that is
+    /// too old: only the first is `far_ahead` (with the message's epoch).
+    #[test]
+    fn too_far_ahead_is_told_apart_from_too_old() {
+        let (a, b, gid) = pair();
+        let first = a.seal(&gid, &chat(0));
+        for n in 1..=MAX_FORWARD {
+            a.seal(&gid, &chat(n as u8));
+        }
+        let ahead = a.seal(&gid, &chat(1));
+        let failure = b.open(&gid, &ahead).unwrap_err();
+        assert_eq!(
+            (failure.class, failure.far_ahead),
+            (CLASS_OUT_OF_ORDER, Some(1))
+        );
+        // Nothing moved: the first message still opens; then everything from 200 behind it on.
+        assert_eq!(opened(&b, &gid, &first), chat(0));
+        let (a, b, gid) = pair();
+        let sealed: Vec<Vec<u8>> = (0..=200).map(|n| a.seal(&gid, &chat(n as u8))).collect();
+        opened(&b, &gid, &sealed[200]);
+        let old = b.open(&gid, &sealed[0]).unwrap_err();
+        assert_eq!((old.class, old.far_ahead), (CLASS_OUT_OF_ORDER, None));
     }
 
     #[test]

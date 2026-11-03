@@ -45,8 +45,9 @@ pub(crate) enum MessageDbOp {
     Seal(MessageKey, u64),
     /// Seals every codec 3 row of the conversation, in lamport order.
     SealPending(ConversationId, u64),
-    /// Seals a codec 2 row again (`reencrypts += 1`); the third time it fails.
-    Reencrypt(MessageKey, u64),
+    /// Seals a codec 2 row again. Counted (`reencrypts += 1`, the third time it fails) after a
+    /// decrypt failure; not counted when only the epoch moved on under it (C1).
+    Reencrypt(MessageKey, u64, bool),
     /// A received MLS application ciphertext: sender peer, sender installation, conversation,
     /// ciphertext, now.
     OpenApp(PeerId, InstallationId, ConversationId, Vec<u8>, u64),
@@ -542,7 +543,7 @@ pub(crate) fn execute(
         }
         MessageDbOp::Seal(key, now) => super::mls_store::seal(c, identity, local, key, now, mls_fault!(fault)),
         MessageDbOp::SealPending(id, now) => super::mls_store::seal_pending(c, identity, local, id, now, mls_fault!(fault)),
-        MessageDbOp::Reencrypt(key, now) => super::mls_store::reencrypt(c, identity, local, key, now, mls_fault!(fault)),
+        MessageDbOp::Reencrypt(key, now, counted) => super::mls_store::reencrypt(c, identity, local, key, now, counted, mls_fault!(fault)),
         MessageDbOp::OpenApp(peer, install, id, ciphertext, now) => super::mls_store::open_app(c, identity, peer, install, id, ciphertext, now, mls_fault!(fault)),
         MessageDbOp::MarkWaitingPeerUpdate(key, waiting) => super::mls_store::mark_waiting(c, identity, key, waiting, mls_fault!(fault)),
         MessageDbOp::MlsAcked(key, recipient, now) => super::mls_store::acked(c, identity, key, recipient, now, mls_fault!(fault)),
@@ -981,6 +982,9 @@ pub(crate) enum MessageDbReply {
     Rejected,
     /// The reply for a received MLS ciphertext that carried (or carried before) this text.
     OpenedText(crate::mls::wire::MlsReply, MessageKey),
+    /// A received MLS ciphertext of the current epoch (`epoch`) whose sender's ratchet is too far
+    /// ahead of this device's view of it (C1). Nothing changed; only a new epoch can help.
+    FarAhead { epoch: u64 },
     Group(super::mls_group::GroupReply),
     Conversation(ConversationView),
     Message(MessageView),
@@ -1106,7 +1110,7 @@ impl MessageDbOp {
                 id: *id,
             }),
             Self::Receive(t, _, _, _) => Some(t.key),
-            Self::Seal(k, _) | Self::Reencrypt(k, _) | Self::MarkWaitingPeerUpdate(k, _) => Some(*k),
+            Self::Seal(k, _) | Self::Reencrypt(k, _, _) | Self::MarkWaitingPeerUpdate(k, _) => Some(*k),
             Self::MlsAcked(k, _, _) | Self::ResealReceipt(k) => Some(*k),
             #[cfg(all(feature="test-hooks",debug_assertions))]
             Self::RejectedPrepare(k,_,_,_) => Some(*k),

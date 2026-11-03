@@ -11,7 +11,7 @@ use crate::message::{
     wire::{self, Frame, ReceiptFrame, RejectReason},
 };
 use crate::mls::{
-    group::CLASS_NO_GROUP,
+    group::{CLASS_FUTURE_EPOCH, CLASS_NO_GROUP},
     wire::{MlsFrame, MlsReply},
 };
 use sha2::{Digest, Sha256};
@@ -87,8 +87,15 @@ pub(super) struct Runtime {
     write_pause: Option<TestPause>,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     scheduler_held: bool,
-    /// Messages whose re-encryption found an attempt in flight: re-encrypted once it settles.
-    reencrypt_after: std::collections::BTreeSet<MessageKey>,
+    /// Messages whose re-encryption found an attempt in flight: re-encrypted once it settles
+    /// (`true`: counted against the re-encryption budget).
+    reencrypt_after: BTreeMap<MessageKey, bool>,
+    /// Messages a recipient could not open because it moved to a newer epoch this device has
+    /// not reached yet (C1): sealed again, uncounted, once the group is at that epoch.
+    epoch_waits: BTreeMap<MessageKey, (PeerId, u64)>,
+    /// The epoch each message was last sealed again in without counting (at most once per
+    /// epoch, so a recipient cannot make this device re-encrypt without end).
+    epoch_resealed: BTreeMap<MessageKey, u64>,
     /// The text the `Ack` about to be written stores (keys the response checkpoint).
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     pub(super) ack_key: Option<MessageKey>,
@@ -1122,11 +1129,15 @@ impl Manager {
                     return Err(unavailable(ErrorCode::InvalidMessage));
                 }
                 // The recipient stored the sealed text: delivered.
-                AttemptOutcome::Acked if pending.receipt.is_none() => MessageDbOp::MlsAcked(
-                    result.key,
-                    result.lease.session.grant.installation,
-                    self.services.clock.wall_ms(),
-                ),
+                AttemptOutcome::Acked if pending.receipt.is_none() => {
+                    self.messages.epoch_resealed.remove(&result.key);
+                    self.messages.epoch_waits.remove(&result.key);
+                    MessageDbOp::MlsAcked(
+                        result.key,
+                        result.lease.session.grant.installation,
+                        self.services.clock.wall_ms(),
+                    )
+                }
                 // The sender of the message stored the sealed receipt: the job is done.
                 AttemptOutcome::Acked => {
                     MessageDbOp::Applied(pending.receipt.clone().unwrap(), pending.peer)
@@ -1243,21 +1254,30 @@ impl Manager {
         };
         if !settled {
             self.messages.pending.insert(result.key, pending);
-        } else if self.messages.reencrypt_after.remove(&result.key)
+        } else if let Some(counted) = self.messages.reencrypt_after.remove(&result.key)
             && let Ok(request) = self.ready()
         {
-            let _ = self.reencrypt(result.key, pending.peer, request).await;
+            let _ = self
+                .reencrypt(result.key, pending.peer, counted, request)
+                .await;
         }
     }
 
-    /// The recipient could not open a sent text (spec 6): it is sealed again in the current
-    /// epoch and is due at once. Its next attempt carries any Commit or Welcome still queued
-    /// for that recipient ahead of it over the same session, so a missing Commit (class 2) is
-    /// sent again right before the new ciphertext. A recipient without the group (class 4)
-    /// cannot open any ciphertext until its Welcome arrives, and a recipient already past this
-    /// device's epoch (`epoch` is the recipient's) means this device still lacks a Commit: in
-    /// both cases a new ciphertext cannot help yet, so the message keeps its back-off and the
-    /// re-encryption budget (3) is not spent.
+    /// The recipient could not open a sent text (spec 6); `epoch` is the recipient's.
+    ///
+    /// * A recipient without the group (class 4) cannot open any ciphertext until its Welcome
+    ///   arrives: the message keeps its back-off and the re-encryption budget (3) is not spent.
+    /// * Class 2 from a recipient behind this device: it lacks a Commit of this device's group
+    ///   state, which the next attempt carries ahead of the message over the same session; then
+    ///   this very ciphertext opens. Nothing is re-encrypted (M2).
+    /// * Class 2 from a recipient ahead of this device: it moved the group to a newer epoch (C1,
+    ///   or any Commit not here yet). The message is sealed again, uncounted, once this device
+    ///   has that epoch (`poll_epoch_waits`). Class 2 at this device's own epoch: the recipient
+    ///   is there already and the ciphertext is older, so it is sealed again now, uncounted.
+    ///   Each message is sealed again uncounted at most once per epoch.
+    /// * Any other class from a recipient already past this device's epoch: this device lacks
+    ///   a Commit; a new ciphertext cannot help yet (budget not spent).
+    /// * Otherwise it is sealed again in the current epoch, counted, and is due at once.
     async fn after_decrypt_failed(
         &mut self,
         key: MessageKey,
@@ -1266,15 +1286,73 @@ impl Manager {
         epoch: u64,
         request: Request,
     ) -> Result<(), CoreError> {
-        if class == CLASS_NO_GROUP
-            || self
-                .group_epoch(key.conversation, request)
-                .await?
-                .is_some_and(|own| own < epoch)
-        {
+        if class == CLASS_NO_GROUP {
             return Ok(());
         }
-        self.reencrypt(key, peer, request).await
+        match self.group_epoch(key.conversation, request).await? {
+            Some(own) if class == CLASS_FUTURE_EPOCH && epoch < own => Ok(()),
+            Some(own) if class == CLASS_FUTURE_EPOCH && epoch > own => {
+                self.messages.epoch_waits.insert(key, (peer, epoch));
+                Ok(())
+            }
+            Some(own) if class == CLASS_FUTURE_EPOCH => {
+                self.reseal_in_epoch(key, peer, own, request).await
+            }
+            Some(own) if own < epoch => Ok(()),
+            _ => self.reencrypt(key, peer, true, request).await,
+        }
+    }
+
+    /// Seals a message again because the epoch moved on under it (C1): uncounted the first time
+    /// in `epoch`, counted after that (a recipient that keeps failing it in one epoch is a real
+    /// failure).
+    async fn reseal_in_epoch(
+        &mut self,
+        key: MessageKey,
+        peer: PeerId,
+        epoch: u64,
+        request: Request,
+    ) -> Result<(), CoreError> {
+        let again = self.messages.epoch_resealed.insert(key, epoch) == Some(epoch);
+        self.reencrypt(key, peer, again, request).await
+    }
+
+    /// Messages waiting for this device to reach a recipient's newer epoch (C1) are sealed again
+    /// once the group is there; a group left meanwhile seals them afresh anyway.
+    async fn poll_epoch_waits(&mut self) {
+        if self.messages.epoch_waits.is_empty() {
+            return;
+        }
+        let Ok(request) = self.ready() else { return };
+        let waits: Vec<(MessageKey, PeerId, u64)> = self
+            .messages
+            .epoch_waits
+            .iter()
+            .map(|(key, (peer, epoch))| (*key, *peer, *epoch))
+            .collect();
+        let mut epochs: BTreeMap<ConversationId, Option<u64>> = BTreeMap::new();
+        for (key, peer, epoch) in waits {
+            let own = match epochs.get(&key.conversation) {
+                Some(own) => *own,
+                None => {
+                    let Ok(own) = self.group_epoch(key.conversation, request).await else {
+                        return;
+                    };
+                    epochs.insert(key.conversation, own);
+                    own
+                }
+            };
+            match own {
+                Some(own) if own >= epoch => {
+                    self.messages.epoch_waits.remove(&key);
+                    let _ = self.reseal_in_epoch(key, peer, own, request).await;
+                }
+                Some(_) => {}
+                None => {
+                    self.messages.epoch_waits.remove(&key);
+                }
+            }
+        }
     }
 
     /// `Seal` before an attempt. A queue too full to take the sealed frame (an upgraded M4
@@ -1301,16 +1379,18 @@ impl Manager {
         }
     }
 
-    /// `Reencrypt`, or, while an attempt of the message is in flight, once it settles.
+    /// `Reencrypt` (`counted` against the budget or not), or, while an attempt of the message
+    /// is in flight, once it settles.
     async fn reencrypt(
         &mut self,
         key: MessageKey,
         peer: PeerId,
+        counted: bool,
         request: Request,
     ) -> Result<(), CoreError> {
         let now = self.schedule_now();
         match self
-            .message_db(MessageDbOp::Reencrypt(key, now), request)
+            .message_db(MessageDbOp::Reencrypt(key, now, counted), request)
             .await
         {
             Ok(MessageDbReply::NeedGroup(conversation)) => {
@@ -1319,7 +1399,7 @@ impl Manager {
             }
             Ok(_) => Ok(()),
             Err(error) if error.code == ErrorCode::Busy => {
-                self.messages.reencrypt_after.insert(key);
+                self.messages.reencrypt_after.insert(key, counted);
                 Ok(())
             }
             // Delivered or cancelled meanwhile: nothing to send again.
@@ -1577,6 +1657,7 @@ impl Manager {
     pub(super) async fn poll_messages(&mut self) {
         // MLS group upkeep and its Commit/Welcome deliveries share this tick.
         self.poll_mls().await;
+        self.poll_epoch_waits().await;
         #[cfg(all(feature = "test-hooks", debug_assertions))]
         if self.messages.scheduler_held {
             return;

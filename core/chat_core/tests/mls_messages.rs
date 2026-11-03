@@ -136,14 +136,15 @@ async fn missing_commit_is_redelivered_before_message() {
         .unwrap()
         .unwrap();
     let sent = send(&a1, &b1, 1, "after the commit").await;
-    // B cannot open it: the Commit before it is missing (class 2). A seals it again.
+    // B cannot open it: the Commit before it is missing (class 2). A keeps the ciphertext and
+    // its re-encryption budget (M2): once the Commit is there the same ciphertext opens.
     let error = a1
         .account
         .message_test_attempt(sent.key, false, MessageMutation::None)
         .await
         .unwrap_err();
     assert_eq!(error.code, ErrorCode::NotAvailable);
-    assert_eq!(outbox(&a1, sent.key).await.reencrypts, 1);
+    assert_eq!(outbox(&a1, sent.key).await.reencrypts, 0);
     assert_eq!(state(&b1, conv).await.group_epoch, Some(epoch - 1));
     assert!(message(&b1, sent.key).await.is_none());
 
@@ -167,10 +168,9 @@ async fn missing_commit_is_redelivered_before_message() {
         .map(|(i, _)| i)
         .collect();
     assert_eq!(apps.len(), 2);
-    assert!(
-        commit < apps[1],
-        "the Commit goes before the re-encrypted message"
-    );
+    assert!(commit < apps[1], "the Commit goes before the message");
+    let cts = app_ciphertexts(&a1).await;
+    assert!(cts[0] == cts[1], "the same ciphertext both times");
     assert_eq!(
         page(&b1, conv)
             .await

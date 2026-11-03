@@ -822,6 +822,25 @@ async fn late_decrypt_failure_after_rejoin_reencrypts_nothing() {
     assert_eq!(view[0].state, DeliveryState::Queued);
 }
 
+/// C1: the empty Commit a device makes on its own goes through the own-Commit path: queued for
+/// every other member, and no second one while it is unacknowledged.
+#[tokio::test]
+async fn an_empty_commit_is_one_own_commit_at_a_time() {
+    let (a, b, conversation) = linked().await;
+    let before = a.f.mls_state(conversation).await.unwrap();
+    let next = before.group_epoch.unwrap() + 1;
+    assert_eq!(
+        a.m.mls_update(conversation, b.peer, NOW).await.unwrap(),
+        Some(next)
+    );
+    let after = a.f.mls_state(conversation).await.unwrap();
+    assert_eq!(after.own_commit_unacked, Some(true));
+    assert_eq!(after.members, before.members);
+    assert!(after.deliveries.contains(&(b.install, 1, next)));
+    assert_eq!(a.m.mls_update(conversation, b.peer, NOW).await.unwrap(), None);
+    assert_eq!(a.f.mls_state(conversation).await.unwrap().group_epoch, Some(next));
+}
+
 /// M4: a receipt is sealed once; its retries resend the same ciphertext (no new generation of
 /// the ratchet per attempt). Only when the recipient could not open it is it sealed again.
 #[tokio::test]

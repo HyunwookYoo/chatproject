@@ -114,8 +114,9 @@ pub fn decrypt_readonly(snapshot: &[u8], ciphertext: &[u8]) -> Result<NsePreview
         Ok(Opened::Commit { .. }) => Err(NseError::NotApplication),
         Err(OpenFailure {
             class: CLASS_NO_GROUP,
+            ..
         }) => Err(NseError::GroupNotFound),
-        Err(OpenFailure { class }) => Err(NseError::Decrypt(class)),
+        Err(OpenFailure { class, .. }) => Err(NseError::Decrypt(class)),
     }
 }
 

@@ -32,7 +32,7 @@ use crate::message::store::{MessageDbOp, MessageDbReply, conversation_id};
 use crate::message::types::ConversationId;
 use crate::message::wire::{Frame, RejectReason};
 use crate::mls::{
-    group::{CLASS_FUTURE_EPOCH, CLASS_OTHER, inspect_key_package},
+    group::{CLASS_FUTURE_EPOCH, CLASS_OTHER, CLASS_OUT_OF_ORDER, inspect_key_package},
     identity::MlsCredential,
     wire::{MlsFrame, MlsReply},
 };
@@ -57,6 +57,10 @@ const MISSING_REJOIN_MS: u64 = 30_000;
 /// `OUTDATED_MAX_MS`, unless its record changes.
 const OUTDATED_RETRY_MS: u64 = 300_000;
 const OUTDATED_MAX_MS: u64 = 3_600_000;
+/// A device moves a conversation's group to a new epoch on its own (an empty Commit, C1) at
+/// most this many times per `RECOVERY_WINDOW_MS`, so a sender cannot make it spin Commits.
+const RECOVERY_LIMIT: usize = 4;
+const RECOVERY_WINDOW_MS: u64 = 3_600_000;
 /// The conversation argument of group operations that are not about one conversation.
 const NO_CONVERSATION: ConversationId = ConversationId([0; 32]);
 
@@ -141,6 +145,9 @@ pub(crate) struct Runtime {
     /// Accounts that answered a kind 17 request properly (this run); with `mls_peer` the
     /// evidence that an account speaks MLS, so a closed stream is not taken for a refusal.
     pub(super) spoke: BTreeSet<PeerId>,
+    /// When this device last moved each conversation's group to a new epoch on its own (C1),
+    /// within `RECOVERY_WINDOW_MS`.
+    recoveries: BTreeMap<ConversationId, Vec<u64>>,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     pub(super) hold_delivery: bool,
     /// The M4-peer fixture: this core behaves like a released M4 app (kind 16 only).
@@ -159,6 +166,8 @@ pub(crate) struct Runtime {
     held: u64,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     rejoined: u64,
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    recovered: u64,
 }
 
 /// Back-off of an account that refused kind 17.
@@ -265,6 +274,32 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
 
+/// Whether a conversation may get another self-made epoch (C1) at `now`: fewer than
+/// `RECOVERY_LIMIT` in the last `RECOVERY_WINDOW_MS`. `recent` keeps only those.
+fn recovery_allowed(recent: &mut Vec<u64>, now: u64) -> bool {
+    recent.retain(|at| now.saturating_sub(*at) < RECOVERY_WINDOW_MS);
+    recent.len() < RECOVERY_LIMIT
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+
+    #[test]
+    fn self_made_epochs_are_limited_per_hour() {
+        let mut recent = Vec::new();
+        for n in 0..RECOVERY_LIMIT as u64 {
+            assert!(recovery_allowed(&mut recent, 1_000 + n));
+            recent.push(1_000 + n);
+        }
+        assert!(!recovery_allowed(&mut recent, 2_000));
+        assert!(!recovery_allowed(&mut recent, 1_000 + RECOVERY_WINDOW_MS - 1));
+        // The oldest one leaves the window: one more is allowed.
+        assert!(recovery_allowed(&mut recent, 1_000 + RECOVERY_WINDOW_MS));
+        assert_eq!(recent.len(), RECOVERY_LIMIT - 1);
+    }
+}
+
 /// What a Commit/Welcome delivery attempt's answer means for its queued row.
 pub(super) fn delivery_outcome(result: &Result<MlsReply, ErrorCode>) -> Delivery {
     match result {
@@ -309,6 +344,7 @@ pub(crate) enum MlsTest {
     Sent,
     Held,
     Rejoined,
+    Recovered,
     Query(PeerId),
     M4Peer(bool),
     M4Close(bool),
@@ -365,6 +401,13 @@ impl AccountHandle {
     /// How many rejoins this actor started (any cause).
     pub async fn mls_test_rejoin_total(&self) -> Result<u64, CoreError> {
         match self.mls_test(MlsTest::Rejoined).await? {
+            MlsTestReply::Count(count) => Ok(count),
+            _ => unreachable!(),
+        }
+    }
+    /// How many times this actor moved a group to a new epoch on its own (C1).
+    pub async fn mls_test_recovery_total(&self) -> Result<u64, CoreError> {
+        match self.mls_test(MlsTest::Recovered).await? {
             MlsTestReply::Count(count) => Ok(count),
             _ => unreachable!(),
         }
@@ -433,6 +476,7 @@ impl Manager {
             }
             MlsTest::Held => MlsTestReply::Count(self.messages.mls.held),
             MlsTest::Rejoined => MlsTestReply::Count(self.messages.mls.rejoined),
+            MlsTest::Recovered => MlsTestReply::Count(self.messages.mls.recovered),
             MlsTest::Query(peer) => {
                 // Test only: this actor waits on the answers (the devices asked do not).
                 let conversation = conversation_id(own, peer)?;
@@ -1887,6 +1931,51 @@ impl Manager {
         })
     }
 
+    /// C1: an application message of the current `epoch` came from a sender whose ratchet is more
+    /// than `MAX_FORWARD` generations past this device's view of it (it sent that many to other
+    /// devices of this account). No resend in this epoch can be opened here, so this device makes
+    /// an empty Commit (a path update) through the own-Commit path: queued for every member like
+    /// any Commit, refused while an own Commit is unacknowledged (one in flight at most), and
+    /// rate limited (`RECOVERY_LIMIT` per `RECOVERY_WINDOW_MS`). The sender is told a Commit is
+    /// on its way (class 2 with the new epoch): it waits for it and seals the message again in
+    /// that epoch without spending its re-encryption budget. When no epoch can be made now, the
+    /// answer is the plain out-of-order failure.
+    async fn move_epoch(
+        &mut self,
+        conversation: ConversationId,
+        peer: PeerId,
+        epoch: u64,
+        request: Request,
+    ) -> Result<MlsReply, CoreError> {
+        let now = self.schedule_now();
+        let out_of_order = MlsReply::DecryptFailed {
+            class: CLASS_OUT_OF_ORDER,
+            epoch,
+        };
+        let recent = self.messages.mls.recoveries.entry(conversation).or_default();
+        if !recovery_allowed(recent, now) {
+            return Ok(out_of_order);
+        }
+        match self
+            .group_db(conversation, GroupOp::Update { peer, now }, request)
+            .await?
+        {
+            GroupReply::Committed(Committed::Done { epoch: moved }) if moved > epoch => {
+                let mls = &mut self.messages.mls;
+                mls.recoveries.entry(conversation).or_default().push(now);
+                #[cfg(all(feature = "test-hooks", debug_assertions))]
+                {
+                    mls.recovered += 1;
+                }
+                Ok(MlsReply::DecryptFailed {
+                    class: CLASS_FUTURE_EPOCH,
+                    epoch: moved,
+                })
+            }
+            _ => Ok(out_of_order),
+        }
+    }
+
     /// The conversation's peer account just spoke MLS (an accepted Commit or Welcome): kept for
     /// the downgrade guard (`mls_peer`, never cleared) and as evidence it is no M4 app.
     async fn peer_spoke(
@@ -1944,6 +2033,9 @@ impl Manager {
                 Ok(Some(reply))
             }
             Ok(MessageDbReply::Rejected) => Ok(None),
+            Ok(MessageDbReply::FarAhead { epoch }) => Ok(Some(
+                self.move_epoch(conversation, sender, epoch, request).await?,
+            )),
             Ok(_) => Err(unavailable(ErrorCode::InvalidMessage)),
             // The MLS sender is not the authenticated device, or the message conflicts.
             Err(error)

@@ -104,6 +104,10 @@ pub(crate) enum GroupOp {
         remove: Vec<InstallationId>,
         now: u64,
     },
+    /// One own Commit with no proposals, only a path update (C1): every member moves to a new
+    /// epoch whose sender ratchets all start over. Refused (`Busy`) while an own Commit is
+    /// unacknowledged, like any own Commit.
+    Update { peer: PeerId, now: u64 },
     /// Leaves the group to rejoin it (spec 4.6), if the rate limit allows.
     Rejoin { now: u64 },
     /// Due Commit/Welcome deliveries to the given (reachable) recipients, the oldest epoch of
@@ -687,6 +691,19 @@ pub(super) fn group_op(
             peer,
             &add,
             &remove,
+            false,
+            now,
+            fault,
+        )?),
+        GroupOp::Update { peer, now } => GroupReply::Committed(own_commit(
+            c,
+            identity,
+            local,
+            conversation,
+            peer,
+            &[],
+            &[],
+            true,
             now,
             fault,
         )?),
@@ -1382,6 +1399,7 @@ fn join_request(
         arrival.peer,
         &[key_package.to_vec()],
         &[asker],
+        false,
         arrival.now,
         fault,
     )?;
@@ -1410,6 +1428,7 @@ fn own_commit(
     peer: PeerId,
     add: &[Vec<u8>],
     remove: &[InstallationId],
+    update: bool,
     now: u64,
     fault: Fault,
 ) -> R<Committed> {
@@ -1436,14 +1455,20 @@ fn own_commit(
         .copied()
         .filter(|i| before.contains(i) && *i != identity.installation)
         .collect();
-    if add.is_empty() && remove.is_empty() {
+    let empty = add.is_empty() && remove.is_empty();
+    if empty && !update {
         return Ok(Committed::Done { epoch: row.epoch });
     }
     let remove = remove.as_slice();
     let vetting = Vetting::new(&records);
     let verify = |credential: &[u8], key: &[u8]| vetting.check(credential, key);
+    let made = if empty {
+        membership::commit_update(&provider, &signer, &row.group_id)
+    } else {
+        membership::commit_changes(&provider, &signer, &row.group_id, add, remove, &verify)
+    };
     let committed =
-        match membership::commit_changes(&provider, &signer, &row.group_id, add, remove, &verify) {
+        match made {
             Ok(committed) => committed,
             Err(error) => {
                 return match vetting.held() {

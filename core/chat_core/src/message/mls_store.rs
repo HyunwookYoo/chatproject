@@ -324,14 +324,18 @@ pub(super) fn seal_pending(
 }
 
 /// Seals a sent message again after the receiver could not open the first ciphertext. The
-/// message id, lamport and everything else stay; only the ciphertext is new. The third time
-/// the message is given up on (a user `Retry` starts the count over).
+/// message id, lamport and everything else stay; only the ciphertext is new. The third
+/// `counted` time the message is given up on (a user `Retry` starts the count over). Not
+/// `counted`: the recipient moved to a newer epoch under the ciphertext (C1), which says
+/// nothing against the message.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn reencrypt(
     c: &mut Connection,
     identity: Identity,
     local: &LocalAccount,
     key: MessageKey,
     now: u64,
+    counted: bool,
     fault: Fault,
 ) -> R<MessageDbReply> {
     check_own(identity, key)?;
@@ -368,7 +372,7 @@ pub(super) fn reencrypt(
         now,
     )?;
     check_outbox_cap(&tx, outgoing.wire.len() as u64, frame.len() as u64)?;
-    let count = outgoing.reencrypts + 1;
+    let count = outgoing.reencrypts + u64::from(counted);
     let capped = count >= REENCRYPT_CAP;
     tx.execute(
         // A given-up message is parked (2) so it is never due; otherwise it is due right away.
@@ -770,6 +774,16 @@ pub(super) fn open_app(
     let provider = MlsProvider::new(KvStore::load(&tx, conversation.0)?);
     let opened = match open_counted(&provider, &group.group_id, &ciphertext) {
         Ok(opened) => opened,
+        // The sender is too far ahead in this epoch: the actor moves the group on (C1).
+        Err(failure) if failure.far_ahead == Some(group.epoch) => {
+            return Ok(MessageDbReply::FarAhead { epoch: group.epoch });
+        }
+        // Too far ahead in an older epoch: no resend of it can open here, one sealed in the
+        // current epoch can. Answered like a missing Commit with this device's epoch, so the
+        // sender seals it again once it is there (without spending its re-encryption budget).
+        Err(failure) if failure.far_ahead.is_some() => {
+            return Ok(decrypt_failed(group::CLASS_FUTURE_EPOCH, group.epoch));
+        }
         Err(failure) => return Ok(decrypt_failed(failure.class, group.epoch)),
     };
     let message = match opened {
