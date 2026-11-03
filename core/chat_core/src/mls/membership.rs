@@ -755,9 +755,13 @@ mod tests {
 
     #[test]
     fn same_epoch_fork_smaller_hash_wins_on_both_sides() {
-        // Hashes are random, so run enough forks to see both devices win.
+        // Hashes are random: forks are made until each device has won at least twice (at most
+        // 64; each fork is a fair coin, so missing a side 64 times in a row is 2^-63).
         let mut winners = [0u32; 2];
-        for _ in 0..12 {
+        for _ in 0..64 {
+            if winners.iter().all(|wins| *wins >= 2) {
+                break;
+            }
             let (a1, b1, gid, by_a, by_b, a2, b2) = competing();
             assert_eq!((by_a.epoch, by_b.epoch), (2, 2));
             let verify = verifier(&[&a1, &a2, &b1, &b2]);
@@ -800,7 +804,7 @@ mod tests {
             assert_eq!(winner.leaves(&gid), loser.leaves(&gid));
             assert_eq!(winner.leaves(&gid).len(), 3);
         }
-        assert!(winners[0] > 0 && winners[1] > 0, "{winners:?}");
+        assert!(winners.iter().all(|wins| *wins >= 2), "{winners:?}");
     }
 
     #[test]
