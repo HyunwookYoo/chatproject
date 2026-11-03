@@ -597,8 +597,9 @@ pub(super) fn group_op(
             let (signer, credential) = signer_of(local);
             let tx = c.transaction().map_err(sql)?;
             let provider = MlsProvider::new(KvStore::load(&tx, GLOBAL)?);
+            // Best effort: one that no longer parses (its lifetime ran out) is left to the cap.
             for old in &replace {
-                group::forget_key_package(&provider, old)?;
+                let _ = group::forget_key_package(&provider, old);
             }
             let key_package = group::new_key_package(&provider, &signer, &credential)?;
             provider.storage().flush(&tx, GLOBAL)?;
