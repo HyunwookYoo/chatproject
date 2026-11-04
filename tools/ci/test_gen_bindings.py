@@ -31,6 +31,9 @@ elif tool == "cargo" and args[:1] == ["build"]:
 elif tool == "cargo" and args[:1] == ["run"]:
     if not pathlib.Path(args[args.index("--library") + 1]).is_file():
         sys.exit("library path is missing or was split")
+    out = pathlib.Path(args[args.index("--out-dir") + 1])
+    names = sorted(p.name for p in out.iterdir()) if out.is_dir() else []
+    (root / ("listing-" + args[args.index("--language") + 1] + ".txt")).write_text(",".join(names), encoding="utf-8")
 '''
 
 
@@ -42,6 +45,9 @@ class GeneratorTest(unittest.TestCase):
         root = pathlib.Path(folder.name)
         (root / "tools").mkdir()
         (root / "app").mkdir()
+        for stale in ("app/ios/NotificationService/Generated/stale.swift", "app/android/app/src/main/kotlin/keep.kt"):
+            (root / stale).parent.mkdir(parents=True, exist_ok=True)
+            (root / stale).write_text("old output", encoding="utf-8")
         shutil.copyfile(ROOT / "tools/gen_bindings.sh", root / "tools/gen_bindings.sh")
         fake_bin = root / "bin"
         fake_bin.mkdir()
@@ -103,6 +109,21 @@ class GeneratorTest(unittest.TestCase):
                     self.assertEqual(args[:7], ["run", "-q", "-p", "uniffi-bindgen", "--", "generate", "--library"])
                     self.assertEqual(pathlib.Path(args[7]), root / "target with spaces/debug" / library)
                     self.assertEqual(args[8:], ["--language", language, "--out-dir", output, "--no-format"])
+
+    def test_swift_output_folder_is_emptied_first_and_kotlin_is_not(self):
+        result, _, root = self.run_generator()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # A file left from an earlier namespace must not survive into the committed output.
+        self.assertEqual((root / "listing-swift.txt").read_text(encoding="utf-8"), "")
+        self.assertEqual((root / "listing-kotlin.txt").read_text(encoding="utf-8"), "keep.kt")
+
+    def test_swift_output_is_kept_when_the_build_fails(self):
+        # Emptied only right before generating: a failed build leaves the old output in place.
+        folder = tempfile.TemporaryDirectory(prefix="bindings fixture ")
+        self.addCleanup(folder.cleanup)
+        result, _, root = self.run_generator(version="2.12.0")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue((root / "app/ios/NotificationService/Generated/stale.swift").is_file())
 
 
 if __name__ == "__main__":

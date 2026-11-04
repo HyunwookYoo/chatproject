@@ -41,6 +41,26 @@ pub(crate) enum MessageDbOp {
     AttemptOutcome(MessageKey, Option<BlockReason>, Option<ErrorCode>, bool),
     Open(PeerId, PeerId),
     Enqueue(PeerId, MessageId, String, u64),
+    /// Codec 3 row -> MLS ciphertext (codec 2), `processed_ct` for the own ciphertext.
+    Seal(MessageKey, u64),
+    /// Seals every codec 3 row of the conversation, in lamport order.
+    SealPending(ConversationId, u64),
+    /// Seals a codec 2 row again. Counted (`reencrypts += 1`, the third time it fails) after a
+    /// decrypt failure; not counted when only the epoch moved on under it (C1).
+    Reencrypt(MessageKey, u64, bool),
+    /// A received MLS application ciphertext: sender peer, sender installation, conversation,
+    /// ciphertext, now.
+    OpenApp(PeerId, InstallationId, ConversationId, Vec<u8>, u64),
+    MarkWaitingPeerUpdate(MessageKey, bool),
+    /// The recipient installation `Ack`ed a sent `App` frame: delivered (now).
+    MlsAcked(MessageKey, InstallationId, u64),
+    /// The recipient could not open the sealed receipt for a received message: its next
+    /// attempt seals it again.
+    ResealReceipt(MessageKey),
+    /// Test-hook builds: the M4-peer fixture's plaintext frame for a row awaiting encryption.
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    M4Encode(MessageKey),
+    MlsGroupOp(ConversationId, super::mls_group::GroupOp),
     Messages(ConversationId, Option<MessageCursor>, u32),
     Conversations(Option<ConversationCursor>, u32),
 }
@@ -83,7 +103,7 @@ impl Drop for PrepareTransition {
     }
 }
 
-fn invalid() -> CoreError {
+pub(super) fn invalid() -> CoreError {
     CoreError::new(ErrorCode::InvalidMessage, "invalid_message")
 }
 pub(crate) fn sql_error(e: rusqlite::Error) -> CoreError {
@@ -94,7 +114,7 @@ pub(crate) fn sql_error(e: rusqlite::Error) -> CoreError {
     }
     CoreError::new(ErrorCode::StorageUncertain, "message_storage_uncertain")
 }
-fn integer(n: u64) -> R<i64> {
+pub(super) fn integer(n: u64) -> R<i64> {
     n.try_into().map_err(|_| invalid())
 }
 fn limit(n: u32) -> R<i64> {
@@ -123,11 +143,11 @@ pub(crate) fn conversation_id(local: PeerId, peer: PeerId) -> R<ConversationId> 
     Ok(ConversationId(hash.finalize().into()))
 }
 const COLUMNS: &str = "conversation,sender_peer,sender_install,msg_id,lamport,sent_at_ms,body,outgoing,outcome,delivered_at_ms,read_at_ms,cancel_requested,block_reason";
-fn uint(row: &Row<'_>, n: usize) -> rusqlite::Result<u64> {
+pub(super) fn uint(row: &Row<'_>, n: usize) -> rusqlite::Result<u64> {
     let value: i64 = row.get(n)?;
     value.try_into().map_err(|_| rusqlite::Error::InvalidQuery)
 }
-fn bytes<const N: usize>(row: &Row<'_>, n: usize) -> rusqlite::Result<[u8; N]> {
+pub(super) fn bytes<const N: usize>(row: &Row<'_>, n: usize) -> rusqlite::Result<[u8; N]> {
     let b: Vec<u8> = row.get(n)?;
     b.try_into().map_err(|_| rusqlite::Error::InvalidQuery)
 }
@@ -173,7 +193,7 @@ fn message_row(row: &Row<'_>) -> rusqlite::Result<MessageView> {
         },
     })
 }
-fn find(c: &Connection, key: MessageKey) -> R<Option<MessageView>> {
+pub(super) fn find(c: &Connection, key: MessageKey) -> R<Option<MessageView>> {
     c.query_row(&format!("SELECT {COLUMNS} FROM message WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4"),
         params![key.conversation.0.as_slice(),key.sender.0.as_slice(),key.installation.0.as_slice(),key.id.0.as_slice()],message_row).optional().map_err(sql_error)
 }
@@ -185,7 +205,7 @@ fn revision(c: &Connection) -> R<u64> {
     )
     .map_err(sql_error)
 }
-fn bump(tx: &Transaction<'_>) -> R<u64> {
+pub(super) fn bump(tx: &Transaction<'_>) -> R<u64> {
     let next = revision(tx)?
         .checked_add(1)
         .filter(|n| *n <= i64::MAX as u64)
@@ -197,7 +217,7 @@ fn bump(tx: &Transaction<'_>) -> R<u64> {
     .map_err(sql_error)?;
     Ok(next)
 }
-fn ensure_conversation(tx: &Transaction<'_>, id: ConversationId, peer: PeerId) -> R<()> {
+pub(super) fn ensure_conversation(tx: &Transaction<'_>, id: ConversationId, peer: PeerId) -> R<()> {
     let exists: bool = tx
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM conversation WHERE id=?1)",
@@ -239,9 +259,15 @@ fn conversation(c: &Connection, id: ConversationId) -> R<ConversationView> {
         change_revision: change,
     })
 }
+// The fault argument exists only in test-hook builds; the MLS operations always take one value.
+#[cfg(all(feature = "test-hooks", debug_assertions))]
+macro_rules! mls_fault { ($fault:ident) => { $fault }; }
+#[cfg(not(all(feature = "test-hooks", debug_assertions)))]
+macro_rules! mls_fault { ($fault:ident) => { () }; }
 pub(crate) fn execute(
     c: &mut Connection,
     identity: Identity,
+    local: &LocalAccount,
     op: MessageDbOp,
     #[cfg(all(feature = "test-hooks", debug_assertions))] fault: Option<
         crate::storage::worker::CommitFault,
@@ -249,7 +275,7 @@ pub(crate) fn execute(
 ) -> R<MessageDbReply> {
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     if fault == Some(crate::storage::worker::CommitFault::WriteDenied)
-        && op.key(identity)?.is_some()
+        && op.faultable(identity)?
     {
         c.pragma_update(None, "query_only", true)
             .map_err(sql_error)?;
@@ -263,9 +289,13 @@ pub(crate) fn execute(
                 MessageDbOp::Open(local, peer) => Some(conversation_id(*local, *peer)?),
                 MessageDbOp::ReleasePeer(peer, _) => Some(conversation_id(identity.peer, *peer)?),
                 MessageDbOp::MarkRead(id, _, _) => Some(*id),
+                MessageDbOp::SealPending(id, _) => Some(*id),
+                // Group operations that span conversations (deliveries, holds) pass a zero id.
+                MessageDbOp::MlsGroupOp(id, _) => (id.0 != [0; 32]).then_some(*id),
+                MessageDbOp::OpenApp(_, _, id, _, _) => Some(*id),
                 _ => key.map(|k| k.conversation),
             };
-            let reply = execute(c, identity, *op, #[cfg(all(feature="test-hooks",debug_assertions))] fault)?;
+            let reply = execute(c, identity, local, *op, #[cfg(all(feature="test-hooks",debug_assertions))] fault)?;
             let after = revision(c)?;
             let mut events = Vec::new();
             if after > before && let Some(conversation) = cid {
@@ -287,6 +317,7 @@ pub(crate) fn execute(
         MessageDbOp::Retry(key, _) => {
             let peer=target(c,identity,key,false)?;
             release_blocked(c,peer,Some(key),#[cfg(all(feature="test-hooks",debug_assertions))] fault)?;
+            super::mls_store::revive_capped(c,key,mls_fault!(fault))?;
             Ok(MessageDbReply::Message(find(c,key)?.ok_or_else(missing)?))
         }
         MessageDbOp::ReleasePeer(peer, _) => {
@@ -359,6 +390,12 @@ pub(crate) fn execute(
         ),
         MessageDbOp::Target(key, receipt) => {
             target(c, identity, key, receipt).map(MessageDbReply::Peer)
+        }
+        // A receipt for a message that came over MLS is sealed and goes back over MLS.
+        MessageDbOp::Prepare(key, receiver, true, wall, now, _)
+            if super::mls_store::received_over_mls(c, key)? =>
+        {
+            super::mls_store::prepare_receipt(c, identity, local, key, receiver, wall, now, mls_fault!(fault))
         }
         MessageDbOp::Prepare(key, receiver, receipt, _wall, now, transition) => prepare(
             c,
@@ -465,6 +502,10 @@ pub(crate) fn execute(
                 sent_at_ms: now as u64,
                 body,
             };
+            // The canonical M4 text frame is never sent (the row is sealed with MLS), but its
+            // hash is the message's `payload_hash` and chain hash, one rule for rows promoted
+            // from M4 and rows made now: M4 receipts for promoted rows keep matching, and
+            // `reconcile` checks a delivered row (outbox row gone) the same way for both.
             let (wire, hash) = frame.encode();
             if wire.len() > 61440 {
                 return Err(CoreError::new(
@@ -472,17 +513,14 @@ pub(crate) fn execute(
                     "message_frame_too_large",
                 ));
             }
-            let (count, bytes): (u64, u64) = tx
-                .query_row(
-                    "SELECT count(*),coalesce(sum(length(wire)),0) FROM outbox",
-                    [],
-                    |r| Ok((uint(r, 0)?, uint(r, 1)?)),
-                )
-                .map_err(sql_error)?;
-            if count >= 10_000 || bytes + wire.len() as u64 > 128 * 1024 * 1024 {
+            // The row is enqueued awaiting encryption (codec 3); it reserves the size it will
+            // seal to, so sealing it later rarely finds the outbox full.
+            let (count, bytes) = super::mls_store::outbox_usage(&tx)?;
+            let reserved = super::mls_store::reserved_bytes(frame.body.len());
+            if count >= 10_000 || bytes + reserved > super::mls_store::outbox_cap() {
                 return Err(CoreError::new(ErrorCode::StorageFull, "message_queue_full"));
             }
-            insert_outgoing(&tx, &frame, &hash, &wire)?;
+            insert_outgoing(&tx, &frame, &hash, 3, &[])?;
             let rev = bump(&tx)?;
             tx.execute("UPDATE conversation SET lamport_max=?2,local_prev_hash=?3,change_revision=?4 WHERE id=?1",params![cid.0.as_slice(),lamport as i64,hash.as_slice(),rev as i64]).map_err(sql_error)?;
             let view = find(&tx, key)?.ok_or_else(invalid)?;
@@ -503,6 +541,16 @@ pub(crate) fn execute(
             }
             Ok(MessageDbReply::Message(view))
         }
+        MessageDbOp::Seal(key, now) => super::mls_store::seal(c, identity, local, key, now, mls_fault!(fault)),
+        MessageDbOp::SealPending(id, now) => super::mls_store::seal_pending(c, identity, local, id, now, mls_fault!(fault)),
+        MessageDbOp::Reencrypt(key, now, counted) => super::mls_store::reencrypt(c, identity, local, key, now, counted, mls_fault!(fault)),
+        MessageDbOp::OpenApp(peer, install, id, ciphertext, now) => super::mls_store::open_app(c, identity, peer, install, id, ciphertext, now, mls_fault!(fault)),
+        MessageDbOp::MarkWaitingPeerUpdate(key, waiting) => super::mls_store::mark_waiting(c, identity, key, waiting, mls_fault!(fault)),
+        MessageDbOp::MlsAcked(key, recipient, now) => super::mls_store::acked(c, identity, key, recipient, now, mls_fault!(fault)),
+        MessageDbOp::ResealReceipt(key) => super::mls_store::reseal_receipt(c, key, mls_fault!(fault)),
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        MessageDbOp::M4Encode(key) => super::mls_store::m4_encode(c, identity, key),
+        MessageDbOp::MlsGroupOp(id, op) => super::mls_group::group_op(c, identity, local, id, op, mls_fault!(fault)),
         MessageDbOp::Messages(id, before, n) => {
             let take = limit(n)?;
             let (lamport, install, msg) = match before {
@@ -590,7 +638,13 @@ pub(crate) fn execute(
         }
     }
 }
-fn insert_outgoing(tx: &Transaction<'_>, frame: &TextFrame, hash: &[u8; 32], wire: &[u8]) -> R<()> {
+fn insert_outgoing(
+    tx: &Transaction<'_>,
+    frame: &TextFrame,
+    hash: &[u8; 32],
+    codec: u8,
+    wire: &[u8],
+) -> R<()> {
     let k = frame.key;
     tx.execute(
         "INSERT INTO message VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?8,?9,1,0,NULL,NULL,1,0,NULL,NULL,?10)",
@@ -609,12 +663,13 @@ fn insert_outgoing(tx: &Transaction<'_>, frame: &TextFrame, hash: &[u8; 32], wir
     )
     .map_err(sql_error)?;
     tx.execute(
-        "INSERT INTO outbox VALUES(?1,?2,?3,?4,1,?5,0,1000,0,0)",
+        "INSERT INTO outbox(conversation,sender_peer,sender_install,msg_id,codec,wire,attempts,retry_delay_ms,next_retry_at_ms,dispatch_state) VALUES(?1,?2,?3,?4,?5,?6,0,1000,0,0)",
         params![
             k.conversation.0.as_slice(),
             k.sender.0.as_slice(),
             k.installation.0.as_slice(),
             k.id.0.as_slice(),
+            codec,
             wire
         ],
     )
@@ -628,8 +683,12 @@ pub(crate) fn reconcile(c: &mut Connection, pending: PendingMessage) -> R<()> {
         let (prev,hash,wire):(Vec<u8>,Vec<u8>,Option<Vec<u8>>)=c.query_row("SELECT m.prev_hash,m.payload_hash,o.wire FROM message m LEFT JOIN outbox o USING(conversation,sender_peer,sender_install,msg_id) WHERE m.conversation=?1 AND m.sender_peer=?2 AND m.sender_install=?3 AND m.msg_id=?4",params![key.conversation.0.as_slice(),key.sender.0.as_slice(),key.installation.0.as_slice(),key.id.0.as_slice()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(sql_error)?;
         let raw:Vec<u8>=c.query_row("SELECT attempted_receivers FROM message WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",params![key.conversation.0.as_slice(),key.sender.0.as_slice(),key.installation.0.as_slice(),key.id.0.as_slice()],|r|r.get(0)).map_err(sql_error)?;
         receivers(&raw)?;
+        // An MLS row (outbox codec 2/3, or a received row whose payload hash is the remembered
+        // MLS ciphertext hash) is not an M4 frame: its wire is not the canonical M4 encoding. A
+        // promoted M4 row keeps its canonical payload hash even after it is sealed.
+        let mls:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM outbox WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4 AND codec IN (2,3)) OR EXISTS(SELECT 1 FROM processed_ct WHERE codec=2 AND sender_peer=?2 AND sender_install=?3 AND hash=?5)",params![key.conversation.0.as_slice(),key.sender.0.as_slice(),key.installation.0.as_slice(),key.id.0.as_slice(),hash.as_slice()],|r|r.get(0)).map_err(sql_error)?;
         if !m.outgoing {
-            let processed:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM processed_ct WHERE codec=1 AND sender_peer=?1 AND sender_install=?2 AND hash=?3)",params![key.sender.0.as_slice(),key.installation.0.as_slice(),hash.as_slice()],|r|r.get(0)).map_err(sql_error)?;
+            let processed:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM processed_ct WHERE codec IN (1,2) AND sender_peer=?1 AND sender_install=?2 AND hash=?3)",params![key.sender.0.as_slice(),key.installation.0.as_slice(),hash.as_slice()],|r|r.get(0)).map_err(sql_error)?;
             if !processed || wire.is_some() {
                 return Err(CoreError::new(
                     ErrorCode::StorageCorrupt,
@@ -645,8 +704,8 @@ pub(crate) fn reconcile(c: &mut Connection, pending: PendingMessage) -> R<()> {
             body: m.body,
         };
         let (canonical, digest) = frame.encode();
-        if digest.as_slice() != hash
-            || wire.as_ref().is_some_and(|w| *w != *canonical)
+        if (!mls && (digest.as_slice() != hash
+            || wire.as_ref().is_some_and(|w| *w != *canonical)))
             || (m.outgoing
                 && wire.is_none()
                 && matches!(
@@ -700,6 +759,19 @@ pub(crate) enum FixtureOp {
     ),
     Delivered(MessageKey, tokio::sync::oneshot::Sender<R<()>>),
     Lamport(ConversationId, u64, tokio::sync::oneshot::Sender<R<()>>),
+    OutboxRetry(MessageKey, u64, u64, u64, tokio::sync::oneshot::Sender<R<()>>),
+    MlsPromote(MessageKey, tokio::sync::oneshot::Sender<R<()>>),
+    MlsOutbox(MessageKey, tokio::sync::oneshot::Sender<R<super::mls_store::MlsOutbox>>),
+    MlsState(ConversationId, tokio::sync::oneshot::Sender<R<super::mls_store::MlsState>>),
+    MlsOutboxCap(Option<u64>, tokio::sync::oneshot::Sender<()>),
+    MlsClearCommitFlag(ConversationId, tokio::sync::oneshot::Sender<R<()>>),
+    /// Body of one queued delivery: conversation, recipient, kind, epoch.
+    MlsDeliveryFrame(ConversationId, InstallationId, u8, u64, tokio::sync::oneshot::Sender<R<Option<Vec<u8>>>>),
+    /// Queues (`Some(body, next_retry_at_ms)`) or deletes (`None`) one delivery row.
+    MlsSetDelivery(ConversationId, InstallationId, u8, u64, Option<(Vec<u8>, u64)>, tokio::sync::oneshot::Sender<R<()>>),
+    /// Optionally writes one raw `mls_kv` row into the global scope (key, value as given), then
+    /// lists the labels of every global-scope row.
+    MlsGlobalRows(Option<(Vec<u8>, Vec<u8>)>, tokio::sync::oneshot::Sender<R<Vec<String>>>),
 }
 #[cfg(all(feature = "test-hooks", debug_assertions))]
 pub(crate) fn fixture(c: &mut Connection, op: FixtureOp) {
@@ -750,6 +822,87 @@ pub(crate) fn fixture(c: &mut Connection, op: FixtureOp) {
                 .map(|_| ())
                 .map_err(sql_error)
             });
+            let _ = reply.send(result);
+        }
+        FixtureOp::OutboxRetry(k, attempts, delay, next, reply) => {
+            let result = (|| {
+                let (a, d, n) = (integer(attempts)?, integer(delay)?, integer(next)?);
+                let changed = c.execute("UPDATE outbox SET attempts=?5,retry_delay_ms=?6,next_retry_at_ms=?7 WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",params![k.conversation.0.as_slice(),k.sender.0.as_slice(),k.installation.0.as_slice(),k.id.0.as_slice(),a,d,n]).map_err(sql_error)?;
+                if changed == 1 { Ok(()) } else { Err(missing()) }
+            })();
+            let _ = reply.send(result);
+        }
+        FixtureOp::MlsPromote(key, reply) => {
+            let _ = reply.send(super::mls_store::fixture_promote(c, key));
+        }
+        FixtureOp::MlsOutbox(key, reply) => {
+            let _ = reply.send(super::mls_store::fixture_outbox(c, key));
+        }
+        FixtureOp::MlsOutboxCap(cap, reply) => {
+            super::mls_store::fixture_outbox_cap(cap);
+            let _ = reply.send(());
+        }
+        FixtureOp::MlsState(id, reply) => {
+            let _ = reply.send(super::mls_store::fixture_state(c, id));
+        }
+        FixtureOp::MlsClearCommitFlag(id, reply) => {
+            let _ = reply.send(super::mls_store::fixture_clear_commit_flag(c, id));
+        }
+        FixtureOp::MlsDeliveryFrame(id, recipient, kind, epoch, reply) => {
+            let result = integer(epoch).and_then(|epoch| {
+                c.query_row(
+                    "SELECT body FROM mls_delivery WHERE conversation=?1 AND recipient_install=?2 AND kind=?3 AND epoch=?4",
+                    params![id.0.as_slice(), recipient.0.as_slice(), kind, epoch],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(sql_error)
+            });
+            let _ = reply.send(result);
+        }
+        FixtureOp::MlsGlobalRows(plant, reply) => {
+            let result = (|| {
+                if let Some((key, value)) = plant {
+                    c.execute(
+                        "INSERT OR REPLACE INTO mls_kv VALUES(zeroblob(32),?1,?2)",
+                        params![key, value],
+                    )
+                    .map_err(sql_error)?;
+                }
+                let mut q = c
+                    .prepare("SELECT key FROM mls_kv WHERE scope=zeroblob(32) ORDER BY rowid")
+                    .map_err(sql_error)?;
+                let keys = q
+                    .query_map([], |r| r.get::<_, Vec<u8>>(0))
+                    .map_err(sql_error)?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(sql_error)?;
+                Ok(keys
+                    .iter()
+                    .map(|key| {
+                        let len = key.first().copied().unwrap_or(0) as usize;
+                        String::from_utf8_lossy(key.get(1..1 + len).unwrap_or_default()).into_owned()
+                    })
+                    .collect())
+            })();
+            let _ = reply.send(result);
+        }
+        FixtureOp::MlsSetDelivery(id, recipient, kind, epoch, row, reply) => {
+            let result = (|| {
+                let epoch = integer(epoch)?;
+                match row {
+                    Some((body, next)) => c.execute(
+                        "INSERT OR REPLACE INTO mls_delivery VALUES(?1,?2,?3,?4,?5,0,?6)",
+                        params![id.0.as_slice(), recipient.0.as_slice(), kind, epoch, body, integer(next)?],
+                    ),
+                    None => c.execute(
+                        "DELETE FROM mls_delivery WHERE conversation=?1 AND recipient_install=?2 AND kind=?3 AND epoch=?4",
+                        params![id.0.as_slice(), recipient.0.as_slice(), kind, epoch],
+                    ),
+                }
+                .map(|_| ())
+                .map_err(sql_error)
+            })();
             let _ = reply.send(result);
         }
         FixtureOp::Delivered(key, reply) => {
@@ -819,7 +972,8 @@ fn fill(c: &mut Connection, key: MessageKey, count: u64, target: Option<u64>) ->
                 }
             }
         }
-        insert_outgoing(&tx, &frame, &hash, &wire)?;
+        // Stand-in sealed rows (codec 2) of an exact wire size: the quota counts their frames.
+        insert_outgoing(&tx, &frame, &hash, 2, &wire)?;
         prev = hash;
         jobs += 1;
         total += wire.len() as u64;
@@ -848,6 +1002,20 @@ pub(crate) enum MessageDbReply {
     Prepared(Zeroizing<Vec<u8>>, Option<ReceiptFrame>),
     Peer(PeerId),
     Done,
+    /// The conversation has no group yet; nothing was sealed.
+    NeedGroup(ConversationId),
+    Sealed { ct_hash: [u8; 32] },
+    Count(u64),
+    /// The reply to send for a received MLS ciphertext.
+    Opened(crate::mls::wire::MlsReply),
+    /// A received MLS text that M4 would refuse: answered with an M4 `Reject(InvalidMessage)`.
+    Rejected,
+    /// The reply for a received MLS ciphertext that carried (or carried before) this text.
+    OpenedText(crate::mls::wire::MlsReply, MessageKey),
+    /// A received MLS ciphertext of the current epoch (`epoch`) whose sender's ratchet is too far
+    /// ahead of this device's view of it (C1). Nothing changed; only a new epoch can help.
+    FarAhead { epoch: u64 },
+    Group(super::mls_group::GroupReply),
     Conversation(ConversationView),
     Message(MessageView),
     Messages(MessagePage),
@@ -937,6 +1105,30 @@ impl MessageRepo {
 }
 
 impl MessageDbOp {
+    /// Operations that change stored state and so take an injected commit fault. Those that
+    /// know their message up front are exactly the ones with a key; the MLS operations that
+    /// learn it only after decrypting, or that act on a whole conversation, are listed.
+    pub(crate) fn faultable(&self, identity: Identity) -> R<bool> {
+        Ok(match self {
+            Self::Observed(op) => return op.faultable(identity),
+            Self::SealPending(..) | Self::OpenApp(..) => true,
+            // The M4-peer fixture's frame is what its enqueue would have stored: not a step
+            // of the attempt that fault tests interrupt.
+            #[cfg(all(feature = "test-hooks", debug_assertions))]
+            Self::M4Encode(_) => false,
+            Self::MlsGroupOp(_, op) => op.writes(),
+            _ => self.key(identity)?.is_some(),
+        })
+    }
+    /// Test hooks: a received MLS application ciphertext (its message is known only inside).
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    pub(crate) fn opens_app(&self) -> bool {
+        match self {
+            Self::Observed(op) => op.opens_app(),
+            Self::OpenApp(..) => true,
+            _ => false,
+        }
+    }
     pub(crate) fn key(&self, identity: Identity) -> R<Option<MessageKey>> {
         Ok(match self {
             Self::Observed(op) => return op.key(identity),
@@ -948,6 +1140,8 @@ impl MessageDbOp {
                 id: *id,
             }),
             Self::Receive(t, _, _, _) => Some(t.key),
+            Self::Seal(k, _) | Self::Reencrypt(k, _, _) | Self::MarkWaitingPeerUpdate(k, _) => Some(*k),
+            Self::MlsAcked(k, _, _) | Self::ResealReceipt(k) => Some(*k),
             #[cfg(all(feature="test-hooks",debug_assertions))]
             Self::RejectedPrepare(k,_,_,_) => Some(*k),
             Self::Retry(k, _)
@@ -967,13 +1161,13 @@ impl MessageRepo {
         self.storage.message(self.identity, op).await
     }
 }
-fn conflict() -> CoreError {
+pub(super) fn conflict() -> CoreError {
     CoreError::new(ErrorCode::MessageConflict, "message_conflict")
 }
-fn missing() -> CoreError {
+pub(super) fn missing() -> CoreError {
     CoreError::new(ErrorCode::MessageNotFound, "message_not_found")
 }
-fn receipt_for(
+pub(super) fn receipt_for(
     c: &Connection,
     key: MessageKey,
     recipient: InstallationId,
@@ -987,7 +1181,7 @@ fn receipt_for(
         recipient,
     })
 }
-fn commit(
+pub(super) fn commit(
     tx: Transaction<'_>,
     #[cfg(all(feature = "test-hooks", debug_assertions))] fault: Option<
         crate::storage::worker::CommitFault,
@@ -1027,6 +1221,22 @@ fn receive(
     }
     let now = integer(now)?;
     let tx = c.transaction().map_err(sql_error)?;
+    // Downgrade guard: once an installation of the peer sent this device MLS, a plaintext text
+    // frame from that installation is refused (an M4 app sends nothing else; an M5 app never
+    // sends one). The peer's other installations may still run M4 and are not affected.
+    let peer_mls: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM mls_peer WHERE conversation=?1 AND installation=?2)",
+            params![k.conversation.0.as_slice(), k.installation.0.as_slice()],
+            |r| r.get(0),
+        )
+        .map_err(sql_error)?;
+    if peer_mls {
+        return Err(CoreError::new(
+            ErrorCode::UnsupportedMessageVersion,
+            "plaintext_after_mls",
+        ));
+    }
     if let Some(existing) = find(&tx, k)? {
         let receipt = receipt_for(&tx, k, identity.installation, ReceiptKind::Delivered)?;
         if existing.outgoing || receipt.text_hash != hash {
@@ -1103,7 +1313,7 @@ fn receive(
     )?;
     Ok(MessageDbReply::Receipt(receipt))
 }
-fn target(c: &Connection, identity: Identity, key: MessageKey, receipt: bool) -> R<PeerId> {
+pub(super) fn target(c: &Connection, identity: Identity, key: MessageKey, receipt: bool) -> R<PeerId> {
     let m = find(c, key)?.ok_or_else(missing)?;
     if receipt {
         if m.outgoing || key.sender == identity.peer {
@@ -1163,9 +1373,18 @@ fn prepare(
         schedule_retry(&tx, k, true, now)?;
         MessageDbReply::Prepared(Frame::Receipt(r.clone()).envelope(), Some(r))
     } else {
-        let (raw,wire,state):(Vec<u8>,Vec<u8>,u64)=tx.query_row("SELECT attempted_receivers,wire,dispatch_state FROM message JOIN outbox USING(conversation,sender_peer,sender_install,msg_id) WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4 AND cancel_requested=0",params![k.conversation.0.as_slice(),k.sender.0.as_slice(),k.installation.0.as_slice(),k.id.0.as_slice()],|r|Ok((r.get(0)?,r.get(1)?,uint(r,2)?))).optional().map_err(sql_error)?.ok_or_else(missing)?;
+        let (raw,wire,state,codec):(Vec<u8>,Vec<u8>,u64,u64)=tx.query_row("SELECT attempted_receivers,wire,dispatch_state,codec FROM message JOIN outbox USING(conversation,sender_peer,sender_install,msg_id) WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4 AND cancel_requested=0",params![k.conversation.0.as_slice(),k.sender.0.as_slice(),k.installation.0.as_slice(),k.id.0.as_slice()],|r|Ok((r.get(0)?,r.get(1)?,uint(r,2)?,uint(r,3)?))).optional().map_err(sql_error)?.ok_or_else(missing)?;
         if state == 1 {
             return Err(CoreError::new(ErrorCode::Busy, "message_in_flight"));
+        }
+        // A row still waiting for encryption has no wire to send. (In test-hook builds the
+        // M4-peer fixture puts its plaintext frame there; production rows never have one.)
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        let unsealed = codec == 3 && wire.is_empty();
+        #[cfg(not(all(feature = "test-hooks", debug_assertions)))]
+        let unsealed = codec == 3;
+        if unsealed {
+            return Err(CoreError::new(ErrorCode::NotAvailable, "message_not_sealed"));
         }
         let mut allowed = receivers(&raw)?;
         if !allowed.contains(&receiver) {
@@ -1255,6 +1474,8 @@ fn applied(
         return Err(invalid());
     }
     tx.execute("DELETE FROM receipt_job WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4 AND recipient_install=?5 AND kind<=?6",params![k.conversation.0.as_slice(),k.sender.0.as_slice(),k.installation.0.as_slice(),k.id.0.as_slice(),r.recipient.0.as_slice(),r.kind.number()]).map_err(sql_error)?;
+    // The sealed MLS receipt of a settled job is not sent again.
+    tx.execute("DELETE FROM mls_receipt WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4 AND kind<=?5",params![k.conversation.0.as_slice(),k.sender.0.as_slice(),k.installation.0.as_slice(),k.id.0.as_slice(),r.kind.number()]).map_err(sql_error)?;
     commit(
         tx,
         #[cfg(all(feature = "test-hooks", debug_assertions))]
@@ -1273,7 +1494,9 @@ fn attempt_outcome(
     >,
 ) -> R<MessageDbReply> {
     let tx = c.transaction().map_err(sql_error)?;
-    let exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM outbox WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4)",params![k.conversation.0.as_slice(),k.sender.0.as_slice(),k.installation.0.as_slice(),k.id.0.as_slice()],|r|r.get(0)).map_err(sql_error)?;
+    // A message given up on after too many re-encryptions (reencrypts reached 3) stays failed
+    // until the user's Retry; a late attempt outcome must not revive it.
+    let exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM outbox WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4 AND reencrypts<3)",params![k.conversation.0.as_slice(),k.sender.0.as_slice(),k.installation.0.as_slice(),k.id.0.as_slice()],|r|r.get(0)).map_err(sql_error)?;
     if exists {
         let reason = block.map(|b| match b {
             BlockReason::Account => 1,
@@ -1440,7 +1663,7 @@ impl MessageDbOp {
     }
 }
 
-fn schedule_retry(tx: &Transaction<'_>, k: MessageKey, receipt: bool, now: u64) -> R<()> {
+pub(super) fn schedule_retry(tx: &Transaction<'_>, k: MessageKey, receipt: bool, now: u64) -> R<()> {
     let table = if receipt { "receipt_job" } else { "outbox" };
     let filter = "conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4";
     let count = tx.query_row(&format!("SELECT max(attempts) FROM {table} WHERE {filter}"),
@@ -1472,6 +1695,7 @@ fn due_sql(receipt: bool, seek: DueSeek) -> String {
     let (table, index, state) = if receipt {
         ("receipt_job", "receipt_due", "")
     } else {
+        // Rows awaiting encryption (codec 3) are due too: the actor seals them first.
         ("outbox", "outbox_due", "AND j.dispatch_state=0")
     };
     let after = match seek {
@@ -1586,7 +1810,7 @@ fn due(
             } else {
                 Zeroizing::new(c.query_row("SELECT wire FROM outbox WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",params![key.conversation.0.as_slice(),key.sender.0.as_slice(),key.installation.0.as_slice(),key.id.0.as_slice()],|r|r.get(0)).map_err(sql_error)?)
             };
-            jobs.push(Dispatch {key,peer,wire,ticket:0});
+            jobs.push(Dispatch {key,peer,wire,ticket:0,ahead:Vec::new()});
         }
         batches.push(jobs);
     }
@@ -1641,7 +1865,7 @@ mod due_tests {
             )
             .unwrap();
             tx.execute(
-                "INSERT INTO outbox VALUES(?1,?1,?1,?2,1,X'01',0,0,0,0)",
+                "INSERT INTO outbox(conversation,sender_peer,sender_install,msg_id,codec,wire,attempts,retry_delay_ms,next_retry_at_ms,dispatch_state) VALUES(?1,?1,?1,?2,2,X'01',0,0,0,0)",
                 params![[peer; 32].as_slice(), id.as_slice()],
             )
             .unwrap();
@@ -1847,7 +2071,7 @@ mod due_tests {
             )
             .unwrap();
             c.execute(
-                "INSERT INTO outbox VALUES(?1,?1,?1,?2,1,X'01',0,0,0,0)",
+                "INSERT INTO outbox(conversation,sender_peer,sender_install,msg_id,codec,wire,attempts,retry_delay_ms,next_retry_at_ms,dispatch_state) VALUES(?1,?1,?1,?2,2,X'01',0,0,0,0)",
                 params![[peer; 32].as_slice(), [peer; 16].as_slice()],
             )
             .unwrap();

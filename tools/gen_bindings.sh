@@ -27,5 +27,8 @@ nse_lib="$target_dir/debug/$nse_name"
 cargo build -p chat_ffi -p chat_nse
 cargo run -q -p uniffi-bindgen -- generate --library "$ffi_lib" --language kotlin \
   --out-dir app/android/app/src/main/kotlin --no-format
+# Emptied first so a file of a namespace that is gone cannot linger in the commit. Only the Swift
+# folder: it holds nothing but generated output (the Kotlin folder is the app's source tree).
+rm -rf app/ios/NotificationService/Generated
 cargo run -q -p uniffi-bindgen -- generate --library "$nse_lib" --language swift \
   --out-dir app/ios/NotificationService/Generated --no-format

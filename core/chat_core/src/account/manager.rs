@@ -76,6 +76,8 @@ enum Command {
     MessageAckPause(crate::MessageKey,oneshot::Sender<Result<(messages::MessagePause,messages::MessagePause),CoreError>>),
     #[cfg(all(feature="test-hooks",debug_assertions))]
     MessageAttempt(crate::message::types::MessageKey,bool,MessageMutation,oneshot::Sender<Result<(),CoreError>>),
+    #[cfg(all(feature="test-hooks",debug_assertions))]
+    Mls(mls::MlsTest,oneshot::Sender<Result<mls::MlsTestReply,CoreError>>),
     Retry(oneshot::Sender<Result<u64, CoreError>>),
     #[cfg(all(feature="test-hooks",debug_assertions))]
     PairTestStop(super::PairTestStop,oneshot::Sender<Result<(),CoreError>>),
@@ -143,6 +145,8 @@ impl Command {
             Self::MessageAckPause(_,reply)=>{let _=reply.send(Err(error));}
             #[cfg(all(feature="test-hooks",debug_assertions))]
             Self::MessageAttempt(_,_,_,reply)=>{let _=reply.send(Err(error));}
+            #[cfg(all(feature="test-hooks",debug_assertions))]
+            Self::Mls(_,reply)=>{let _=reply.send(Err(error));}
             Self::Retry(reply) => { let _ = reply.send(Err(error)); }
             #[cfg(all(feature="test-hooks",debug_assertions))]
             Self::PairTestStop(_,reply)=>{let _=reply.send(Err(error));}
@@ -1203,6 +1207,8 @@ impl Manager {
                         Command::MessageAckPause(key,reply)=>{let _=reply.send(self.message_ack_pause(key));}
                         #[cfg(all(feature="test-hooks",debug_assertions))]
                         Command::MessageAttempt(key,receipt,mutation,reply)=>{self.message_attempt(key,receipt,mutation,reply).await;}
+                        #[cfg(all(feature="test-hooks",debug_assertions))]
+                        Command::Mls(test,reply)=>{let result=self.mls_test(test).await;let _=reply.send(result);}
                         Command::Retry(reply) => { let result = self.retry_open(); let _ = reply.send(result); }
                         #[cfg(all(feature="test-hooks",debug_assertions))]
                         Command::PairTestStop(stop,reply)=>{self.pair.stop=Some(stop);self.pair.reached=None;let _=reply.send(Ok(()));}
@@ -3016,6 +3022,7 @@ impl Manager {
             Input::MessageAttempt(result)=>self.message_attempt_result(result).await,
             Input::MessageLookup(key,ticket,result)=>self.message_lookup(key,ticket,result).await,
             Input::MessageProof(result)=>self.message_proof(result).await,
+            Input::Mls(event)=>self.mls_event(event).await,
             Input::Incoming(conn) => {
                 let result = async {
                     let request = self.ready()?;
@@ -3058,7 +3065,7 @@ impl Manager {
             } => {
                 let result = self.receive_control(&connection, &body).await;
                 let result=result.and_then(|body| {
-                    let gate=if super::auth::payload(&body,16).is_ok() {Some(self.message_response_gate(&connection, #[cfg(all(feature="test-hooks",debug_assertions))] &body)?)} else {None};
+                    let gate=if super::auth::payload(&body,16).is_ok() || super::auth::payload(&body,17).is_ok() {Some(self.message_response_gate(&connection, #[cfg(all(feature="test-hooks",debug_assertions))] &body)?)} else {None};
                     Ok(super::connection::Response {body,gate})
                 });
                 let _ = reply.send(result);
@@ -3210,6 +3217,10 @@ impl Manager {
         if let Ok(inner)=super::auth::payload(body,16) {
             if body.len()>61440 { return Ok(crate::message::wire::Frame::Reject(crate::message::wire::RejectReason::InvalidMessage).envelope().to_vec()); }
             return self.receive_message(conn,&inner,request).await;
+        }
+        // Kind 17: MLS group protocol (manager/mls.rs); the frame limit is checked before parsing.
+        if let Ok(inner)=super::auth::payload(body,17) {
+            return self.receive_mls(conn,&inner,request).await;
         }
         let mut frame = (body.len() as u32).to_be_bytes().to_vec();
         frame.extend_from_slice(body);
@@ -3836,3 +3847,5 @@ impl Manager {
 pub(super) mod messages;
 #[cfg(all(feature="test-hooks",debug_assertions))]
 pub use messages::{MessageMutation,MessagePause,MessagePoint};
+pub(super) mod mls;
+pub use mls::GroupState;

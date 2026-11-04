@@ -8,6 +8,9 @@ pub(crate) struct Dispatch {
     pub peer: PeerId,
     pub wire: Zeroizing<Vec<u8>>,
     pub ticket: u64,
+    /// Queued Commits/Welcomes for the recipient, sent ahead of an MLS `wire` over the same
+    /// session (the actor fills it when it launches the attempt).
+    pub ahead: Vec<super::mls_group::DueDelivery>,
 }
 
 use crate::CoreError;

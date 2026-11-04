@@ -137,13 +137,16 @@ fn schema_enforces_identity_ordering_foreign_keys_and_ranges() {
             "invalid message constraint accepted"
         );
     }
-    c.execute("INSERT INTO outbox SELECT conversation,sender_peer,sender_install,msg_id,1,X'01',0,1000,1,0 FROM message",[]).unwrap();
+    c.execute("INSERT INTO outbox(conversation,sender_peer,sender_install,msg_id,codec,wire,attempts,retry_delay_ms,next_retry_at_ms,dispatch_state) SELECT conversation,sender_peer,sender_install,msg_id,2,X'01',0,1000,1,0 FROM message",[]).unwrap();
     for sql in [
         "UPDATE outbox SET wire=zeroblob(61441)",
+        "UPDATE outbox SET wire=X''",
         "UPDATE outbox SET attempts=4294967296",
         "UPDATE outbox SET attempts=-1",
         "UPDATE outbox SET dispatch_state=3",
         "UPDATE outbox SET codec=0",
+        // M5 never queues an M4 plaintext job (codec 1).
+        "UPDATE outbox SET codec=1",
         "UPDATE outbox SET next_retry_at_ms=-1",
         "UPDATE outbox SET retry_delay_ms=300001",
     ] {
@@ -195,8 +198,9 @@ async fn enqueue_commits_text_and_job_once() {
     assert_eq!(m, same);
     let facts = f.message_facts(m.key).await.unwrap();
     assert_eq!((facts.messages, facts.jobs), (1, 1));
-    assert_eq!(facts.wire.len() as u64, facts.quota_bytes);
-    assert!(facts.wire.starts_with(&[0x83, 1, 16]));
+    // Queued awaiting encryption: no frame yet (M5 seals it when it is sent).
+    assert!(facts.wire.is_empty());
+    assert_eq!(facts.quota_bytes, 0);
     assert_eq!(
         r.enqueue(peer(2), id(1), "different".into(), 24)
             .await
@@ -208,22 +212,12 @@ async fn enqueue_commits_text_and_job_once() {
     assert_eq!(page.items, vec![m]);
     let second = r.enqueue(peer(2), id(2), "chain".into(), 25).await.unwrap();
     let second_facts = f.message_facts(second.key).await.unwrap();
-    let mut outer = minicbor::Decoder::new(&second_facts.wire);
-    assert_eq!(outer.array().unwrap(), Some(3));
-    assert_eq!(outer.u8().unwrap(), 1);
-    assert_eq!(outer.u8().unwrap(), 16);
-    let inner = outer.bytes().unwrap();
-    let mut inner_decoder = minicbor::Decoder::new(inner);
-    assert_eq!(inner_decoder.array().unwrap(), Some(10));
-    for _ in 0..7 {
-        inner_decoder.skip().unwrap();
-    }
+    // The local chain links each text to the canonical hash of the one before.
     assert!(
-        inner_decoder.bytes().unwrap() == facts.hash,
+        second_facts.prev_hash == facts.hash,
         "local text chain changed"
     );
-    use sha2::{Digest, Sha256};
-    assert_eq!(second_facts.hash, <[u8; 32]>::from(Sha256::digest(inner)));
+    assert_ne!(second_facts.hash, facts.hash);
     f.close().await;
 }
 

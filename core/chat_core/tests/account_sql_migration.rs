@@ -776,3 +776,139 @@ async fn old_binary_guard_survives_cleanup() {
     f.close().await;
     assert!(Store::open(dir.path(), resources(dir.path())).is_err());
 }
+
+// ---- schema v1 -> v2 (M5) -------------------------------------------------------------
+
+/// A real M4-shaped database: one conversation, three messages, two codec-1 outbox
+/// rows (distinct retry facts) and one cancelled message. Built by the real message
+/// repo on a fresh DB, then rewritten to the exact v1 shape by the narrow fixture.
+async fn v1_database(root: &Path, p: Arc<dyn KeyProtector>) {
+    use chat_core::account::PeerId;
+    use chat_core::storage_fixture::MessageId;
+    let f = Fixture::open(root, p.clone()).await.unwrap();
+    f.handle
+        .commit_account(migration_states().pop().unwrap().unwrap())
+        .await
+        .unwrap();
+    let r = f.messages().await.unwrap();
+    let peer = PeerId([2; 32]);
+    let a = r
+        .enqueue(peer, MessageId([1; 16]), "first".into(), 1)
+        .await
+        .unwrap();
+    let b = r
+        .enqueue(peer, MessageId([2; 16]), "second".into(), 2)
+        .await
+        .unwrap();
+    let c = r
+        .enqueue(peer, MessageId([3; 16]), "cancelled".into(), 3)
+        .await
+        .unwrap();
+    r.cancel_send(c.key).await.unwrap();
+    f.saturate_message_attempts(a.key, false).await.unwrap();
+    f.set_outbox_retry(b.key, 3, 4000, 123_456).await.unwrap();
+    f.close().await;
+    Fixture::downgrade_to_v1(root, p).unwrap();
+}
+
+#[tokio::test]
+async fn v1_db_upgrades_to_v2_preserving_messages_and_outbox() {
+    let dir = tempfile::tempdir().unwrap();
+    let p: Arc<dyn KeyProtector> = protector();
+    v1_database(dir.path(), p.clone()).await;
+    let before = Fixture::probe_database(dir.path(), p.clone()).unwrap();
+    assert_eq!((before.user_version, before.schema_version), (1, 1));
+    assert!(!before.tables.iter().any(|t| t.starts_with("mls_")));
+    assert_eq!(before.message_count, 3);
+    assert_eq!(before.outbox.len(), 2);
+    assert!(
+        before
+            .outbox
+            .iter()
+            .all(|o| o.codec == 1 && !o.wire.is_empty() && o.reencrypts.is_none())
+    );
+
+    let f = Fixture::open(dir.path(), p.clone()).await.unwrap();
+    let r = f.messages().await.unwrap();
+    assert_eq!(r.list_conversations(None, 50).await.unwrap().items.len(), 1);
+    f.close().await;
+    let after = Fixture::probe_database(dir.path(), p.clone()).unwrap();
+    assert_eq!((after.user_version, after.schema_version), (2, 2));
+    for table in [
+        "mls_kv",
+        "mls_conversation",
+        "mls_delivery",
+        "mls_hold",
+        "mls_peer",
+        "mls_receipt",
+    ] {
+        assert!(after.tables.iter().any(|t| t == table), "{table}");
+    }
+    // `message` rows (cancelled one included) are byte-for-byte unchanged.
+    assert_eq!(after.message_rows, before.message_rows);
+    assert_eq!(after.outbox.len(), 2);
+    for (old, new) in before.outbox.iter().zip(&after.outbox) {
+        assert_eq!(new.msg_id, old.msg_id);
+        assert_eq!(new.codec, 3);
+        assert!(new.wire.is_empty());
+        assert_eq!(
+            (new.attempts, new.retry_delay_ms, new.next_retry_at_ms),
+            (old.attempts, old.retry_delay_ms, old.next_retry_at_ms)
+        );
+        assert_eq!(new.dispatch_state, old.dispatch_state);
+        assert_eq!((new.reencrypts, new.waiting_peer_update), (Some(0), Some(0)));
+    }
+    assert_eq!(after.outbox[0].attempts, u32::MAX as i64);
+    assert_eq!(after.outbox[1].next_retry_at_ms, 123_456);
+
+    // A second open is a no-op on a v2 database.
+    Fixture::open(dir.path(), p.clone()).await.unwrap().close().await;
+    assert_eq!(Fixture::probe_database(dir.path(), p).unwrap(), after);
+}
+
+#[tokio::test]
+async fn upgraded_schema_matches_a_fresh_v2_schema() {
+    let upgraded = tempfile::tempdir().unwrap();
+    let fresh = tempfile::tempdir().unwrap();
+    let p: Arc<dyn KeyProtector> = protector();
+    v1_database(upgraded.path(), p.clone()).await;
+    Fixture::open(upgraded.path(), p.clone()).await.unwrap().close().await;
+    Fixture::open(fresh.path(), p.clone()).await.unwrap().close().await;
+    let a = Fixture::probe_database(upgraded.path(), p.clone()).unwrap();
+    let b = Fixture::probe_database(fresh.path(), p).unwrap();
+    assert!(a.schema.len() > 10);
+    assert_eq!(a.schema, b.schema);
+}
+
+#[tokio::test]
+async fn v2_db_rejected_by_v1_reader() {
+    let dir = tempfile::tempdir().unwrap();
+    let p: Arc<dyn KeyProtector> = protector();
+    Fixture::open(dir.path(), p.clone()).await.unwrap().close().await;
+    let error = Fixture::v1_reader_check(dir.path(), p.clone()).unwrap_err();
+    assert_eq!(error.code, ErrorCode::StorageCorrupt);
+    // The replica is a real v1 reader: it accepts a genuine v1 database.
+    let v1 = tempfile::tempdir().unwrap();
+    v1_database(v1.path(), p.clone()).await;
+    Fixture::v1_reader_check(v1.path(), p).unwrap();
+}
+
+#[tokio::test]
+async fn upgrade_interrupted_keeps_v1() {
+    let dir = tempfile::tempdir().unwrap();
+    let p: Arc<dyn KeyProtector> = protector();
+    v1_database(dir.path(), p.clone()).await;
+    let before = Fixture::probe_database(dir.path(), p.clone()).unwrap();
+    Fixture::fail_next_upgrade(dir.path());
+    assert!(Fixture::open(dir.path(), p.clone()).await.is_err());
+    // Everything the failed transaction touched was rolled back.
+    let interrupted = Fixture::probe_database(dir.path(), p.clone()).unwrap();
+    assert_eq!(interrupted, before);
+    assert_eq!(interrupted.user_version, 1);
+    // The next open migrates again and succeeds.
+    Fixture::open(dir.path(), p.clone()).await.unwrap().close().await;
+    let after = Fixture::probe_database(dir.path(), p).unwrap();
+    assert_eq!((after.user_version, after.schema_version), (2, 2));
+    assert_eq!(after.message_rows, before.message_rows);
+    assert!(after.outbox.iter().all(|o| o.codec == 3));
+}

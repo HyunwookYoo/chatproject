@@ -6,10 +6,8 @@ publish = false
 
 [dependencies]
 base64 = "0.22"
+chat_core = { path = "../../core/chat_core", features = ["nse-fixture"] }
 chat_nse = { path = "../../core/chat_nse" }
-openmls = "=0.9.0"
-openmls_basic_credential = "=0.6.0"
-openmls_rust_crypto = "=0.6.0"
 
 [dev-dependencies]
 tempfile = "3"

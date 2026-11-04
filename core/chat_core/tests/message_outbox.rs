@@ -360,6 +360,8 @@ async fn reopen(f: Fixture, backend: Arc<Backend>, now: u64) -> Fixture {
     .unwrap();
     assert_eq!(account.lifecycle_status(), 0);
     account.snapshot().await.unwrap();
+    // The restarted core is the M4-peer fixture again, like every core `pair` makes.
+    account.message_test_m4_peer(true).await.unwrap();
     let f = Fixture {
         _sql: sql_store::Store::from_fixture(account.storage_test_fixture()),
         _dir,

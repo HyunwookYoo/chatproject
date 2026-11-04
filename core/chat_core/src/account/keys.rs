@@ -65,6 +65,12 @@ impl DeviceKeys {
         public_key(&self.transport)
     }
 
+    /// Ed25519 seed of this installation's MLS signature key, derived from `seed` so a
+    /// recovered device yields the same key.
+    pub(crate) fn mls_signature_seed(&self) -> Secret32 {
+        derive(&self.seed, DEVICE_SALT, b"ChatProject/mls-signature/v1")
+    }
+
     // Consumed by the later account signing/storage tasks, never exported to FFI.
     #[allow(dead_code)]
     pub(crate) fn seed(&self) -> &Secret32 {
