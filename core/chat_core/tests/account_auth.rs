@@ -519,6 +519,14 @@ async fn real_revoke_closes_target_then_confirms_remaining_peer_before_public_mu
     let target = c.view().await.installation.unwrap();
     *backend.capture.lock().unwrap() =
         Some((vec![a.account.storage_test_fixture().handle, b.account.storage_test_fixture().handle], target));
+    // The capacity check below must see B persisting the revoke, not B's own upkeep reading
+    // its store: hold B's message scheduler and Commit/Welcome deliveries, then let B run the
+    // upkeep tick its new sessions call for (a changed session set reads the group list) and
+    // wait for it to end (the wake runs before the next command). B is then idle.
+    b.account.message_test_hold_scheduler(true).await.unwrap();
+    b.account.mls_test_hold_delivery(true).await.unwrap();
+    b.clock.advance_monotonic_ms(0);
+    b.account.mls_test_sent_frames().await.unwrap();
     let sql = b.account.storage_test_fixture();
     let pause = sql.pause().await;
     pause.wait_entered().await;

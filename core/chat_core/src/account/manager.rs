@@ -2890,14 +2890,19 @@ impl Manager {
             .map(|d| d.installation_id)
             .filter(|installation| self.dial_target(peer, &record, *installation).is_some())
             .collect();
-        let (mut connected, mut last) = (false, unavailable(ErrorCode::AccountRestricted));
-        for installation in installations {
-            match self.connect_installation(peer, installation).await {
-                Ok(()) => connected = true,
-                Err(error) => last = error,
+        let mut last = unavailable(ErrorCode::AccountRestricted);
+        for installation in &installations {
+            if let Err(error) = self.connect_installation(peer, *installation).await {
+                last = error;
             }
         }
-        if connected { Ok(()) } else { Err(last) }
+        // Decided afterwards: a record one device presented may have taken every session with
+        // the account out of use, including ones that were ready before.
+        if installations.iter().any(|i| self.ready_session(peer, *i)) {
+            Ok(())
+        } else {
+            Err(last)
+        }
     }
     /// Connects to one device of `peer` (this account's or a contact's) under a freshly looked
     /// up record, unless a ready session with it exists already. Runs in the actor turn.

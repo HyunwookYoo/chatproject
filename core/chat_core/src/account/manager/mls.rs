@@ -51,6 +51,8 @@ const SYNC_RETRY_MS: u64 = 1_000;
 const DIAL_RETRY_MS: u64 = 30_000;
 /// Limit for one such dial and its handshake.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
+/// The queued deliveries are looked through for recipients to dial at most this often.
+const DIAL_CHECK_MS: u64 = 1_000;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often an empty `mls_hold` is looked at again (rows can be written outside this actor).
@@ -133,6 +135,8 @@ pub(crate) struct Runtime {
     /// When each recipient of a queued delivery without a session was last dialed (or found not
     /// to be dialed), within `DIAL_RETRY_MS`.
     dials: BTreeMap<InstallationId, u64>,
+    /// Scheduler time from which `dial_unreachable` may read the queue again.
+    dial_check_at: u64,
     /// `(rejoin_count, rejoin_after_ms)` of a conversation that left its group to rejoin, for
     /// the group it joins or creates next.
     rejoins: BTreeMap<ConversationId, (u32, u64)>,
@@ -1554,11 +1558,16 @@ impl Manager {
 
     /// Dials one recipient of a due delivery that has no session (spec 10.1): a device in this
     /// account's record (not a revoked one), or else in the conversation peer's record; any
-    /// other recipient is not dialed. One dial per tick, and one per installation within
+    /// other recipient is not dialed. The queue is read at most once per `DIAL_CHECK_MS` (not
+    /// every tick), one dial is started per read, and one per installation within
     /// `DIAL_RETRY_MS`. No lookup: the record this device holds is used, and a stale record or
     /// one with a conflict pending is left to the hold and record-review flows (no dial). The
     /// dial and handshake run in a spawned task; `dialed` installs the session.
     async fn dial_unreachable(&mut self, sessions: &[Session], now: u64, request: Request) {
+        if now < self.messages.mls.dial_check_at {
+            return;
+        }
+        self.messages.mls.dial_check_at = now.saturating_add(DIAL_CHECK_MS);
         self.messages
             .mls
             .dials

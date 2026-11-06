@@ -651,3 +651,36 @@ async fn dialing_an_unreachable_member_does_not_block_inbound_requests() {
         "{answers:?}"
     );
 }
+
+/// `connect_account(A)` on B1 with A1 ready and A2 presenting another record of A's than the
+/// one B1 holds: the conflict takes every session with A out of use, so the call fails instead
+/// of reporting A connected.
+#[tokio::test]
+async fn connect_fails_when_another_device_shows_a_conflicting_record() {
+    let (ra, rb) = (record(A, &[A1, A2], 0), record(B, &[B1], 0));
+    let net = backend(&[(A, ra.clone()), (B, rb.clone())]);
+    let a1 = device(A, A1, &ra, &net).await;
+    let b1 = device(B, B1, &rb, &net).await;
+    // A2 runs under a newer record of A's that lists only A2; it starts while the records are
+    // unreachable, so it never sees the published one and keeps presenting its own.
+    net.offline.store(true, Ordering::SeqCst);
+    let a2 = device(A, A2, &record(A, &[A2], 1), &net).await;
+    net.offline.store(false, Ordering::SeqCst);
+    link(&a1, &b1).await;
+    link(&a2, &b1).await;
+    befriend(&a1, &b1).await;
+    befriend(&b1, &a1).await;
+    a1.account.connect_account(b1.peer).await.unwrap();
+    let result = b1.account.connect_account(a1.peer).await;
+    let conflict = b1
+        .view()
+        .await
+        .remote_records
+        .iter()
+        .any(|r| r.peer == a1.peer && r.conflict_hash.is_some());
+    assert!(conflict, "A2 did not show its record");
+    assert!(
+        result.is_err(),
+        "connected although A's record is in conflict"
+    );
+}
