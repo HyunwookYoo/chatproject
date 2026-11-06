@@ -22,23 +22,13 @@ async fn open(root: &std::path::Path) -> (Arc<CoreSlot>, AccountHandle) {
     )
     .unwrap();
     slot.network().unwrap().configure_local(None).await.unwrap();
-    // A dropped prior runtime releases its Store actor asynchronously.
-    let account = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            let owned = slot.clone();
-            match tokio::task::spawn_blocking(move || {
-                owned.open_account_with_services(support::protector(), services::offline())
-            })
-            .await
-            .unwrap()
-            {
-                Ok(account) => break account,
-                Err(e) if e.code == ErrorCode::WriterBusy => tokio::task::yield_now().await,
-                Err(e) => panic!("{e}"),
-            }
-        }
+    // Dropping a prior core releases its writer before the drop returns.
+    let owned = slot.clone();
+    let account = tokio::task::spawn_blocking(move || {
+        owned.open_account_with_services(support::protector(), services::offline())
     })
     .await
+    .unwrap()
     .unwrap();
     settled(&account).await;
     (slot, account)

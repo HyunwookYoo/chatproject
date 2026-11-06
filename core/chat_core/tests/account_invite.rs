@@ -268,20 +268,12 @@ mod actor {
         .unwrap();
         slot.network().unwrap().configure_local(None).await.unwrap();
         let backend = Arc::new(Backend(AtomicUsize::new(0)));
-        let account = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            loop {
-                match slot.open_account_with_services(
-                    support::protector(),
-                    AccountServices::new(backend.clone(), Arc::new(FakeClock::new(NOW, 0))),
-                ) {
-                    Ok(a) => break a,
-                    Err(e) if e.code == ErrorCode::WriterBusy => tokio::task::yield_now().await,
-                    Err(e) => panic!("{e}"),
-                }
-            }
-        })
-        .await
-        .unwrap();
+        let account = slot
+            .open_account_with_services(
+                support::protector(),
+                AccountServices::new(backend.clone(), Arc::new(FakeClock::new(NOW, 0))),
+            )
+            .unwrap();
         settled(&account).await;
         (slot, account, backend)
     }
@@ -382,17 +374,7 @@ mod actor {
             .unwrap();
         drop(a);
         drop(slot);
-        let mut store = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            loop {
-                match Store::open(dir.path(), support::protector()) {
-                    Ok(s) => break s,
-                    Err(e) if e.code == ErrorCode::WriterBusy => tokio::task::yield_now().await,
-                    Err(e) => panic!("{e}"),
-                }
-            }
-        })
-        .await
-        .unwrap();
+        let mut store = Store::open(dir.path(), support::protector()).unwrap();
         let mut state = store.load().unwrap().unwrap();
         let mut d = minicbor::Decoder::new(&state.payload);
         assert_eq!(d.array().unwrap(), Some(11));

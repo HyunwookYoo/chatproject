@@ -1,4 +1,7 @@
 #![cfg(all(feature = "test-hooks", debug_assertions))]
+//! The competing-writer test that spawns a child process lives in
+//! account_endpoint_process.rs: a spawn here would let the child's copy of a
+//! store's lock descriptor outlive that store's close (see there).
 use chat_core::account::{
     Secret32, StoreId,
     storage::{KeyProtector, Store, StoredPlaintext},
@@ -77,21 +80,13 @@ async fn active_and_candidate_restart_keep_endpoint_new_instance() {
     drop(account);
     drop(net);
     drop(first);
-    // Runtime shutdown drops the Store actor asynchronously; ownership must really end.
+    // Dropping the core ends its writer ownership before the drop returns.
     let second = core(dir.path());
     let net = second.network().unwrap();
     net.configure_local(None).await.unwrap();
-    let account = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            match second.open_account_with_services(support::protector(), services::offline()) {
-                Ok(a) => break a,
-                Err(e) if e.code == ErrorCode::WriterBusy => tokio::task::yield_now().await,
-                Err(e) => panic!("{e}"),
-            }
-        }
-    })
-    .await
-    .unwrap();
+    let account = second
+        .open_account_with_services(support::protector(), services::offline())
+        .unwrap();
     settled(&account).await;
     assert_eq!(info(&net).await.state, NetworkState::Stopped);
     assert_eq!(online(&net).await.endpoint_id, Some(candidate.endpoint_id));
@@ -151,59 +146,6 @@ async fn transition_busy_and_bind_failure_keeps_saved_key() {
     assert_eq!(saved_id, Some(candidate.endpoint_id));
     assert!(account.storage_test_fixture().handle.load_account().await.unwrap().unwrap().payload == bytes);
     net.execute(NetworkOp::Stop).await.unwrap();
-}
-
-#[tokio::test]
-async fn suspend_blocks_immediately_and_failed_resume_keeps_ownership() {
-    let dir = tempfile::tempdir().unwrap();
-    let slot = core(dir.path());
-    let net = slot.network().unwrap();
-    net.configure_local(None).await.unwrap();
-    let account = slot.open_account_with_services(support::protector(), services::offline()).unwrap();
-    account.prepare_candidate().await.unwrap();
-    competing_writer(dir.path());
-    assert_eq!(account.request_suspend(), 1);
-    assert_eq!(
-        net.execute(NetworkOp::Start).await.unwrap_err().code,
-        ErrorCode::Busy
-    );
-    assert_eq!(
-        account.prepare_candidate().await.unwrap_err().code,
-        ErrorCode::StorageLocked
-    );
-    settled(&account).await;
-    competing_writer(dir.path());
-    #[cfg(not(target_os = "ios"))]
-    assert_eq!(
-        Store::open(dir.path(), support::protector())
-            .err()
-            .unwrap()
-            .code,
-        ErrorCode::WriterBusy
-    );
-    std::fs::write(dir.path().join("storage.mode"), b"corrupt").unwrap();
-    assert_eq!(account.request_resume(), 1);
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while account.lifecycle_status() == 1 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-    assert_eq!(account.lifecycle_status(), 2);
-    competing_writer(dir.path());
-    assert_eq!(
-        net.execute(NetworkOp::Start).await.unwrap_err().code,
-        ErrorCode::Busy
-    );
-    #[cfg(not(target_os = "ios"))]
-    assert_eq!(
-        Store::open(dir.path(), support::protector())
-            .err()
-            .unwrap()
-            .code,
-        ErrorCode::WriterBusy
-    );
 }
 
 #[tokio::test]
@@ -347,36 +289,6 @@ async fn lifecycle_without_account_does_not_strand_diagnostic_start() {
     assert_eq!(slot.account_resume(), 0);
     online(&net).await;
     net.execute(NetworkOp::Stop).await.unwrap();
-}
-
-#[test]
-fn account_writer_child() {
-    let Some(path) = std::env::var_os("CP_A4_WRITER_PATH") else {
-        return;
-    };
-    assert_eq!(
-        Store::open(std::path::Path::new(&path), support::protector())
-            .err()
-            .unwrap()
-            .code,
-        ErrorCode::WriterBusy
-    );
-}
-fn competing_writer(path: &std::path::Path) {
-    #[cfg(not(target_os = "ios"))]
-    {
-        let result = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "account_writer_child", "--nocapture"])
-            .env("CP_A4_WRITER_PATH", path)
-            .output()
-            .unwrap();
-        assert!(
-            result.status.success(),
-            "{}",
-            String::from_utf8_lossy(&result.stderr)
-        );
-    }
-    let _ = path;
 }
 
 #[test]
