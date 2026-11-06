@@ -1268,10 +1268,8 @@ impl Manager {
         if self.current(request) {
             self.lock_error = result.as_ref().err().map(|error| error.code);
         }
-        let status = if result.is_ok() { 1 } else { 2 };
-        self.shared
-            .status
-            .fetch_max((request.ticket << 2) | status, Ordering::AcqRel);
+        // Reopen the network gate before the status reads completed: a native caller may start
+        // the network as soon as it reads 0.
         if result.is_ok()
             && !request.suspend
             && !self.shared.network.desired_suspend()
@@ -1279,6 +1277,10 @@ impl Manager {
         {
             self.shared.network.release(request.ticket);
         }
+        let status = if result.is_ok() { 1 } else { 2 };
+        self.shared
+            .status
+            .fetch_max((request.ticket << 2) | status, Ordering::AcqRel);
     }
     async fn restore(&mut self, request: Request) -> Result<(), CoreError> {
         if let Some(state) = &self.state {
