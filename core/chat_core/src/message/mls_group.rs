@@ -122,6 +122,9 @@ pub(crate) enum GroupOp {
         now: u64,
         recipients: Vec<InstallationId>,
     },
+    /// The conversation and recipient of every due Commit/Welcome delivery, whatever session
+    /// this device has: the ones without a session are the recipients to dial.
+    UnreachableDue { now: u64 },
     /// Every queued delivery of the conversation to `recipient`, in the order it must get them
     /// (whatever their retry time): sent ahead of an application message to that recipient so
     /// it holds the group state the message needs.
@@ -171,6 +174,7 @@ impl GroupOp {
                 | Self::OwnWelcome { .. }
                 | Self::Plan { .. }
                 | Self::DueDeliveries { .. }
+                | Self::UnreachableDue { .. }
                 | Self::Pending { .. }
                 | Self::HoldPeers
                 | Self::Groups
@@ -269,6 +273,7 @@ pub(crate) enum GroupReply {
     /// The stored `(rejoin_count, rejoin_after_ms)` after the rejoin, or `None` when refused.
     Rejoin(Option<(u32, u64)>),
     Due(Vec<DueDelivery>),
+    Unreachable(Vec<(ConversationId, InstallationId)>),
     Peers(Vec<PeerId>),
     /// Holds that were settled: conversation, its peer, and what became of the item.
     Reprocessed(Vec<(ConversationId, PeerId, Outcome)>),
@@ -762,6 +767,7 @@ pub(super) fn group_op(
         GroupOp::DueDeliveries { now, recipients } => {
             GroupReply::Due(due_deliveries(c, now, &recipients)?)
         }
+        GroupOp::UnreachableDue { now } => GroupReply::Unreachable(due_recipients(c, now)?),
         GroupOp::Pending { recipient } => {
             GroupReply::Due(pending_deliveries(c, conversation, recipient)?)
         }
@@ -1612,6 +1618,19 @@ fn due_deliveries(c: &Connection, now: u64, recipients: &[InstallationId]) -> R<
             epoch: uint(r, 3)?,
             body: r.get(4)?,
         })
+    })
+    .map_err(sql)?
+    .collect::<Result<_, _>>()
+    .map_err(sql)
+}
+
+/// Every `(conversation, recipient)` with a delivery due at `now`.
+fn due_recipients(c: &Connection, now: u64) -> R<Vec<(ConversationId, InstallationId)>> {
+    let mut q = c
+        .prepare("SELECT DISTINCT conversation,recipient_install FROM mls_delivery WHERE next_retry_at_ms<=?1 ORDER BY recipient_install,conversation")
+        .map_err(sql)?;
+    q.query_map(params![integer(now)?], |r| {
+        Ok((ConversationId(bytes(r, 0)?), InstallationId(bytes(r, 1)?)))
     })
     .map_err(sql)?
     .collect::<Result<_, _>>()

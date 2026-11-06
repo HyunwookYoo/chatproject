@@ -8,7 +8,16 @@ include!("support/mls_messaging.rs");
 /// A = [A1, A2], B = [B1]. A1 and A2 each have B as a contact and dial B1 (B1 dials nobody, so
 /// no `connect_account` of B's takes A's sessions away). B1 makes the group with both.
 async fn three() -> (Fixture, Fixture, Fixture, Arc<Backend>, ConversationId) {
-    let (ra, rb) = (record(A, &[A1, A2], 0), record(B, &[B1], 0));
+    three_with(&[B1], true).await
+}
+
+/// `three` with B's record listing `b_devices` (only B1 ever runs). Without `a2_member` A2 does
+/// not dial B1, so B1 makes the group with A1 alone and has no session with A2.
+async fn three_with(
+    b_devices: &[u8],
+    a2_member: bool,
+) -> (Fixture, Fixture, Fixture, Arc<Backend>, ConversationId) {
+    let (ra, rb) = (record(A, &[A1, A2], 0), record(B, b_devices, 0));
     let net = backend(&[(A, ra.clone()), (B, rb.clone())]);
     let a1 = device(A, A1, &ra, &net).await;
     let a2 = device(A, A2, &ra, &net).await;
@@ -19,7 +28,9 @@ async fn three() -> (Fixture, Fixture, Fixture, Arc<Backend>, ConversationId) {
     befriend(&a2, &b1).await;
     befriend(&b1, &a1).await;
     a1.account.connect_account(b1.peer).await.unwrap();
-    a2.account.connect_account(b1.peer).await.unwrap();
+    if a2_member {
+        a2.account.connect_account(b1.peer).await.unwrap();
+    }
     let conv = conversation(&b1, &a1).await;
     conversation(&a1, &b1).await;
     conversation(&a2, &b1).await;
@@ -27,7 +38,7 @@ async fn three() -> (Fixture, Fixture, Fixture, Arc<Backend>, ConversationId) {
     settle!(
         [&a1, &a2, &b1],
         agreed(&a1, &b1, conv).await
-            && agreed(&a2, &b1, conv).await
+            && (!a2_member || agreed(&a2, &b1, conv).await)
             && state(&b1, conv).await.deliveries.is_empty()
     );
     (a1, a2, b1, net, conv)
@@ -426,4 +437,217 @@ async fn commits_held(a: &Fixture, b: &Fixture, conv: ConversationId) {
         .unwrap()
         .expect("an own Commit");
     assert_eq!(state(a, conv).await.own_commit_unacked, Some(true));
+}
+
+/// The transport key (endpoint id) of the installation derived from `seed`.
+fn transport(seed: u8) -> [u8; 32] {
+    derive_device(Secret32::from([seed; 32]))
+        .unwrap()
+        .transport_public_key()
+}
+
+/// How many account dials `from` asked for to the installation derived from `seed`.
+fn dials(from: &Fixture, seed: u8) -> usize {
+    from.slot
+        .network()
+        .unwrap()
+        .account_dials_for_test(transport(seed))
+}
+
+/// How many frames of `kind` ("commit", "welcome", ...) `from` sent to `to`.
+async fn sent_to(from: &Fixture, to: chat_core::account::InstallationId, kind: &str) -> usize {
+    from.account
+        .mls_test_sent_frames_to(to)
+        .await
+        .unwrap()
+        .iter()
+        .filter(|label| label.split(':').next() == Some(kind))
+        .count()
+}
+
+/// Spec 10.2: B1 calling `connect_account(A)` while A1 and A2 both have a ready session with it
+/// takes neither session away, and B1's next message reaches both of A's devices.
+#[tokio::test]
+async fn connect_account_keeps_other_device_sessions_ready() {
+    let (a1, a2, b1, _net, _conv) = three().await;
+    let events = Arc::new(Events::default());
+    b1.bus.subscribe(events.clone());
+    let not_ready = |events: &Events| {
+        events
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e, CoreEvent::AccountAuthChanged { ready: false, .. }))
+            .count()
+    };
+    b1.account.connect_account(a1.peer).await.unwrap();
+    assert_eq!(not_ready(&events), 0, "a session with A went not ready");
+    let sent = send(&b1, &a1, 1, "to both of A's devices").await;
+    settle!(
+        [&a1, &a2, &b1],
+        message(&a1, sent.key).await.is_some() && message(&a2, sent.key).await.is_some()
+    );
+    assert_eq!(not_ready(&events), 0, "a session with A went not ready");
+}
+
+/// Spec 10.1: B1 has no session with A2 when it adds a device of B's; it dials A2 for the
+/// Commit, and A2 reaches the new epoch with exactly one Commit sent to it.
+#[tokio::test]
+async fn commit_to_member_without_session_dials_it() {
+    let (a1, a2, b1, _net, conv) = three_with(&[B1, B2], true).await;
+    let ia2 = installation(&a2).await;
+    b1.account.mls_test_close_session(ia2).await.unwrap();
+    let before = sent_to(&b1, ia2, "commit").await;
+    let epoch = b1
+        .account
+        .storage_test_fixture()
+        .messages()
+        .await
+        .unwrap()
+        .mls_commit(
+            conv,
+            a1.peer,
+            vec![mls_detached_key_package(b1.peer, [B2; 32])],
+            vec![],
+            NOW * 1000,
+        )
+        .await
+        .unwrap()
+        .expect("an own Commit");
+    settle!(
+        [&a1, &a2, &b1],
+        state(&a2, conv).await.group_epoch == Some(epoch)
+    );
+    assert!(dials(&b1, A2) >= 1, "B1 dialed A2");
+    assert_eq!(sent_to(&b1, ia2, "commit").await - before, 1);
+}
+
+/// Spec 10.1: B1 made the group with A1 alone and has no session with A2; it adds A2 (with a
+/// KeyPackage A2 made) and dials A2 for the Welcome, which A2 joins.
+#[tokio::test]
+async fn welcome_to_member_without_session_dials_it() {
+    let (a1, a2, b1, _net, conv) = three_with(&[B1], false).await;
+    let ia2 = installation(&a2).await;
+    assert_eq!(state(&a2, conv).await.group_epoch, None);
+    let key_package = a2
+        .account
+        .storage_test_fixture()
+        .messages()
+        .await
+        .unwrap()
+        .mls_key_package()
+        .await
+        .unwrap();
+    let epoch = b1
+        .account
+        .storage_test_fixture()
+        .messages()
+        .await
+        .unwrap()
+        .mls_commit(conv, a1.peer, vec![key_package], vec![], NOW * 1000)
+        .await
+        .unwrap()
+        .expect("an own Commit");
+    settle!(
+        [&a1, &a2, &b1],
+        agreed(&a2, &b1, conv).await && state(&a2, conv).await.group_epoch == Some(epoch)
+    );
+    assert!(dials(&b1, A2) >= 1, "B1 dialed A2");
+    assert!(sent_to(&b1, ia2, "welcome").await >= 1);
+}
+
+/// A1 revoked A2 and still has a delivery queued for it: A2 is never dialed. A delivery queued
+/// for B's device B2 (in B's record, never online) is, so the dialing itself runs.
+#[tokio::test]
+async fn revoked_member_is_not_dialed() {
+    let (a1, a2, b1, _net, conv) = three_with(&[B1, B2], true).await;
+    let (ia2, ib1) = (installation(&a2).await, installation(&b1).await);
+    a1.account.revoke_device(ia2).await.unwrap();
+    // A1 removes A2 from the group and B1 takes the Commit.
+    settle!(
+        [&a1, &b1],
+        !state(&a1, conv).await.members.contains(&ia2)
+            && state(&a1, conv)
+                .await
+                .deliveries
+                .iter()
+                .all(|(to, _, _)| *to != ib1)
+    );
+    let epoch = state(&a1, conv).await.group_epoch.unwrap();
+    let ib2 = derive_device(Secret32::from([B2; 32]))
+        .unwrap()
+        .installation_id();
+    let fixture = a1.account.storage_test_fixture();
+    for to in [ia2, ib2] {
+        fixture
+            .mls_set_delivery(conv, to, 1, epoch + 1, Some((vec![0], 0)))
+            .await
+            .unwrap();
+    }
+    // `connect_account` in the setup may have dialed B2 already.
+    let before = (dials(&a1, A2), dials(&a1, B2));
+    idle(&[&a1, &b1], 35).await;
+    assert!(dials(&a1, B2) > before.1, "B2 was not dialed");
+    assert_eq!(dials(&a1, A2), before.0, "the revoked A2 was dialed");
+}
+
+/// A2 is off and B1 has a Commit queued for it: over 61 s B1 dials A2 at most every 30 s.
+#[tokio::test]
+async fn unreachable_member_is_dialed_at_most_every_30s() {
+    let (a1, a2, b1, _net, conv) = three().await;
+    let ia2 = installation(&a2).await;
+    drop(a2);
+    b1.account.mls_test_close_session(ia2).await.unwrap();
+    b1.account
+        .storage_test_fixture()
+        .messages()
+        .await
+        .unwrap()
+        .mls_update(conv, a1.peer, NOW * 1000)
+        .await
+        .unwrap()
+        .expect("an own Commit");
+    for _ in 0..61 {
+        for d in [&a1, &b1] {
+            d.clock.advance_monotonic_ms(1_000);
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        // Lets B1's actor finish its turn.
+        b1.account.mls_test_sent_frames().await.unwrap();
+    }
+    let n = dials(&b1, A2);
+    assert!((2..=3).contains(&n), "{n} dials to A2 in 61 s");
+}
+
+/// The dial of an unreachable member runs outside B1's actor: while it is in flight (a dial to
+/// A2's dead address takes seconds), B1 answers A1's kind 17 request right away.
+#[tokio::test]
+async fn dialing_an_unreachable_member_does_not_block_inbound_requests() {
+    let (a1, a2, b1, _net, conv) = three().await;
+    let ia2 = installation(&a2).await;
+    drop(a2);
+    b1.account.mls_test_close_session(ia2).await.unwrap();
+    let before = dials(&b1, A2);
+    b1.account
+        .storage_test_fixture()
+        .messages()
+        .await
+        .unwrap()
+        .mls_update(conv, a1.peer, NOW * 1000)
+        .await
+        .unwrap()
+        .expect("an own Commit");
+    settle!([&a1, &b1], dials(&b1, A2) > before);
+    let started = tokio::time::Instant::now();
+    let answers = a1.account.mls_test_query(b1.peer).await.unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(
+        answers.contains(&(installation(&b1).await, true)),
+        "{answers:?}"
+    );
 }

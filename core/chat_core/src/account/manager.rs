@@ -2782,12 +2782,13 @@ impl Manager {
         super::parse_record(&signed.packet, peer, self.services.clock.unix_seconds())?;
         entry.accepted = signed;
         entry.conflict = None;
-        self.restrict_peer_grants(peer, true);
+        self.restrict_peer_grants(peer);
         self.commit_remote(remote, request).await
     }
-    fn restrict_peer_grants(&self, peer: PeerId, close: bool) {
-        if close {self.cancel_message_proofs(peer);}
-        for grant in self.auth.registry.apply(|grant| (grant.peer != peer, close && grant.peer == peer)) {
+    /// Closes every session with `peer`'s devices.
+    fn restrict_peer_grants(&self, peer: PeerId) {
+        self.cancel_message_proofs(peer);
+        for grant in self.auth.registry.apply(|grant| (grant.peer != peer, grant.peer == peer)) {
             self.bus.publish(crate::CoreEvent::AccountAuthChanged {
                 peer_id: grant.peer.to_string(), installation_id: grant.installation.to_string(), ready: false,
             });
@@ -2873,82 +2874,121 @@ impl Manager {
         }
         Ok(record)
     }
+    /// Connects to every device in `peer`'s record that has no ready session yet; the sessions
+    /// already ready (with this or other devices of the account) stay as they are. `Ok` when at
+    /// least one device of the account is connected afterwards.
     async fn connect(&mut self, peer: PeerId) -> Result<(), CoreError> {
-        self.restrict_peer_grants(peer, false);
         self.restrict_grants();
+        if !self.local_authorized() {
+            return Err(unavailable(ErrorCode::AccountRestricted));
+        }
+        let record = self.remote_record(peer).await?;
+        let installations: Vec<_> = record
+            .record
+            .devices
+            .iter()
+            .map(|d| d.installation_id)
+            .filter(|installation| self.dial_target(peer, &record, *installation).is_some())
+            .collect();
+        let (mut connected, mut last) = (false, unavailable(ErrorCode::AccountRestricted));
+        for installation in installations {
+            match self.connect_installation(peer, installation).await {
+                Ok(()) => connected = true,
+                Err(error) => last = error,
+            }
+        }
+        if connected { Ok(()) } else { Err(last) }
+    }
+    /// Connects to one device of `peer` (this account's or a contact's) under a freshly looked
+    /// up record, unless a ready session with it exists already. Runs in the actor turn.
+    async fn connect_installation(
+        &mut self,
+        peer: PeerId,
+        installation: InstallationId,
+    ) -> Result<(), CoreError> {
+        if self.ready_session(peer, installation) {
+            return Ok(());
+        }
         if !self.local_authorized() {
             return Err(unavailable(ErrorCode::AccountRestricted));
         }
         let request = self.ready()?;
         let record = self.remote_record(peer).await?;
-        let local_id = self.local()?.device.transport_public_key();
-        let targets: Vec<_> = record
+        let Some(key) = self.dial_target(peer, &record, installation) else {
+            return Err(unavailable(ErrorCode::AccountRestricted));
+        };
+        let id = iroh::EndpointId::from_bytes(&key)
+            .map_err(|_| unavailable(ErrorCode::AuthFailed))?;
+        let conn = self
+            .service(
+                request,
+                Box::pin(
+                    self.shared
+                        .network
+                        .dial_account(iroh::EndpointAddr::from(id)),
+                ),
+            )
+            .await?;
+        let mut evidence = None;
+        let result = self
+            .service(
+                request,
+                Box::pin(super::auth::authenticate(
+                    conn.clone(),
+                    peer,
+                    self.local()?,
+                    &record,
+                    &*self.services.clock,
+                    &mut evidence,
+                    None,
+                )),
+            )
+            .await;
+        if let Some(signed) = evidence
+            && let Err(error) = self.observe_auth_record(peer, signed, request).await {
+            conn.close(0u32.into(), b"account record changed");
+            return Err(error);
+        }
+        match result {
+            Ok(grant) => self.install_grant(conn, grant, None).await,
+            Err(error) => {
+                conn.close(0u32.into(), b"account authentication failed");
+                Err(error)
+            }
+        }
+    }
+    /// Whether a ready, currently authorized session with that device exists.
+    fn ready_session(&self, peer: PeerId, installation: InstallationId) -> bool {
+        self.auth.registry.0.lock().unwrap().iter().any(|s| {
+            s.grant.peer == peer
+                && s.grant.installation == installation
+                && s.ready
+                && s.conn.close_reason().is_none()
+                && self.grant_authorized(&s.grant)
+        })
+    }
+    /// The transport key of the device `installation` in `record` (`peer`'s), unless it is this
+    /// device or a device this account revoked.
+    fn dial_target(
+        &self,
+        peer: PeerId,
+        record: &super::publication::SignedRecord,
+        installation: InstallationId,
+    ) -> Option<[u8; 32]> {
+        let local = self.local().ok()?;
+        let revoked = peer == local.keys.peer_id()
+            && local
+                .records
+                .tombstones
+                .iter()
+                .any(|t| t.target_installation == installation);
+        record
             .record
             .devices
             .iter()
-            .filter(|d| d.transport_public_key != local_id)
-            .cloned()
-            .collect();
-        let mut last = unavailable(ErrorCode::AccountRestricted);
-        for device in targets {
-            if peer == self.local()?.keys.peer_id()
-                && self
-                    .local()?
-                    .records
-                    .tombstones
-                    .iter()
-                    .any(|t| t.target_installation == device.installation_id)
-            {
-                continue;
-            }
-            let id = iroh::EndpointId::from_bytes(&device.transport_public_key)
-                .map_err(|_| unavailable(ErrorCode::AuthFailed))?;
-            let conn = match self
-                .service(
-                    request,
-                    Box::pin(
-                        self.shared
-                            .network
-                            .dial_account(iroh::EndpointAddr::from(id)),
-                    ),
-                )
-                .await
-            {
-                Ok(conn) => conn,
-                Err(error) => {
-                    last = error;
-                    continue;
-                }
-            };
-            let mut evidence = None;
-            let result = self
-                .service(
-                    request,
-                    Box::pin(super::auth::authenticate(
-                        conn.clone(),
-                        peer,
-                        self.local()?,
-                        &record,
-                        &*self.services.clock,
-                        &mut evidence,
-                        None,
-                    )),
-                )
-                .await;
-            if let Some(signed) = evidence
-                && let Err(error) = self.observe_auth_record(peer, signed, request).await {
-                conn.close(0u32.into(), b"account record changed");
-                return Err(error);
-            }
-            match result {
-                Ok(grant) => return self.install_grant(conn, grant, None).await,
-                Err(error) => {
-                    conn.close(0u32.into(), b"account authentication failed");
-                    last = error;
-                }
-            }
-        }
-        Err(last)
+            .find(|d| d.installation_id == installation)
+            .map(|d| d.transport_public_key)
+            .filter(|key| *key != local.device.transport_public_key() && !revoked)
     }
     async fn install_grant(
         &mut self,

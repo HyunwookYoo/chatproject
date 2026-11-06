@@ -72,6 +72,9 @@ pub(crate) struct Gate {
     token_window: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     key_transition: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
+    /// The endpoint id of every account dial asked for (`dial_account`), in order.
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    account_dials: Mutex<Vec<[u8; 32]>>,
 }
 impl Gate {
     pub(crate) fn desired_suspend(&self) -> bool { self.desired_suspend.load(Ordering::Acquire) }
@@ -142,6 +145,8 @@ impl NetworkHandle {
         self.controls.try_send(Control::AccountRegister(input)).map_err(|_|err(ErrorCode::Busy))
     }
     pub(crate) async fn dial_account(&self, target: EndpointAddr)->Result<iroh::endpoint::Connection,CoreError> {
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        self.gate.account_dials.lock().unwrap().push(*target.id.as_bytes());
         if self.gate.blocked(){return Err(err(ErrorCode::Busy));}
         let (reply,result)=oneshot::channel(); self.controls.try_send(Control::AccountDial{target,alpn:crate::account::auth::ALPN,reply}).map_err(|_|err(ErrorCode::Busy))?;
         result.await.map_err(|_|err(ErrorCode::TransportFailed))?
@@ -150,6 +155,11 @@ impl NetworkHandle {
     pub(crate) async fn dial_pair(&self,target:EndpointAddr)->Result<iroh::endpoint::Connection,CoreError>{
         if self.gate.blocked(){return Err(err(ErrorCode::Busy));}
         let(reply,result)=oneshot::channel();self.controls.try_send(Control::AccountDial{target,alpn:crate::account::pair::ALPN,reply}).map_err(|_|err(ErrorCode::Busy))?;result.await.map_err(|_|err(ErrorCode::TransportFailed))?
+    }
+    /// How many account dials to the endpoint `transport` were asked for so far.
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    pub fn account_dials_for_test(&self, transport: [u8; 32]) -> usize {
+        self.gate.account_dials.lock().unwrap().iter().filter(|id| **id == transport).count()
     }
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     pub async fn account_target_for_test(&self, ticket:String)->Result<(),CoreError> {

@@ -47,6 +47,10 @@ const RETRY_MS: u64 = 2_000;
 const LOOKUP_RETRY_MS: u64 = 30_000;
 /// Pause before planning again while the own Commit is unacknowledged.
 const SYNC_RETRY_MS: u64 = 1_000;
+/// A recipient of a queued Commit/Welcome without a session is dialed at most this often.
+const DIAL_RETRY_MS: u64 = 30_000;
+/// Limit for one such dial and its handshake.
+const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often an empty `mls_hold` is looked at again (rows can be written outside this actor).
@@ -126,6 +130,9 @@ pub(crate) struct Runtime {
     collecting: BTreeMap<ConversationId, Collect>,
     /// One delivery per recipient of a conversation at a time, in epoch order.
     pub(super) inflight: BTreeSet<(ConversationId, InstallationId)>,
+    /// When each recipient of a queued delivery without a session was last dialed (or found not
+    /// to be dialed), within `DIAL_RETRY_MS`.
+    dials: BTreeMap<InstallationId, u64>,
     /// `(rejoin_count, rejoin_after_ms)` of a conversation that left its group to rejoin, for
     /// the group it joins or creates next.
     rejoins: BTreeMap<ConversationId, (u32, u64)>,
@@ -172,8 +179,9 @@ pub(crate) struct Runtime {
     /// Every kind 16/17 request frame this actor sent (group requests and message attempts).
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     pub(super) frames: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    /// The recipient and label of every kind 17 request frame this actor sent.
     #[cfg(all(feature = "test-hooks", debug_assertions))]
-    sent: Vec<String>,
+    sent: Vec<(InstallationId, String)>,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     held: u64,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
@@ -232,11 +240,15 @@ enum Task {
     Lookup {
         peer: PeerId,
     },
+    /// A dial of a delivery recipient that had no session.
+    Dial,
 }
 
 enum Answer {
     Reply(Result<MlsReply, ErrorCode>),
     Lookup(Result<Lookup, CoreError>),
+    /// A dial run outside the actor (`dial_unreachable`): the connection and its proof.
+    Dial(Result<(iroh::endpoint::Connection, auth::AuthGrant), CoreError>),
 }
 
 /// The answer to one kind 17 request, or one record lookup, this actor started.
@@ -339,6 +351,8 @@ pub(crate) enum MlsTest {
     Rejoin(PeerId),
     HoldDelivery(bool),
     Sent,
+    SentTo(InstallationId),
+    CloseSession(InstallationId),
     Held,
     Rejoined,
     Recovered,
@@ -388,6 +402,25 @@ impl AccountHandle {
             MlsTestReply::Sent(sent) => Ok(sent),
             _ => unreachable!(),
         }
+    }
+    /// Every kind 17 frame this actor sent to `installation`, as `op` or `op:content type`.
+    pub async fn mls_test_sent_frames_to(
+        &self,
+        installation: InstallationId,
+    ) -> Result<Vec<String>, CoreError> {
+        match self.mls_test(MlsTest::SentTo(installation)).await? {
+            MlsTestReply::Sent(sent) => Ok(sent),
+            _ => unreachable!(),
+        }
+    }
+    /// Closes this device's sessions with `installation` (both ends see the connection close).
+    pub async fn mls_test_close_session(
+        &self,
+        installation: InstallationId,
+    ) -> Result<(), CoreError> {
+        self.mls_test(MlsTest::CloseSession(installation))
+            .await
+            .map(|_| ())
     }
     /// How many received Commits/Welcomes were held for a missing device.
     pub async fn mls_test_held_total(&self) -> Result<u64, CoreError> {
@@ -469,7 +502,31 @@ impl Manager {
                 self.messages.mls.hold_delivery = hold;
                 MlsTestReply::Done
             }
-            MlsTest::Sent => MlsTestReply::Sent(self.messages.mls.sent.clone()),
+            MlsTest::Sent => MlsTestReply::Sent(
+                self.messages
+                    .mls
+                    .sent
+                    .iter()
+                    .map(|(_, label)| label.clone())
+                    .collect(),
+            ),
+            MlsTest::SentTo(installation) => MlsTestReply::Sent(
+                self.messages
+                    .mls
+                    .sent
+                    .iter()
+                    .filter(|(to, _)| *to == installation)
+                    .map(|(_, label)| label.clone())
+                    .collect(),
+            ),
+            MlsTest::CloseSession(installation) => {
+                for session in self.auth.registry.0.lock().unwrap().iter() {
+                    if session.grant.installation == installation {
+                        session.conn.close(0u32.into(), b"test close");
+                    }
+                }
+                MlsTestReply::Done
+            }
             MlsTest::M4Peer(m4) => {
                 self.messages.mls.m4_peer = m4;
                 self.messages.mls.m4_close = false;
@@ -564,7 +621,10 @@ impl Manager {
     fn launch(&mut self, session: &Session, body: Vec<u8>, task: Task, request: Request) {
         #[cfg(all(feature = "test-hooks", debug_assertions))]
         {
-            self.messages.mls.sent.push(label(&body));
+            self.messages
+                .mls
+                .sent
+                .push((session.grant.installation, label(&body)));
             self.messages.mls.frames.lock().unwrap().push(body.clone());
         }
         let mailbox = self.auth.send.clone();
@@ -1435,17 +1495,23 @@ impl Manager {
 
     /// Sends due Commits/Welcomes over ready sessions, one per recipient of a conversation at a
     /// time and in epoch order. Only rows of recipients with a ready session are read, so a
-    /// recipient without one simply waits (no attempt counted) and never holds others back.
+    /// recipient without one waits (no attempt counted) and never holds others back; it is
+    /// dialed instead (`dial_unreachable`).
     async fn poll_deliveries(&mut self, request: Request) {
         #[cfg(all(feature = "test-hooks", debug_assertions))]
         if self.messages.mls.hold_delivery {
             return;
         }
         let sessions = self.mls_sessions();
+        let now = self.schedule_now();
+        self.deliver_due(&sessions, now, request).await;
+        self.dial_unreachable(&sessions, now, request).await;
+    }
+
+    async fn deliver_due(&mut self, sessions: &[Session], now: u64, request: Request) {
         if sessions.is_empty() {
             return;
         }
-        let now = self.schedule_now();
         let recipients = sessions.iter().map(|s| s.grant.installation).collect();
         let Ok(GroupReply::Due(rows)) = self
             .group_db(
@@ -1484,6 +1550,188 @@ impl Manager {
             };
             self.launch(session, row.body, task, request);
         }
+    }
+
+    /// Dials one recipient of a due delivery that has no session (spec 10.1): a device in this
+    /// account's record (not a revoked one), or else in the conversation peer's record; any
+    /// other recipient is not dialed. One dial per tick, and one per installation within
+    /// `DIAL_RETRY_MS`. No lookup: the record this device holds is used, and a stale record or
+    /// one with a conflict pending is left to the hold and record-review flows (no dial). The
+    /// dial and handshake run in a spawned task; `dialed` installs the session.
+    async fn dial_unreachable(&mut self, sessions: &[Session], now: u64, request: Request) {
+        self.messages
+            .mls
+            .dials
+            .retain(|_, at| now < at.saturating_add(DIAL_RETRY_MS));
+        let Ok(GroupReply::Unreachable(rows)) = self
+            .group_db(NO_CONVERSATION, GroupOp::UnreachableDue { now }, request)
+            .await
+        else {
+            return;
+        };
+        let rows: Vec<_> = rows
+            .into_iter()
+            .filter(|(_, to)| {
+                !sessions.iter().any(|s| s.grant.installation == *to)
+                    && !self.messages.mls.dials.contains_key(to)
+            })
+            .collect();
+        if rows.is_empty() {
+            return;
+        }
+        let Ok(GroupReply::Groups(groups)) = self
+            .group_db(NO_CONVERSATION, GroupOp::Groups, request)
+            .await
+        else {
+            return;
+        };
+        for (conversation, recipient) in rows {
+            if self.messages.mls.dials.contains_key(&recipient) {
+                continue;
+            }
+            self.messages.mls.dials.insert(recipient, now);
+            let Some(peer) = groups
+                .iter()
+                .find(|(c, _)| *c == conversation)
+                .and_then(|(_, peer)| self.recipient_account(*peer, recipient))
+            else {
+                continue;
+            };
+            if self.start_dial(peer, recipient, request) {
+                return;
+            }
+        }
+    }
+
+    /// Spawns the dial of `peer`'s device `installation` under the record this device holds;
+    /// false when there is no record to dial it under.
+    fn start_dial(&mut self, peer: PeerId, installation: InstallationId, request: Request) -> bool {
+        if !self.local_authorized() {
+            return false;
+        }
+        let Some(record) = self.held_record(peer) else {
+            return false;
+        };
+        let Some(id) = self
+            .dial_target(peer, &record, installation)
+            .and_then(|key| iroh::EndpointId::from_bytes(&key).ok())
+        else {
+            return false;
+        };
+        let Some(AccountState::Active(local)) = self.copy_state() else {
+            return false;
+        };
+        let shared = self.shared.clone();
+        let clock = self.services.clock.clone();
+        let cancel = self.auth.cancel.child_token();
+        let mailbox = self.auth.send.clone();
+        let ticket = request.ticket;
+        tokio::spawn(async move {
+            let mut conn = None;
+            let work = async {
+                if !super::messages::acquisition_current(&shared, ticket) {
+                    return Err(unavailable(ErrorCode::StorageLocked));
+                }
+                let connected = shared
+                    .network
+                    .dial_account(iroh::EndpointAddr::from(id))
+                    .await?;
+                conn = Some(connected.clone());
+                if !super::messages::acquisition_current(&shared, ticket) {
+                    return Err(unavailable(ErrorCode::StorageLocked));
+                }
+                // A device presenting another record than this one fails the handshake. The
+                // record it showed is not observed here: record changes belong to the lookup
+                // and record-review flows (a lagging device must not raise a conflict).
+                let mut evidence = None;
+                let grant = auth::authenticate(
+                    connected.clone(),
+                    peer,
+                    &local,
+                    &record,
+                    &*clock,
+                    &mut evidence,
+                    None,
+                )
+                .await?;
+                Ok((connected, grant))
+            };
+            let result = tokio::select! {biased;
+                _ = cancel.cancelled() => Err(unavailable(ErrorCode::StorageLocked)),
+                result = tokio::time::timeout(DIAL_TIMEOUT, work) =>
+                    result.unwrap_or_else(|_| Err(unavailable(ErrorCode::NetworkTimeout))),
+            };
+            if result.is_err()
+                && let Some(conn) = &conn
+            {
+                conn.close(0u32.into(), b"account authentication failed");
+            }
+            let _ = mailbox
+                .send(Input::Mls(MlsEvent {
+                    ticket,
+                    peer,
+                    installation: None,
+                    task: Task::Dial,
+                    answer: Answer::Dial(result),
+                }))
+                .await;
+        });
+        true
+    }
+
+    /// `peer`'s record as this device holds it, if it is fit to authenticate with: current, not
+    /// expired and (another account's) without a conflict pending.
+    fn held_record(&self, peer: PeerId) -> Option<crate::account::publication::SignedRecord> {
+        let local = self.local().ok()?;
+        let record = if peer == local.keys.peer_id() {
+            local.records.accepted.clone()?
+        } else {
+            let remote = local.remote.iter().find(|r| r.peer == peer)?;
+            if remote.conflict.is_some() || remote.accepted.seq < remote.floor {
+                return None;
+            }
+            remote.accepted.clone()
+        };
+        let now = self.services.clock.unix_seconds();
+        (record.current(now) && !record.record.is_expired(now)).then_some(record)
+    }
+
+    /// A spawned dial came back: the session is installed (checked again here, as for
+    /// `connect_account`).
+    async fn dialed(
+        &mut self,
+        dialed: Result<(iroh::endpoint::Connection, auth::AuthGrant), CoreError>,
+    ) {
+        if let Ok((conn, grant)) = dialed {
+            let _ = self.install_grant(conn, grant, None).await;
+        }
+    }
+
+    /// The account to dial `recipient` under: this one if its record lists the device (none if
+    /// this account revoked it), else the conversation's `peer` if its record lists it.
+    fn recipient_account(&self, peer: PeerId, recipient: InstallationId) -> Option<PeerId> {
+        let local = self.local().ok()?;
+        let lists = |record: &crate::account::publication::SignedRecord| {
+            record
+                .record
+                .devices
+                .iter()
+                .any(|d| d.installation_id == recipient)
+        };
+        if local.records.accepted.as_ref().is_some_and(lists) {
+            let revoked = local
+                .records
+                .tombstones
+                .iter()
+                .any(|t| t.target_installation == recipient);
+            return (!revoked).then(|| local.keys.peer_id());
+        }
+        local
+            .remote
+            .iter()
+            .find(|r| r.peer == peer)
+            .filter(|r| lists(&r.accepted))
+            .map(|_| peer)
     }
 
     fn mls_fingerprint(&self) -> [u8; 32] {
@@ -1629,6 +1877,7 @@ impl Manager {
             (Task::Lookup { peer }, Answer::Lookup(lookup)) => {
                 self.looked_up(peer, lookup, request).await
             }
+            (_, Answer::Dial(dialed)) => self.dialed(dialed).await,
             (task, Answer::Reply(result)) => {
                 let _ = self.mls_answer(task, result, request).await;
             }
@@ -1712,7 +1961,7 @@ impl Manager {
                 };
                 self.group_db(conversation, op, request).await.map(|_| ())
             }
-            Task::Lookup { .. } => Ok(()),
+            Task::Lookup { .. } | Task::Dial => Ok(()),
         }
     }
 

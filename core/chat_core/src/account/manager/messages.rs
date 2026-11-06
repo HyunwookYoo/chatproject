@@ -1598,7 +1598,7 @@ impl Drop for ProofResult {
         }
     }
 }
-fn acquisition_current(shared: &Shared, ticket: u64) -> bool {
+pub(super) fn acquisition_current(shared: &Shared, ticket: u64) -> bool {
     let request = *shared.requests.borrow();
     request.ticket == ticket
         && !request.suspend
@@ -1884,7 +1884,6 @@ impl Manager {
                 return;
             }
         };
-        self.restrict_peer_grants(peer, false);
         let cancel = self.auth.cancel.child_token();
         self.messages.acquiring.insert(
             key,

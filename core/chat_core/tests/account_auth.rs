@@ -385,6 +385,9 @@ async fn cached_unexpired_allows_new_proof_but_not_mutation() {
     let (a, b, backend) = pair().await;
     a.account.connect_account(b.peer).await.unwrap();
     backend.offline.store(true, Ordering::SeqCst);
+    // `connect_account` dials only devices without a ready session: close B's for a new proof.
+    let ib = b.view().await.installation.unwrap();
+    a.account.mls_test_close_session(ib).await.unwrap();
     a.account.connect_account(b.peer).await.unwrap();
     assert!(
         a.events
@@ -746,6 +749,10 @@ async fn replay_other_connection_role_nonce_rejected() {
         });
         if mode == "replay" {
             a.account.connect_account(b_peer).await.unwrap();
+            // `connect_account` dials only devices without a ready session: close B's so the
+            // next one makes a second proof.
+            let ib = derive_device(Secret32::from([12; 32])).unwrap().installation_id();
+            a.account.mls_test_close_session(ib).await.unwrap();
         }
         assert!(
             a.account.connect_account(b_peer).await.is_err(),
