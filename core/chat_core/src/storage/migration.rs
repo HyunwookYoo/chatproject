@@ -19,8 +19,9 @@ use std::{fs, path::Path};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 type R<T> = Result<T, CoreError>;
-/// Current SQL schema. v1 (M4) is upgraded in place by `upgrade_v1_to_v2`; nothing else is accepted.
-const SCHEMA_VERSION: i64 = 2;
+/// Current SQL schema. v1 (M4) and v2 (M5) are upgraded in place by `upgrade_v1_to_v2` and
+/// `upgrade_v2_to_v3`; nothing else is accepted.
+const SCHEMA_VERSION: i64 = 3;
 const DB: &str = "db.sqlite3";
 const PREP: &str = "migration.prep";
 pub(crate) struct OpenedStore {
@@ -434,7 +435,7 @@ fn open_locked(root: &Path, protector: &dyn KeyProtector) -> R<(Connection, DbSe
     if !p.importing {
         return Err(corrupt());
     }
-    upgrade_if_v1(&mut conn)?;
+    upgrade_if_old(&mut conn)?;
     ready(&conn, &secrets.db_id, &p)?;
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     checkpoint(root, MigrationStage::AfterImport);
@@ -506,12 +507,15 @@ fn upgrade_failed(e: rusqlite::Error) -> CoreError {
     }
     CoreError::new(ErrorCode::StorageCorrupt, "schema_upgrade_failed")
 }
-fn upgrade_if_v1(conn: &mut Connection) -> R<()> {
+fn upgrade_if_old(conn: &mut Connection) -> R<()> {
     let version: i64 = conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .map_err(|_| corrupt())?;
     if version == 1 {
         upgrade_v1_to_v2(conn)?;
+    }
+    if version == 1 || version == 2 {
+        upgrade_v2_to_v3(conn)?;
     }
     Ok(())
 }
@@ -542,7 +546,41 @@ pub(crate) fn upgrade_v1_to_v2(c: &mut Connection) -> R<()> {
             "schema_upgrade_fixture_fault",
         ));
     }
-    tx.pragma_update(None, "user_version", SCHEMA_VERSION)
+    tx.pragma_update(None, "user_version", 2)
+        .map_err(upgrade_failed)?;
+    tx.commit().map_err(|_| {
+        CoreError::new(ErrorCode::StorageUncertain, "schema_upgrade_commit_uncertain")
+    })
+}
+
+/// One transaction: the mailbox tables, `storage_meta` rebuilt as v3, the `mailbox_local` row,
+/// `user_version = 3`. Any failure rolls back to an intact v2 database. A v2 app opening the
+/// result rejects it as corrupt (version != 2).
+pub(crate) fn upgrade_v2_to_v3(c: &mut Connection) -> R<()> {
+    let tx = c.transaction().map_err(upgrade_failed)?;
+    let version: i64 = tx
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .map_err(|_| corrupt())?;
+    let schema: i64 = tx
+        .query_row(
+            "SELECT schema_version FROM storage_meta WHERE singleton=1",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|_| corrupt())?;
+    if version != 2 || schema != 2 {
+        return Err(corrupt());
+    }
+    tx.execute_batch(include_str!("upgrade_v2_to_v3.sql"))
+        .map_err(upgrade_failed)?;
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    if take_upgrade_fault(&tx) {
+        return Err(CoreError::new(
+            ErrorCode::StorageCorrupt,
+            "schema_upgrade_fixture_fault",
+        ));
+    }
+    tx.pragma_update(None, "user_version", 3)
         .map_err(upgrade_failed)?;
     tx.commit().map_err(|_| {
         CoreError::new(ErrorCode::StorageUncertain, "schema_upgrade_commit_uncertain")
@@ -598,6 +636,25 @@ pub(crate) fn ready_v1(conn: &Connection) -> R<()> {
         )
         .map_err(|_| corrupt())?;
     if version != 1 || schema != 1 {
+        return Err(corrupt());
+    }
+    Ok(())
+}
+
+/// Test-only copy of the M5 (v2) reader's version check, to prove v2 rejects a v3 database.
+#[cfg(all(feature = "test-hooks", debug_assertions))]
+pub(crate) fn ready_v2(conn: &Connection) -> R<()> {
+    let version: i64 = conn
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .map_err(|_| corrupt())?;
+    let schema: i64 = conn
+        .query_row(
+            "SELECT schema_version FROM storage_meta WHERE singleton=1",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|_| corrupt())?;
+    if version != 2 || schema != 2 {
         return Err(corrupt());
     }
     Ok(())

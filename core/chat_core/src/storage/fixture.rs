@@ -373,6 +373,11 @@ pub struct DbProbe {
     /// Canonical, type-tagged dump of every `message` row (all columns, primary-key order).
     pub message_rows: Vec<u8>,
     pub outbox: Vec<OutboxProbe>,
+    /// Canonical dump of every table that exists in v2 (all columns, row order), keyed by name.
+    /// `storage_meta` omits `schema_version`, the one column a later upgrade rewrites.
+    pub v2_rows: Vec<(String, Vec<u8>)>,
+    /// `mailbox_local` rows as (singleton, enabled, first_link_shown); empty before v3.
+    pub mailbox_local: Vec<(i64, i64, i64)>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboxProbe {
@@ -429,11 +434,33 @@ DROP TABLE outbox;
 ALTER TABLE outbox_v1 RENAME TO outbox;
 CREATE INDEX outbox_due ON outbox(dispatch_state,next_retry_at_ms,conversation);
 ";
+const V2_DOWNGRADE: &str = "
+DROP TABLE mailbox_store;
+DROP TABLE mailbox_cursor;
+DROP TABLE mailbox_pull;
+DROP TABLE mailbox_status_ahead;
+DROP TABLE mailbox_handoff;
+DROP TABLE mailbox_local;
+DROP TABLE mailbox_device;
+DROP TABLE mailbox_uptime;
+CREATE TABLE storage_meta_v2 (
+    singleton INTEGER PRIMARY KEY NOT NULL CHECK(singleton = 1),
+    schema_version INTEGER NOT NULL CHECK(schema_version = 2),
+    db_id BLOB NOT NULL CHECK(length(db_id) = 16),
+    binding BLOB NOT NULL,
+    legacy_hash BLOB CHECK(legacy_hash IS NULL OR length(legacy_hash) = 32),
+    migration_ready INTEGER NOT NULL CHECK(migration_ready IN (0, 1)),
+    message_revision INTEGER NOT NULL CHECK(message_revision BETWEEN 0 AND 9223372036854775807)
+) STRICT;
+INSERT INTO storage_meta_v2
+    SELECT singleton,2,db_id,binding,legacy_hash,migration_ready,message_revision FROM storage_meta;
+DROP TABLE storage_meta;
+ALTER TABLE storage_meta_v2 RENAME TO storage_meta;
+";
 fn probe_error(_: rusqlite::Error) -> CoreError {
     CoreError::new(ErrorCode::StorageCorrupt, "fixture_probe_failed")
 }
 fn probe(c: &rusqlite::Connection) -> Result<DbProbe, CoreError> {
-    use rusqlite::types::ValueRef;
     let user_version = c
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .map_err(probe_error)?;
@@ -460,36 +487,34 @@ fn probe(c: &rusqlite::Connection) -> Result<DbProbe, CoreError> {
         .map_err(probe_error)?
         .collect::<Result<_, _>>()
         .map_err(probe_error)?;
-    let mut message_rows = Vec::new();
-    let mut message_count = 0;
-    {
-        let mut stmt = c
-            .prepare("SELECT * FROM message ORDER BY conversation,sender_peer,sender_install,msg_id")
-            .map_err(probe_error)?;
-        let columns = stmt.column_count();
-        let mut rows = stmt.query([]).map_err(probe_error)?;
-        while let Some(row) = rows.next().map_err(probe_error)? {
-            message_count += 1;
-            for i in 0..columns {
-                match row.get_ref(i).map_err(probe_error)? {
-                    ValueRef::Null => message_rows.push(0),
-                    ValueRef::Integer(n) => {
-                        message_rows.push(1);
-                        message_rows.extend(n.to_be_bytes());
-                    }
-                    ValueRef::Real(f) => {
-                        message_rows.push(2);
-                        message_rows.extend(f.to_be_bytes());
-                    }
-                    ValueRef::Text(t) | ValueRef::Blob(t) => {
-                        message_rows.push(3);
-                        message_rows.extend((t.len() as u64).to_be_bytes());
-                        message_rows.extend(t);
-                    }
-                }
-            }
+    let (message_rows, message_count) = dump_rows(
+        c,
+        "SELECT * FROM message ORDER BY conversation,sender_peer,sender_install,msg_id",
+    )?;
+    let mut v2_rows = Vec::new();
+    for table in &tables {
+        if table.starts_with("mailbox_") || table == "sqlite_sequence" {
+            continue;
         }
+        let sql = if table == "storage_meta" {
+            "SELECT singleton,db_id,binding,legacy_hash,migration_ready,message_revision \
+             FROM storage_meta ORDER BY rowid"
+                .to_string()
+        } else {
+            format!("SELECT * FROM {table} ORDER BY rowid")
+        };
+        v2_rows.push((table.clone(), dump_rows(c, &sql)?.0));
     }
+    let mailbox_local = if tables.iter().any(|t| t == "mailbox_local") {
+        c.prepare("SELECT singleton,enabled,first_link_shown FROM mailbox_local ORDER BY singleton")
+            .map_err(probe_error)?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .map_err(probe_error)?
+            .collect::<Result<_, _>>()
+            .map_err(probe_error)?
+    } else {
+        Vec::new()
+    };
     let has_v2_columns = c
         .query_row(
             "SELECT count(*) FROM pragma_table_info('outbox') WHERE name='reencrypts'",
@@ -533,7 +558,40 @@ fn probe(c: &rusqlite::Connection) -> Result<DbProbe, CoreError> {
         message_count,
         message_rows,
         outbox,
+        v2_rows,
+        mailbox_local,
     })
+}
+/// Canonical, type-tagged dump of every row `sql` returns, and the row count.
+fn dump_rows(c: &rusqlite::Connection, sql: &str) -> Result<(Vec<u8>, u64), CoreError> {
+    use rusqlite::types::ValueRef;
+    let mut out = Vec::new();
+    let mut count = 0;
+    let mut stmt = c.prepare(sql).map_err(probe_error)?;
+    let columns = stmt.column_count();
+    let mut rows = stmt.query([]).map_err(probe_error)?;
+    while let Some(row) = rows.next().map_err(probe_error)? {
+        count += 1;
+        for i in 0..columns {
+            match row.get_ref(i).map_err(probe_error)? {
+                ValueRef::Null => out.push(0),
+                ValueRef::Integer(n) => {
+                    out.push(1);
+                    out.extend(n.to_be_bytes());
+                }
+                ValueRef::Real(f) => {
+                    out.push(2);
+                    out.extend(f.to_be_bytes());
+                }
+                ValueRef::Text(t) | ValueRef::Blob(t) => {
+                    out.push(3);
+                    out.extend((t.len() as u64).to_be_bytes());
+                    out.extend(t);
+                }
+            }
+        }
+    }
+    Ok((out, count))
 }
 
 /// What `Messages::mls_create_group` produced for the peer.
@@ -807,7 +865,7 @@ impl Fixture {
             })
         })
     }
-    /// Rewrite a closed, migrated store into the exact M4 (schema v1) shape: the four MLS tables
+    /// Rewrite a closed, migrated store into the exact M4 (schema v1) shape: the mailbox and MLS tables
     /// and the v2 outbox columns go away, `user_version` and `schema_version` return to 1, and
     /// every queued row becomes the M4 plaintext job (codec 1) with the canonical text frame an
     /// M4 app would have queued for it. Only valid while no row is sealed (codec 2).
@@ -850,9 +908,72 @@ impl Fixture {
                 )
                 .map_err(probe_error)?;
             }
+            tx.execute_batch(V2_DOWNGRADE).map_err(probe_error)?;
             tx.execute_batch(V1_DOWNGRADE).map_err(probe_error)?;
             tx.pragma_update(None, "user_version", 1).map_err(probe_error)?;
             tx.commit().map_err(probe_error)
+        })
+    }
+    /// Rewrite a closed, migrated store into the exact M5 (schema v2) shape: the mailbox tables
+    /// go away and `user_version` and `schema_version` return to 2.
+    pub fn downgrade_to_v2(root: &Path, p: Arc<dyn KeyProtector>) -> Result<(), CoreError> {
+        crate::storage::migration::with_raw_connection(root, &*p, |c| {
+            let tx = c.transaction().map_err(probe_error)?;
+            tx.execute_batch(V2_DOWNGRADE).map_err(probe_error)?;
+            tx.pragma_update(None, "user_version", 2).map_err(probe_error)?;
+            tx.commit().map_err(probe_error)
+        })
+    }
+    /// Give a closed v2 store's first conversation two `mls_kv` rows and an `mls_conversation`
+    /// row, and seal its first outbox row (codec 2) so both outbox codecs are present.
+    pub fn seed_v2_rows(root: &Path, p: Arc<dyn KeyProtector>) -> Result<(), CoreError> {
+        crate::storage::migration::with_raw_connection(root, &*p, |c| {
+            let tx = c.transaction().map_err(probe_error)?;
+            let conversation: Vec<u8> = tx
+                .query_row("SELECT id FROM conversation ORDER BY id LIMIT 1", [], |r| r.get(0))
+                .map_err(probe_error)?;
+            for (key, value) in [(b"k1", b"v1"), (b"k2", b"v2")] {
+                tx.execute(
+                    "INSERT INTO mls_kv VALUES(?1,?2,?3)",
+                    rusqlite::params![[7u8; 32].as_slice(), key.as_slice(), value.as_slice()],
+                )
+                .map_err(probe_error)?;
+            }
+            tx.execute(
+                "INSERT INTO mls_conversation VALUES(?1,?2,?3,5,NULL,0,0,0,1,NULL)",
+                rusqlite::params![conversation, [9u8; 16].as_slice(), [8u8; 32].as_slice()],
+            )
+            .map_err(probe_error)?;
+            tx.execute(
+                "UPDATE outbox SET codec=2,wire=x'0a0b' WHERE msg_id=(SELECT min(msg_id) FROM outbox)",
+                [],
+            )
+            .map_err(probe_error)?;
+            tx.commit().map_err(probe_error)
+        })
+    }
+    /// On a closed v3 store: insert three `mailbox_store` rows, delete them all, insert one more,
+    /// and return that row's `seq`.
+    pub fn mailbox_seq_after_clearing(root: &Path, p: Arc<dyn KeyProtector>) -> Result<i64, CoreError> {
+        crate::storage::migration::with_raw_connection(root, &*p, |c| {
+            let tx = c.transaction().map_err(probe_error)?;
+            let insert = |n: u8| {
+                tx.execute(
+                    "INSERT INTO mailbox_store(conversation,sender_peer,sender_install,kind,msg_id,hash,body,recorded_at_ms) \
+                     VALUES(?1,?1,?1,1,NULL,?2,x'01',0)",
+                    rusqlite::params![[1u8; 32].as_slice(), [n; 32].as_slice()],
+                )
+            };
+            for n in 0..3 {
+                insert(n).map_err(probe_error)?;
+            }
+            tx.execute("DELETE FROM mailbox_store", []).map_err(probe_error)?;
+            insert(3).map_err(probe_error)?;
+            let seq = tx
+                .query_row("SELECT seq FROM mailbox_store", [], |r| r.get(0))
+                .map_err(probe_error)?;
+            tx.commit().map_err(probe_error)?;
+            Ok(seq)
         })
     }
     /// Inspect a closed store without upgrading it.
@@ -863,6 +984,12 @@ impl Fixture {
     pub fn v1_reader_check(root: &Path, p: Arc<dyn KeyProtector>) -> Result<(), CoreError> {
         crate::storage::migration::with_raw_connection(root, &*p, |c| {
             crate::storage::migration::ready_v1(c)
+        })
+    }
+    /// Run the M5 (v2) reader's version check against a closed store.
+    pub fn v2_reader_check(root: &Path, p: Arc<dyn KeyProtector>) -> Result<(), CoreError> {
+        crate::storage::migration::with_raw_connection(root, &*p, |c| {
+            crate::storage::migration::ready_v2(c)
         })
     }
     /// The next schema upgrade of the store under `root` fails after its DDL, before commit.
