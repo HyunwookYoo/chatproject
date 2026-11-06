@@ -1064,6 +1064,38 @@ mod tests {
     }
 
     #[test]
+    fn max_bucket_entry_fits_one_page() {
+        use crate::mailbox::wire::{EntryBody, LogEntry, MAX_ENTRY_BODY, MailboxReply, page};
+        let (a, _b, gid) = pair();
+        let ct = a.seal(&gid, &text(MAX_BUCKET - 150));
+        let body = crate::mls::wire::MlsFrame::App {
+            conversation: CONV,
+            ciphertext: ct,
+        }
+        .inner()
+        .to_vec();
+        assert!(body.len() <= MAX_ENTRY_BODY, "{} B > {MAX_ENTRY_BODY} B", body.len());
+        let entry = LogEntry {
+            seq: i64::MAX as u64,
+            conversation: CONV,
+            sender_peer: crate::account::PeerId([3; 32]),
+            sender_install: crate::account::InstallationId([2; 32]),
+            recorded_at_ms: i64::MAX as u64,
+            body: EntryBody::Frame(body),
+        };
+        let reply = MailboxReply::SyncResp {
+            entries: vec![entry.clone()],
+            next_seq: i64::MAX as u64,
+            more: true,
+        };
+        eprintln!("max bucket entry: {} B SyncResp inner", reply.inner().len());
+        assert!(reply.inner().len() <= 61_434);
+        assert!(MailboxReply::decode(&reply.inner()).unwrap() == reply);
+        let (taken, more) = page([entry.clone(), entry].into_iter());
+        assert_eq!((taken.len(), more), (1, true));
+    }
+
+    #[test]
     fn every_bucket_seals_within_limits() {
         let (a, b, gid) = pair();
         for bucket in crate::mls::payload::BUCKETS {

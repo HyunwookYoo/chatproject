@@ -1098,3 +1098,10 @@ impl Fixture {
 pub use crate::message::wire::{decode as decode_message, Frame as MessageFrame};
 pub use crate::account::MessageMutation;
 pub use crate::mls::wire::{MlsFrame, MlsReply};
+pub use crate::mailbox::wire::{
+    EntryBody, HandoffEntry, LogEntry, MailboxFrame, MailboxReply, PlainRecord,
+};
+pub const MAILBOX_MAX_ENTRY_BODY: usize = crate::mailbox::wire::MAX_ENTRY_BODY;
+pub fn mailbox_page(entries: impl Iterator<Item = LogEntry>) -> (Vec<LogEntry>, bool) {
+    crate::mailbox::wire::page(entries)
+}

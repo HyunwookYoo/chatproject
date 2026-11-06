@@ -4,6 +4,7 @@
 pub mod account;
 pub mod error;
 pub mod event;
+mod mailbox;
 pub mod runtime;
 pub mod message;
 // Only `mls::nse` is public, and only for the notification extension.

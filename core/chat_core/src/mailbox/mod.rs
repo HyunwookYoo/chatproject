@@ -1,0 +1,16 @@
+//! Mailbox devices and own-device sync (M6).
+//!
+//! Items here are consumed by the later M6 tasks, hence the blanket `dead_code` allowance
+//! until they land.
+#![allow(dead_code)]
+
+pub(crate) mod wire;
+
+/// Account frame kind of the own-device sync protocol.
+pub(crate) const KIND: u8 = 18;
+/// Most log entries in one `SyncResp` page (and in one `Handoff`).
+pub(crate) const PAGE_MAX_ENTRIES: usize = 64;
+/// How long a mailbox keeps its log: 30 days.
+pub(crate) const MAILBOX_RETENTION_MS: u64 = 2_592_000_000;
+/// Longest a mailbox may delay a notification.
+pub(crate) const MAILBOX_MAX_DELAY_MS: u64 = 30_000;
