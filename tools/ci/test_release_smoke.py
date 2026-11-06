@@ -29,6 +29,15 @@ class Child implements OwnedProcess {
     if (owner.mode == 'cleanup' && pid == 100) throw StateError('fixture cleanup failure');
   }
 }
+// The smoke's deadlines run on this clock: each fake command costs 5 ms, so a deadline counts
+// commands, never the speed of the host running the fixture.
+var virtualMicros = 0;
+class VirtualWatch implements Stopwatch {
+  int origin = virtualMicros;
+  Duration get elapsed => Duration(microseconds: virtualMicros - origin);
+  void start() => origin = virtualMicros;
+  dynamic noSuchMethod(Invocation i) => throw StateError('unexpected stopwatch API: $i');
+}
 class Fake implements ProcessRunner {
   Fake(this.mode, this.cancel);
   final String mode;
@@ -47,6 +56,8 @@ class Fake implements ProcessRunner {
   String? contractRoot;
   Future<OwnedProcess> start(String exe, List<String> args, {required Directory logDir, String? workingDirectory, String? stdin, bool retainOutput = false}) async {
     final child = Child(next++, Completer<int>(), this);
+    virtualMicros += 5000;
+    if (mode == 'slow') await Future<void>.delayed(const Duration(milliseconds: 150));
     var output = '';
     var errorOutput = '';
     var commandExit = 0;
@@ -162,7 +173,7 @@ Future<void> main(List<String> args) async {
       cancellation: cancel,
       contractNonce: args[0].contains('contract') ? 'fixture-nonce' : null,
       readyTimeout: const Duration(milliseconds: 80), settleTime: const Duration(milliseconds: 30),
-      pollInterval: const Duration(milliseconds: 5));
+      pollInterval: const Duration(milliseconds: 5), stopwatch: VirtualWatch.new);
   } catch (error) { result = 'FAIL: $error'; }
   final phaseLogs = fake.launches == 3 ? 'cleaned' : fake.launches == 2 ? 'reopened' : 'created';
   final ownershipFile = File(args[0].contains('contract') ? '${logs.path}/$phaseLogs/ownership.json' : '${logs.path}/ownership.json');
@@ -202,6 +213,10 @@ class ReleaseSmokeTests(unittest.TestCase):
 
     def test_ready_home_and_native_version(self):
         self.probe("ready", True)
+
+    def test_slow_host_cannot_exhaust_the_fixture_deadline(self):
+        # Each fake command takes longer than the whole fixture deadline in wall time.
+        self.probe("slow", True)
 
     def test_crash_late_exception_foreign_window_and_pid_only_fail(self):
         for mode in ("crash", "late", "foreign", "no-window", "pid-only"):
