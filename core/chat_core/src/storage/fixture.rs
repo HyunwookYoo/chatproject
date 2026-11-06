@@ -2,6 +2,8 @@
 pub use crate::account::storage::migration_fixtures::{
     MlsAccount, assert_account_preserved, migration_states, mls_account,
 };
+pub use crate::message::mailbox_store::{MailboxPage, MailboxRow, MailboxState};
+use crate::message::mailbox_store::{MailboxDbOp, MailboxDbReply};
 pub use crate::message::mls_store::{MlsOutbox, MlsState};
 pub use crate::message::store::MessageFacts;
 use crate::message::mls_group::{Committed, GroupOp, GroupReply, Outcome};
@@ -85,12 +87,26 @@ impl Messages {
         first_commit_hash: [u8; 32],
         now: u64,
     ) -> Result<u64, CoreError> {
+        let nobody = crate::account::InstallationId([0; 32]);
+        self.mls_join_group_from(conversation, peer, nobody, welcome, first_commit_hash, now)
+            .await
+    }
+    /// `mls_join_group` with the Welcome sent by `sender_install` of `peer`.
+    pub async fn mls_join_group_from(
+        &self,
+        conversation: ConversationId,
+        peer: crate::account::PeerId,
+        sender_install: crate::account::InstallationId,
+        welcome: Vec<u8>,
+        first_commit_hash: [u8; 32],
+        now: u64,
+    ) -> Result<u64, CoreError> {
         let op = MessageDbOp::MlsGroupOp(
             conversation,
             GroupOp::Join {
                 peer,
                 sender_peer: peer,
-                sender_install: crate::account::InstallationId([0; 32]),
+                sender_install,
                 welcome,
                 first_commit_hash,
                 rejoin: None,
@@ -322,6 +338,44 @@ impl Messages {
     pub async fn mls_mark_waiting(&self, key: MessageKey, waiting: bool) -> Result<(), CoreError> {
         match self.mls(MessageDbOp::MarkWaitingPeerUpdate(key, waiting)).await? {
             MessageDbReply::Done => Ok(()),
+            _ => unreachable!(),
+        }
+    }
+    async fn mailbox(&self, op: MailboxDbOp) -> Result<MailboxDbReply, CoreError> {
+        match self.0.operation(MessageDbOp::Mailbox(op)).await? {
+            MessageDbReply::Mailbox(reply) => Ok(reply),
+            _ => unreachable!(),
+        }
+    }
+    /// The page served to own device `puller` for its `SyncReq { since_seq }`.
+    pub async fn mailbox_page(&self, puller: crate::account::InstallationId, since_seq: u64, now: u64) -> Result<MailboxPage, CoreError> {
+        match self.mailbox(MailboxDbOp::Page { puller, since_seq, now }).await? {
+            MailboxDbReply::Page(page) => Ok(page),
+            _ => unreachable!(),
+        }
+    }
+    pub async fn mailbox_pulled(&self, holder: crate::account::InstallationId, next_seq: u64) -> Result<u64, CoreError> {
+        match self.mailbox(MailboxDbOp::Pulled { holder, next_seq }).await? {
+            MailboxDbReply::Since(since) => Ok(since),
+            _ => unreachable!(),
+        }
+    }
+    pub async fn mailbox_pull_from(&self, holder: crate::account::InstallationId) -> Result<u64, CoreError> {
+        match self.mailbox(MailboxDbOp::PullFrom(holder)).await? {
+            MailboxDbReply::Since(since) => Ok(since),
+            _ => unreachable!(),
+        }
+    }
+    /// The account's other devices that are not revoked; how many entries were pruned.
+    pub async fn mailbox_devices(&self, others: Vec<crate::account::InstallationId>, now: u64) -> Result<u64, CoreError> {
+        match self.mailbox(MailboxDbOp::Devices { others, now }).await? {
+            MailboxDbReply::Count(n) => Ok(n),
+            _ => unreachable!(),
+        }
+    }
+    pub async fn mailbox_prune(&self, now: u64) -> Result<u64, CoreError> {
+        match self.mailbox(MailboxDbOp::Prune(now)).await? {
+            MailboxDbReply::Count(n) => Ok(n),
             _ => unreachable!(),
         }
     }
@@ -798,6 +852,25 @@ impl Fixture {
     pub async fn mls_global_rows(&self, plant: Option<(Vec<u8>, Vec<u8>)>) -> Result<Vec<String>, CoreError> {
         let (tx, rx) = oneshot::channel();
         self.handle.0.test(TestOp::Message(FixtureOp::MlsGlobalRows(plant, tx))).await;
+        rx.await.unwrap()
+    }
+    /// The device log, cursors and pulls, and counts of the other per-device tables.
+    pub async fn mailbox_state(&self) -> Result<MailboxState, CoreError> {
+        let (tx, rx) = oneshot::channel();
+        self.handle.0.test(TestOp::Message(FixtureOp::MailboxState(tx))).await;
+        rx.await.unwrap()
+    }
+    /// Records a `Frame` entry (fixed ids) with `body` at `now`; its seq, or `None` if refused.
+    pub async fn mailbox_record(&self, body: Vec<u8>, now: u64) -> Result<Option<u64>, CoreError> {
+        let (tx, rx) = oneshot::channel();
+        self.handle.0.test(TestOp::Message(FixtureOp::MailboxRecord(body, now, tx))).await;
+        rx.await.unwrap()
+    }
+    /// A `mailbox_device` and a `mailbox_handoff` row of `installation`, and a
+    /// `mailbox_status_ahead` row, all at `at`.
+    pub async fn mailbox_seed(&self, installation: crate::account::InstallationId, at: u64) -> Result<(), CoreError> {
+        let (tx, rx) = oneshot::channel();
+        self.handle.0.test(TestOp::Message(FixtureOp::MailboxSeed(installation, at, tx))).await;
         rx.await.unwrap()
     }
     pub async fn due_hint(&self, now: u64) -> Result<bool, CoreError> {

@@ -2,6 +2,7 @@
 //! conversation's group, the per-installation Commit/Welcome delivery queue (`mls_delivery`) and
 //! the holds for devices missing from a cached record (`mls_hold`). Like the rest of
 //! `mls_store`, every operation is one SQL transaction carrying the MLS state it changed.
+use super::mailbox_store::record_frame;
 use super::mls_store::{Fault, GLOBAL, MAX_FRAME, NO_FAULT, finish};
 use super::store::{Identity, MessageDbReply, bytes, ensure_conversation, integer, invalid, uint};
 use super::types::*;
@@ -438,23 +439,40 @@ fn drop_deliveries_to(
     .map_err(sql)?;
     Ok(())
 }
-fn commit_frame(conversation: ConversationId, epoch: u64, commit: &[u8]) -> Vec<u8> {
-    MlsFrame::Commit {
+/// The complete kind 17 frame of an own Commit or Welcome, logged (spec 5.1) once however many
+/// members it is queued for.
+fn own_frame(tx: &Transaction<'_>, identity: Identity, frame: MlsFrame, now: u64) -> R<Vec<u8>> {
+    record_frame(tx, identity.peer, identity.installation, None, &frame, now)?;
+    Ok(frame.encode().to_vec())
+}
+fn commit_frame(
+    tx: &Transaction<'_>,
+    identity: Identity,
+    conversation: ConversationId,
+    epoch: u64,
+    commit: &[u8],
+    now: u64,
+) -> R<Vec<u8>> {
+    let frame = MlsFrame::Commit {
         conversation,
         epoch,
         commit: commit.to_vec(),
-    }
-    .encode()
-    .to_vec()
+    };
+    own_frame(tx, identity, frame, now)
 }
-fn welcome_frame(conversation: ConversationId, welcome: &[u8], sender: InstallationId) -> Vec<u8> {
-    MlsFrame::Welcome {
+fn welcome_frame(
+    tx: &Transaction<'_>,
+    identity: Identity,
+    conversation: ConversationId,
+    welcome: &[u8],
+    now: u64,
+) -> R<Vec<u8>> {
+    let frame = MlsFrame::Welcome {
         conversation,
         welcome: welcome.to_vec(),
-        sender_install: sender,
-    }
-    .encode()
-    .to_vec()
+        sender_install: identity.installation,
+    };
+    own_frame(tx, identity, frame, now)
 }
 
 fn key_package_installation(bytes: &[u8]) -> R<InstallationId> {
@@ -927,17 +945,19 @@ fn create(
             peer_mls: false,
         },
     )?;
-    let frame = welcome_frame(conversation, &created.welcome, identity.installation);
-    for installation in added {
-        deliver(
-            &tx,
-            conversation,
-            installation,
-            DELIVER_WELCOME,
-            epoch,
-            &frame,
-            now,
-        )?;
+    if !added.is_empty() {
+        let frame = welcome_frame(&tx, identity, conversation, &created.welcome, now)?;
+        for installation in added {
+            deliver(
+                &tx,
+                conversation,
+                installation,
+                DELIVER_WELCOME,
+                epoch,
+                &frame,
+                now,
+            )?;
+        }
     }
     finish(tx, fault)?;
     Ok(GroupReply::Created {
@@ -1190,6 +1210,19 @@ fn join(
                 if replacing {
                     unseal_unacked(&tx, conversation)?;
                 }
+                let frame = MlsFrame::Welcome {
+                    conversation,
+                    welcome: welcome.welcome.to_vec(),
+                    sender_install: welcome.sender_install,
+                };
+                record_frame(
+                    &tx,
+                    arrival.sender_peer,
+                    welcome.sender_install,
+                    None,
+                    &frame,
+                    arrival.now,
+                )?;
                 finish(tx, fault)?;
                 true
             }
@@ -1267,6 +1300,7 @@ fn apply(
     let provider = MlsProvider::new(KvStore::load(&tx, conversation.0)?);
     let before = membership::group_installations(&provider, &row.group_id)?;
     if let Ok(applied) = membership::apply_commit(&provider, &row.group_id, commit, &verify) {
+        log_commit(&tx, conversation, &arrival, epoch, commit, applied.committer)?;
         if applied.self_removed {
             forget(&tx, conversation)?;
             finish(tx, fault)?;
@@ -1337,6 +1371,7 @@ fn apply(
     let verify = |credential: &[u8], key: &[u8]| checked.check(credential, key);
     match membership::apply_commit(&provider, &row.group_id, commit, &verify) {
         Ok(applied) if applied.epoch == row.epoch => {
+            log_commit(&tx, conversation, &arrival, epoch, commit, applied.committer)?;
             if applied.self_removed {
                 forget(&tx, conversation)?;
                 finish(tx, fault)?;
@@ -1359,6 +1394,24 @@ fn apply(
         // Not a valid Commit for this epoch: the transaction is dropped, nothing changes.
         _ => Ok(refused),
     }
+}
+
+/// Logs a Commit this device applied (spec 5.1), as it arrived, under the leaf that made it.
+fn log_commit(
+    tx: &Transaction<'_>,
+    conversation: ConversationId,
+    arrival: &Arrival,
+    epoch: u64,
+    commit: &[u8],
+    committer: InstallationId,
+) -> R<()> {
+    let frame = MlsFrame::Commit {
+        conversation,
+        epoch,
+        commit: commit.to_vec(),
+    };
+    record_frame(tx, arrival.sender_peer, committer, None, &frame, arrival.now)?;
+    Ok(())
 }
 
 /// Stores an applied Commit: the new epoch, the state before it as the one kept snapshot, its
@@ -1549,7 +1602,14 @@ fn own_commit(
         .into_iter()
         .filter(|i| *i != identity.installation && !remove.contains(i))
         .collect();
-    let frame = commit_frame(conversation, committed.epoch, &committed.commit);
+    let frame = commit_frame(
+        &tx,
+        identity,
+        conversation,
+        committed.epoch,
+        &committed.commit,
+        now,
+    )?;
     for member in &members {
         deliver(
             &tx,
@@ -1562,7 +1622,7 @@ fn own_commit(
         )?;
     }
     if let Some(welcome) = &committed.welcome {
-        let frame = welcome_frame(conversation, welcome, identity.installation);
+        let frame = welcome_frame(&tx, identity, conversation, welcome, now)?;
         for installation in &added {
             deliver(
                 &tx,

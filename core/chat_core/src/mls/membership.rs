@@ -268,6 +268,8 @@ pub(crate) struct Applied {
     pub previous: Vec<u8>,
     /// The Commit removed this device; the group is finished here and the caller drops it.
     pub self_removed: bool,
+    /// The installation whose leaf sent the Commit.
+    pub committer: InstallationId,
 }
 
 /// Applies a received Commit. Only Add and Remove proposals are accepted, and `verify` vets the
@@ -297,11 +299,12 @@ pub(crate) fn apply_commit(
     }
     let previous = snapshot(p).map_err(|_| fail(CLASS_OTHER))?;
     match apply_staged(p, &mut group, protocol, verify) {
-        Ok((epoch, self_removed)) => Ok(Applied {
+        Ok((epoch, self_removed, committer)) => Ok(Applied {
             epoch,
             commit_hash: Sha256::digest(commit).into(),
             previous,
             self_removed,
+            committer,
         }),
         Err(failure) => {
             let _ = restore_snapshot(p, &previous);
@@ -315,11 +318,12 @@ fn apply_staged(
     group: &mut MlsGroup,
     protocol: ProtocolMessage,
     verify: LeafVerifier<'_>,
-) -> Result<(u64, bool), OpenFailure> {
+) -> Result<(u64, bool, InstallationId), OpenFailure> {
     let (message_epoch, current) = (protocol.epoch().as_u64(), group.epoch().as_u64());
     let processed = group
         .process_message(p, protocol)
         .map_err(|error| fail(classify(&error, message_epoch, current)))?;
+    let committer = installation_of(processed.credential()).ok_or(fail(CLASS_OTHER))?;
     let ProcessedMessageContent::StagedCommitMessage(staged) = processed.into_content() else {
         return Err(fail(CLASS_OTHER));
     };
@@ -340,7 +344,7 @@ fn apply_staged(
     group
         .merge_staged_commit(p, *staged)
         .map_err(|_| fail(CLASS_OTHER))?;
-    Ok((group.epoch().as_u64(), self_removed))
+    Ok((group.epoch().as_u64(), self_removed, committer))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

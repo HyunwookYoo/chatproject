@@ -6,6 +6,7 @@
 //! A `KvStore` is loaded per operation and `flush`ed into the operation's transaction only on
 //! success. `flush` clears its dirty set before the caller commits, so after any failure the
 //! store (and its provider) is dropped; the next operation loads a fresh one.
+use super::mailbox_store::record_frame;
 use super::mls_group::{check_own, group_row, signer_of, sql};
 use super::store::{
     Identity, MessageDbReply, bump, bytes, commit, ensure_conversation, find, integer, invalid,
@@ -176,18 +177,18 @@ fn seal_one(
     now: u64,
 ) -> R<([u8; 32], Vec<u8>)> {
     let ciphertext = group::seal(provider, signer, group_id, message)?;
-    let frame = MlsFrame::App {
+    let hash: [u8; 32] = Sha256::digest(&ciphertext).into();
+    let app = MlsFrame::App {
         conversation: key.conversation,
-        ciphertext: ciphertext.clone(),
-    }
-    .encode();
+        ciphertext,
+    };
+    let frame = app.encode();
     if frame.len() > MAX_FRAME {
         return Err(CoreError::new(
             ErrorCode::MessageTooLarge,
             "message_frame_too_large",
         ));
     }
-    let hash: [u8; 32] = Sha256::digest(&ciphertext).into();
     tx.execute(
         "INSERT OR IGNORE INTO processed_ct VALUES(2,?1,?2,?3,?4)",
         params![
@@ -198,6 +199,10 @@ fn seal_one(
         ],
     )
     .map_err(sql)?;
+    // Every sealed frame goes into the device log (spec 5.1): a message names its id, a
+    // receipt does not.
+    let text = matches!(message.content, Content::Text { .. }).then_some(message.msg_id);
+    record_frame(tx, identity.peer, identity.installation, text, &app, now)?;
     Ok((hash, frame.to_vec()))
 }
 
@@ -859,6 +864,15 @@ pub(super) fn open_app(
         ],
     )
     .map_err(sql)?;
+    // A taken frame goes into the device log as received, under the leaf that sent it.
+    if matches!(stored, Stored::Yes) {
+        let app = MlsFrame::App {
+            conversation,
+            ciphertext,
+        };
+        let id = text.map(|key| key.id);
+        record_frame(&tx, sender_peer, sender_install, id, &app, now as u64)?;
+    }
     if !own {
         tx.execute(
             "UPDATE mls_conversation SET peer_mls=1 WHERE conversation=?1 AND peer_mls=0",

@@ -1,5 +1,6 @@
 //! Durable messages; account actor authority and the one storage worker stay private.
 #![allow(dead_code)] // Private producer methods are also consumed by storage fixtures.
+pub(crate) mod mailbox_store;
 pub(crate) mod mls_group;
 pub(crate) mod mls_store;
 pub(crate) mod store;

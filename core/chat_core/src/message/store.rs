@@ -61,6 +61,8 @@ pub(crate) enum MessageDbOp {
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     M4Encode(MessageKey),
     MlsGroupOp(ConversationId, super::mls_group::GroupOp),
+    /// The device log: pages, cursors, retention (M6).
+    Mailbox(super::mailbox_store::MailboxDbOp),
     Messages(ConversationId, Option<MessageCursor>, u32),
     Conversations(Option<ConversationCursor>, u32),
 }
@@ -551,6 +553,7 @@ pub(crate) fn execute(
         #[cfg(all(feature = "test-hooks", debug_assertions))]
         MessageDbOp::M4Encode(key) => super::mls_store::m4_encode(c, identity, key),
         MessageDbOp::MlsGroupOp(id, op) => super::mls_group::group_op(c, identity, local, id, op, mls_fault!(fault)),
+        MessageDbOp::Mailbox(op) => super::mailbox_store::mailbox_op(c, identity, op, mls_fault!(fault)),
         MessageDbOp::Messages(id, before, n) => {
             let take = limit(n)?;
             let (lamport, install, msg) = match before {
@@ -772,6 +775,11 @@ pub(crate) enum FixtureOp {
     /// Optionally writes one raw `mls_kv` row into the global scope (key, value as given), then
     /// lists the labels of every global-scope row.
     MlsGlobalRows(Option<(Vec<u8>, Vec<u8>)>, tokio::sync::oneshot::Sender<R<Vec<String>>>),
+    MailboxState(tokio::sync::oneshot::Sender<R<super::mailbox_store::MailboxState>>),
+    /// Records a `Frame` entry with this body at this time.
+    MailboxRecord(Vec<u8>, u64, tokio::sync::oneshot::Sender<R<Option<u64>>>),
+    /// Device, handoff and status-ahead rows of an installation at a time.
+    MailboxSeed(InstallationId, u64, tokio::sync::oneshot::Sender<R<()>>),
 }
 #[cfg(all(feature = "test-hooks", debug_assertions))]
 pub(crate) fn fixture(c: &mut Connection, op: FixtureOp) {
@@ -886,6 +894,15 @@ pub(crate) fn fixture(c: &mut Connection, op: FixtureOp) {
                     .collect())
             })();
             let _ = reply.send(result);
+        }
+        FixtureOp::MailboxState(reply) => {
+            let _ = reply.send(super::mailbox_store::fixture_state(c));
+        }
+        FixtureOp::MailboxRecord(body, now, reply) => {
+            let _ = reply.send(super::mailbox_store::fixture_record(c, &body, now));
+        }
+        FixtureOp::MailboxSeed(installation, at, reply) => {
+            let _ = reply.send(super::mailbox_store::fixture_seed(c, installation, at));
         }
         FixtureOp::MlsSetDelivery(id, recipient, kind, epoch, row, reply) => {
             let result = (|| {
@@ -1016,6 +1033,7 @@ pub(crate) enum MessageDbReply {
     /// ahead of this device's view of it (C1). Nothing changed; only a new epoch can help.
     FarAhead { epoch: u64 },
     Group(super::mls_group::GroupReply),
+    Mailbox(super::mailbox_store::MailboxDbReply),
     Conversation(ConversationView),
     Message(MessageView),
     Messages(MessagePage),
@@ -1117,6 +1135,7 @@ impl MessageDbOp {
             #[cfg(all(feature = "test-hooks", debug_assertions))]
             Self::M4Encode(_) => false,
             Self::MlsGroupOp(_, op) => op.writes(),
+            Self::Mailbox(op) => op.writes(),
             _ => self.key(identity)?.is_some(),
         })
     }
