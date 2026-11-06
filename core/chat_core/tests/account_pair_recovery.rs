@@ -120,19 +120,7 @@ impl Fixture {
         drop(a);
         drop(slot);
         drop(_sql);
-        let mut store = tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                match sql_store::Store::open(_dir.path(), protector.clone()) {
-                    Ok(s) => break s,
-                    Err(e) if e.code == chat_core::ErrorCode::WriterBusy => {
-                        tokio::time::sleep(Duration::from_millis(10)).await
-                    }
-                    Err(e) => panic!("store restart: {e}"),
-                }
-            }
-        })
-        .await
-        .unwrap();
+        let mut store = sql_store::Store::open(_dir.path(), protector.clone()).unwrap();
         edit(&mut store);
         drop(store);
         let slot = CoreSlot::new();
@@ -144,22 +132,12 @@ impl Fixture {
         )
         .unwrap();
         slot.network().unwrap().configure_local(None).await.unwrap();
-        let a = tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                match slot.open_account_with_services(
-                    protector.clone(),
-                    AccountServices::new(backend.clone(), clock.clone()),
-                ) {
-                    Ok(a) => break a,
-                    Err(e) if e.code == chat_core::ErrorCode::WriterBusy => {
-                        tokio::time::sleep(Duration::from_millis(10)).await
-                    }
-                    Err(e) => panic!("restart: {e}"),
-                }
-            }
-        })
-        .await
-        .unwrap();
+        let a = slot
+            .open_account_with_services(
+                protector.clone(),
+                AccountServices::new(backend.clone(), clock.clone()),
+            )
+            .unwrap();
         settled(&a).await;
         Self {
             _sql: sql_store::Store::from_fixture(a.storage_test_fixture()),

@@ -80,21 +80,13 @@ async fn active_and_candidate_restart_keep_endpoint_new_instance() {
     drop(account);
     drop(net);
     drop(first);
-    // Runtime shutdown drops the Store actor asynchronously; ownership must really end.
+    // Dropping the core ends its writer ownership before the drop returns.
     let second = core(dir.path());
     let net = second.network().unwrap();
     net.configure_local(None).await.unwrap();
-    let account = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            match second.open_account_with_services(support::protector(), services::offline()) {
-                Ok(a) => break a,
-                Err(e) if e.code == ErrorCode::WriterBusy => tokio::task::yield_now().await,
-                Err(e) => panic!("{e}"),
-            }
-        }
-    })
-    .await
-    .unwrap();
+    let account = second
+        .open_account_with_services(support::protector(), services::offline())
+        .unwrap();
     settled(&account).await;
     assert_eq!(info(&net).await.state, NetworkState::Stopped);
     assert_eq!(online(&net).await.endpoint_id, Some(candidate.endpoint_id));
