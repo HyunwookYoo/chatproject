@@ -347,6 +347,37 @@ async fn suspended_commands_cannot_write_or_handoff_phrase() {
 }
 
 #[tokio::test]
+async fn completed_resume_has_already_reopened_the_network_gate() {
+    use futures_util::FutureExt;
+    // A native caller may start the network as soon as it reads 0 (completed). A thread that
+    // spins on the status checks the gate at the earliest moment: a gated operation looks at
+    // the gate before its first await, so a closed gate answers Busy on the first poll.
+    let dir = tempfile::tempdir().unwrap();
+    let (slot, account) = open(dir.path()).await;
+    let network = slot.network().unwrap();
+    for _ in 0..200 {
+        account.request_suspend();
+        settled(&account).await;
+        assert_eq!(account.request_resume(), 1);
+        let (account, network) = (account.clone(), network.clone());
+        let (status, first_poll) = tokio::task::spawn_blocking(move || {
+            while account.lifecycle_status() == 1 {
+                std::hint::spin_loop();
+            }
+            let first_poll = network.execute(NetworkOp::Stop).now_or_never();
+            (account.lifecycle_status(), first_poll)
+        })
+        .await
+        .unwrap();
+        assert_eq!(status, 0);
+        assert!(
+            !matches!(&first_poll, Some(Err(e)) if e.code == ErrorCode::Busy),
+            "{first_poll:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn queued_creation_cannot_cross_a_lifecycle_cycle() {
     let dir = tempfile::tempdir().unwrap();
     let (slot, account) = open(dir.path()).await;

@@ -65,7 +65,9 @@ CONFIGS.each do |name|
     'SWIFT_OBJC_BRIDGING_HEADER' => "#{NSE}/#{NSE}-Bridging-Header.h",
     'LIBRARY_SEARCH_PATHS[sdk=iphoneos*]' => '$(SRCROOT)/../../target/aarch64-apple-ios/release',
     'LIBRARY_SEARCH_PATHS[sdk=iphonesimulator*]' => '$(SRCROOT)/../../target/aarch64-apple-ios-sim/release',
-    'OTHER_LDFLAGS' => ['$(inherited)', '-lchat_nse'],
+    # A Rust static archive does not carry its native link requirements; chat_nse links all of
+    # chat_core, and iroh's netdev calls Network.framework (as chat_ffi.podspec also states).
+    'OTHER_LDFLAGS' => ['$(inherited)', '-lchat_nse', '-framework', 'Network'],
     'EXCLUDED_ARCHS[sdk=iphonesimulator*]' => '$(inherited) x86_64' # the Rust simulator library is arm64 only
   }.each { |key, value| set.(config, key, value) }
 end

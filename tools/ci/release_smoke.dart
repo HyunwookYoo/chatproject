@@ -83,6 +83,8 @@ Future<void> runSmoke({
   Duration readyTimeout = const Duration(seconds: 45),
   Duration settleTime = const Duration(seconds: 3),
   Duration pollInterval = const Duration(milliseconds: 300),
+  // Times the readiness and exit deadlines. Tests pass a clock that advances per fake command.
+  Stopwatch Function() stopwatch = Stopwatch.new,
 }) async {
   if (contractNonce == null) {
     await _runSmokeOnce(
@@ -95,6 +97,7 @@ Future<void> runSmoke({
       readyTimeout: readyTimeout,
       settleTime: settleTime,
       pollInterval: pollInterval,
+      stopwatch: stopwatch,
     );
     return;
   }
@@ -121,6 +124,7 @@ Future<void> runSmoke({
       readyTimeout: readyTimeout,
       settleTime: settleTime,
       pollInterval: pollInterval,
+      stopwatch: stopwatch,
     );
     if (phase == 'created') {
       created = proof;
@@ -163,6 +167,7 @@ Future<Map<String, dynamic>?> _runSmokeOnce({
   required Duration readyTimeout,
   required Duration settleTime,
   required Duration pollInterval,
+  required Stopwatch Function() stopwatch,
 }) async {
   Map<String, dynamic>? proof;
   final run = _Smoke(runner, logs, cancellation ?? RunCancellation());
@@ -272,7 +277,7 @@ Future<Map<String, dynamic>?> _runSmokeOnce({
         }
         if (current.isNotEmpty) {
           await command(['shell', 'am', 'force-stop', _package], cleanup: true);
-          final stopped = Stopwatch()..start();
+          final stopped = stopwatch()..start();
           while (true) {
             final remaining = await appPid(cleanup: true);
             if (remaining.isEmpty) break;
@@ -354,7 +359,7 @@ Future<Map<String, dynamic>?> _runSmokeOnce({
     } else {
       throw const FormatException('Unsupported platform');
     }
-    final timer = Stopwatch()..start();
+    final timer = stopwatch()..start();
     Duration? readyAt;
     while (true) {
       run.cancel.check();
