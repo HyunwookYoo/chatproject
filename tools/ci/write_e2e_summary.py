@@ -20,6 +20,11 @@ FAILURE_KINDS = set('cleanup command_exit timeout cancelled socket filesystem pr
                     'owned_child_exit timeout_network_start timeout_network_info timeout_connect_peer '
                     'timeout_send_probe_text timeout_set_offline timeout_disconnect_peer '
                     'timeout_network_stop timeout_state_event timeout_probe_event timeout_offline_event'.split())
+SCENARIOS = {'m2', 'm3', 'm3-auth', 'm4', 'm6'}
+# Fixed public failure texts, shared with tools/e2e/lib/src/diagnostic.dart.
+DETAILS = frozenset(json.loads(
+    (pathlib.Path(__file__).resolve().parents[1] / 'e2e' / 'diagnostic_details.json')
+    .read_text(encoding='utf-8'))['details'])
 EXIT_KINDS = set('command_exit avd_list_exit avd_create_exit avd_devices_exit avd_console_exit '
                  'avd_snapshot_exit owned_relay_exit owned_emulator_exit owned_chat_node_exit '
                  'owned_windows_exit owned_child_exit'.split())
@@ -43,13 +48,14 @@ def main():
             match = re.fullmatch(r'\s*Maximum resident set size \(kbytes\): (\d+)\s*', line)
             if match:
                 peak = int(match[1])
-    safe = {'phase': None, 'failure_kind': None, 'command_exit_code': None}
+    safe = {'phase': None, 'failure_kind': None, 'command_exit_code': None,
+            'detail': None, 'scenario': None, 'android_crash': None}
     if args.diagnostic_file and args.diagnostic_file.is_file():
         try:
             diagnostic = json.loads(args.diagnostic_file.read_text(encoding='utf-8'))
             if not isinstance(diagnostic, dict) or set(diagnostic) != set(safe):
                 raise ValueError()
-            phase, kind, code = (diagnostic[key] for key in safe)
+            phase, kind, code, detail, scenario, crash = (diagnostic[key] for key in safe)
             if not isinstance(phase, str) or phase not in PHASES:
                 raise ValueError()
             if kind is not None and (not isinstance(kind, str) or kind not in FAILURE_KINDS):
@@ -58,11 +64,19 @@ def main():
                 raise ValueError()
             if (kind in EXIT_KINDS) != (code is not None):
                 raise ValueError()
-            safe = {'phase': phase, 'failure_kind': kind, 'command_exit_code': code}
+            if detail is not None and (not isinstance(detail, str) or detail not in DETAILS):
+                raise ValueError()
+            if not isinstance(scenario, str) or scenario not in SCENARIOS:
+                raise ValueError()
+            # Presence of Android crash-buffer entries only, never their text.
+            if crash is not None and (type(crash) is not bool or args.profile != 'android'):
+                raise ValueError()
+            safe = {'phase': phase, 'failure_kind': kind, 'command_exit_code': code,
+                    'detail': detail, 'scenario': scenario, 'android_crash': crash}
         except (OSError, ValueError):
             parser.error('Invalid safe diagnostic')
     # Reconstruct only fixed keys and validated values; never copy log/error text.
-    value = {'schema_version': 3, 'profile': args.profile, 'stage': args.stage,
+    value = {'schema_version': 4, 'profile': args.profile, 'stage': args.stage,
              'outcome': args.outcome, 'exitCode': args.exit_code, 'peak_rss_kib': peak,
              **safe}
     args.output.write_text(json.dumps(value, indent=2) + '\n', encoding='utf-8')

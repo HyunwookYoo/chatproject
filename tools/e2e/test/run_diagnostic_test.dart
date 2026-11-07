@@ -293,6 +293,7 @@ void main() {
             'phase': origin,
             'failure_kind': 'timeout',
             'command_exit_code': null,
+            'detail': 'Future not completed',
           });
         } finally {
           release.complete();
@@ -333,6 +334,7 @@ void main() {
         'phase': 'avd_create',
         'failure_kind': 'avd_list_exit',
         'command_exit_code': -9,
+        'detail': null,
       });
     },
   );
@@ -401,6 +403,7 @@ void main() {
           'phase': 'avd_create',
           'failure_kind': entry.$3,
           'command_exit_code': entry.$4,
+          'detail': null,
         });
         expect(projection().toString(), isNot(contains('PRIVATE_TOKEN')));
         await runner.stop(process);
@@ -441,6 +444,7 @@ void main() {
         'phase': 'scenario',
         'failure_kind': 'timeout',
         'command_exit_code': null,
+        'detail': null,
       });
     },
   );
@@ -481,6 +485,7 @@ void main() { Timer.periodic(const Duration(seconds: 1), (_) {}); }
         'phase': 'build_node',
         'failure_kind': 'timeout',
         'command_exit_code': null,
+        'detail': 'Future not completed',
       });
     },
   );
@@ -516,6 +521,7 @@ void main() { Timer.periodic(const Duration(seconds: 1), (_) {}); }
         'phase': 'build_android',
         'failure_kind': 'command_exit',
         'command_exit_code': 17,
+        'detail': null,
       });
     },
   );
@@ -544,6 +550,7 @@ void main() { Timer.periodic(const Duration(seconds: 1), (_) {}); }
       'phase': 'cleanup',
       'failure_kind': 'cleanup',
       'command_exit_code': null,
+      'detail': null,
     });
   });
 
@@ -568,6 +575,7 @@ void main() { Timer.periodic(const Duration(seconds: 1), (_) {}); }
         'phase': 'build_android',
         'failure_kind': 'command_exit',
         'command_exit_code': 17,
+        'detail': null,
       });
       expect(projection().toString(), isNot(contains('PRIVATE_TOKEN')));
     },
@@ -580,6 +588,7 @@ void main() { Timer.periodic(const Duration(seconds: 1), (_) {}); }
       'phase': 'cleanup',
       'failure_kind': 'cleanup',
       'command_exit_code': null,
+      'detail': null,
     });
     run = type('_Run').newInstance(const Symbol(''), [logs]);
     phase('android_participant');
@@ -588,6 +597,20 @@ void main() { Timer.periodic(const Duration(seconds: 1), (_) {}); }
       'phase': 'android_participant',
       'failure_kind': 'other',
       'command_exit_code': null,
+      'detail': null,
+    });
+  });
+
+  test('a listed fixed failure text is kept as the detail', () {
+    phase('scenario');
+    run.invoke(const Symbol('recordFailure'), [
+      StateError('Android owned activity exited'),
+    ]);
+    expect(projection(), {
+      'phase': 'scenario',
+      'failure_kind': 'state',
+      'command_exit_code': null,
+      'detail': 'Android owned activity exited',
     });
   });
 }

@@ -360,6 +360,7 @@ void main() {
             'phase': entry.$4,
             'failure_kind': entry.$5,
             'command_exit_code': null,
+            'detail': 'Future not completed',
           });
           runner.recordFailure(const FileSystemException('PRIVATE_TOKEN'));
           runner.recordFailure(
@@ -376,6 +377,7 @@ void main() {
           'phase': entry.$4,
           'failure_kind': entry.$5,
           'command_exit_code': null,
+          'detail': 'Future not completed',
         });
         expect(captures, [same(original)]);
         expect(originalStack.toString(), contains('scenario.dart'));

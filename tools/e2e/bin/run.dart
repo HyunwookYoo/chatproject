@@ -6,6 +6,7 @@ import 'package:args/args.dart';
 import 'package:chat_e2e/src/android_sdk.dart';
 import 'package:chat_e2e/src/controller.dart';
 import 'package:chat_e2e/src/account_scenario.dart';
+import 'package:chat_e2e/src/diagnostic.dart';
 import 'package:chat_e2e/src/mailbox_scenario.dart';
 import 'package:chat_e2e/src/message_scenario.dart';
 import 'package:chat_e2e/src/emulators.dart';
@@ -105,6 +106,7 @@ Future<void> main(List<String> arguments) async {
   final messageScenario = options['scenario'] == 'm4';
   final mailboxScenario = options['scenario'] == 'm6';
   final accountScenario = options['scenario'] != 'm2';
+  final scenarioName = options['scenario'] as String;
   final logs = await Directory(
     p.join(
       root,
@@ -116,6 +118,8 @@ Future<void> main(List<String> arguments) async {
   ).create(recursive: true);
   final run = _Run(logs);
   Controller? controller;
+  // Presence of Android crash-buffer entries only; the entries stay private.
+  Future<bool?> Function()? androidCrashed;
   StreamSubscription<ProcessSignal>? signal;
   Future<void>? interrupted;
   var finished = false;
@@ -327,6 +331,23 @@ Future<void> main(List<String> arguments) async {
       }
       run.phase = _Phase.avdBoot;
       await run.wait(emulators.up(specs), timeout: const Duration(minutes: 5));
+      androidCrashed = () async {
+        var known = true;
+        for (final spec in specs) {
+          final result = await run.command(
+            sdk.adb,
+            ['-s', spec.serial, 'logcat', '-b', 'crash', '-d'],
+            requireSuccess: false,
+            cleanup: true,
+          );
+          if (result.exitCode != 0) {
+            known = false;
+          } else if ((result.stdout as String).trim().isNotEmpty) {
+            return true;
+          }
+        }
+        return known ? false : null;
+      };
       for (var i = 0; i < specs.length; i++) {
         final spec = specs[i];
         run.phase = _Phase.adbReverse;
@@ -336,6 +357,10 @@ Future<void> main(List<String> arguments) async {
         final name = 'android-${i + 1}';
         final adb = ['-s', spec.serial];
         run.phase = _Phase.androidInstall;
+        if (accountScenario) {
+          // A restored snapshot may carry an older crash buffer.
+          await run.command(sdk.adb, [...adb, 'logcat', '-b', 'crash', '-c']);
+        }
         await run.command(sdk.adb, [
           ...adb,
           'install',
@@ -692,6 +717,13 @@ Future<void> main(List<String> arguments) async {
     code = userInterrupted ? 130 : 1;
     run.token.cancel();
     await run.interrupt(controller);
+    if (accountScenario && androidCrashed != null) {
+      try {
+        run.androidCrash = await androidCrashed();
+      } catch (_) {
+        /* Unknown stays null in the retained summary. */
+      }
+    }
     File(
       p.join(logs.path, 'failure.log'),
     ).writeAsStringSync('${jsonEncode(run.safeFailure)}\n$stack', flush: true);
@@ -762,14 +794,17 @@ Future<void> main(List<String> arguments) async {
     if (diagnostic != null) {
       try {
         File(diagnostic).writeAsStringSync(
-          jsonEncode(
-            run.safeFailure ??
+          jsonEncode({
+            ...run.safeFailure ??
                 {
                   'phase': _Phase.complete.value,
                   'failure_kind': null,
                   'command_exit_code': null,
+                  'detail': null,
                 },
-          ),
+            'scenario': scenarioName,
+            'android_crash': run.androidCrash,
+          }),
           flush: true,
         );
       } on FileSystemException {
@@ -885,6 +920,8 @@ class _Run extends IoProcessRunner {
   bool finishing = false;
   _Phase phase = _Phase.preflight;
   Map<String, Object?>? safeFailure;
+  bool? androidCrash;
+  final safeDetails = loadSafeDetails();
 
   void recordFailure(
     Object? error, {
@@ -915,6 +952,7 @@ class _Run extends IoProcessRunner {
         _OwnedChildFailure() => error.code,
         _ => null,
       },
+      'detail': safeDetail(error, safeDetails),
     };
   }
 
