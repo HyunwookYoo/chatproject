@@ -21,8 +21,10 @@ class MailboxHost {
   MailboxHost(const MailboxHost&) = delete;
   MailboxHost& operator=(const MailboxHost&) = delete;
 
-  // Started with --tray: stay hidden behind a tray icon until Dart reports
-  // the mailbox setting. Off, or no report in time, shows the window.
+  // Started with --tray. If the last setMailbox was on (remembered under
+  // HKCU\Software\ChatProject), stay in the tray as a mailbox at once.
+  // Otherwise stay hidden behind a tray icon until Dart reports the setting;
+  // off, or no report in time, shows the window.
   void StartInTray();
 
   // Adds or removes the tray icon and re-evaluates the power request.

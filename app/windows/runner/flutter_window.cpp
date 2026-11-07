@@ -10,7 +10,13 @@
 FlutterWindow::FlutterWindow(const flutter::DartProject& project, bool start_in_tray)
     : start_in_tray_(start_in_tray), project_(project) {}
 
-FlutterWindow::~FlutterWindow() {}
+// If the message loop ends with the window still alive, OnDestroy has not run
+// (~Win32Window's Destroy() reaches only the base OnDestroy). Release the host
+// here, while the engine's messenger and the window still exist, so its
+// channel and tray icon are torn down safely.
+FlutterWindow::~FlutterWindow() {
+  mailbox_.reset();
+}
 
 bool FlutterWindow::OnCreate() {
   if (!Win32Window::OnCreate()) {

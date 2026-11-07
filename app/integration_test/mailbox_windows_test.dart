@@ -6,6 +6,7 @@ import 'package:integration_test/integration_test.dart';
 
 const _channel = MethodChannel('chat_app/mailbox');
 const _runKey = r'HKCU\Software\Microsoft\Windows\CurrentVersion\Run';
+const _settingsKey = r'HKCU\Software\ChatProject';
 
 /// The `ChatProject` Run value as Windows stores it, read without the runner.
 Future<String?> _runValue() async {
@@ -40,6 +41,41 @@ Future<void> _restoreRunValue(String? value) async {
   await Process.run('reg', arguments);
 }
 
+/// The runner's remembered setMailbox value, read without the runner: whether
+/// its key exists and the `Mailbox` DWORD (null when absent).
+Future<({bool key, int? mailbox})> _rememberedValue() async {
+  final key = await Process.run('reg', ['query', _settingsKey]);
+  if (key.exitCode != 0) return (key: false, mailbox: null);
+  final match = RegExp(
+    r'^\s*Mailbox\s+REG_DWORD\s+0x([0-9a-fA-F]+)\s*$',
+    multiLine: true,
+  ).firstMatch(key.stdout as String);
+  return (
+    key: true,
+    mailbox: match == null ? null : int.parse(match.group(1)!, radix: 16),
+  );
+}
+
+Future<void> _restoreRemembered(({bool key, int? mailbox}) value) async {
+  if (!value.key) {
+    await Process.run('reg', ['delete', _settingsKey, '/f']);
+  } else if (value.mailbox == null) {
+    await Process.run('reg', ['delete', _settingsKey, '/v', 'Mailbox', '/f']);
+  } else {
+    await Process.run('reg', [
+      'add',
+      _settingsKey,
+      '/v',
+      'Mailbox',
+      '/t',
+      'REG_DWORD',
+      '/d',
+      '${value.mailbox}',
+      '/f',
+    ]);
+  }
+}
+
 Future<Map<String, dynamic>> _probe([
   Map<String, Object?> arguments = const {},
 ]) async => (await _channel.invokeMapMethod<String, dynamic>(
@@ -54,17 +90,28 @@ void main() {
     tester,
   ) async {
     expect(Platform.isWindows, isTrue);
-    // Leave this machine as it was: no tray icon, the Run value it had before.
+    // Leave this machine as it was: no tray icon, the Run value and the
+    // remembered mailbox setting it had before.
     final original = await _runValue();
+    final remembered = await _rememberedValue();
     addTearDown(() async {
       await _channel.invokeMethod<bool>('setMailbox', false);
       await _restoreRunValue(original);
+      await _restoreRemembered(remembered);
       expect(await _runValue(), original);
+      final restored = await _rememberedValue();
+      expect(
+        (restored.key, restored.mailbox),
+        (remembered.key, remembered.mailbox),
+      );
     });
 
     expect(await _channel.invokeMethod<bool>('setMailbox', true), isTrue);
     var state = await _probe();
     expect(state['tray'], isTrue);
+    // A --tray start reads this before Dart reports the setting.
+    expect(state['remembered'], isTrue);
+    expect((await _rememberedValue()).mailbox, 1);
     // Without overrides the probe uses this machine's real power status.
     expect(state['powerHeld'], state['hold']);
 
@@ -94,6 +141,8 @@ void main() {
     state = await _probe();
     expect(state['tray'], isFalse);
     expect(state['powerHeld'], isFalse);
+    expect(state['remembered'], isFalse);
+    expect((await _rememberedValue()).mailbox, 0);
     state = await _probe({'ac': 1, 'battery': 1});
     expect(state['hold'], isFalse);
     expect(state['powerHeld'], isFalse);

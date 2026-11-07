@@ -14,6 +14,9 @@
 namespace {
 
 constexpr UINT kTrayMessage = WM_APP + 1;
+// Quit by destroying the window, the same teardown as closing it. Ending the
+// message loop with the window still alive crashes in the runner's teardown.
+constexpr UINT kQuitMessage = WM_APP + 2;
 constexpr UINT kTrayIconId = 1;
 constexpr UINT_PTR kTrayStartTimer = 0x4D42;
 // How long a --tray start waits for Dart to report the mailbox setting before
@@ -23,6 +26,25 @@ constexpr UINT kMenuOpen = 1;
 constexpr UINT kMenuQuit = 2;
 constexpr wchar_t kRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 constexpr wchar_t kRunValue[] = L"ChatProject";
+// The last setMailbox value, so a --tray start knows it before Dart reports.
+constexpr wchar_t kSettingsKey[] = L"Software\\ChatProject";
+constexpr wchar_t kMailboxValue[] = L"Mailbox";
+
+std::optional<bool> RememberedMailbox() {
+  DWORD value = 0;
+  DWORD size = sizeof(value);
+  if (RegGetValueW(HKEY_CURRENT_USER, kSettingsKey, kMailboxValue, RRF_RT_REG_DWORD,
+                   nullptr, &value, &size) != ERROR_SUCCESS) {
+    return std::nullopt;
+  }
+  return value != 0;
+}
+
+void RememberMailbox(bool on) {
+  const DWORD value = on ? 1 : 0;
+  RegSetKeyValueW(HKEY_CURRENT_USER, kSettingsKey, kMailboxValue, REG_DWORD, &value,
+                  sizeof(value));
+}
 
 std::wstring Utf16FromUtf8(const std::string& utf8) {
   if (utf8.empty()) return std::wstring();
@@ -168,7 +190,7 @@ void MailboxHost::HandleCall(
   }
   if (method == "quit") {
     result->Success();
-    PostQuitMessage(0);
+    PostMessage(window_, kQuitMessage, 0, 0);
     return;
   }
 #ifndef NDEBUG
@@ -209,6 +231,15 @@ void MailboxHost::HandleCall(
 }
 
 void MailboxHost::StartInTray() {
+  if (RememberedMailbox().value_or(false)) {
+    // Last told on: be a mailbox in the tray now. Dart's setMailbox at
+    // startup still corrects this.
+    mailbox_on_ = true;
+    UpdateIcon();
+    if (!icon_added_) ShowWindow(window_, SW_SHOW);
+    OnPowerBroadcast();
+    return;
+  }
   tray_start_pending_ = true;
   UpdateIcon();
   SetTimer(window_, kTrayStartTimer, kTrayStartTimeoutMs, nullptr);
@@ -224,6 +255,7 @@ void MailboxHost::SettleTrayStart() {
 
 void MailboxHost::SetMailbox(bool on) {
   mailbox_on_ = on;
+  RememberMailbox(on);
   SettleTrayStart();
   UpdateIcon();
   OnPowerBroadcast();
@@ -333,6 +365,12 @@ std::optional<LRESULT> MailboxHost::HandleMessage(UINT message, WPARAM wparam,
     UpdateIcon();
     return 0;
   }
+  if (message == kQuitMessage) {
+    // WM_DESTROY runs FlutterWindow::OnDestroy, which deletes this host, and
+    // then posts WM_QUIT. Touch no member after this call.
+    DestroyWindow(window_);
+    return 0;
+  }
   if (taskbar_created_ != 0 && message == taskbar_created_) {
     // Explorer restarted and dropped every tray icon.
     icon_added_ = false;
@@ -376,10 +414,11 @@ void MailboxHost::RequestExit() {
       "exitRequested", nullptr,
       std::make_unique<flutter::MethodResultFunctions<flutter::EncodableValue>>(
           nullptr,
-          [](const std::string&, const std::string&, const flutter::EncodableValue*) {
-            PostQuitMessage(0);
+          [window = window_](const std::string&, const std::string&,
+                             const flutter::EncodableValue*) {
+            PostMessage(window, kQuitMessage, 0, 0);
           },
-          []() { PostQuitMessage(0); }));
+          [window = window_]() { PostMessage(window, kQuitMessage, 0, 0); }));
 }
 
 void MailboxHost::ShowMenu(int x, int y) {
@@ -424,7 +463,10 @@ void MailboxHost::UpdateIcon() {
 #ifndef NDEBUG
 flutter::EncodableValue MailboxHost::ProbeState(bool hold, const char* close_action) {
   const auto run = RunValue();
+  const auto remembered = RememberedMailbox();
   return flutter::EncodableValue(flutter::EncodableMap{
+      {flutter::EncodableValue("remembered"),
+       remembered ? flutter::EncodableValue(*remembered) : flutter::EncodableValue()},
       {flutter::EncodableValue("tray"), flutter::EncodableValue(icon_added_)},
       {flutter::EncodableValue("powerHeld"), flutter::EncodableValue(power_held_)},
       {flutter::EncodableValue("hold"), flutter::EncodableValue(hold)},
