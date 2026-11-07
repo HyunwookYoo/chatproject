@@ -393,6 +393,7 @@ impl Default for Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::account::storage::ownership::child;
     use crate::account::{
         DeviceKind, Generation, IdentityRecord, RecordDevice, Secret32, derive_account,
         derive_device, record_packet,
@@ -490,11 +491,10 @@ mod tests {
         ];
         for retained in [false, true] {
             for (case, hash, seq, below, generation, devices, time) in cases {
-                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                let output = child::output(std::process::Command::new(std::env::current_exe().unwrap())
                     .args(["--exact", "account::connection::tests::remote_record_failure_diagnostic_preserves_observation_policy", "--nocapture"])
                     .env(CHILD, case)
-                    .env("CHAT_CORE_RECORD_CONFLICT_RETAINED", retained.to_string())
-                    .output().unwrap();
+                    .env("CHAT_CORE_RECORD_CONFLICT_RETAINED", retained.to_string()));
                 assert!(output.status.success(), "child {case}/{retained} failed: {}", String::from_utf8_lossy(&output.stderr));
                 let stderr = String::from_utf8(output.stderr).unwrap().replace("\r\n", "\n");
                 let expected = if !retained && matches!(case, "exact" | "renewal") {
@@ -515,6 +515,7 @@ mod tests {
         use std::io::Write;
         use std::process::Stdio;
 
+        let _spawning = child::spawning();
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "account::connection::tests::remote_record_failure_diagnostic_preserves_observation_policy", "--nocapture"])
             .env(CHILD, "lower")
