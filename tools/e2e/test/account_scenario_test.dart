@@ -549,6 +549,13 @@ class AccountFixture {
             return;
           }
           for (final s in states.values) {
+            // As in M6: a ready session stays as it is; only a new one
+            // carries this proof's provenance.
+            if ((s['contacts'] as List).any(
+              (c) => (c as Map)['device_unverified'] == false,
+            )) {
+              continue;
+            }
             s['contacts'] = [
               {'verified': true, 'device_unverified': false},
             ];

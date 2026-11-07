@@ -312,11 +312,25 @@ Future<void> runAccountScenario(
         }
       }
 
+      // Since M6 connect_account keeps a ready session (it dials only devices
+      // without one), so each later proof starts with no session: A's network
+      // restarts, both sides see the proof gone, and the routes are renewed.
+      Future<void> dropSessions() async {
+        await a.call('network_stop', {});
+        for (final p in [a, b]) {
+          await until(p, (v) => !proved(v));
+        }
+        await a.call('network_start', {});
+        await routeBoth();
+      }
+
       await routeBoth();
       await proof('auth_fresh', a, bPeer, false);
+      await dropSessions();
       controller.recordLookupsPaused = true;
       await proof('auth_cached', a, bPeer, true);
       controller.recordLookupsPaused = false;
+      await dropSessions();
       await proof('auth_fresh_again', a, bPeer, false);
       await b.call('network_stop', {});
       final disconnected = await until(a, (v) => !proved(v));
