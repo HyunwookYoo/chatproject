@@ -9,6 +9,8 @@ use crate::transport::{NetworkInfo, PeerInfo};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectionSnapshot {
     pub direct_peers: u32,
+    /// A ready session with another of my devices that announced itself as a mailbox (M6). The
+    /// account actor owns it (`EventBus::set_mailbox_ok`); every snapshot published carries it.
     pub mailbox_ok: bool,
     /// `None` while this user has no server queue.
     pub queue_ok: Option<bool>,
@@ -67,6 +69,7 @@ struct BusState {
     sinks: Vec<Arc<dyn EventSink>>,
     last_connection: Option<ConnectionSnapshot>,
     last_account: Option<CoreEvent>,
+    mailbox_ok: bool,
 }
 
 impl EventBus {
@@ -85,15 +88,30 @@ impl EventBus {
         state.sinks.push(sink);
     }
 
-    pub fn publish(&self, event: CoreEvent) {
+    pub fn publish(&self, mut event: CoreEvent) {
         let mut state = self.state.lock().expect("event bus lock poisoned");
-        if let CoreEvent::ConnectionState(snapshot) = &event {
+        if let CoreEvent::ConnectionState(snapshot) = &mut event {
+            snapshot.mailbox_ok = state.mailbox_ok;
             state.last_connection = Some(*snapshot);
         }
         if matches!(&event, CoreEvent::AccountChanged { .. }) {
             state.last_account = Some(event.clone());
         }
         state.sinks.retain(|sink| sink.send(event.clone()));
+    }
+
+    /// The account actor's word on `mailbox_ok`: a change is published at once with the rest of
+    /// the latest snapshot, and every later snapshot (the transport's) carries it.
+    pub(crate) fn set_mailbox_ok(&self, ok: bool) {
+        let snapshot = {
+            let mut state = self.state.lock().expect("event bus lock poisoned");
+            if state.mailbox_ok == ok {
+                return;
+            }
+            state.mailbox_ok = ok;
+            state.last_connection.unwrap_or(ConnectionSnapshot::OFFLINE)
+        };
+        self.publish(CoreEvent::ConnectionState(snapshot));
     }
 
     pub fn subscriber_count(&self) -> usize {
@@ -201,6 +219,22 @@ mod tests {
         let sink = Arc::new(RecordingSink::default());
         bus.subscribe(sink.clone());
         assert_eq!(sink.events(), Vec::<CoreEvent>::new());
+    }
+
+    #[test]
+    fn mailbox_ok_is_published_and_carried_by_later_snapshots() {
+        let bus = EventBus::new();
+        let sink = Arc::new(RecordingSink::default());
+        bus.subscribe(sink.clone());
+        bus.publish(state(2));
+        bus.set_mailbox_ok(true);
+        bus.set_mailbox_ok(true);
+        bus.publish(state(3));
+        bus.set_mailbox_ok(false);
+        let ok = |direct_peers, mailbox_ok| {
+            CoreEvent::ConnectionState(ConnectionSnapshot { direct_peers, mailbox_ok, queue_ok: None })
+        };
+        assert_eq!(sink.events(), vec![ok(2, false), ok(2, true), ok(3, true), ok(3, false)]);
     }
 
     #[test]

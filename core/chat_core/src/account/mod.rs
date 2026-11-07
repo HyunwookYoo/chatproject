@@ -32,7 +32,8 @@ pub use types::{DeviceKind, FlowId, Generation, InstallationId, PeerId, Secret32
 mod manager;
 pub use creation::RecoveryDisplay;
 pub use manager::{
-    AccountHandle, AccountPhase, AccountView, CandidateInfo, GroupState, PublishIntent,
+    AccountHandle, AccountPhase, AccountView, CandidateInfo, GroupState, MailboxStateView,
+    PublishIntent,
 };
 
 mod invite;

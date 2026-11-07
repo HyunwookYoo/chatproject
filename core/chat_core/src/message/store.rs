@@ -371,8 +371,10 @@ pub(crate) fn execute(
         MessageDbOp::RecoverScheduler(now) => {
             let tx = c.transaction().map_err(sql_error)?;
             let now = integer(now)?;
-            // Called only once by a new Manager before any local launch.
-            tx.execute("UPDATE outbox SET dispatch_state=CASE WHEN dispatch_state=1 THEN 0 ELSE dispatch_state END,next_retry_at_ms=?1+min(max(next_retry_at_ms-?1,0),retry_delay_ms,300000)",params![now]).map_err(sql_error)?;
+            // Called only once by a new Manager before any local launch. A mailbox's outbox
+            // waits at most its own cap (Ruling 7).
+            let cap = integer(outbox_delay_cap(&tx)?)?;
+            tx.execute("UPDATE outbox SET dispatch_state=CASE WHEN dispatch_state=1 THEN 0 ELSE dispatch_state END,next_retry_at_ms=?1+min(max(next_retry_at_ms-?1,0),retry_delay_ms,?2)",params![now,cap]).map_err(sql_error)?;
             tx.execute("UPDATE receipt_job SET next_retry_at_ms=?1+min(max(next_retry_at_ms-?1,0),300000)",params![now]).map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
             Ok(MessageDbReply::Done)
@@ -1796,6 +1798,15 @@ impl MessageDbOp {
     }
 }
 
+/// The longest an outbox row waits between attempts: 30 s while this device is a mailbox (M6
+/// roadmap, Ruling 7), otherwise `MAX_DELAY_MS`. Read in the transaction that schedules.
+fn outbox_delay_cap(c: &Connection) -> R<u64> {
+    Ok(if super::mailbox_store::mailbox_enabled(c)? {
+        crate::mailbox::MAILBOX_MAX_DELAY_MS
+    } else {
+        super::scheduler::MAX_DELAY_MS
+    })
+}
 pub(super) fn schedule_retry(tx: &Transaction<'_>, k: MessageKey, receipt: bool, now: u64) -> R<()> {
     let table = if receipt { "receipt_job" } else { "outbox" };
     let filter = "conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4";
@@ -1804,7 +1815,11 @@ pub(super) fn schedule_retry(tx: &Transaction<'_>, k: MessageKey, receipt: bool,
         |r| r.get::<_,Option<i64>>(0)).map_err(sql_error)?;
     let Some(count) = count else { return Ok(()) };
     let count = (count as u64).saturating_add(1).min(u32::MAX as u64);
-    let delay = super::scheduler::retry_delay(count);
+    let delay = if receipt {
+        super::scheduler::retry_delay(count)
+    } else {
+        super::scheduler::retry_delay_capped(count, outbox_delay_cap(tx)?)
+    };
     let next = integer(now.checked_add(delay).ok_or_else(invalid)?)?;
     let extra = if receipt { String::new() } else { format!(",retry_delay_ms={delay}") };
     tx.execute(&format!("UPDATE {table} SET attempts=?5,next_retry_at_ms=?6{extra} WHERE {filter}"),

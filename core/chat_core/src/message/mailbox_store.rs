@@ -10,6 +10,10 @@
 //! As a mailbox (spec 7), this device also keeps the ciphertexts its other devices handed over
 //! (`mailbox_handoff`) with their retry state; how each attempt ended goes into the log as a
 //! note for the device that handed it over.
+//!
+//! The mailbox role itself (`mailbox_local`: set on this device; `mailbox_device`: what my other
+//! devices announced; `mailbox_uptime`: this device's up periods while it is a mailbox) is kept
+//! here too (spec 8.4).
 use super::mls_group::sql;
 use super::mls_store::{Fault, finish, store_plain};
 use super::scheduler::retry_delay_capped;
@@ -20,7 +24,7 @@ use super::types::{ConversationId, MessageId};
 use crate::CoreError;
 use crate::account::{InstallationId, PeerId};
 use crate::mailbox::{
-    MAILBOX_MAX_DELAY_MS, MAILBOX_RETENTION_MS, PAGE_MAX_ENTRIES,
+    MAILBOX_MAX_DELAY_MS, MAILBOX_RETENTION_MS, PAGE_MAX_ENTRIES, UPTIME_GAP_MS, UPTIME_WINDOW_MS,
     wire::{
         EntryBody, HandoffEntry, LogEntry, MAX_ENTRY_BODY, PlainRecord, decode_note, note_body,
         page,
@@ -189,7 +193,8 @@ pub(crate) enum MailboxDbOp {
     /// The sealed ciphertexts (codec 2) of this device's messages that are not delivered,
     /// cancelled, failed or waiting for the peer's update, in send order (spec 7).
     HandoffRows,
-    /// Ciphertexts own device `origin` handed over, each due at `now`. Another ciphertext of a
+    /// Ciphertexts own device `origin` handed over, each due at `now`; none while this device is
+    /// not a mailbox (`Disabled`). Another ciphertext of a
     /// message already here replaces the one kept (its attempts start over); the same one again
     /// changes nothing. Not taken (Ruling 27): entries whose conversation is not this account's
     /// with `peer`, and messages already settled here — withdrawn (cancelled by the origin),
@@ -214,6 +219,23 @@ pub(crate) enum MailboxDbOp {
         now: u64,
         wall: u64,
     },
+    /// This device's mailbox setting and its uptime over the 7 days before `now` (wall time).
+    Local { now: u64 },
+    /// Sets (or clears) this device's mailbox role.
+    SetEnabled(bool),
+    /// The first-link screen (spec 8.1) was shown.
+    FirstLinkShown,
+    /// Own device `installation` announced at `at` whether it is a mailbox. `Count(1)` when that
+    /// changed what is recorded (a device not recorded counts as not a mailbox).
+    Announced {
+        installation: InstallationId,
+        mailbox: bool,
+        at: u64,
+    },
+    /// This device is up as a mailbox at `now` (wall time): the last period goes on if it ended
+    /// at most `UPTIME_GAP_MS` before, otherwise a new one starts; periods that ended more than
+    /// `UPTIME_WINDOW_MS` before are dropped.
+    Uptime { now: u64 },
 }
 impl MailboxDbOp {
     pub(crate) fn writes(&self) -> bool {
@@ -225,6 +247,7 @@ impl MailboxDbOp {
                 | Self::Unsealed
                 | Self::HandoffRows
                 | Self::HandoffDue(_)
+                | Self::Local { .. }
         )
     }
 }
@@ -272,6 +295,14 @@ pub(crate) enum MailboxDbReply {
         jobs: Vec<(InstallationId, HandoffEntry)>,
         next: Option<u64>,
     },
+    /// `mailbox_local` and the uptime over the 7-day window, per mille of it.
+    Local {
+        enabled: bool,
+        first_link_shown: bool,
+        uptime_7d_permille: u32,
+    },
+    /// This device is not a mailbox: the handoff was not taken.
+    Disabled,
 }
 
 pub(super) fn mailbox_op(
@@ -397,6 +428,9 @@ pub(super) fn mailbox_op(
             now,
         } => {
             let tx = c.transaction().map_err(sql)?;
+            if !mailbox_enabled(&tx)? {
+                return Ok(MessageDbReply::Mailbox(MailboxDbReply::Disabled));
+            }
             let mut taken = 0;
             for entry in entries {
                 if conversation_id(identity.peer, entry.peer).ok() != Some(entry.conversation)
@@ -455,8 +489,127 @@ pub(super) fn mailbox_op(
             finish(tx, fault)?;
             MailboxDbReply::Count(changed)
         }
+        MailboxDbOp::Local { now } => {
+            let (enabled, first_link_shown) = c
+                .query_row(
+                    "SELECT enabled,first_link_shown FROM mailbox_local WHERE singleton=1",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .map_err(sql)?;
+            MailboxDbReply::Local {
+                enabled,
+                first_link_shown,
+                uptime_7d_permille: uptime_permille(c, now)?,
+            }
+        }
+        MailboxDbOp::SetEnabled(enabled) => {
+            let tx = c.transaction().map_err(sql)?;
+            tx.execute(
+                "UPDATE mailbox_local SET enabled=?1 WHERE singleton=1",
+                params![enabled],
+            )
+            .map_err(sql)?;
+            finish(tx, fault)?;
+            MailboxDbReply::Count(1)
+        }
+        MailboxDbOp::FirstLinkShown => {
+            let tx = c.transaction().map_err(sql)?;
+            tx.execute(
+                "UPDATE mailbox_local SET first_link_shown=1 WHERE singleton=1",
+                [],
+            )
+            .map_err(sql)?;
+            finish(tx, fault)?;
+            MailboxDbReply::Count(1)
+        }
+        MailboxDbOp::Announced {
+            installation,
+            mailbox,
+            at,
+        } => {
+            let tx = c.transaction().map_err(sql)?;
+            let before: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM mailbox_device WHERE installation=?1 AND mailbox=1)",
+                    params![installation.0.as_slice()],
+                    |r| r.get(0),
+                )
+                .map_err(sql)?;
+            tx.execute(
+                "INSERT INTO mailbox_device VALUES(?1,?2,?3) ON CONFLICT(installation) DO UPDATE SET mailbox=excluded.mailbox,announced_at_ms=excluded.announced_at_ms",
+                params![installation.0.as_slice(), mailbox, integer(at)?],
+            )
+            .map_err(sql)?;
+            finish(tx, fault)?;
+            MailboxDbReply::Count(u64::from(before != mailbox))
+        }
+        MailboxDbOp::Uptime { now } => {
+            let tx = c.transaction().map_err(sql)?;
+            record_uptime(&tx, now)?;
+            finish(tx, fault)?;
+            MailboxDbReply::Count(1)
+        }
     };
     Ok(MessageDbReply::Mailbox(reply))
+}
+
+/// This device is set as a mailbox (`mailbox_local.enabled`).
+pub(super) fn mailbox_enabled(c: &Connection) -> R<bool> {
+    c.query_row(
+        "SELECT enabled FROM mailbox_local WHERE singleton=1",
+        [],
+        |r| r.get(0),
+    )
+    .map_err(sql)
+}
+
+fn record_uptime(tx: &Transaction, now: u64) -> R<()> {
+    tx.execute(
+        "DELETE FROM mailbox_uptime WHERE ended_at_ms<?1",
+        params![integer(now.saturating_sub(UPTIME_WINDOW_MS))?],
+    )
+    .map_err(sql)?;
+    let last: Option<(i64, u64)> = tx
+        .query_row(
+            "SELECT started_at_ms,ended_at_ms FROM mailbox_uptime ORDER BY started_at_ms DESC LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, uint(r, 1)?)),
+        )
+        .optional()
+        .map_err(sql)?;
+    match last {
+        Some((started, ended)) if now >= ended && now - ended <= UPTIME_GAP_MS => {
+            tx.execute(
+                "UPDATE mailbox_uptime SET ended_at_ms=?2 WHERE started_at_ms=?1",
+                params![started, integer(now)?],
+            )
+            .map_err(sql)?;
+        }
+        // The wall clock went back: this time is counted already.
+        Some((_, ended)) if now < ended => {}
+        _ => {
+            tx.execute(
+                "INSERT OR IGNORE INTO mailbox_uptime VALUES(?1,?1)",
+                params![integer(now)?],
+            )
+            .map_err(sql)?;
+        }
+    }
+    Ok(())
+}
+
+/// The time up within the 7 days before `now`, per mille of them.
+fn uptime_permille(c: &Connection, now: u64) -> R<u32> {
+    let from = now.saturating_sub(UPTIME_WINDOW_MS);
+    let up: u64 = c
+        .query_row(
+            "SELECT coalesce(sum(min(ended_at_ms,?1)-max(started_at_ms,?2)),0) FROM mailbox_uptime WHERE ended_at_ms>?2 AND started_at_ms<?1",
+            params![integer(now)?, integer(from)?],
+            |r| uint(r, 0),
+        )
+        .map_err(sql)?;
+    Ok((up.saturating_mul(1000) / UPTIME_WINDOW_MS).min(1000) as u32)
 }
 
 /// Whether this device already knows message `msg_id` that `origin` sent in `conversation` to be
@@ -1008,6 +1161,10 @@ pub struct MailboxState {
     pub status_ahead: u64,
     /// The `mailbox_handoff` rows, by origin, conversation and message.
     pub handoff_rows: Vec<HandoffRow>,
+    /// `mailbox_device` as `(installation, mailbox)`, by installation.
+    pub device_rows: Vec<(InstallationId, bool)>,
+    /// `mailbox_uptime` as `(started_at_ms, ended_at_ms)`, oldest first.
+    pub uptime: Vec<(u64, u64)>,
 }
 
 /// One `mailbox_handoff` row, for fixture assertions.
@@ -1082,6 +1239,24 @@ pub(super) fn fixture_state(c: &Connection) -> R<MailboxState> {
         .collect::<Result<_, _>>()
         .map_err(sql)?
     };
+    let device_rows = {
+        let mut q = c
+            .prepare("SELECT installation,mailbox FROM mailbox_device ORDER BY installation")
+            .map_err(sql)?;
+        q.query_map([], |r| Ok((InstallationId(bytes(r, 0)?), r.get(1)?)))
+            .map_err(sql)?
+            .collect::<Result<_, _>>()
+            .map_err(sql)?
+    };
+    let uptime = {
+        let mut q = c
+            .prepare("SELECT started_at_ms,ended_at_ms FROM mailbox_uptime ORDER BY started_at_ms")
+            .map_err(sql)?;
+        q.query_map([], |r| Ok((uint(r, 0)?, uint(r, 1)?)))
+            .map_err(sql)?
+            .collect::<Result<_, _>>()
+            .map_err(sql)?
+    };
     Ok(MailboxState {
         entries,
         cursors: pairs("mailbox_cursor", "next_seq")?,
@@ -1090,11 +1265,13 @@ pub(super) fn fixture_state(c: &Connection) -> R<MailboxState> {
         handoffs: count("mailbox_handoff")?,
         status_ahead: count("mailbox_status_ahead")?,
         handoff_rows,
+        device_rows,
+        uptime,
     })
 }
 
-/// Records `installation` as a mailbox device (or not) at `at`, the way its `Announce` will
-/// (Task 10); until then tests mark mailboxes with this (Ruling 12).
+/// Records `installation` as a mailbox device (or not) at `at`, the way its `Announce` does, for
+/// tests that need it recorded at a precise moment.
 #[cfg(all(feature = "test-hooks", debug_assertions))]
 pub(super) fn fixture_mark(
     c: &Connection,

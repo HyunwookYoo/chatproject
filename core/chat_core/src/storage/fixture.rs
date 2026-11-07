@@ -935,8 +935,8 @@ impl Fixture {
         self.handle.0.test(TestOp::Message(FixtureOp::MailboxSeed(installation, at, tx))).await;
         rx.await.unwrap()
     }
-    /// Records `installation` as a mailbox device of this account (Ruling 12: until Task 10's
-    /// `Announce` does), or not.
+    /// Records `installation` as a mailbox device of this account, or not, as its `Announce`
+    /// does (for a test that needs it recorded at a precise moment).
     pub async fn mailbox_mark(&self, installation: crate::account::InstallationId, mailbox: bool, at: u64) -> Result<(), CoreError> {
         let (tx, rx) = oneshot::channel();
         self.handle.0.test(TestOp::Message(FixtureOp::MailboxMark(installation, mailbox, at, tx))).await;

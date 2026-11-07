@@ -57,6 +57,14 @@ pub struct AccountView {
     pub publication: PublicationView,
 }
 
+/// This device's mailbox role (M6 spec 8.1, 8.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MailboxStateView {
+    pub enabled: bool,
+    pub first_link_shown: bool,
+    /// Time up as a mailbox within the last 7 days, per mille of them.
+    pub uptime_7d_permille: u32,
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CandidateInfo {
     pub installation_id: InstallationId,
@@ -82,6 +90,9 @@ enum Command {
     MailboxTest(mailbox::MailboxTest,oneshot::Sender<Result<mailbox::MailboxTestReply,CoreError>>),
     MailboxSyncNow(oneshot::Sender<Result<(),CoreError>>),
     MailboxBackground(oneshot::Sender<Result<u32,CoreError>>),
+    MailboxState(oneshot::Sender<Result<MailboxStateView,CoreError>>),
+    SetMailbox(bool,oneshot::Sender<Result<(),CoreError>>),
+    MailboxFirstLinkShown(oneshot::Sender<Result<(),CoreError>>),
     Retry(oneshot::Sender<Result<u64, CoreError>>),
     #[cfg(all(feature="test-hooks",debug_assertions))]
     PairTestStop(super::PairTestStop,oneshot::Sender<Result<(),CoreError>>),
@@ -155,6 +166,9 @@ impl Command {
             Self::MailboxTest(_,reply)=>{let _=reply.send(Err(error));}
             Self::MailboxSyncNow(reply)=>{let _=reply.send(Err(error));}
             Self::MailboxBackground(reply)=>{let _=reply.send(Err(error));}
+            Self::MailboxState(reply)=>{let _=reply.send(Err(error));}
+            Self::SetMailbox(_,reply)=>{let _=reply.send(Err(error));}
+            Self::MailboxFirstLinkShown(reply)=>{let _=reply.send(Err(error));}
             Self::Retry(reply) => { let _ = reply.send(Err(error)); }
             #[cfg(all(feature="test-hooks",debug_assertions))]
             Self::PairTestStop(_,reply)=>{let _=reply.send(Err(error));}
@@ -413,6 +427,21 @@ impl AccountHandle {
     /// retry them. Returns how many messages were handed over.
     pub async fn mailbox_background(&self) -> Result<u32, CoreError> {
         self.send(Command::MailboxBackground).await
+    }
+    /// This device's mailbox setting, whether the first-link screen was shown, and its uptime
+    /// over the last 7 days (spec 8.4: recorded only, nothing is judged from it in M6).
+    pub async fn mailbox_state(&self) -> Result<MailboxStateView, CoreError> {
+        self.send(Command::MailboxState).await
+    }
+    /// Sets this device as a mailbox (or not) and tells my other connected devices
+    /// (`Announce`; never a contact). While it is one, its outbox backs off at most 30 s and its
+    /// uptime is recorded.
+    pub async fn set_mailbox(&self, enabled: bool) -> Result<(), CoreError> {
+        self.send(|reply| Command::SetMailbox(enabled, reply)).await
+    }
+    /// The first-link screen (spec 8.1) was shown; it is not shown again.
+    pub async fn mark_first_link_shown(&self) -> Result<(), CoreError> {
+        self.send(Command::MailboxFirstLinkShown).await
     }
     pub async fn refresh_record(&self, peer: PeerId) -> Result<(), CoreError> {
         self.send(|reply| Command::Refresh(peer, reply)).await
@@ -1232,6 +1261,9 @@ impl Manager {
                         Command::MailboxTest(test,reply)=>{let result=self.mailbox_test(test).await;let _=reply.send(result);}
                         Command::MailboxSyncNow(reply)=>{let result=self.mailbox_sync_now().await;let _=reply.send(result);}
                         Command::MailboxBackground(reply)=>{let result=self.mailbox_background().await;let _=reply.send(result);}
+                        Command::MailboxState(reply)=>{let result=self.mailbox_state().await;let _=reply.send(result);}
+                        Command::SetMailbox(enabled,reply)=>{let result=self.set_mailbox(enabled).await;let _=reply.send(result);}
+                        Command::MailboxFirstLinkShown(reply)=>{let result=self.mark_first_link_shown().await;let _=reply.send(result);}
                         Command::Retry(reply) => { let result = self.retry_open(); let _ = reply.send(result); }
                         #[cfg(all(feature="test-hooks",debug_assertions))]
                         Command::PairTestStop(stop,reply)=>{self.pair.stop=Some(stop);self.pair.reached=None;let _=reply.send(Ok(()));}

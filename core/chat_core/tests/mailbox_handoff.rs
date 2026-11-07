@@ -13,8 +13,10 @@ use sha2::Digest;
 /// `next_retry_at_ms` of a handed-off ciphertext the peer could not open.
 const STOPPED: u64 = i64::MAX as u64;
 
-/// Records `mailbox` as a mailbox device on `f` (what its `Announce` will do, Task 10).
+/// Sets `mailbox` as a mailbox and records it as one on `f` at once (its `Announce` reaches `f`
+/// a moment later).
 async fn mark_mailbox(f: &Fixture, mailbox: &Fixture) {
+    mailbox.account.set_mailbox(true).await.unwrap();
     let id = installation(mailbox).await;
     f.account
         .storage_test_fixture()
@@ -397,6 +399,7 @@ async fn withdraw_pulled_before_the_handoff_frame_keeps_it_out() {
         .unwrap()
         .unwrap();
     let ct = sealed(&a1, key).await;
+    a2.account.set_mailbox(true).await.unwrap();
     a1.account.messages().cancel_send(key).await.unwrap();
     // A2 has the withdrawal (kept, as nothing was handed over yet).
     settle!(
@@ -438,6 +441,7 @@ async fn delivered_pulled_before_the_handoff_frame_keeps_it_out() {
     );
     // From here B1 would never ack: a row, if made, would stay and be tried.
     b1.account.message_test_m4_peer(true).await.unwrap();
+    a2.account.set_mailbox(true).await.unwrap();
 
     late_handoff(&a1, &a2, b1.peer, key, ct).await;
     quiet(&[&a1, &a2, &b1]).await;

@@ -31,6 +31,13 @@
 //! `Delivered`, or `HandoffStop` when the peer could not open it, which the origin takes as its
 //! own decrypt failure (only the origin re-encrypts). The origin keeps retrying too; the peer
 //! drops the duplicate.
+//!
+//! The mailbox role (spec 8.4): a device set as a mailbox (`set_mailbox`) tells my other devices
+//! with `Announce`, when it changes and on every session with one that becomes ready, and never
+//! a contact. What they announce is recorded (`mailbox_device`): it is where handoffs go, which
+//! of my devices `mailbox_sync_now` dials first, and what `ConnectionSnapshot::mailbox_ok`
+//! reports. A mailbox takes handoffs only while it is one (what it took it tries until settled),
+//! and records its uptime every `UPTIME_EVERY_MS` (M6 records it, nothing judges it).
 use super::mls::{Origin, Via};
 use super::*;
 use crate::account::{
@@ -56,6 +63,8 @@ const NOTIFY_GAP_MS: u64 = 200;
 const PRUNE_EVERY_MS: u64 = 3_600_000;
 /// A peer without a session is dialed for the ciphertexts handed over for it at most this often.
 const HANDOFF_DIAL_GAP_MS: u64 = 30_000;
+/// A mailbox records that it is up this often.
+const UPTIME_EVERY_MS: u64 = 60_000;
 
 /// A handed-off ciphertext's row: the device that handed it over, conversation, message.
 type HandoffKey = (InstallationId, ConversationId, MessageId);
@@ -89,6 +98,21 @@ pub(crate) struct Runtime {
     woken: BTreeSet<PeerId>,
     /// Per peer, when its devices were last dialed for what was handed over for it.
     dialed: BTreeMap<PeerId, u64>,
+    /// This device is set as a mailbox (`None`: read at the next poll).
+    enabled: Option<bool>,
+    /// My devices recorded as mailboxes (`None`: read at the next poll).
+    mailboxes: Option<BTreeSet<InstallationId>>,
+    /// Own devices whose session became ready: told at the next poll whether this one is a
+    /// mailbox.
+    announce_due: BTreeSet<InstallationId>,
+    /// Scheduler time this device, while a mailbox, next records that it is up.
+    uptime_at: u64,
+    /// Each `Announce` sent: to which device, saying what.
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    announces: Vec<(InstallationId, bool)>,
+    /// The devices the last `mailbox_sync_now` dialed, in order.
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    sync_dials: Vec<InstallationId>,
     /// Each handed-off ciphertext sent: scheduler time and SHA-256 of the ciphertext.
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     handoff_sends: Vec<(u64, [u8; 32])>,
@@ -307,6 +331,8 @@ pub(crate) enum MailboxTest {
     Hold(bool),
     Counters,
     HandoffSends,
+    Announces,
+    SyncDials,
 }
 #[cfg(all(feature = "test-hooks", debug_assertions))]
 pub(crate) enum MailboxTestReply {
@@ -314,6 +340,8 @@ pub(crate) enum MailboxTestReply {
     Done,
     Counters(MailboxCounters),
     Sends(Vec<(u64, [u8; 32])>),
+    Announces(Vec<(InstallationId, bool)>),
+    Dials(Vec<InstallationId>),
 }
 
 /// What own-device sync counted since this core started (for the M6 results).
@@ -371,6 +399,21 @@ impl AccountHandle {
             _ => unreachable!(),
         }
     }
+    /// Each `Announce` this device sent, in order: to which device, and whether it said it is a
+    /// mailbox.
+    pub async fn mailbox_test_announces(&self) -> Result<Vec<(InstallationId, bool)>, CoreError> {
+        match self.mailbox_test(MailboxTest::Announces).await? {
+            MailboxTestReply::Announces(announces) => Ok(announces),
+            _ => unreachable!(),
+        }
+    }
+    /// The devices the last `mailbox_sync_now` dialed, in the order it dialed them.
+    pub async fn mailbox_test_sync_dials(&self) -> Result<Vec<InstallationId>, CoreError> {
+        match self.mailbox_test(MailboxTest::SyncDials).await? {
+            MailboxTestReply::Dials(dials) => Ok(dials),
+            _ => unreachable!(),
+        }
+    }
 }
 
 impl Manager {
@@ -417,6 +460,12 @@ impl Manager {
             MailboxTest::HandoffSends => {
                 MailboxTestReply::Sends(self.messages.mailbox.handoff_sends.clone())
             }
+            MailboxTest::Announces => {
+                MailboxTestReply::Announces(self.messages.mailbox.announces.clone())
+            }
+            MailboxTest::SyncDials => {
+                MailboxTestReply::Dials(self.messages.mailbox.sync_dials.clone())
+            }
         })
     }
 
@@ -443,9 +492,10 @@ impl Manager {
     }
 
     /// A session became ready (`install_grant`): with another own device, this device pulls its
-    /// log, and that device (doing the same) needs no `Notify` for what is logged so far; then
-    /// what this device has not delivered is handed over if it is a mailbox (spec 7). With
-    /// another account, what was handed over to this device for it is due at once.
+    /// log, and that device (doing the same) needs no `Notify` for what is logged so far; it is
+    /// told whether this device is a mailbox (spec 8.4); then what this device has not delivered
+    /// is handed over if it is a mailbox (spec 7). With another account, what was handed over to
+    /// this device for it is due at once.
     pub(super) fn mailbox_session_ready(&mut self, grant: &auth::AuthGrant) {
         let Ok(local) = self.local() else { return };
         if grant.installation == local.device.installation_id() {
@@ -461,7 +511,74 @@ impl Manager {
             .notified
             .insert(grant.installation, (mailbox.head, now));
         mailbox.schedule(grant.installation);
+        mailbox.announce_due.insert(grant.installation);
         mailbox.handoff_due = true;
+    }
+
+    /// This device's mailbox setting and uptime (spec 8.4).
+    pub(super) async fn mailbox_state(&mut self) -> Result<MailboxStateView, CoreError> {
+        let request = self.ready()?;
+        let op = MailboxDbOp::Local {
+            now: self.services.clock.wall_ms(),
+        };
+        match self.mailbox_db(op, request).await? {
+            MailboxDbReply::Local {
+                enabled,
+                first_link_shown,
+                uptime_7d_permille,
+            } => Ok(MailboxStateView {
+                enabled,
+                first_link_shown,
+                uptime_7d_permille,
+            }),
+            _ => Err(unavailable(ErrorCode::InvalidMessage)),
+        }
+    }
+
+    /// Sets this device's mailbox role and tells my other devices with a ready session; one
+    /// without a session is told once its session is ready.
+    pub(super) async fn set_mailbox(&mut self, enabled: bool) -> Result<(), CoreError> {
+        let request = self.ready()?;
+        self.mailbox_db(MailboxDbOp::SetEnabled(enabled), request)
+            .await?;
+        let mailbox = &mut self.messages.mailbox;
+        mailbox.enabled = Some(enabled);
+        // Up from now on: recorded at the next poll.
+        mailbox.uptime_at = 0;
+        let stopped = &self.messages.mailbox.stopped;
+        let sessions: Vec<Session> = self
+            .own_sessions()
+            .into_iter()
+            .filter(|s| !stopped.contains(&s.conn.stable_id()))
+            .collect();
+        for session in sessions {
+            self.announce(session, enabled);
+        }
+        Ok(())
+    }
+
+    pub(super) async fn mark_first_link_shown(&mut self) -> Result<(), CoreError> {
+        let request = self.ready()?;
+        self.mailbox_db(MailboxDbOp::FirstLinkShown, request)
+            .await
+            .map(|_| ())
+    }
+
+    /// Spec 8.4: tells another own device whether this one is a mailbox, in a spawned task (its
+    /// answer changes nothing). Never a contact: the role is for my devices to know.
+    fn announce(&mut self, session: Session, mailbox: bool) {
+        if self.local().map(|local| local.keys.peer_id()).ok() != Some(session.grant.peer) {
+            return;
+        }
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        self.messages
+            .mailbox
+            .announces
+            .push((session.grant.installation, mailbox));
+        let body = MailboxFrame::Announce { mailbox }.encode();
+        tokio::spawn(async move {
+            let _ = exchange(&session, &body).await;
+        });
     }
 
     /// The app goes to the background or exits (spec 7): hands what this device has not
@@ -559,6 +676,18 @@ impl Manager {
                 self.dial_target(own, &record, *i).is_some() && !self.ready_session(own, *i)
             })
             .collect();
+        let MailboxDbReply::Installations(mailboxes) =
+            self.mailbox_db(MailboxDbOp::Mailboxes, request).await?
+        else {
+            return Err(unavailable(ErrorCode::InvalidMessage));
+        };
+        // Spec 8.4: my mailboxes first (they are the ones likely up), the rest in record order.
+        let mut unconnected = unconnected;
+        unconnected.sort_by_key(|i| !mailboxes.contains(i));
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        {
+            self.messages.mailbox.sync_dials = unconnected.clone();
+        }
         for installation in unconnected {
             self.start_dial(own, installation, request);
         }
@@ -628,6 +757,10 @@ impl Manager {
                     now: self.schedule_now(),
                 };
                 match self.mailbox_db(op, request).await {
+                    // Not a mailbox (any more): `Busy`, not `Refused`, which would stop all sync
+                    // with a device that is still mine. Its `Announce { mailbox: false }` (sent on
+                    // the change and on every session) is what stops handoffs to it.
+                    Ok(MailboxDbReply::Disabled) => MailboxReply::Busy,
                     Ok(_) => {
                         self.messages.mailbox.handoff_at = None;
                         MailboxReply::Ok
@@ -636,9 +769,31 @@ impl Manager {
                     Err(_) => MailboxReply::Busy,
                 }
             }
-            // Mailbox announcements come with Task 10; until then (and for anything
-            // undecodable) the asker tries later.
-            Ok(_) | Err(_) => MailboxReply::Busy,
+            // Spec 8.4: whether that device is a mailbox, recorded for handoffs, dialing order
+            // and `mailbox_ok`.
+            Ok(MailboxFrame::Announce { mailbox }) => {
+                let op = MailboxDbOp::Announced {
+                    installation,
+                    mailbox,
+                    at: self.services.clock.wall_ms(),
+                };
+                match self.mailbox_db(op, request).await {
+                    Ok(MailboxDbReply::Count(changed)) => {
+                        let runtime = &mut self.messages.mailbox;
+                        runtime.mailboxes = None;
+                        // A device that just became a mailbox gets what is not delivered.
+                        if mailbox && changed > 0 {
+                            runtime.handoff_due = true;
+                        }
+                        MailboxReply::Ok
+                    }
+                    Ok(_) => MailboxReply::Busy,
+                    Err(error) if fatal(&error) => return Err(error),
+                    Err(_) => MailboxReply::Busy,
+                }
+            }
+            // Anything undecodable: the asker tries later.
+            Err(_) => MailboxReply::Busy,
         };
         // The device may have been revoked while the page was read: it gets nothing.
         if self.mailbox_peer(conn) != Some(installation) {
@@ -669,10 +824,13 @@ impl Manager {
     }
 
     /// One tick of own-device sync, with the message scheduler's poll: the device list and
-    /// retention of the log, due pulls, and `Notify` to devices behind this log's head.
+    /// retention of the log, the mailbox role (uptime, `Announce` to newly ready own devices,
+    /// `mailbox_ok`), due pulls, and `Notify` to devices behind this log's head.
     pub(super) async fn poll_mailbox(&mut self) {
-        let Ok(request) = self.ready() else { return };
-        let Ok(local) = self.local() else { return };
+        let (Ok(request), Ok(local)) = (self.ready(), self.local()) else {
+            self.bus.set_mailbox_ok(false);
+            return;
+        };
         if self.messages.mailbox.halted() || self.messages.mailbox.held() {
             return;
         }
@@ -688,7 +846,10 @@ impl Manager {
             if self.mailbox_db(op, request).await.is_err() {
                 return;
             }
-            self.messages.mailbox.devices = Some(others);
+            let mailbox = &mut self.messages.mailbox;
+            mailbox.devices = Some(others);
+            // Revoked devices' announcements went with them.
+            mailbox.mailboxes = None;
         }
         let now = self.schedule_now();
         if now >= self.messages.mailbox.prune_at {
@@ -697,6 +858,9 @@ impl Manager {
                 return;
             }
             self.messages.mailbox.prune_at = now.saturating_add(PRUNE_EVERY_MS);
+        }
+        if self.mailbox_role(request).await.is_err() {
+            return;
         }
         let sessions = self.own_sessions();
         let mailbox = &mut self.messages.mailbox;
@@ -707,6 +871,20 @@ impl Manager {
             .into_iter()
             .filter(|s| !mailbox.stopped.contains(&s.conn.stable_id()))
             .collect();
+        let ok = mailbox
+            .mailboxes
+            .as_ref()
+            .is_some_and(|m| usable.iter().any(|s| m.contains(&s.grant.installation)));
+        let enabled = mailbox.enabled.unwrap_or(false);
+        let announce: Vec<Session> = std::mem::take(&mut mailbox.announce_due)
+            .into_iter()
+            .filter_map(|i| usable.iter().find(|s| s.grant.installation == i).cloned())
+            .collect();
+        self.bus.set_mailbox_ok(ok);
+        for session in announce {
+            self.announce(session, enabled);
+        }
+        let mailbox = &mut self.messages.mailbox;
         for installation in std::mem::take(&mut mailbox.due) {
             if let Some(session) = usable.iter().find(|s| s.grant.installation == installation) {
                 // A device without a session pulls when one is ready again.
@@ -742,6 +920,38 @@ impl Manager {
             let _ = self.hand_off(request).await;
         }
         self.poll_handoffs(request).await;
+    }
+
+    /// The mailbox role's upkeep (spec 8.4): this device's setting and my mailboxes are read
+    /// when not known, and while this device is a mailbox it records every `UPTIME_EVERY_MS`
+    /// that it is up.
+    async fn mailbox_role(&mut self, request: Request) -> Result<(), CoreError> {
+        let wall = self.services.clock.wall_ms();
+        if self.messages.mailbox.enabled.is_none() {
+            let MailboxDbReply::Local { enabled, .. } = self
+                .mailbox_db(MailboxDbOp::Local { now: wall }, request)
+                .await?
+            else {
+                return Err(unavailable(ErrorCode::InvalidMessage));
+            };
+            self.messages.mailbox.enabled = Some(enabled);
+        }
+        if self.messages.mailbox.mailboxes.is_none() {
+            let MailboxDbReply::Installations(mailboxes) =
+                self.mailbox_db(MailboxDbOp::Mailboxes, request).await?
+            else {
+                return Err(unavailable(ErrorCode::InvalidMessage));
+            };
+            self.messages.mailbox.mailboxes = Some(mailboxes.into_iter().collect());
+        }
+        let now = self.schedule_now();
+        let mailbox = &self.messages.mailbox;
+        if mailbox.enabled == Some(true) && now >= mailbox.uptime_at {
+            self.mailbox_db(MailboxDbOp::Uptime { now: wall }, request)
+                .await?;
+            self.messages.mailbox.uptime_at = now.saturating_add(UPTIME_EVERY_MS);
+        }
+        Ok(())
     }
 
     /// Spec 7, as a mailbox: each due handed-off ciphertext is sent as it is (kind 17 `App`) to
