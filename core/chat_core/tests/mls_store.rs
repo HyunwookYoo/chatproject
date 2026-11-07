@@ -1113,6 +1113,26 @@ async fn message_ops_never_load_the_global_scope() {
         .unwrap());
 }
 
+/// Ruling 36: when the `Read` receipt cannot be sealed because the group's MLS state is
+/// unreadable, the read is still stored; the receipt job seals and sends it later.
+#[tokio::test]
+async fn mark_read_keeps_the_read_when_the_receipt_cannot_be_sealed() {
+    let (a, b, conversation) = linked().await;
+    let key = send(&a, &b, 1, "read me").await;
+    a.m.mls_seal(key, NOW).await.unwrap().unwrap();
+    ack(&open(&b, &a, conversation, &ciphertext(&a, key).await).await);
+    // A row nothing can decode: loading the conversation's MLS state fails.
+    b.f.mls_plant_row(conversation, b"Bogus".to_vec(), vec![0xFF])
+        .await
+        .unwrap();
+    b.m.mark_read(conversation, vec![key], NOW).await.unwrap();
+    let page = b.m.load_messages(conversation, None, 50).await.unwrap();
+    assert_eq!(page.items.iter().filter(|m| m.key == key).count(), 1);
+    assert_eq!(b.f.message_counts().await.unwrap().2, 1, "the receipt job");
+    let listed = b.m.list_conversations(None, 50).await.unwrap();
+    assert_eq!(listed.items[0].unread, 0);
+}
+
 /// I1: a joined (or dropped) group leaves nothing in the global scope: the KeyPackage it was
 /// joined with is gone with its private keys, and no other private key stays behind there.
 #[tokio::test]

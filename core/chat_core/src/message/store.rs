@@ -820,6 +820,8 @@ pub(crate) enum FixtureOp {
     /// Optionally writes one raw `mls_kv` row into the global scope (key, value as given), then
     /// lists the labels of every global-scope row.
     MlsGlobalRows(Option<(Vec<u8>, Vec<u8>)>, tokio::sync::oneshot::Sender<R<Vec<String>>>),
+    /// Writes one raw `mls_kv` row (key, value as given) into a conversation's scope.
+    MlsPlantRow(ConversationId, Vec<u8>, Vec<u8>, tokio::sync::oneshot::Sender<R<()>>),
     MailboxState(tokio::sync::oneshot::Sender<R<super::mailbox_store::MailboxState>>),
     /// The database size: `page_count × page_size` (the M6 per-entry size measurement).
     DbBytes(tokio::sync::oneshot::Sender<R<u64>>),
@@ -955,6 +957,16 @@ pub(crate) fn fixture(c: &mut Connection, op: FixtureOp) {
                     })
                     .collect())
             })();
+            let _ = reply.send(result);
+        }
+        FixtureOp::MlsPlantRow(id, key, value, reply) => {
+            let result = c
+                .execute(
+                    "INSERT OR REPLACE INTO mls_kv VALUES(?1,?2,?3)",
+                    params![id.0.as_slice(), key, value],
+                )
+                .map(|_| ())
+                .map_err(sql_error);
             let _ = reply.send(result);
         }
         FixtureOp::MailboxState(reply) => {
@@ -2338,7 +2350,13 @@ fn mark_read(
             ],
         )
         .map_err(sql_error)?;
-        super::mls_store::seal_read(&tx, identity, local, k, wall)?;
+        // Ruling 36: only a storage failure fails the read; when the MLS state cannot seal the
+        // receipt here (unreadable, no group, seal failed) the receipt job seals it later.
+        if let Err(e) = super::mls_store::seal_read(&tx, identity, local, k, wall)
+            && matches!(e.code, ErrorCode::StorageUncertain | ErrorCode::StorageFull)
+        {
+            return Err(e);
+        }
     }
     if changed > 0 {
         let rev = bump(&tx)?;

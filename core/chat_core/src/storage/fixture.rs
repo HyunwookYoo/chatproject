@@ -905,6 +905,12 @@ impl Fixture {
         self.handle.0.test(TestOp::Message(FixtureOp::MlsGlobalRows(plant, tx))).await;
         rx.await.unwrap()
     }
+    /// Writes one raw `mls_kv` row (key, value as given) into `conversation`'s scope.
+    pub async fn mls_plant_row(&self, conversation: ConversationId, key: Vec<u8>, value: Vec<u8>) -> Result<(), CoreError> {
+        let (tx, rx) = oneshot::channel();
+        self.handle.0.test(TestOp::Message(FixtureOp::MlsPlantRow(conversation, key, value, tx))).await;
+        rx.await.unwrap()
+    }
     /// The device log, cursors and pulls, and counts of the other per-device tables.
     pub async fn mailbox_state(&self) -> Result<MailboxState, CoreError> {
         let (tx, rx) = oneshot::channel();
