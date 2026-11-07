@@ -8,19 +8,22 @@
 #include <flutter/method_channel.h>
 #include <flutter/encodable_value.h>
 
+#include "mailbox_host.h"
 #include "win32_window.h"
 
 // A window that does nothing but host a Flutter view.
 class FlutterWindow : public Win32Window {
  public:
   // Creates a new FlutterWindow hosting a Flutter view running |project|.
-  explicit FlutterWindow(const flutter::DartProject& project);
+  // With |start_in_tray| the first frame does not show the window.
+  FlutterWindow(const flutter::DartProject& project, bool start_in_tray);
   virtual ~FlutterWindow();
 
  protected:
   // Win32Window:
   bool OnCreate() override;
   void OnDestroy() override;
+  bool OnCloseRequested() override;
   LRESULT MessageHandler(HWND window, UINT const message, WPARAM const wparam,
                          LPARAM const lparam) noexcept override;
 
@@ -45,6 +48,8 @@ class FlutterWindow : public Win32Window {
 #endif
   std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>> account_channel_;
   std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>> privacy_events_;
+  bool start_in_tray_ = false;
+  std::unique_ptr<MailboxHost> mailbox_;
   // The project to run.
   flutter::DartProject project_;
 

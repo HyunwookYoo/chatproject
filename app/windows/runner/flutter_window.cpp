@@ -7,8 +7,8 @@
 
 #include "flutter/generated_plugin_registrant.h"
 
-FlutterWindow::FlutterWindow(const flutter::DartProject& project)
-    : project_(project) {}
+FlutterWindow::FlutterWindow(const flutter::DartProject& project, bool start_in_tray)
+    : start_in_tray_(start_in_tray), project_(project) {}
 
 FlutterWindow::~FlutterWindow() {}
 
@@ -78,11 +78,14 @@ bool FlutterWindow::OnCreate() {
 #endif
     result->NotImplemented();
   });
+  mailbox_ = std::make_unique<MailboxHost>(GetHandle(), flutter_controller_->engine()->messenger());
   SetChildContent(flutter_controller_->view()->GetNativeWindow());
 
+  // A --tray start stays hidden; MailboxHost shows it if the mailbox is off.
   flutter_controller_->engine()->SetNextFrameCallback([&]() {
-    this->Show();
+    if (!start_in_tray_) this->Show();
   });
+  if (start_in_tray_) mailbox_->StartInTray();
 
   // Flutter can complete the first frame before the "show window" callback is
   // registered. The following call ensures a frame is pending to ensure the
@@ -94,6 +97,7 @@ bool FlutterWindow::OnCreate() {
 
 void FlutterWindow::OnDestroy() {
   SetSensitive(false);
+  mailbox_.reset();
   account_channel_.reset();
   privacy_events_.reset();
   if (flutter_controller_) {
@@ -119,6 +123,11 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
     if (FAILED(preview_result_)) PrivacyFailed();
     return 0;
   }
+  if (mailbox_) {
+    if (std::optional<LRESULT> handled = mailbox_->HandleMessage(message, wparam, lparam)) {
+      return *handled;
+    }
+  }
   // Give Flutter, including plugins, an opportunity to handle window messages.
   if (flutter_controller_) {
     std::optional<LRESULT> result =
@@ -136,6 +145,10 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
   }
 
   return Win32Window::MessageHandler(hwnd, message, wparam, lparam);
+}
+
+bool FlutterWindow::OnCloseRequested() {
+  return !mailbox_ || mailbox_->OnCloseRequested();
 }
 
 HRESULT FlutterWindow::DrawPrivateBitmap(HWND window, int width, int height, bool thumbnail) {
