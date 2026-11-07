@@ -65,6 +65,10 @@ const PRUNE_EVERY_MS: u64 = 3_600_000;
 const HANDOFF_DIAL_GAP_MS: u64 = 30_000;
 /// A mailbox records that it is up this often.
 const UPTIME_EVERY_MS: u64 = 60_000;
+/// A pull that failed (no answer, `Busy`, storage) is tried again after this long, doubling
+/// with each failure in a row up to `PULL_RETRY_MAX_MS`.
+const PULL_RETRY_MIN_MS: u64 = 1_000;
+const PULL_RETRY_MAX_MS: u64 = 30_000;
 
 /// A handed-off ciphertext's row: the device that handed it over, conversation, message.
 type HandoffKey = (InstallationId, ConversationId, MessageId);
@@ -75,6 +79,9 @@ pub(crate) struct Runtime {
     due: BTreeSet<InstallationId>,
     /// Pulls running, by the device whose log is pulled.
     pulls: BTreeMap<InstallationId, Pull>,
+    /// Own devices whose last pull failed: the scheduler time it is tried again (`u64::MAX`:
+    /// it was), and the back-off that wait was. Gone once a pull from it gets to the end.
+    retry: BTreeMap<InstallationId, (u64, u64)>,
     /// Connections (`stable_id`) this device stopped syncing over: `Refused`, or a page that
     /// broke the order rules.
     stopped: BTreeSet<usize>,
@@ -134,6 +141,9 @@ pub(crate) struct Runtime {
     /// Sync is paused: no upkeep, pulls or `Notify`, and requests are answered `Busy`.
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     held: bool,
+    /// Page requests still to fail as timed out, without being sent.
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    fail_pulls: u32,
 }
 
 impl Runtime {
@@ -145,6 +155,18 @@ impl Runtime {
                 self.due.insert(installation);
             }
         }
+    }
+    /// A pull from `installation` failed: it is tried again after a back-off twice the last one
+    /// (`PULL_RETRY_MIN_MS` the first time), at most `PULL_RETRY_MAX_MS`.
+    fn back_off(&mut self, installation: InstallationId, now: u64) {
+        let delay = self
+            .retry
+            .get(&installation)
+            .map_or(PULL_RETRY_MIN_MS, |(_, last)| {
+                last.saturating_mul(2).min(PULL_RETRY_MAX_MS)
+            });
+        self.retry
+            .insert(installation, (now.saturating_add(delay), delay));
     }
     fn halted(&self) -> bool {
         #[cfg(all(feature = "test-hooks", debug_assertions))]
@@ -241,6 +263,17 @@ impl Unopened {
     }
 }
 
+/// How a pull ended.
+#[derive(Clone, Copy)]
+enum Ended {
+    /// At the end of the log.
+    Done,
+    /// Short of it, for now (no answer, `Busy`, storage, the session gone).
+    Failed,
+    /// No more over that session (`Refused`, a page out of order).
+    Stopped,
+}
+
 /// What became of one log entry.
 enum Entry {
     /// Processed: stored, applied, already known, or nothing this device can use.
@@ -334,6 +367,8 @@ pub(crate) enum MailboxTest {
     HaltAfter(u64),
     /// Pauses (or resumes) sync: no upkeep, pulls or `Notify`; requests answered `Busy`.
     Hold(bool),
+    /// The next this many page requests of pulls fail as timed out, without being sent.
+    FailPulls(u32),
     Counters,
     HandoffSends,
     Announces,
@@ -402,6 +437,13 @@ impl AccountHandle {
     pub async fn mailbox_test_hold(&self, hold: bool) -> Result<(), CoreError> {
         self.mailbox_test(MailboxTest::Hold(hold)).await.map(|_| ())
     }
+    /// The next `requests` page requests of this core's pulls fail as a timeout would, without
+    /// being sent.
+    pub async fn mailbox_test_fail_pulls(&self, requests: u32) -> Result<(), CoreError> {
+        self.mailbox_test(MailboxTest::FailPulls(requests))
+            .await
+            .map(|_| ())
+    }
     /// Each attempt this device (as a mailbox) made of a handed-off ciphertext, in order: the
     /// scheduler time it was sent at and the SHA-256 of the ciphertext.
     pub async fn mailbox_test_handoff_sends(&self) -> Result<Vec<(u64, [u8; 32])>, CoreError> {
@@ -463,6 +505,10 @@ impl Manager {
             }
             MailboxTest::Hold(hold) => {
                 self.messages.mailbox.held = hold;
+                MailboxTestReply::Done
+            }
+            MailboxTest::FailPulls(requests) => {
+                self.messages.mailbox.fail_pulls = requests;
                 MailboxTestReply::Done
             }
             MailboxTest::Counters => MailboxTestReply::Counters(MailboxCounters {
@@ -898,12 +944,20 @@ impl Manager {
             self.announce(session, enabled);
         }
         let mailbox = &mut self.messages.mailbox;
+        // Failed pulls whose back-off is over are due again.
+        for (installation, (at, _)) in mailbox.retry.iter_mut() {
+            if now >= *at {
+                *at = u64::MAX;
+                mailbox.due.insert(*installation);
+            }
+        }
         for installation in std::mem::take(&mut mailbox.due) {
             if let Some(session) = usable.iter().find(|s| s.grant.installation == installation) {
                 // A device without a session pulls when one is ready again.
                 let session = session.clone();
                 if self.pull_from(session, request).await.is_err() {
-                    return;
+                    // The other due devices are still pulled from.
+                    self.messages.mailbox.back_off(installation, now);
                 }
             }
         }
@@ -1207,8 +1261,21 @@ impl Manager {
         let mailbox = self.auth.send.clone();
         let session = holder.clone();
         let ticket = request.ticket;
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        let fail = {
+            let runtime = &mut self.messages.mailbox;
+            let fail = runtime.fail_pulls > 0;
+            runtime.fail_pulls = runtime.fail_pulls.saturating_sub(1);
+            fail
+        };
+        #[cfg(not(all(feature = "test-hooks", debug_assertions)))]
+        let fail = false;
         tokio::spawn(async move {
-            let answer = exchange(&session, &body).await;
+            let answer = if fail {
+                Err(ErrorCode::NetworkTimeout)
+            } else {
+                exchange(&session, &body).await
+            };
             let _ = mailbox
                 .send(Input::Mailbox(MailboxEvent {
                     ticket,
@@ -1266,15 +1333,15 @@ impl Manager {
                     }) if page_in_order(&entries, since, next_seq, more) => {
                         (entries, next_seq, more)
                     }
-                    // Not now: the next sync asks again.
+                    // Not now: asked again after a back-off.
                     Ok(MailboxReply::Busy) | Err(_) => {
-                        self.end_pull(holder, request).await;
+                        self.end_pull(holder, Ended::Failed, request).await;
                         return;
                     }
                     // `Refused`, or a page out of order: no more syncing over this session.
                     Ok(_) => {
                         self.messages.mailbox.stopped.insert(conn);
-                        self.end_pull(holder, request).await;
+                        self.end_pull(holder, Ended::Stopped, request).await;
                         return;
                     }
                 };
@@ -1284,7 +1351,7 @@ impl Manager {
                     return;
                 }
                 let Ok(summary) = summary else {
-                    self.end_pull(holder, request).await;
+                    self.end_pull(holder, Ended::Failed, request).await;
                     return;
                 };
                 if !summary.unopened.is_empty() {
@@ -1311,7 +1378,7 @@ impl Manager {
         };
         let pulled = MailboxDbOp::Pulled { holder, next_seq };
         if self.mailbox_db(pulled, request).await.is_err() {
-            self.end_pull(holder, request).await;
+            self.end_pull(holder, Ended::Failed, request).await;
             return;
         }
         let session = self
@@ -1320,7 +1387,9 @@ impl Manager {
             .find(|s| s.conn.stable_id() == conn);
         match session {
             Some(session) if more => self.request_page(&session, next_seq, request),
-            _ => self.end_pull(holder, request).await,
+            // The rest of the log over another session, if one comes.
+            None if more => self.end_pull(holder, Ended::Failed, request).await,
+            _ => self.end_pull(holder, Ended::Done, request).await,
         }
     }
 
@@ -1465,7 +1534,7 @@ impl Manager {
             .find(|s| s.conn.stable_id() == conn)
         else {
             // The session is gone: the page is pulled again over the next one.
-            self.end_pull(holder, request).await;
+            self.end_pull(holder, Ended::Failed, request).await;
             return;
         };
         let mailbox = self.auth.send.clone();
@@ -1515,7 +1584,7 @@ impl Manager {
                         return false;
                     }
                     if stored.is_err() {
-                        self.end_pull(holder, request).await;
+                        self.end_pull(holder, Ended::Failed, request).await;
                         return false;
                     }
                 }
@@ -1525,20 +1594,20 @@ impl Manager {
                         self.messages.mailbox.missing += 1;
                     }
                 }
-                // Not now: the page is pulled (and its entries asked for) again.
+                // Not now: the page is pulled (and its entries asked for) again after a back-off.
                 Ok(MailboxReply::Busy) | Err(_) => {
-                    self.end_pull(holder, request).await;
+                    self.end_pull(holder, Ended::Failed, request).await;
                     return false;
                 }
                 Ok(_) => {
                     self.messages.mailbox.stopped.insert(conn);
-                    self.end_pull(holder, request).await;
+                    self.end_pull(holder, Ended::Stopped, request).await;
                     return false;
                 }
             }
         }
         if !complete {
-            self.end_pull(holder, request).await;
+            self.end_pull(holder, Ended::Failed, request).await;
         }
         complete
     }
@@ -1629,13 +1698,24 @@ impl Manager {
     }
 
     /// The pull from `holder` is over: what it stored and is still unread is notified, per
-    /// conversation, in one event, with the conversations it found read elsewhere.
-    async fn end_pull(&mut self, holder: InstallationId, request: Request) {
+    /// conversation, in one event, with the conversations it found read elsewhere. A pull that
+    /// failed is tried again after a back-off (final review I1: nothing else may come to pull
+    /// again); one that got to the end of the log ends the back-off.
+    async fn end_pull(&mut self, holder: InstallationId, ended: Ended, request: Request) {
         let Some(pull) = self.messages.mailbox.pulls.remove(&holder) else {
             return;
         };
+        let now = self.schedule_now();
+        let mailbox = &mut self.messages.mailbox;
+        match ended {
+            Ended::Done => {
+                mailbox.retry.remove(&holder);
+            }
+            Ended::Failed => mailbox.back_off(holder, now),
+            Ended::Stopped => {}
+        }
         if pull.again {
-            self.messages.mailbox.due.insert(holder);
+            mailbox.due.insert(holder);
         }
         if !pull.fresh.is_empty() || !pull.read.is_empty() {
             self.notify(pull.fresh, pull.read.into_iter().collect(), request)

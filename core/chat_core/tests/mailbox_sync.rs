@@ -177,6 +177,35 @@ async fn restart_mid_page_resumes_without_duplicates_or_second_notification() {
     assert_eq!(first_run + notify_count(&a1), 1, "one notification in all");
 }
 
+/// Final review I1: A1 comes back and its first exchange with A2 fails (as a timeout would),
+/// then A2 is busy for a while and answers `Busy`. Nothing else happens (no new message, no
+/// foreground, no new session), and A1 still gets what A2 kept: a failed pull is tried again.
+#[tokio::test]
+async fn failed_or_busy_pull_is_retried_without_a_new_trigger() {
+    let (mut a, b1, net, conv) = accounts(&[A1, A2], &[B1]).await;
+    let a2 = a.pop().unwrap();
+    let dir = stop(a.pop().unwrap());
+    for n in 1..=3 {
+        delivered(&b1, &a2, &[], n).await;
+    }
+    a2.account.mailbox_test_hold(true).await.unwrap();
+    let a1 = start(dir, net.clone()).await;
+    a1.account.mailbox_test_fail_pulls(1).await.unwrap();
+    link(&a1, &a2).await;
+    link(&a1, &b1).await;
+    a1.account.mailbox_sync_now().await.unwrap();
+    quiet(&[&a1, &a2, &b1]).await;
+    assert!(
+        texts_from(&a1, conv, b1.peer).await.is_empty(),
+        "A2 was busy"
+    );
+    a2.account.mailbox_test_hold(false).await.unwrap();
+    settle!(
+        [&a1, &a2, &b1],
+        texts_from(&a1, conv, b1.peer).await.len() == 3 && caught_up(&a1, &a2).await
+    );
+}
+
 /// Spec 11 (both ways): A2 is off while A1 and B1 talk. A2 comes back and has the six texts in
 /// their order; those A1 sent are A2's own sent messages.
 #[tokio::test]
