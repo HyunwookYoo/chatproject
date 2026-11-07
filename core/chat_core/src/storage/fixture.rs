@@ -47,8 +47,8 @@ impl Messages {
     pub async fn retry_send(&self, key: MessageKey, now_ms: u64) -> Result<MessageView,CoreError> {
         self.0.retry_send(key,now_ms).await
     }
-    pub async fn cancel_send(&self, key: MessageKey) -> Result<MessageView,CoreError> {
-        self.0.cancel_send(key).await
+    pub async fn cancel_send(&self, key: MessageKey, now_ms: u64) -> Result<MessageView,CoreError> {
+        self.0.cancel_send(key,now_ms).await
     }
     async fn mls(&self, op: MessageDbOp) -> Result<MessageDbReply, CoreError> {
         self.0.operation(op).await

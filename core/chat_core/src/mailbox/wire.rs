@@ -50,6 +50,7 @@ const OP_REFUSED: u64 = 13;
 const BODY_FRAME: u64 = 1;
 const BODY_DELIVERED: u64 = 2;
 const BODY_HANDOFF_STOP: u64 = 3;
+const BODY_HANDOFF_WITHDRAW: u64 = 4;
 
 /// One log record of a mailbox.
 #[derive(Clone, PartialEq, Eq)]
@@ -76,6 +77,9 @@ pub enum EntryBody {
         class: u8,
         epoch: u64,
     },
+    /// The origin cancelled the message (Ruling 26): a mailbox holding a ciphertext of it from
+    /// that device stops trying it.
+    HandoffWithdraw { msg_id: MessageId },
 }
 
 /// A decrypted message a mailbox hands back to an own device.
@@ -267,6 +271,14 @@ fn encode_body(e: &mut Encoder<Vec<u8>>, body: &EntryBody) {
                 .u64(*epoch)
                 .unwrap();
         }
+        EntryBody::HandoffWithdraw { msg_id } => {
+            e.array(2)
+                .unwrap()
+                .u64(BODY_HANDOFF_WITHDRAW)
+                .unwrap()
+                .bytes(&msg_id.0)
+                .unwrap();
+        }
     }
 }
 fn decode_entry(d: &mut Decoder<'_>) -> R<LogEntry> {
@@ -302,13 +314,15 @@ fn decode_body(d: &mut Decoder<'_>) -> R<EntryBody> {
             class: u8::try_from(d.u64().map_err(|_| invalid())?).map_err(|_| invalid())?,
             epoch: int(d)?,
         },
+        (BODY_HANDOFF_WITHDRAW, 2) => EntryBody::HandoffWithdraw { msg_id: msg_id(d)? },
         _ => return Err(invalid()),
     })
 }
 
-/// The `mailbox_store.body` of a note (kind 2 `Delivered`, kind 3 `HandoffStop`): the canonical
-/// CBOR of its `EntryBody` exactly as a `SyncResp` entry carries it, `[tag, ...]` with the tag
-/// equal to the row's kind. `None` for a `Frame`, whose row body is the kind 17 inner itself.
+/// The `mailbox_store.body` of a note (kind 2 `Delivered`, 3 `HandoffStop`, 4
+/// `HandoffWithdraw`): the canonical CBOR of its `EntryBody` exactly as a `SyncResp` entry
+/// carries it, `[tag, ...]` with the tag equal to the row's kind. `None` for a `Frame`, whose row
+/// body is the kind 17 inner itself.
 pub(crate) fn note_body(body: &EntryBody) -> Option<Vec<u8>> {
     if matches!(body, EntryBody::Frame(_)) {
         return None;
@@ -329,6 +343,7 @@ pub(crate) fn decode_note(kind: u64, bytes: &[u8]) -> R<EntryBody> {
         EntryBody::Frame(_) => BODY_FRAME,
         EntryBody::Delivered { .. } => BODY_DELIVERED,
         EntryBody::HandoffStop { .. } => BODY_HANDOFF_STOP,
+        EntryBody::HandoffWithdraw { .. } => BODY_HANDOFF_WITHDRAW,
     };
     if tag != kind || d.position() != bytes.len() || note_body(&body).as_deref() != Some(bytes) {
         return Err(invalid());
@@ -654,6 +669,31 @@ mod tests {
             epoch: 5,
         };
         assert!(decode_note(3, &note_body(&stop).unwrap()).unwrap() == stop);
+        // Kind 4 (Ruling 26): `[4, msg_id]`, and it reads back under kind 4 only.
+        let withdraw = EntryBody::HandoffWithdraw {
+            msg_id: MessageId([7; 16]),
+        };
+        let bytes = note_body(&withdraw).unwrap();
+        let mut expected = vec![0x82, 0x04, 0x50];
+        expected.extend_from_slice(&[7; 16]);
+        assert_eq!(bytes, expected);
+        assert!(decode_note(4, &bytes).unwrap() == withdraw);
+        assert!(decode_note(3, &bytes).is_err());
+        assert!(decode_note(4, &bytes[..bytes.len() - 1]).is_err());
+        // It travels in a `SyncResp` entry like the other notes.
+        let resp = MailboxReply::SyncResp {
+            entries: vec![LogEntry {
+                seq: 4,
+                conversation: ConversationId([1; 32]),
+                sender_peer: PeerId([2; 32]),
+                sender_install: InstallationId([3; 32]),
+                recorded_at_ms: 5,
+                body: withdraw,
+            }],
+            next_seq: 5,
+            more: false,
+        };
+        assert!(MailboxReply::decode(&resp.inner()).unwrap() == resp);
         assert!(note_body(&EntryBody::Frame(vec![1])).is_none());
     }
 }

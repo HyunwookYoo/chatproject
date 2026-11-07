@@ -317,3 +317,40 @@ async fn handoff_to_foreign_or_revoked_device_never_happens() {
     assert_eq!(a1.account.mailbox_background().await.unwrap(), 0);
     assert!(handoffs(&b1).await.is_empty());
 }
+
+/// Ruling 26: A1 cancels a message it handed over. A2 pulls the `HandoffWithdraw` note, drops
+/// its ciphertext and starts no attempt after that, however long it runs; it does not log the
+/// note again.
+#[tokio::test]
+async fn cancel_withdraws_the_handed_off_ciphertext() {
+    let (mut a, b1, _net, _conv) = accounts(&[A1, A2], &[B1]).await;
+    let a2 = a.pop().unwrap();
+    let a1 = a.pop().unwrap();
+    a1.account.message_test_hold_scheduler(true).await.unwrap();
+    // B1 never acks: without the withdrawal A2 would go on trying.
+    b1.account.message_test_m4_peer(true).await.unwrap();
+    let key = send(&a1, &b1, 1, "cancelled after the handoff").await.key;
+    mark_mailbox(&a1, &a2).await;
+    assert_eq!(a1.account.mailbox_background().await.unwrap(), 1);
+    settle!([&a1, &a2, &b1], !sends(&a2).await.is_empty());
+
+    let cancelled = a1.account.messages().cancel_send(key).await.unwrap();
+    assert!(cancelled.cancel_requested);
+    settle!([&a1, &a2, &b1], handoffs(&a2).await.is_empty());
+    let tried = sends(&a2).await.len();
+    // Well past several 30 s caps.
+    for _ in 0..150 {
+        a2.clock.advance_monotonic_ms(1_000);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        sends(&a2).await.len(),
+        tried,
+        "no attempt after the withdrawal"
+    );
+    assert!(
+        !mailbox(&a2).await.entries.iter().any(|e| e.kind == 4),
+        "A2 does not log it again"
+    );
+}

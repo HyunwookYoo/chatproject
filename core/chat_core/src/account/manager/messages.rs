@@ -627,7 +627,7 @@ impl Manager {
             Q::Send(peer, id, body) => {
                 MessageDbOp::Enqueue(peer, id, body, self.services.clock.wall_ms())
             }
-            Q::Cancel(key) => MessageDbOp::Cancel(key),
+            Q::Cancel(key) => MessageDbOp::Cancel(key, self.services.clock.wall_ms()),
             Q::Retry(key) => MessageDbOp::Retry(key, self.services.clock.wall_ms()),
             Q::Read(id, keys) => MessageDbOp::MarkRead(
                 id,

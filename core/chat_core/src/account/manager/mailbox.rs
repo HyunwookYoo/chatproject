@@ -1141,7 +1141,7 @@ impl Manager {
         // message is how it learns what another device did with it.
         let inner = match body {
             EntryBody::Frame(inner) => inner,
-            body @ EntryBody::Delivered { .. } => {
+            body @ (EntryBody::Delivered { .. } | EntryBody::HandoffWithdraw { .. }) => {
                 let entry = LogEntry {
                     seq,
                     conversation,

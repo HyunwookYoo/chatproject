@@ -4,7 +4,7 @@ CREATE TABLE mailbox_store (
     conversation BLOB NOT NULL CHECK(length(conversation)=32),
     sender_peer BLOB NOT NULL CHECK(length(sender_peer)=32),
     sender_install BLOB NOT NULL CHECK(length(sender_install)=32),  -- 원래 보낸 기기 (MLS leaf)
-    kind INTEGER NOT NULL CHECK(kind IN (1,2,3)),  -- 1 kind 17 frame inner, 2 Delivered 노트, 3 HandoffStop 노트
+    kind INTEGER NOT NULL CHECK(kind IN (1,2,3,4)),  -- 1 kind 17 frame inner, 2 Delivered 노트, 3 HandoffStop 노트, 4 HandoffWithdraw 노트
     msg_id BLOB CHECK(msg_id IS NULL OR length(msg_id)=16),  -- App Text와 노트의 대상 메시지
     hash BLOB UNIQUE NOT NULL CHECK(length(hash)=32),  -- SHA-256(body)
     body BLOB NOT NULL CHECK(length(body) BETWEEN 1 AND 61434),

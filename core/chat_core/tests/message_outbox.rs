@@ -113,7 +113,7 @@ async fn cancel_then_late_receipt_keeps_both_facts() {
         .messages()
         .await
         .unwrap()
-        .cancel_send(m.key)
+        .cancel_send(m.key, NOW * 1000)
         .await
         .unwrap();
     assert!(cancelled.cancel_requested);
@@ -667,7 +667,7 @@ async fn retry_only_releases_current_resolvable_blocked_and_never_recreates_term
         .enqueue(b.peer, MessageId([88; 16]), "cancelled".into(), NOW * 1000)
         .await
         .unwrap();
-    repo.cancel_send(cancelled.key).await.unwrap();
+    repo.cancel_send(cancelled.key, NOW * 1000).await.unwrap();
     assert_eq!(
         repo.retry_send(cancelled.key, NOW * 1000)
             .await

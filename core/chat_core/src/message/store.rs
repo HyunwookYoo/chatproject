@@ -37,7 +37,7 @@ pub(crate) enum MessageDbOp {
     RecoverScheduler(u64),
     SettleCompleted(MessageKey),
     Defer(MessageKey, bool, u64),
-    Cancel(MessageKey),
+    Cancel(MessageKey, u64),
     Retry(MessageKey, u64),
     ReleasePeer(PeerId, u64),
     ResetUnlaunched(MessageKey, PrepareToken),
@@ -349,13 +349,17 @@ pub(crate) fn execute(
             release_blocked(c,peer,None,#[cfg(all(feature="test-hooks",debug_assertions))] fault)?;
             Ok(MessageDbReply::Done)
         }
-        MessageDbOp::Cancel(key) => {
+        MessageDbOp::Cancel(key, now) => {
             let tx=c.transaction().map_err(sql_error)?;
             let view=find(&tx,key)?.ok_or_else(missing)?;
             if !view.outgoing || key.sender!=identity.peer || key.installation!=identity.installation {return Err(invalid());}
             if !view.cancel_requested {
                 tx.execute("UPDATE message SET cancel_requested=1 WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",params![key.conversation.0.as_slice(),key.sender.0.as_slice(),key.installation.0.as_slice(),key.id.0.as_slice()]).map_err(sql_error)?;
-                tx.execute("DELETE FROM outbox WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",params![key.conversation.0.as_slice(),key.sender.0.as_slice(),key.installation.0.as_slice(),key.id.0.as_slice()]).map_err(sql_error)?;
+                let queued=tx.execute("DELETE FROM outbox WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",params![key.conversation.0.as_slice(),key.sender.0.as_slice(),key.installation.0.as_slice(),key.id.0.as_slice()]).map_err(sql_error)?;
+                // Ruling 26: a mailbox this device may have handed the ciphertext to stops trying it.
+                if queued>0 {
+                    super::mailbox_store::record_note(&tx,key.conversation,key.sender,key.installation,&crate::mailbox::wire::EntryBody::HandoffWithdraw{msg_id:key.id},now)?;
+                }
                 let revision=bump(&tx)?;
                 tx.execute("UPDATE conversation SET change_revision=?2 WHERE id=?1",params![key.conversation.0.as_slice(),integer(revision)?]).map_err(sql_error)?;
             }
@@ -1124,8 +1128,8 @@ impl MessageRepo {
             MessageDbReply::Message(view)=>Ok(view), _=>unreachable!()
         }
     }
-    pub(crate) async fn cancel_send(&self, key: MessageKey) -> R<MessageView> {
-        match self.operation(MessageDbOp::Cancel(key)).await? {
+    pub(crate) async fn cancel_send(&self, key: MessageKey, now_ms: u64) -> R<MessageView> {
+        match self.operation(MessageDbOp::Cancel(key, now_ms)).await? {
             MessageDbReply::Message(view)=>Ok(view), _=>unreachable!()
         }
     }
@@ -1231,7 +1235,7 @@ impl MessageDbOp {
             #[cfg(all(feature="test-hooks",debug_assertions))]
             Self::RejectedPrepare(k,_,_,_) => Some(*k),
             Self::Retry(k, _)
-            | Self::Cancel(k)
+            | Self::Cancel(k, _)
             | Self::SettleCompleted(k)
             | Self::Defer(k, _, _)
             | Self::ResetUnlaunched(k, _)

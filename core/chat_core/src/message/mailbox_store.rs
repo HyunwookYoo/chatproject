@@ -39,6 +39,7 @@ pub(crate) enum EntryKind {
     Frame = 1,
     Delivered = 2,
     HandoffStop = 3,
+    HandoffWithdraw = 4,
 }
 
 pub(crate) struct NewEntry<'a> {
@@ -107,7 +108,8 @@ pub(super) fn record_frame(
     )
 }
 
-/// Logs a note (`Delivered`) about message `msg_id` that `sender_install` of `sender_peer` sent.
+/// Logs a note (`Delivered`, `HandoffStop`, `HandoffWithdraw`) about message `msg_id` that
+/// `sender_install` of `sender_peer` sent.
 pub(super) fn record_note(
     tx: &Transaction,
     conversation: ConversationId,
@@ -116,13 +118,11 @@ pub(super) fn record_note(
     body: &EntryBody,
     now: u64,
 ) -> R<Option<u64>> {
-    let msg_id = match body {
-        EntryBody::Delivered { msg_id, .. } | EntryBody::HandoffStop { msg_id, .. } => *msg_id,
+    let (kind, msg_id) = match body {
+        EntryBody::Delivered { msg_id, .. } => (EntryKind::Delivered, *msg_id),
+        EntryBody::HandoffStop { msg_id, .. } => (EntryKind::HandoffStop, *msg_id),
+        EntryBody::HandoffWithdraw { msg_id } => (EntryKind::HandoffWithdraw, *msg_id),
         EntryBody::Frame(_) => return Err(invalid()),
-    };
-    let kind = match body {
-        EntryBody::HandoffStop { .. } => EntryKind::HandoffStop,
-        _ => EntryKind::Delivered,
     };
     let bytes = note_body(body).ok_or_else(invalid)?;
     record(
@@ -761,25 +761,23 @@ fn serve_page(
 /// of it is done; a message not here yet keeps the delivery in `mailbox_status_ahead` for when it
 /// comes. What changed something here is logged here too, so a third own device gets it from
 /// this one; a repeat changes nothing and is not logged again. A ciphertext of the message handed
-/// over to this device is not tried any more. `HandoffStop` is the origin's alone to act on (the
-/// account actor does, Ruling 1): nothing here. Returns the message rows changed.
+/// over to this device is not tried any more. `HandoffWithdraw` (Ruling 26: the origin cancelled
+/// the message) only drops the ciphertext of it the origin handed over to this device, if any; it
+/// is not logged again. `HandoffStop` is the origin's alone to act on (the account actor does,
+/// Ruling 1): nothing here. Returns the rows changed (messages, or the withdrawn ciphertext).
 fn apply_note(tx: &Transaction, identity: Identity, entry: &LogEntry, now: u64) -> R<u64> {
-    let EntryBody::Delivered { msg_id, at_ms, .. } = entry.body else {
-        return Ok(0);
-    };
-    // Only this account's own sent messages have a delivery to learn.
+    // Only this account's own sent messages have a delivery or a withdrawal to learn.
     if entry.sender_peer != identity.peer {
         return Ok(0);
     }
-    tx.execute(
-        "DELETE FROM mailbox_handoff WHERE origin_install=?1 AND conversation=?2 AND msg_id=?3",
-        params![
-            entry.sender_install.0.as_slice(),
-            entry.conversation.0.as_slice(),
-            msg_id.0.as_slice()
-        ],
-    )
-    .map_err(sql)?;
+    let (msg_id, at_ms) = match entry.body {
+        EntryBody::Delivered { msg_id, at_ms, .. } => (msg_id, at_ms),
+        EntryBody::HandoffWithdraw { msg_id } => {
+            return drop_handoff(tx, entry.sender_install, entry.conversation, msg_id);
+        }
+        _ => return Ok(0),
+    };
+    drop_handoff(tx, entry.sender_install, entry.conversation, msg_id)?;
     let key = params![
         entry.conversation.0.as_slice(),
         entry.sender_peer.0.as_slice(),
@@ -848,6 +846,26 @@ fn apply_note(tx: &Transaction, identity: Identity, entry: &LogEntry, now: u64) 
         )?;
     }
     Ok(changed)
+}
+
+/// Deletes the ciphertext of message `msg_id` that `origin` handed over to this device; rows
+/// deleted.
+fn drop_handoff(
+    tx: &Transaction,
+    origin: InstallationId,
+    conversation: ConversationId,
+    msg_id: MessageId,
+) -> R<u64> {
+    tx.execute(
+        "DELETE FROM mailbox_handoff WHERE origin_install=?1 AND conversation=?2 AND msg_id=?3",
+        params![
+            origin.0.as_slice(),
+            conversation.0.as_slice(),
+            msg_id.0.as_slice()
+        ],
+    )
+    .map(|n| n as u64)
+    .map_err(sql)
 }
 
 /// The text logged as entry `seq` (only an App Text entry names its message), from its message

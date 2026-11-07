@@ -500,7 +500,7 @@ async fn populated_database(root: &Path, p: Arc<dyn KeyProtector>) {
         .enqueue(peer, MessageId([3; 16]), "cancelled".into(), 3)
         .await
         .unwrap();
-    r.cancel_send(c.key).await.unwrap();
+    r.cancel_send(c.key, 4).await.unwrap();
     f.saturate_message_attempts(a.key, false).await.unwrap();
     f.set_outbox_retry(b.key, 3, 4000, 123_456).await.unwrap();
     f.close().await;
