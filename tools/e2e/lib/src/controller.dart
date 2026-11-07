@@ -237,7 +237,8 @@ class Controller {
           final op = connection.participant?._operations[safe['id']];
           if (op == null ||
               op.startsWith('account_local_') ||
-              op.startsWith('message_local_')) {
+              op.startsWith('message_local_') ||
+              op.startsWith('mailbox_local_')) {
             return jsonEncode({
               'type': 'result',
               'id': safe['id'],
@@ -438,7 +439,7 @@ class Controller {
           }
           if (record.error != null) {
             pending.completeError(
-              const ['account_local_', 'message_local_'].any(
+              const ['account_local_', 'message_local_', 'mailbox_local_'].any(
                     (prefix) =>
                         participant._operations[record.id]?.startsWith(
                           prefix,

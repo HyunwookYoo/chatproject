@@ -1,4 +1,5 @@
 mod account;
+mod mailbox;
 mod message;
 pub(crate) mod records;
 pub mod protocol;
@@ -225,6 +226,9 @@ async fn run(
                             } else if op.starts_with("message_local_") {
                                 let handle = account.lock().expect("account slot lock poisoned").handle.clone();
                                 pending.push(Box::pin(async move { (id, protocol::Outcome::account(message::execute(handle, &op, args).await)) }));
+                            } else if op.starts_with("mailbox_local_") {
+                                let handle = account.lock().expect("account slot lock poisoned").handle.clone();
+                                pending.push(Box::pin(async move { (id, protocol::Outcome::account(mailbox::execute(handle, &op, args).await)) }));
                             } else if op.starts_with("account_local_") {
                                 let handle = account.lock().expect("account slot lock poisoned").handle.clone();
                                 let network = network.clone();

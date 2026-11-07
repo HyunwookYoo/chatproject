@@ -55,6 +55,13 @@ struct Participant {
 }
 impl Participant {
     async fn accept(listener: &tokio::net::TcpListener, name: &str) -> Self {
+        Self::accept_with(listener, name, serde_json::json!({"type":"config","relay":"http://127.0.0.1:3340"})).await
+    }
+    async fn accept_with(
+        listener: &tokio::net::TcpListener,
+        name: &str,
+        config: serde_json::Value,
+    ) -> Self {
         use futures_util::SinkExt;
         let stream = tokio::time::timeout(Duration::from_secs(10), listener.accept())
             .await
@@ -67,7 +74,7 @@ impl Participant {
         assert_eq!(hello["name"], name);
         socket
             .send(tokio_tungstenite::tungstenite::Message::text(
-                serde_json::json!({"type":"config","relay":"http://127.0.0.1:3340"}).to_string(),
+                config.to_string(),
             ))
             .await
             .unwrap();
@@ -90,6 +97,12 @@ impl Participant {
         record
     }
     async fn rpc(&mut self, op: &str, args: serde_json::Value) -> serde_json::Value {
+        let record = self.call(op, args).await;
+        assert_eq!(record["ok"], true, "RPC {op} must succeed");
+        record["value"].clone()
+    }
+    /// The whole result record of one command.
+    async fn call(&mut self, op: &str, args: serde_json::Value) -> serde_json::Value {
         use futures_util::SinkExt;
         self.id += 1;
         self.socket
@@ -102,8 +115,7 @@ impl Participant {
             let record = self.next().await;
             if record["type"] == "result" {
                 assert_eq!(record["id"], self.id);
-                assert_eq!(record["ok"], true, "RPC {op} must succeed");
-                return record["value"].clone();
+                return record;
             }
         }
     }
@@ -389,9 +401,51 @@ async fn hooked_pair_exchanges_utf8_and_actual_core_selects_relay_without_direct
         .unwrap();
     assert_eq!(String::from_utf8(body).unwrap(), "relay 응답");
     endpoint.close().await;
+    // A plain puppet opens no account.
+    assert_eq!(
+        a.call("account_local_snapshot", json!({})).await["error"]["code"],
+        "NotAvailable"
+    );
     a.rpc("network_stop", json!({})).await;
     stop(&mut a_child).await;
     stop(&mut b_child).await;
+
+    // `--account` (the M6 scenario's B1): the account in the data directory is open, with the
+    // controller's local records.
+    let cd = tempfile::tempdir().unwrap();
+    let mut c_child = node()
+        .args([
+            "puppet",
+            "--control-url",
+            "ws://127.0.0.1:47000",
+            "--name",
+            "c",
+            "--data-dir",
+            cd.path().to_str().unwrap(),
+            "--account",
+        ])
+        .spawn()
+        .unwrap();
+    let mut c = Participant::accept_with(
+        &listener,
+        "c",
+        json!({"type":"config","relay":"http://127.0.0.1:3340","records":"ws://127.0.0.1:47000/records"}),
+    )
+    .await;
+    let snapshot = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let record = c.call("account_local_snapshot", json!({})).await;
+            if record["ok"] == true {
+                return record["value"].clone();
+            }
+            assert_eq!(record["error"]["code"], "NotAvailable");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(snapshot["phase"], "Unconfigured");
+    stop(&mut c_child).await;
     stop(&mut relay_child).await;
 }
 

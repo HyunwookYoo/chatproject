@@ -126,6 +126,11 @@ pub(crate) struct Runtime {
     /// Entries skipped because their holder had no plaintext record for them (`NoPlain`).
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     missing: u64,
+    /// Notifications published with a new message, and those new messages summed.
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    alerts: u64,
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    alerted_messages: u64,
     /// Sync is paused: no upkeep, pulls or `Notify`, and requests are answered `Busy`.
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     held: bool,
@@ -349,8 +354,14 @@ pub(crate) enum MailboxTestReply {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MailboxCounters {
     /// Entries this device could not open whose holder had no plaintext record (spec 6.3: the
-    /// message is missing here).
+    /// message is missing here). Unopened receipt entries are counted too: a receipt has no
+    /// plaintext record.
     pub missing: u64,
+    /// `CoreEvent::Notify` events published with at least one new message (an alerting
+    /// notification; an update with no new message is not one).
+    pub notifications: u64,
+    /// The new messages of those events, summed (`NotifyItem::new_messages`).
+    pub notified: u64,
 }
 
 #[cfg(all(feature = "test-hooks", debug_assertions))]
@@ -456,6 +467,8 @@ impl Manager {
             }
             MailboxTest::Counters => MailboxTestReply::Counters(MailboxCounters {
                 missing: self.messages.mailbox.missing,
+                notifications: self.messages.mailbox.alerts,
+                notified: self.messages.mailbox.alerted_messages,
             }),
             MailboxTest::HandoffSends => {
                 MailboxTestReply::Sends(self.messages.mailbox.handoff_sends.clone())
@@ -1636,6 +1649,13 @@ impl Manager {
             .await
             && !items.is_empty()
         {
+            #[cfg(all(feature = "test-hooks", debug_assertions))]
+            {
+                let new: u64 = items.iter().map(|i| u64::from(i.new_messages)).sum();
+                let mailbox = &mut self.messages.mailbox;
+                mailbox.alerts += u64::from(new > 0);
+                mailbox.alerted_messages += new;
+            }
             self.bus.publish(crate::CoreEvent::Notify { items });
         }
     }

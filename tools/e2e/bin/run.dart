@@ -6,6 +6,7 @@ import 'package:args/args.dart';
 import 'package:chat_e2e/src/android_sdk.dart';
 import 'package:chat_e2e/src/controller.dart';
 import 'package:chat_e2e/src/account_scenario.dart';
+import 'package:chat_e2e/src/mailbox_scenario.dart';
 import 'package:chat_e2e/src/message_scenario.dart';
 import 'package:chat_e2e/src/emulators.dart';
 import 'package:chat_e2e/src/owned_resources.dart';
@@ -75,7 +76,7 @@ Future<void> main(List<String> arguments) async {
     ..addOption(
       'scenario',
       defaultsTo: 'm2',
-      allowed: ['m2', 'm3', 'm3-auth', 'm4'],
+      allowed: ['m2', 'm3', 'm3-auth', 'm4', 'm6'],
     )
     ..addOption('repo-root', mandatory: true);
   late ArgResults options;
@@ -83,14 +84,17 @@ Future<void> main(List<String> arguments) async {
     options = parser.parse(arguments);
     if (options.rest.isNotEmpty ||
         !p.isAbsolute(options['repo-root'] as String) ||
-        (!Platform.isWindows && options['profile'] != 'android')) {
+        (!Platform.isWindows && options['profile'] != 'android') ||
+        // M6 needs an Android phone: a Windows app or a second emulator is
+        // its mailbox.
+        (options['scenario'] == 'm6' && options['profile'] == 'windows')) {
       throw const FormatException(
         'Profile requires a supported host and absolute repo root',
       );
     }
   } on FormatException {
     stderr.writeln(
-      'Usage: dart run bin/run.dart --profile mixed|android|windows --scenario m2|m3|m3-auth|m4 --repo-root <absolute>',
+      'Usage: dart run bin/run.dart --profile mixed|android|windows --scenario m2|m3|m3-auth|m4|m6 --repo-root <absolute>',
     );
     exitCode = 64;
     return;
@@ -99,6 +103,7 @@ Future<void> main(List<String> arguments) async {
   final profile = options['profile'] as String;
   final authOnly = options['scenario'] == 'm3-auth';
   final messageScenario = options['scenario'] == 'm4';
+  final mailboxScenario = options['scenario'] == 'm6';
   final accountScenario = options['scenario'] != 'm2';
   final logs = await Directory(
     p.join(
@@ -234,6 +239,8 @@ Future<void> main(List<String> arguments) async {
     final participants = <Participant>[];
     final appRestarts = <String, AccountRestart>{};
     final appClocks = <String, Future<int> Function()>{};
+    final appAirplane = <String, Future<void> Function(bool)>{};
+    final appForeground = <String, Future<void> Function()>{};
     for (var i = 1; i <= windowsCount; i++) {
       run.phase = _Phase.windowsStart;
       final name = 'windows-$i';
@@ -451,6 +458,27 @@ Future<void> main(List<String> arguments) async {
         final first = await launch(null);
         appRestarts[name] = (old, {bool freshStore = false}) =>
             launch(old, freshStore: freshStore);
+        appAirplane[name] = (on) async {
+          await run.command(sdk.adb, [
+            ...adb,
+            'shell',
+            'cmd',
+            'connectivity',
+            'airplane-mode',
+            on ? 'enable' : 'disable',
+          ]);
+        };
+        // singleTop: the running activity comes to the front (onNewIntent).
+        appForeground[name] = () async {
+          await run.command(sdk.adb, [
+            ...adb,
+            'shell',
+            'am',
+            'start',
+            '-n',
+            '$package/.MainActivity',
+          ], requireSuccess: false);
+        };
         appClocks[name] = () async {
           final result = await run.command(sdk.adb, [
             ...adb,
@@ -550,6 +578,7 @@ Future<void> main(List<String> arguments) async {
         'node',
         '--data-dir',
         p.join(logs.path, 'node'),
+        if (mailboxScenario) '--account',
       ], logDir: logs);
       Participant? next;
       run.phase = _Phase.nodeParticipant;
@@ -561,10 +590,45 @@ Future<void> main(List<String> arguments) async {
       return next!;
     }
 
-    if (!accountScenario) participants.add(await launchNode());
+    if (!accountScenario || mailboxScenario) {
+      participants.add(await launchNode());
+    }
     run.phase = _Phase.scenario;
+    Participant named(String name) =>
+        participants.singleWhere((participant) => participant.name == name);
     await run.wait(
-      messageScenario
+      mailboxScenario
+          ? runMailboxScenario(
+              control,
+              [
+                named('android-1'),
+                named(profile == 'mixed' ? 'windows-1' : 'android-2'),
+                named('node'),
+              ],
+              airplane: (participant, on) {
+                final action = appAirplane[participant.name];
+                if (action == null) {
+                  throw StateError('Airplane participant is not owned');
+                }
+                return action(on);
+              },
+              foreground: (participant) {
+                final action = appForeground[participant.name];
+                if (action == null) {
+                  throw StateError('Foreground participant is not owned');
+                }
+                return action();
+              },
+              evidence: (stage, data) =>
+                  File(
+                    p.join(logs.path, 'mailbox-public-evidence.jsonl'),
+                  ).writeAsStringSync(
+                    '${jsonEncode({'stage': stage, ...data})}\n',
+                    mode: FileMode.append,
+                    flush: true,
+                  ),
+            )
+          : messageScenario
           ? runMessageScenario(
               control,
               participants,
@@ -667,7 +731,9 @@ Future<void> main(List<String> arguments) async {
     if (userInterrupted && code == 0) code = 130;
     if (code == 0) {
       stdout.writeln(
-        messageScenario
+        mailboxScenario
+            ? '$profile M6 PASS: phone in airplane mode, mailbox kept three texts, phone got them in order once with one notification.'
+            : messageScenario
             ? '$profile M4 PASS: native retained message restart, durable ack and read.'
             : accountScenario
             ? authOnly
