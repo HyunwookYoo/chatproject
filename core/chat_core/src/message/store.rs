@@ -30,7 +30,9 @@ pub(crate) struct OpenFrom {
 }
 pub(crate) enum MessageDbOp {
     Observed(Box<MessageDbOp>),
-    MarkRead(ConversationId, Vec<MessageKey>, u64),
+    /// The user saw these received messages: conversation, keys, scheduler time (receipt jobs)
+    /// and wall time (a `Read` receipt sealed now).
+    MarkRead(ConversationId, Vec<MessageKey>, u64, u64),
     #[cfg(all(feature="test-hooks",debug_assertions))]
     RejectedPrepare(MessageKey, InstallationId, u64, PrepareTransition),
     Due(u64, Vec<PeerId>, [Option<DueCursor>; 2]),
@@ -301,7 +303,7 @@ pub(crate) fn execute(
             let cid = match &*op {
                 MessageDbOp::Open(local, peer) => Some(conversation_id(*local, *peer)?),
                 MessageDbOp::ReleasePeer(peer, _) => Some(conversation_id(identity.peer, *peer)?),
-                MessageDbOp::MarkRead(id, _, _) => Some(*id),
+                MessageDbOp::MarkRead(id, ..) => Some(*id),
                 MessageDbOp::SealPending(id, _) => Some(*id),
                 // Group operations that span conversations (deliveries, holds) pass a zero id.
                 MessageDbOp::MlsGroupOp(id, _) => (id.0 != [0; 32]).then_some(*id),
@@ -332,7 +334,7 @@ pub(crate) fn execute(
             }
             Ok(MessageDbReply::Observed(Box::new(reply), events, head))
         }
-        MessageDbOp::MarkRead(id, keys, now) => mark_read(c, identity, id, keys, now, #[cfg(all(feature="test-hooks",debug_assertions))] fault),
+        MessageDbOp::MarkRead(id, keys, now, wall) => mark_read(c, identity, local, id, keys, (now, wall), #[cfg(all(feature="test-hooks",debug_assertions))] fault),
         #[cfg(all(feature="test-hooks",debug_assertions))]
         MessageDbOp::RejectedPrepare(key,receiver,now,transition) => {
             let state:Option<u64>=c.query_row("SELECT dispatch_state FROM outbox WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",params![key.conversation.0.as_slice(),key.sender.0.as_slice(),key.installation.0.as_slice(),key.id.0.as_slice()],|r|uint(r,0)).optional().map_err(sql_error)?;
@@ -1237,7 +1239,7 @@ impl MessageDbOp {
     pub(crate) fn key(&self, identity: Identity) -> R<Option<MessageKey>> {
         Ok(match self {
             Self::Observed(op) => return op.key(identity),
-            Self::MarkRead(_, keys, _) => keys.first().copied(),
+            Self::MarkRead(_, keys, ..) => keys.first().copied(),
             Self::Enqueue(peer, id, _, _) => Some(MessageKey {
                 conversation: conversation_id(identity.peer, *peer)?,
                 sender: identity.peer,
@@ -2283,9 +2285,10 @@ mod due_tests {
 fn mark_read(
     c: &mut Connection,
     identity: Identity,
+    local: &LocalAccount,
     id: ConversationId,
     keys: Vec<MessageKey>,
-    now: u64,
+    (now, wall): (u64, u64),
     #[cfg(all(feature = "test-hooks", debug_assertions))] fault: Option<
         crate::storage::worker::CommitFault,
     >,
@@ -2328,6 +2331,7 @@ fn mark_read(
             ],
         )
         .map_err(sql_error)?;
+        super::mls_store::seal_read(&tx, identity, local, k, wall)?;
     }
     if changed > 0 {
         let rev = bump(&tx)?;

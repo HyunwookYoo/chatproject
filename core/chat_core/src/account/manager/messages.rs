@@ -639,6 +639,7 @@ impl Manager {
                     .scheduler
                     .as_ref()
                     .map_or_else(|| self.services.clock.wall_ms(), |s| s.now_ms()),
+                self.services.clock.wall_ms(),
             ),
         };
         Ok(match self.message_db(op, request).await? {

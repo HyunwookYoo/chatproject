@@ -249,14 +249,16 @@ async fn a_receipt_is_logged_once_when_it_is_sealed() {
         .unwrap()
         .1;
     ack(&open(&b, &a, conversation, &ct).await);
-    b.m.mark_read(conversation, vec![key], NOW).await.unwrap();
     let before = b.log().await.entries.len();
+    // Final review I2: the Read is sealed, and so logged, as the user reads.
+    b.m.mark_read(conversation, vec![key], NOW).await.unwrap();
+    assert_eq!(b.log().await.entries.len(), before + 1);
 
     let first =
         b.m.prepare_receipt_attempt(key, a.install, 2_000_000)
             .await
             .unwrap();
-    // A retry resends the cached receipt: nothing new to log.
+    // The attempts send the receipt sealed then: nothing new to log.
     b.m.prepare_receipt_attempt(key, a.install, 2_001_000)
         .await
         .unwrap();

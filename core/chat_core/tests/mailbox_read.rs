@@ -84,6 +84,64 @@ async fn read_on_a1_marks_a2_read_without_notification_or_receipt() {
     assert_eq!(delivery(&b1, key).await, DeliveryState::Read);
 }
 
+/// Final review I2: B1 sends and goes off; then A1 reads. A2 shows the text read (its
+/// notification cleared, no alert, no receipt of its own) while B1 is still off: my read
+/// reaches my devices without the contact. B1 comes back and gets one Read, from A1.
+#[tokio::test]
+async fn read_reaches_my_devices_while_contact_is_off() {
+    let (mut a, b1, net, conv) = accounts(&[A1, A2], &[B1]).await;
+    let a2 = a.pop().unwrap();
+    let a1 = a.pop().unwrap();
+    let key = delivered(&b1, &a1, &[&a2], 1).await;
+    settle!([&a1, &a2, &b1], has(&a2, key).await);
+    settle!([&a1, &a2, &b1], unread(&a2, conv).await == 1);
+    let b_peer = b1.peer;
+    let b1_id = installation(&b1).await;
+    let b_dir = stop(b1);
+    // Their transports notice B1 is gone (no ready session with it).
+    for f in [&a1, &a2] {
+        f.account.mls_test_close_session(b1_id).await.unwrap();
+    }
+    let (a1_sent, a2_sent) = (app_ciphertexts(&a1).await.len(), app_frames(&a2).await);
+    let notified_before = notify_events(&a2).len();
+
+    a1.account
+        .messages()
+        .mark_read(conv, vec![key])
+        .await
+        .unwrap();
+    settle!(
+        [&a1, &a2],
+        seen(&a2, key).await && unread(&a2, conv).await == 0
+    );
+    settle!([&a1, &a2], notify_events(&a2).len() > notified_before);
+    assert_eq!(
+        notify_events(&a2)[notified_before..],
+        [NotifyItem {
+            conversation: conv,
+            peer: b_peer,
+            new_messages: 0,
+            unread: 0
+        }]
+    );
+
+    let b1 = start_as(B, b_dir, net.clone()).await;
+    link(&b1, &a1).await;
+    link(&b1, &a2).await;
+    settle!(
+        [&a1, &a2, &b1],
+        delivery(&b1, key).await == DeliveryState::Read && receipt_jobs(&a1).await == 0
+    );
+    quiet(&[&a1, &a2, &b1]).await;
+    let receipts: std::collections::BTreeSet<Vec<u8>> = app_ciphertexts(&a1).await[a1_sent..]
+        .iter()
+        .cloned()
+        .collect();
+    assert_eq!(receipts.len(), 1, "one Read, sealed once");
+    assert_eq!(app_frames(&a2).await, a2_sent, "A2 sent no receipt");
+    assert_eq!(receipt_jobs(&a2).await, 0);
+}
+
 /// Spec 11 (both ways, the read part): A2 is off while B1 sends three texts and A1 reads them.
 /// A2 comes back: all three read, nothing unread, and no notification of a new message.
 #[tokio::test]

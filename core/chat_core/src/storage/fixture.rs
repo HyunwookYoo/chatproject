@@ -288,7 +288,7 @@ impl Messages {
     }
     /// The user saw these received messages (queues their `Read` receipt jobs).
     pub async fn mark_read(&self, conversation: ConversationId, keys: Vec<MessageKey>, now: u64) -> Result<(), CoreError> {
-        match self.mls(MessageDbOp::MarkRead(conversation, keys, now)).await? {
+        match self.mls(MessageDbOp::MarkRead(conversation, keys, now, now)).await? {
             MessageDbReply::Done => Ok(()),
             _ => unreachable!(),
         }

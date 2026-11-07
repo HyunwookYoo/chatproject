@@ -514,13 +514,6 @@ pub(super) fn prepare_receipt(
     {
         return Err(invalid());
     }
-    let (lamport, prev): (u64, Vec<u8>) = tx
-        .query_row(
-            "SELECT lamport_max,local_prev_hash FROM conversation WHERE id=?1",
-            params![key.conversation.0.as_slice()],
-            |r| Ok((uint(r, 0)?, r.get(1)?)),
-        )
-        .map_err(sql)?;
     schedule_retry(&tx, key, true, now)?;
     let cache = params![
         key.conversation.0.as_slice(),
@@ -538,13 +531,78 @@ pub(super) fn prepare_receipt(
         )
         .optional()
         .map_err(sql)?;
-    if let Some(frame) = sealed {
-        finish(tx, fault)?;
-        return Ok(MessageDbReply::Prepared(
-            zeroize::Zeroizing::new(frame),
-            Some(receipt),
-        ));
+    let frame = match sealed {
+        Some(frame) => frame,
+        None => seal_receipt(
+            &tx,
+            identity,
+            local,
+            key,
+            &group.group_id,
+            receipt.kind,
+            wall,
+        )?,
+    };
+    finish(tx, fault)?;
+    Ok(MessageDbReply::Prepared(
+        zeroize::Zeroizing::new(frame),
+        Some(receipt),
+    ))
+}
+
+/// Final review I2: the `Read` receipt for received message `key` that `mark_read` just made
+/// seen, sealed now when the message came over MLS and its conversation has a group, in the
+/// `mark_read` transaction. Sealing logs it (spec 6.4: my other devices take my read from my
+/// log), so my read reaches them whether or not the contact can be reached; the receipt job's
+/// attempts then send this same frame. Without a group nothing happens here: the attempt
+/// seals it, or waits for a group, as before.
+pub(super) fn seal_read(
+    tx: &Transaction<'_>,
+    identity: Identity,
+    local: &LocalAccount,
+    key: MessageKey,
+    wall: u64,
+) -> R<()> {
+    if !received_over_mls(tx, key)? {
+        return Ok(());
     }
+    let Some(group) = group_row(tx, key.conversation)? else {
+        return Ok(());
+    };
+    seal_receipt(
+        tx,
+        identity,
+        local,
+        key,
+        &group.group_id,
+        ReceiptKind::Read,
+        wall,
+    )
+    .map(|_| ())
+}
+
+/// Seals receipt `kind` for received message `key` in group `group_id` at `wall`: logged (as
+/// every sealed frame) and kept in `mls_receipt`, so the job's attempts resend this frame.
+fn seal_receipt(
+    tx: &Transaction<'_>,
+    identity: Identity,
+    local: &LocalAccount,
+    key: MessageKey,
+    group_id: &[u8],
+    kind: ReceiptKind,
+    wall: u64,
+) -> R<Vec<u8>> {
+    let (lamport, prev): (u64, Vec<u8>) = tx
+        .query_row(
+            "SELECT lamport_max,local_prev_hash FROM conversation WHERE id=?1",
+            params![key.conversation.0.as_slice()],
+            |r| Ok((uint(r, 0)?, r.get(1)?)),
+        )
+        .map_err(sql)?;
+    let number: u8 = match kind {
+        ReceiptKind::Delivered => 1,
+        ReceiptKind::Read => 2,
+    };
     // A receipt is not a message of its own: an id derived from what it acknowledges.
     let mut id = Sha256::new();
     id.update(b"ChatProject/m5/receipt-id/v1");
@@ -552,7 +610,7 @@ pub(super) fn prepare_receipt(
     id.update(key.sender.0);
     id.update(key.installation.0);
     id.update(key.id.0);
-    id.update([kind as u8]);
+    id.update([number]);
     id.update(wall.to_be_bytes());
     let id: [u8; 32] = id.finalize().into();
     let message = ChatMessage {
@@ -561,21 +619,14 @@ pub(super) fn prepare_receipt(
         prev_hash: prev.try_into().map_err(|_| invalid())?,
         sent_at_ms: wall,
         content: Content::Receipt {
-            kind: receipt.kind,
+            kind,
             targets: vec![key.id],
         },
     };
-    let provider = MlsProvider::new(KvStore::load_scope(&tx, key.conversation.0)?);
+    let provider = MlsProvider::new(KvStore::load_scope(tx, key.conversation.0)?);
     let (signer, _) = signer_of(local);
     let (_, frame) = seal_one(
-        &tx,
-        &provider,
-        &signer,
-        identity,
-        key,
-        &group.group_id,
-        &message,
-        wall,
+        tx, &provider, &signer, identity, key, group_id, &message, wall,
     )?;
     tx.execute(
         "INSERT OR REPLACE INTO mls_receipt VALUES(?1,?2,?3,?4,?5,?6)",
@@ -584,17 +635,13 @@ pub(super) fn prepare_receipt(
             key.sender.0.as_slice(),
             key.installation.0.as_slice(),
             key.id.0.as_slice(),
-            kind as i64,
+            i64::from(number),
             frame.as_slice()
         ],
     )
     .map_err(sql)?;
-    provider.storage().flush(&tx, key.conversation.0)?;
-    finish(tx, fault)?;
-    Ok(MessageDbReply::Prepared(
-        zeroize::Zeroizing::new(frame),
-        Some(receipt),
-    ))
+    provider.storage().flush(tx, key.conversation.0)?;
+    Ok(frame)
 }
 
 /// The recipient could not open the sealed receipt for received message `key`: it is
