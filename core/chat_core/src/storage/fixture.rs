@@ -2,7 +2,7 @@
 pub use crate::account::storage::migration_fixtures::{
     MlsAccount, assert_account_preserved, migration_states, mls_account,
 };
-pub use crate::message::mailbox_store::{MailboxPage, MailboxRow, MailboxState};
+pub use crate::message::mailbox_store::{HandoffRow, MailboxPage, MailboxRow, MailboxState};
 use crate::message::mailbox_store::{MailboxDbOp, MailboxDbReply};
 pub use crate::message::mls_store::{MlsOutbox, MlsState};
 pub use crate::message::store::MessageFacts;
@@ -933,6 +933,13 @@ impl Fixture {
     pub async fn mailbox_seed(&self, installation: crate::account::InstallationId, at: u64) -> Result<(), CoreError> {
         let (tx, rx) = oneshot::channel();
         self.handle.0.test(TestOp::Message(FixtureOp::MailboxSeed(installation, at, tx))).await;
+        rx.await.unwrap()
+    }
+    /// Records `installation` as a mailbox device of this account (Ruling 12: until Task 10's
+    /// `Announce` does), or not.
+    pub async fn mailbox_mark(&self, installation: crate::account::InstallationId, mailbox: bool, at: u64) -> Result<(), CoreError> {
+        let (tx, rx) = oneshot::channel();
+        self.handle.0.test(TestOp::Message(FixtureOp::MailboxMark(installation, mailbox, at, tx))).await;
         rx.await.unwrap()
     }
     /// Deletes the message and what refers to it, as deleting its conversation would.

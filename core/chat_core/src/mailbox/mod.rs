@@ -12,5 +12,5 @@ pub(crate) const KIND: u8 = 18;
 pub(crate) const PAGE_MAX_ENTRIES: usize = 64;
 /// How long a mailbox keeps its log: 30 days.
 pub(crate) const MAILBOX_RETENTION_MS: u64 = 2_592_000_000;
-/// Longest a mailbox may delay a notification.
+/// Back-off cap of a mailbox's retries (spec 7: handed-off ciphertexts).
 pub(crate) const MAILBOX_MAX_DELAY_MS: u64 = 30_000;

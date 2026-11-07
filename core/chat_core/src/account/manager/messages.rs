@@ -1386,7 +1386,7 @@ impl Manager {
     /// * Any other class from a recipient already past this device's epoch: this device lacks
     ///   a Commit; a new ciphertext cannot help yet (budget not spent).
     /// * Otherwise it is sealed again in the current epoch, counted, and is due at once.
-    async fn after_decrypt_failed(
+    pub(super) async fn after_decrypt_failed(
         &mut self,
         key: MessageKey,
         peer: PeerId,

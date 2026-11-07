@@ -150,6 +150,11 @@ fn stop(f: Fixture) -> tempfile::TempDir {
 
 /// Starts a core on an existing data directory (the account `A`).
 async fn start(dir: tempfile::TempDir, backend: Arc<Backend>) -> Fixture {
+    start_as(A, dir, backend).await
+}
+
+/// Starts a core on an existing data directory of a device of account `seed`.
+async fn start_as(seed: u8, dir: tempfile::TempDir, backend: Arc<Backend>) -> Fixture {
     let slot = CoreSlot::new();
     let bus = EventBus::new();
     let events = Arc::new(Events::default());
@@ -178,7 +183,7 @@ async fn start(dir: tempfile::TempDir, backend: Arc<Backend>) -> Fixture {
         bus,
         events,
         account,
-        peer: peer_of(A),
+        peer: peer_of(seed),
         clock,
     };
     online(&f).await;

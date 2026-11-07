@@ -559,9 +559,76 @@ pub(crate) fn page(entries: impl Iterator<Item = LogEntry>) -> (Vec<LogEntry>, b
     (page, false)
 }
 
+/// Splits `entries` (in order) into the entry lists of `Handoff` frames, each within
+/// `MAX_INNER` and `PAGE_MAX_ENTRIES`. An entry too large for a frame of its own is left out.
+pub(crate) fn handoff_batches(entries: Vec<HandoffEntry>) -> Vec<Vec<HandoffEntry>> {
+    // `[1, 3, entries]` without the entries array head.
+    const FIXED: usize = 3;
+    let mut batches = Vec::new();
+    let (mut batch, mut body) = (Vec::new(), 0);
+    for entry in entries {
+        let size = {
+            let mut e = Encoder::new(Vec::new());
+            e.array(4)
+                .unwrap()
+                .bytes(&entry.conversation.0)
+                .unwrap()
+                .bytes(&entry.peer.0)
+                .unwrap()
+                .bytes(&entry.msg_id.0)
+                .unwrap()
+                .bytes(&entry.ciphertext)
+                .unwrap();
+            e.into_writer().len()
+        };
+        let fits = |count: usize, body: usize| {
+            let head = if count < 24 { 1 } else { 2 };
+            count <= PAGE_MAX_ENTRIES && FIXED + head + body <= MAX_INNER
+        };
+        if !fits(1, size) {
+            continue;
+        }
+        if !fits(batch.len() + 1, body + size) {
+            batches.push(std::mem::take(&mut batch));
+            body = 0;
+        }
+        body += size;
+        batch.push(entry);
+    }
+    if !batch.is_empty() {
+        batches.push(batch);
+    }
+    batches
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn handoff_batches_fit_one_frame_each_and_keep_order() {
+        let entry = |n: u8, len: usize| HandoffEntry {
+            conversation: ConversationId([n; 32]),
+            peer: PeerId([2; 32]),
+            msg_id: MessageId([n; 16]),
+            ciphertext: vec![n; len],
+        };
+        // Two large ciphertexts cannot share a frame, one too large for any frame is left out,
+        // and no frame carries more than 64 entries.
+        let mut entries = vec![entry(1, 40_000), entry(2, 40_000), entry(3, MAX_INNER)];
+        entries.extend((10..80).map(|n| entry(n, 100)));
+        let batches = handoff_batches(entries);
+        let sizes: Vec<usize> = batches.iter().map(Vec::len).collect();
+        assert_eq!(sizes, [1, 64, 7]);
+        let order: Vec<u8> = batches.iter().flatten().map(|e| e.msg_id.0[0]).collect();
+        assert_eq!(order, [1, 2].into_iter().chain(10..80).collect::<Vec<_>>());
+        for entries in batches {
+            let frame = MailboxFrame::Handoff { entries };
+            let inner = frame.inner();
+            assert!(inner.len() <= MAX_INNER);
+            assert!(MailboxFrame::decode(&inner).unwrap() == frame);
+        }
+    }
 
     #[test]
     fn note_bodies_round_trip_under_their_kind_only() {

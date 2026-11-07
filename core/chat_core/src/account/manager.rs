@@ -81,6 +81,7 @@ enum Command {
     #[cfg(all(feature="test-hooks",debug_assertions))]
     MailboxTest(mailbox::MailboxTest,oneshot::Sender<Result<mailbox::MailboxTestReply,CoreError>>),
     MailboxSyncNow(oneshot::Sender<Result<(),CoreError>>),
+    MailboxBackground(oneshot::Sender<Result<u32,CoreError>>),
     Retry(oneshot::Sender<Result<u64, CoreError>>),
     #[cfg(all(feature="test-hooks",debug_assertions))]
     PairTestStop(super::PairTestStop,oneshot::Sender<Result<(),CoreError>>),
@@ -153,6 +154,7 @@ impl Command {
             #[cfg(all(feature="test-hooks",debug_assertions))]
             Self::MailboxTest(_,reply)=>{let _=reply.send(Err(error));}
             Self::MailboxSyncNow(reply)=>{let _=reply.send(Err(error));}
+            Self::MailboxBackground(reply)=>{let _=reply.send(Err(error));}
             Self::Retry(reply) => { let _ = reply.send(Err(error)); }
             #[cfg(all(feature="test-hooks",debug_assertions))]
             Self::PairTestStop(_,reply)=>{let _=reply.send(Err(error));}
@@ -405,6 +407,12 @@ impl AccountHandle {
     /// session, and pulls what every connected one logged since the last sync.
     pub async fn mailbox_sync_now(&self) -> Result<(), CoreError> {
         self.send(Command::MailboxSyncNow).await
+    }
+    /// The app goes to the background or exits (M6 spec 7): the sealed ciphertexts of this
+    /// device's undelivered messages are handed to its mailbox devices that are connected, which
+    /// retry them. Returns how many messages were handed over.
+    pub async fn mailbox_background(&self) -> Result<u32, CoreError> {
+        self.send(Command::MailboxBackground).await
     }
     pub async fn refresh_record(&self, peer: PeerId) -> Result<(), CoreError> {
         self.send(|reply| Command::Refresh(peer, reply)).await
@@ -1223,6 +1231,7 @@ impl Manager {
                         #[cfg(all(feature="test-hooks",debug_assertions))]
                         Command::MailboxTest(test,reply)=>{let result=self.mailbox_test(test).await;let _=reply.send(result);}
                         Command::MailboxSyncNow(reply)=>{let result=self.mailbox_sync_now().await;let _=reply.send(result);}
+                        Command::MailboxBackground(reply)=>{let result=self.mailbox_background().await;let _=reply.send(result);}
                         Command::Retry(reply) => { let result = self.retry_open(); let _ = reply.send(result); }
                         #[cfg(all(feature="test-hooks",debug_assertions))]
                         Command::PairTestStop(stop,reply)=>{self.pair.stop=Some(stop);self.pair.reached=None;let _=reply.send(Ok(()));}

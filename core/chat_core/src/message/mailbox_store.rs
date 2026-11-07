@@ -6,15 +6,25 @@
 //! Each other own device has a cursor here (`mailbox_cursor`: the first seq it has not taken)
 //! and this device keeps how far it took each of theirs (`mailbox_pull`). Entries every cursor
 //! has passed, and entries older than `MAILBOX_RETENTION_MS`, are pruned.
+//!
+//! As a mailbox (spec 7), this device also keeps the ciphertexts its other devices handed over
+//! (`mailbox_handoff`) with their retry state; how each attempt ended goes into the log as a
+//! note for the device that handed it over.
 use super::mls_group::sql;
 use super::mls_store::{Fault, finish, store_plain};
-use super::store::{Identity, MessageDbReply, bump, bytes, integer, invalid, uint};
+use super::scheduler::retry_delay_capped;
+use super::store::{
+    Identity, MessageDbReply, bump, bytes, conversation_id, integer, invalid, uint,
+};
 use super::types::{ConversationId, MessageId};
 use crate::CoreError;
 use crate::account::{InstallationId, PeerId};
 use crate::mailbox::{
-    MAILBOX_RETENTION_MS, PAGE_MAX_ENTRIES,
-    wire::{EntryBody, LogEntry, MAX_ENTRY_BODY, PlainRecord, decode_note, note_body, page},
+    MAILBOX_MAX_DELAY_MS, MAILBOX_RETENTION_MS, PAGE_MAX_ENTRIES,
+    wire::{
+        EntryBody, HandoffEntry, LogEntry, MAX_ENTRY_BODY, PlainRecord, decode_note, note_body,
+        page,
+    },
 };
 use crate::mls::wire::MlsFrame;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -170,12 +180,71 @@ pub(crate) enum MailboxDbOp {
         ct_hash: [u8; 32],
         now: u64,
     },
+    /// This account's devices recorded as mailboxes (`mailbox_device.mailbox = 1`), the only
+    /// ones unsent ciphertexts are handed to (spec 7, Ruling 12).
+    Mailboxes,
+    /// The conversations where this device has messages awaiting encryption (codec 3), to be
+    /// sealed (`SealPending`) before a handoff.
+    Unsealed,
+    /// The sealed ciphertexts (codec 2) of this device's messages that are not delivered,
+    /// cancelled, failed or waiting for the peer's update, in send order (spec 7).
+    HandoffRows,
+    /// Ciphertexts own device `origin` handed over, each due at `now`. Another ciphertext of a
+    /// message already here replaces the one kept (its attempts start over); the same one again
+    /// changes nothing. Entries whose conversation is not this account's with `peer` are not
+    /// taken.
+    TakeHandoff {
+        origin: InstallationId,
+        entries: Vec<HandoffEntry>,
+        now: u64,
+    },
+    /// Handed-off ciphertexts due at `now` (at most `HANDOFF_DUE_MAX`).
+    HandoffDue(u64),
+    /// A session with `peer` is ready: its handed-off ciphertexts are due at `now`.
+    HandoffWake { peer: PeerId, now: u64 },
+    /// How the attempt of the ciphertext hashing to `ct_hash` that `origin` handed over for
+    /// message `msg_id` ended; `now` is scheduler time, `wall` the time notes carry.
+    HandoffResult {
+        origin: InstallationId,
+        conversation: ConversationId,
+        msg_id: MessageId,
+        ct_hash: [u8; 32],
+        outcome: HandoffOutcome,
+        now: u64,
+        wall: u64,
+    },
 }
 impl MailboxDbOp {
     pub(crate) fn writes(&self) -> bool {
-        !matches!(self, Self::PullFrom(_) | Self::Plain { .. })
+        !matches!(
+            self,
+            Self::PullFrom(_)
+                | Self::Plain { .. }
+                | Self::Mailboxes
+                | Self::Unsealed
+                | Self::HandoffRows
+                | Self::HandoffDue(_)
+        )
     }
 }
+
+/// How one attempt of a handed-off ciphertext ended.
+pub(crate) enum HandoffOutcome {
+    /// The recipient `receiver` stored it: the row goes, and a `Delivered` note tells the origin.
+    Acked { receiver: InstallationId },
+    /// The recipient could not open it: it is not tried again, and a `HandoffStop` note tells
+    /// the origin, which alone re-encrypts.
+    Stop { class: u8, epoch: u64 },
+    /// No answer, `Busy`, no session: tried again after the back-off (capped at 30 s).
+    Retry,
+}
+
+/// Most handed-off ciphertexts one `HandoffDue` returns.
+pub(crate) const HANDOFF_DUE_MAX: usize = 32;
+/// `mailbox_handoff.next_retry_at_ms` of a ciphertext the recipient could not open: never due
+/// again, kept so the same ciphertext handed over again is not tried again (until the origin
+/// hands over a new one, or the row is pruned).
+const STOPPED: i64 = i64::MAX;
 
 pub struct MailboxPage {
     /// In `seq` order, as many as one `SyncResp` carries.
@@ -193,6 +262,15 @@ pub(crate) enum MailboxDbReply {
     Plain(Option<PlainRecord>),
     /// The handed-over text was stored just now (false: already here, or not taken).
     Stored(bool),
+    Installations(Vec<InstallationId>),
+    Conversations(Vec<ConversationId>),
+    Handoff(Vec<HandoffEntry>),
+    /// Due handed-off ciphertexts with the device that handed each over, and when the next of
+    /// the others is due (`None`: none is).
+    HandoffDue {
+        jobs: Vec<(InstallationId, HandoffEntry)>,
+        next: Option<u64>,
+    },
 }
 
 pub(super) fn mailbox_op(
@@ -295,8 +373,263 @@ pub(super) fn mailbox_op(
             finish(tx, fault)?;
             MailboxDbReply::Stored(stored)
         }
+        MailboxDbOp::Mailboxes => MailboxDbReply::Installations(
+            column(c, "SELECT installation FROM mailbox_device WHERE mailbox=1 ORDER BY installation", [])?
+                .into_iter()
+                .map(InstallationId)
+                .collect(),
+        ),
+        MailboxDbOp::Unsealed => MailboxDbReply::Conversations(
+            column(
+                c,
+                "SELECT DISTINCT conversation FROM outbox WHERE sender_peer=?1 AND sender_install=?2 AND codec=3",
+                params![identity.peer.0.as_slice(), identity.installation.0.as_slice()],
+            )?
+            .into_iter()
+            .map(ConversationId)
+            .collect(),
+        ),
+        MailboxDbOp::HandoffRows => MailboxDbReply::Handoff(handoff_rows(c, identity)?),
+        MailboxDbOp::TakeHandoff {
+            origin,
+            entries,
+            now,
+        } => {
+            let tx = c.transaction().map_err(sql)?;
+            let mut taken = 0;
+            for entry in entries {
+                if conversation_id(identity.peer, entry.peer).ok() != Some(entry.conversation) {
+                    continue;
+                }
+                taken += tx
+                    .execute(
+                        "INSERT INTO mailbox_handoff VALUES(?1,?2,?3,?4,?5,0,?6,?6) ON CONFLICT(origin_install,conversation,msg_id) DO UPDATE SET peer=excluded.peer,ciphertext=excluded.ciphertext,attempts=0,next_retry_at_ms=excluded.next_retry_at_ms,received_at_ms=excluded.received_at_ms WHERE ciphertext<>excluded.ciphertext",
+                        params![
+                            origin.0.as_slice(),
+                            entry.conversation.0.as_slice(),
+                            entry.msg_id.0.as_slice(),
+                            entry.peer.0.as_slice(),
+                            entry.ciphertext,
+                            integer(now)?
+                        ],
+                    )
+                    .map_err(sql)? as u64;
+            }
+            finish(tx, fault)?;
+            MailboxDbReply::Count(taken)
+        }
+        MailboxDbOp::HandoffDue(now) => handoff_due(c, now)?,
+        MailboxDbOp::HandoffWake { peer, now } => {
+            let tx = c.transaction().map_err(sql)?;
+            let woken = tx
+                .execute(
+                    "UPDATE mailbox_handoff SET next_retry_at_ms=?2 WHERE peer=?1 AND next_retry_at_ms>?2 AND next_retry_at_ms<?3",
+                    params![peer.0.as_slice(), integer(now)?, STOPPED],
+                )
+                .map_err(sql)?;
+            finish(tx, fault)?;
+            MailboxDbReply::Count(woken as u64)
+        }
+        MailboxDbOp::HandoffResult {
+            origin,
+            conversation,
+            msg_id,
+            ct_hash,
+            outcome,
+            now,
+            wall,
+        } => {
+            let tx = c.transaction().map_err(sql)?;
+            let changed = handoff_result(
+                &tx,
+                identity,
+                (origin, conversation, msg_id),
+                ct_hash,
+                outcome,
+                now,
+                wall,
+            )?;
+            finish(tx, fault)?;
+            MailboxDbReply::Count(changed)
+        }
     };
     Ok(MessageDbReply::Mailbox(reply))
+}
+
+/// The 32-byte values of the first column of `query`.
+fn column(c: &Connection, query: &str, values: impl rusqlite::Params) -> R<Vec<[u8; 32]>> {
+    let mut q = c.prepare(query).map_err(sql)?;
+    q.query_map(values, |r| bytes::<32>(r, 0))
+        .map_err(sql)?
+        .collect::<Result<_, _>>()
+        .map_err(sql)
+}
+
+fn handoff_rows(c: &Connection, identity: Identity) -> R<Vec<HandoffEntry>> {
+    let mut q = c
+        .prepare("SELECT o.conversation,v.peer,o.msg_id,o.wire FROM outbox o JOIN message m USING(conversation,sender_peer,sender_install,msg_id) JOIN conversation v ON v.id=o.conversation WHERE o.sender_peer=?1 AND o.sender_install=?2 AND o.codec=2 AND o.waiting_peer_update=0 AND m.outgoing=1 AND m.delivered_at_ms IS NULL AND m.cancel_requested=0 AND m.outcome<>3 ORDER BY m.lamport,o.msg_id")
+        .map_err(sql)?;
+    let rows = q
+        .query_map(
+            params![
+                identity.peer.0.as_slice(),
+                identity.installation.0.as_slice()
+            ],
+            |r| {
+                Ok((
+                    bytes::<32>(r, 0)?,
+                    bytes::<32>(r, 1)?,
+                    bytes::<16>(r, 2)?,
+                    r.get::<_, Vec<u8>>(3)?,
+                ))
+            },
+        )
+        .map_err(sql)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(sql)?;
+    // The row holds the complete kind 17 `App` frame; the mailbox gets its ciphertext.
+    Ok(rows
+        .into_iter()
+        .filter_map(|(conversation, peer, msg_id, wire)| {
+            let inner = crate::account::auth::payload(&wire, 17).ok()?;
+            match MlsFrame::decode(&inner).ok()? {
+                MlsFrame::App {
+                    conversation: id,
+                    ciphertext,
+                } if id.0 == conversation => Some(HandoffEntry {
+                    conversation: id,
+                    peer: PeerId(peer),
+                    msg_id: MessageId(msg_id),
+                    ciphertext,
+                }),
+                _ => None,
+            }
+        })
+        .collect())
+}
+
+fn handoff_due(c: &Connection, now: u64) -> R<MailboxDbReply> {
+    let jobs: Vec<(InstallationId, HandoffEntry)> = {
+        let mut q = c
+            .prepare("SELECT origin_install,conversation,msg_id,peer,ciphertext FROM mailbox_handoff WHERE next_retry_at_ms<=?1 ORDER BY next_retry_at_ms LIMIT ?2")
+            .map_err(sql)?;
+        q.query_map(params![integer(now)?, HANDOFF_DUE_MAX as i64], |r| {
+            Ok((
+                InstallationId(bytes(r, 0)?),
+                HandoffEntry {
+                    conversation: ConversationId(bytes(r, 1)?),
+                    msg_id: MessageId(bytes(r, 2)?),
+                    peer: PeerId(bytes(r, 3)?),
+                    ciphertext: r.get(4)?,
+                },
+            ))
+        })
+        .map_err(sql)?
+        .collect::<Result<_, _>>()
+        .map_err(sql)?
+    };
+    let next = if jobs.len() == HANDOFF_DUE_MAX {
+        Some(now)
+    } else {
+        c.query_row(
+            "SELECT min(next_retry_at_ms) FROM mailbox_handoff WHERE next_retry_at_ms>?1 AND next_retry_at_ms<?2",
+            params![integer(now)?, STOPPED],
+            |r| r.get::<_, Option<i64>>(0),
+        )
+        .map_err(sql)?
+        .map(|at| at as u64)
+    };
+    Ok(MailboxDbReply::HandoffDue { jobs, next })
+}
+
+/// Spec 7: an `Ack` delivers the message (whichever ciphertext of it was acked) and is noted
+/// for the origin; a decrypt failure of the ciphertext kept stops it and is noted for the
+/// origin; anything else backs it off. A result about a ciphertext the origin replaced since
+/// changes nothing else. Returns the rows changed.
+fn handoff_result(
+    tx: &Transaction,
+    identity: Identity,
+    (origin, conversation, msg_id): (InstallationId, ConversationId, MessageId),
+    ct_hash: [u8; 32],
+    outcome: HandoffOutcome,
+    now: u64,
+    wall: u64,
+) -> R<u64> {
+    let key = params![
+        origin.0.as_slice(),
+        conversation.0.as_slice(),
+        msg_id.0.as_slice()
+    ];
+    let kept: Option<(Vec<u8>, u64)> = tx
+        .query_row(
+            "SELECT ciphertext,attempts FROM mailbox_handoff WHERE origin_install=?1 AND conversation=?2 AND msg_id=?3",
+            key,
+            |r| Ok((r.get(0)?, uint(r, 1)?)),
+        )
+        .optional()
+        .map_err(sql)?;
+    let attempts = match kept {
+        Some((ciphertext, attempts)) if Sha256::digest(&ciphertext).as_slice() == ct_hash => {
+            attempts
+        }
+        _ if matches!(outcome, HandoffOutcome::Acked { .. }) => 0,
+        // Replaced (or gone) meanwhile: the result is of a ciphertext nobody tries any more.
+        _ => return Ok(0),
+    };
+    let note = |body: EntryBody| -> R<()> {
+        record_note(tx, conversation, identity.peer, origin, &body, wall).map(|_| ())
+    };
+    match outcome {
+        HandoffOutcome::Acked { receiver } => {
+            let body = EntryBody::Delivered {
+                msg_id,
+                receiver,
+                at_ms: wall,
+            };
+            let entry = LogEntry {
+                seq: 0,
+                conversation,
+                sender_peer: identity.peer,
+                sender_install: origin,
+                recorded_at_ms: wall,
+                body: body.clone(),
+            };
+            // This device's copy of the message is delivered too (that also drops the row);
+            // the note is logged even if the copy already was, for the origin.
+            let changed = apply_note(tx, identity, &entry, wall)?;
+            note(body)?;
+            Ok(changed)
+        }
+        HandoffOutcome::Stop { class, epoch } => {
+            tx.execute(
+                "UPDATE mailbox_handoff SET next_retry_at_ms=?4 WHERE origin_install=?1 AND conversation=?2 AND msg_id=?3",
+                params![origin.0.as_slice(), conversation.0.as_slice(), msg_id.0.as_slice(), STOPPED],
+            )
+            .map_err(sql)?;
+            note(EntryBody::HandoffStop {
+                msg_id,
+                class,
+                epoch,
+            })?;
+            Ok(1)
+        }
+        HandoffOutcome::Retry => {
+            let attempts = attempts.saturating_add(1).min(u64::from(u32::MAX));
+            let next = now.saturating_add(retry_delay_capped(attempts, MAILBOX_MAX_DELAY_MS));
+            tx.execute(
+                "UPDATE mailbox_handoff SET attempts=?4,next_retry_at_ms=?5 WHERE origin_install=?1 AND conversation=?2 AND msg_id=?3",
+                params![
+                    origin.0.as_slice(),
+                    conversation.0.as_slice(),
+                    msg_id.0.as_slice(),
+                    integer(attempts)?,
+                    integer(next)?
+                ],
+            )
+            .map_err(sql)?;
+            Ok(1)
+        }
+    }
 }
 
 /// The largest seq ever handed out (`AUTOINCREMENT` never reuses one, even after the log was
@@ -427,8 +760,9 @@ fn serve_page(
 /// account it names is delivered (never undone; `Read` stays), and this device's own outbox row
 /// of it is done; a message not here yet keeps the delivery in `mailbox_status_ahead` for when it
 /// comes. What changed something here is logged here too, so a third own device gets it from
-/// this one; a repeat changes nothing and is not logged again. `HandoffStop` comes with Task 9.
-/// Returns the message rows changed.
+/// this one; a repeat changes nothing and is not logged again. A ciphertext of the message handed
+/// over to this device is not tried any more. `HandoffStop` is the origin's alone to act on (the
+/// account actor does, Ruling 1): nothing here. Returns the message rows changed.
 fn apply_note(tx: &Transaction, identity: Identity, entry: &LogEntry, now: u64) -> R<u64> {
     let EntryBody::Delivered { msg_id, at_ms, .. } = entry.body else {
         return Ok(0);
@@ -437,6 +771,15 @@ fn apply_note(tx: &Transaction, identity: Identity, entry: &LogEntry, now: u64) 
     if entry.sender_peer != identity.peer {
         return Ok(0);
     }
+    tx.execute(
+        "DELETE FROM mailbox_handoff WHERE origin_install=?1 AND conversation=?2 AND msg_id=?3",
+        params![
+            entry.sender_install.0.as_slice(),
+            entry.conversation.0.as_slice(),
+            msg_id.0.as_slice()
+        ],
+    )
+    .map_err(sql)?;
     let key = params![
         entry.conversation.0.as_slice(),
         entry.sender_peer.0.as_slice(),
@@ -608,6 +951,22 @@ pub struct MailboxState {
     pub devices: u64,
     pub handoffs: u64,
     pub status_ahead: u64,
+    /// The `mailbox_handoff` rows, by origin, conversation and message.
+    pub handoff_rows: Vec<HandoffRow>,
+}
+
+/// One `mailbox_handoff` row, for fixture assertions.
+#[cfg(all(feature = "test-hooks", debug_assertions))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandoffRow {
+    pub origin: InstallationId,
+    pub conversation: ConversationId,
+    pub msg_id: MessageId,
+    pub peer: PeerId,
+    pub ciphertext: Vec<u8>,
+    pub attempts: u64,
+    /// `i64::MAX` once the recipient could not open it.
+    pub next_retry_at_ms: u64,
 }
 
 #[cfg(all(feature = "test-hooks", debug_assertions))]
@@ -649,6 +1008,25 @@ pub(super) fn fixture_state(c: &Connection) -> R<MailboxState> {
         c.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| uint(r, 0))
             .map_err(sql)
     };
+    let handoff_rows = {
+        let mut q = c
+            .prepare("SELECT origin_install,conversation,msg_id,peer,ciphertext,attempts,next_retry_at_ms FROM mailbox_handoff ORDER BY origin_install,conversation,msg_id")
+            .map_err(sql)?;
+        q.query_map([], |r| {
+            Ok(HandoffRow {
+                origin: InstallationId(bytes(r, 0)?),
+                conversation: ConversationId(bytes(r, 1)?),
+                msg_id: MessageId(bytes(r, 2)?),
+                peer: PeerId(bytes(r, 3)?),
+                ciphertext: r.get(4)?,
+                attempts: uint(r, 5)?,
+                next_retry_at_ms: uint(r, 6)?,
+            })
+        })
+        .map_err(sql)?
+        .collect::<Result<_, _>>()
+        .map_err(sql)?
+    };
     Ok(MailboxState {
         entries,
         cursors: pairs("mailbox_cursor", "next_seq")?,
@@ -656,7 +1034,25 @@ pub(super) fn fixture_state(c: &Connection) -> R<MailboxState> {
         devices: count("mailbox_device")?,
         handoffs: count("mailbox_handoff")?,
         status_ahead: count("mailbox_status_ahead")?,
+        handoff_rows,
     })
+}
+
+/// Records `installation` as a mailbox device (or not) at `at`, the way its `Announce` will
+/// (Task 10); until then tests mark mailboxes with this (Ruling 12).
+#[cfg(all(feature = "test-hooks", debug_assertions))]
+pub(super) fn fixture_mark(
+    c: &Connection,
+    installation: InstallationId,
+    mailbox: bool,
+    at: u64,
+) -> R<()> {
+    c.execute(
+        "INSERT INTO mailbox_device VALUES(?1,?2,?3) ON CONFLICT(installation) DO UPDATE SET mailbox=excluded.mailbox,announced_at_ms=excluded.announced_at_ms",
+        params![installation.0.as_slice(), mailbox, integer(at)?],
+    )
+    .map_err(sql)?;
+    Ok(())
 }
 
 /// Records a `Frame` entry with fixed ids and the given body.

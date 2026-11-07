@@ -22,17 +22,28 @@
 //! from the other account it stored that are still unread, and the conversations whose messages
 //! it found read on another own device (spec 6.4: the app clears or updates their notification);
 //! a text received directly, or my read sent directly, is reported on its own at once.
+//!
+//! Outbox handoff (spec 7): when the app goes to the background (`mailbox_background`), and
+//! once a session with another own device is ready and its pull is done, this device hands the
+//! sealed ciphertexts of its undelivered messages to its mailbox devices (Ruling 12: only the
+//! devices recorded as mailboxes). A mailbox retries each as it is (kind 17 `App` to the peer,
+//! back-off capped at `MAILBOX_MAX_DELAY_MS`) and logs how it ended as a note for the origin:
+//! `Delivered`, or `HandoffStop` when the peer could not open it, which the origin takes as its
+//! own decrypt failure (only the origin re-encrypts). The origin keeps retrying too; the peer
+//! drops the duplicate.
 use super::mls::{Origin, Via};
 use super::*;
 use crate::account::{
     auth,
     connection::{Input, Session},
 };
-use crate::mailbox::wire::{EntryBody, LogEntry, MailboxFrame, MailboxReply, PlainRecord};
+use crate::mailbox::wire::{
+    EntryBody, HandoffEntry, LogEntry, MailboxFrame, MailboxReply, PlainRecord, handoff_batches,
+};
 use crate::message::{
-    mailbox_store::{MailboxDbOp, MailboxDbReply},
+    mailbox_store::{HandoffOutcome, MailboxDbOp, MailboxDbReply},
     store::{MessageDbOp, MessageDbReply},
-    types::{ConversationId, MessageKey},
+    types::{ConversationId, MessageId, MessageKey},
 };
 use crate::mls::wire::{MlsFrame, MlsReply};
 use sha2::{Digest, Sha256};
@@ -43,6 +54,11 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const NOTIFY_GAP_MS: u64 = 200;
 /// The log is pruned at least this often (Ruling 11), on every device.
 const PRUNE_EVERY_MS: u64 = 3_600_000;
+/// A peer without a session is dialed for the ciphertexts handed over for it at most this often.
+const HANDOFF_DIAL_GAP_MS: u64 = 30_000;
+
+/// A handed-off ciphertext's row: the device that handed it over, conversation, message.
+type HandoffKey = (InstallationId, ConversationId, MessageId);
 
 #[derive(Default)]
 pub(crate) struct Runtime {
@@ -61,6 +77,21 @@ pub(crate) struct Runtime {
     devices: Option<Vec<InstallationId>>,
     /// Scheduler time of the next prune.
     prune_at: u64,
+    /// A session with another own device became ready: what is not delivered goes to the
+    /// mailboxes among them once no pull runs (what a pull brings may settle some of it first).
+    handoff_due: bool,
+    /// Handed-off ciphertexts being tried now.
+    sending: BTreeSet<HandoffKey>,
+    /// Scheduler time handed-off ciphertexts are next due (`None`: read the table to know;
+    /// `u64::MAX`: none is).
+    handoff_at: Option<u64>,
+    /// Peers whose session became ready: what was handed over for them is due now.
+    woken: BTreeSet<PeerId>,
+    /// Per peer, when its devices were last dialed for what was handed over for it.
+    dialed: BTreeMap<PeerId, u64>,
+    /// Each handed-off ciphertext sent: scheduler time and SHA-256 of the ciphertext.
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    handoff_sends: Vec<(u64, [u8; 32])>,
     /// After this many texts stored by pulls, processing stops as if the device died there.
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     halt_after: Option<u64>,
@@ -138,6 +169,14 @@ enum Step {
     Plain {
         page: Resolving,
         answers: Vec<Result<MailboxReply, ErrorCode>>,
+    },
+    /// The peer's answer to one attempt of a handed-off ciphertext (`grant`: the session it
+    /// went over; the event's `holder` is that session's device).
+    Handoff {
+        key: HandoffKey,
+        ct_hash: [u8; 32],
+        grant: auth::AuthGrant,
+        answer: Result<MlsReply, ErrorCode>,
     },
 }
 
@@ -267,12 +306,14 @@ pub(crate) enum MailboxTest {
     /// Pauses (or resumes) sync: no upkeep, pulls or `Notify`; requests answered `Busy`.
     Hold(bool),
     Counters,
+    HandoffSends,
 }
 #[cfg(all(feature = "test-hooks", debug_assertions))]
 pub(crate) enum MailboxTestReply {
     Reply(MailboxReply),
     Done,
     Counters(MailboxCounters),
+    Sends(Vec<(u64, [u8; 32])>),
 }
 
 /// What own-device sync counted since this core started (for the M6 results).
@@ -322,6 +363,14 @@ impl AccountHandle {
     pub async fn mailbox_test_hold(&self, hold: bool) -> Result<(), CoreError> {
         self.mailbox_test(MailboxTest::Hold(hold)).await.map(|_| ())
     }
+    /// Each attempt this device (as a mailbox) made of a handed-off ciphertext, in order: the
+    /// scheduler time it was sent at and the SHA-256 of the ciphertext.
+    pub async fn mailbox_test_handoff_sends(&self) -> Result<Vec<(u64, [u8; 32])>, CoreError> {
+        match self.mailbox_test(MailboxTest::HandoffSends).await? {
+            MailboxTestReply::Sends(sends) => Ok(sends),
+            _ => unreachable!(),
+        }
+    }
 }
 
 impl Manager {
@@ -365,6 +414,9 @@ impl Manager {
             MailboxTest::Counters => MailboxTestReply::Counters(MailboxCounters {
                 missing: self.messages.mailbox.missing,
             }),
+            MailboxTest::HandoffSends => {
+                MailboxTestReply::Sends(self.messages.mailbox.handoff_sends.clone())
+            }
         })
     }
 
@@ -391,12 +443,16 @@ impl Manager {
     }
 
     /// A session became ready (`install_grant`): with another own device, this device pulls its
-    /// log, and that device (doing the same) needs no `Notify` for what is logged so far.
+    /// log, and that device (doing the same) needs no `Notify` for what is logged so far; then
+    /// what this device has not delivered is handed over if it is a mailbox (spec 7). With
+    /// another account, what was handed over to this device for it is due at once.
     pub(super) fn mailbox_session_ready(&mut self, grant: &auth::AuthGrant) {
         let Ok(local) = self.local() else { return };
-        if grant.peer != local.keys.peer_id()
-            || grant.installation == local.device.installation_id()
-        {
+        if grant.installation == local.device.installation_id() {
+            return;
+        }
+        if grant.peer != local.keys.peer_id() {
+            self.messages.mailbox.woken.insert(grant.peer);
             return;
         }
         let now = self.schedule_now();
@@ -405,6 +461,76 @@ impl Manager {
             .notified
             .insert(grant.installation, (mailbox.head, now));
         mailbox.schedule(grant.installation);
+        mailbox.handoff_due = true;
+    }
+
+    /// The app goes to the background or exits (spec 7): hands what this device has not
+    /// delivered to its mailbox devices now. Returns the rows handed over.
+    pub(super) async fn mailbox_background(&mut self) -> Result<u32, CoreError> {
+        self.restrict_grants();
+        let request = self.ready()?;
+        if !self.local_authorized() {
+            return Err(unavailable(ErrorCode::AccountRestricted));
+        }
+        self.hand_off(request).await
+    }
+
+    /// Spec 7: the sealed ciphertexts of this device's undelivered messages go to each mailbox
+    /// device of this account with a ready session (Ruling 12: no other device), rows awaiting
+    /// encryption sealed first. The sends run in a spawned task (Ruling 17) and their answers
+    /// change nothing here: this device goes on retrying too. Returns the rows handed over (0
+    /// without a mailbox session).
+    async fn hand_off(&mut self, request: Request) -> Result<u32, CoreError> {
+        let MailboxDbReply::Installations(mailboxes) =
+            self.mailbox_db(MailboxDbOp::Mailboxes, request).await?
+        else {
+            return Err(unavailable(ErrorCode::InvalidMessage));
+        };
+        let stopped = &self.messages.mailbox.stopped;
+        let targets: Vec<Session> = self
+            .own_sessions()
+            .into_iter()
+            .filter(|s| {
+                mailboxes.contains(&s.grant.installation) && !stopped.contains(&s.conn.stable_id())
+            })
+            .collect();
+        if targets.is_empty() {
+            return Ok(0);
+        }
+        let MailboxDbReply::Conversations(unsealed) =
+            self.mailbox_db(MailboxDbOp::Unsealed, request).await?
+        else {
+            return Err(unavailable(ErrorCode::InvalidMessage));
+        };
+        let now = self.schedule_now();
+        for conversation in unsealed {
+            // Without a group (or room in the queue) a row stays unsealed and is not handed over.
+            let _ = self
+                .message_db(MessageDbOp::SealPending(conversation, now), request)
+                .await;
+        }
+        let MailboxDbReply::Handoff(entries) =
+            self.mailbox_db(MailboxDbOp::HandoffRows, request).await?
+        else {
+            return Err(unavailable(ErrorCode::InvalidMessage));
+        };
+        let batches = handoff_batches(entries);
+        let handed: usize = batches.iter().map(Vec::len).sum();
+        let frames: Vec<_> = batches
+            .into_iter()
+            .map(|entries| MailboxFrame::Handoff { entries }.encode())
+            .collect();
+        for session in targets {
+            let frames = frames.clone();
+            tokio::spawn(async move {
+                for body in frames {
+                    if !matches!(exchange(&session, &body).await, Ok(MailboxReply::Ok)) {
+                        break;
+                    }
+                }
+            });
+        }
+        Ok(handed as u32)
     }
 
     /// The app came to the foreground: pulls from every connected own device, and dials each
@@ -493,8 +619,25 @@ impl Manager {
                     Err(_) => MailboxReply::Busy,
                 }
             }
-            // Send hand-over and mailbox announcements come with Tasks 9 and 10; until then
-            // (and for anything undecodable) the asker tries later.
+            // Spec 7: ciphertexts this device retries, as they are, for the device that sent
+            // them.
+            Ok(MailboxFrame::Handoff { entries }) => {
+                let op = MailboxDbOp::TakeHandoff {
+                    origin: installation,
+                    entries,
+                    now: self.schedule_now(),
+                };
+                match self.mailbox_db(op, request).await {
+                    Ok(_) => {
+                        self.messages.mailbox.handoff_at = None;
+                        MailboxReply::Ok
+                    }
+                    Err(error) if fatal(&error) => return Err(error),
+                    Err(_) => MailboxReply::Busy,
+                }
+            }
+            // Mailbox announcements come with Task 10; until then (and for anything
+            // undecodable) the asker tries later.
             Ok(_) | Err(_) => MailboxReply::Busy,
         };
         // The device may have been revoked while the page was read: it gets nothing.
@@ -593,6 +736,217 @@ impl Manager {
                 let _ = exchange(&session, &body).await;
             });
         }
+        let mailbox = &mut self.messages.mailbox;
+        if mailbox.handoff_due && mailbox.pulls.is_empty() && mailbox.due.is_empty() {
+            mailbox.handoff_due = false;
+            let _ = self.hand_off(request).await;
+        }
+        self.poll_handoffs(request).await;
+    }
+
+    /// Spec 7, as a mailbox: each due handed-off ciphertext is sent as it is (kind 17 `App`) to
+    /// its peer over a ready session, one attempt per ciphertext at a time, in a spawned task
+    /// (Ruling 17). With no session the attempt counts as failed and the peer's devices are
+    /// dialed (`start_dial`). The table is read only when something may be due.
+    async fn poll_handoffs(&mut self, request: Request) {
+        let now = self.schedule_now();
+        let woken = std::mem::take(&mut self.messages.mailbox.woken);
+        if self.messages.mailbox.handoff_at != Some(u64::MAX) {
+            for peer in woken {
+                let op = MailboxDbOp::HandoffWake { peer, now };
+                if self.mailbox_db(op, request).await.is_err() {
+                    return;
+                }
+                self.messages.mailbox.handoff_at = None;
+            }
+        }
+        if self.messages.mailbox.handoff_at.is_some_and(|at| now < at) {
+            return;
+        }
+        let Ok(MailboxDbReply::HandoffDue { jobs, next }) =
+            self.mailbox_db(MailboxDbOp::HandoffDue(now), request).await
+        else {
+            return;
+        };
+        self.messages.mailbox.handoff_at = Some(next.unwrap_or(u64::MAX));
+        for (origin, entry) in jobs {
+            let key = (origin, entry.conversation, entry.msg_id);
+            if self.messages.mailbox.sending.contains(&key) {
+                continue;
+            }
+            let ct_hash: [u8; 32] = Sha256::digest(&entry.ciphertext).into();
+            let session = self
+                .mls_sessions()
+                .into_iter()
+                .filter(|s| s.grant.peer == entry.peer)
+                .min_by_key(|s| self.outdated_now(s.grant.installation));
+            let Some(session) = session else {
+                self.dial_peer(entry.peer, now, request);
+                let op = MailboxDbOp::HandoffResult {
+                    origin,
+                    conversation: entry.conversation,
+                    msg_id: entry.msg_id,
+                    ct_hash,
+                    outcome: HandoffOutcome::Retry,
+                    now,
+                    wall: self.services.clock.wall_ms(),
+                };
+                // Backed off: when the next one is due is read again.
+                self.messages.mailbox.handoff_at = None;
+                if self.mailbox_db(op, request).await.is_err() {
+                    return;
+                }
+                continue;
+            };
+            self.send_handoff(key, entry, ct_hash, session, request);
+        }
+    }
+
+    fn send_handoff(
+        &mut self,
+        key: HandoffKey,
+        entry: HandoffEntry,
+        ct_hash: [u8; 32],
+        session: Session,
+        request: Request,
+    ) {
+        self.messages.mailbox.sending.insert(key);
+        let body = MlsFrame::App {
+            conversation: entry.conversation,
+            ciphertext: entry.ciphertext,
+        }
+        .encode();
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        {
+            let now = self.schedule_now();
+            self.messages.mailbox.handoff_sends.push((now, ct_hash));
+            self.messages.mls.frames.lock().unwrap().push(body.to_vec());
+        }
+        let mailbox = self.auth.send.clone();
+        let ticket = request.ticket;
+        tokio::spawn(async move {
+            let answer = super::mls::exchange(&session, &body).await;
+            let _ = mailbox
+                .send(Input::Mailbox(MailboxEvent {
+                    ticket,
+                    holder: session.grant.installation,
+                    conn: session.conn.stable_id(),
+                    step: Step::Handoff {
+                        key,
+                        ct_hash,
+                        grant: session.grant.clone(),
+                        answer,
+                    },
+                }))
+                .await;
+        });
+    }
+
+    /// Dials the devices of `peer` (as its record here lists them) that have no session, unless
+    /// that was done within `HANDOFF_DIAL_GAP_MS`; a session that comes up makes what was
+    /// handed over for the peer due.
+    fn dial_peer(&mut self, peer: PeerId, now: u64, request: Request) {
+        let dialed = &mut self.messages.mailbox.dialed;
+        if dialed
+            .get(&peer)
+            .is_some_and(|at| now < at.saturating_add(HANDOFF_DIAL_GAP_MS))
+        {
+            return;
+        }
+        dialed.insert(peer, now);
+        let Some(record) = self.local().ok().and_then(|local| {
+            local
+                .remote
+                .iter()
+                .find(|r| r.peer == peer)
+                .map(|r| r.accepted.clone())
+        }) else {
+            return;
+        };
+        let targets: Vec<InstallationId> = record
+            .record
+            .devices
+            .iter()
+            .map(|d| d.installation_id)
+            .filter(|i| {
+                self.dial_target(peer, &record, *i).is_some() && !self.ready_session(peer, *i)
+            })
+            .collect();
+        for installation in targets {
+            self.start_dial(peer, installation, request);
+        }
+    }
+
+    /// How an attempt of a handed-off ciphertext ended (spec 7). Only an answer over a session
+    /// still authorized speaks for the peer.
+    async fn handoff_answered(
+        &mut self,
+        ticket: u64,
+        (origin, conversation, msg_id): HandoffKey,
+        ct_hash: [u8; 32],
+        grant: auth::AuthGrant,
+        answer: Result<MlsReply, ErrorCode>,
+    ) {
+        let mailbox = &mut self.messages.mailbox;
+        mailbox.sending.remove(&(origin, conversation, msg_id));
+        mailbox.handoff_at = None;
+        let Some(request) = self.ready().ok().filter(|r| r.ticket == ticket) else {
+            return;
+        };
+        let outcome = match answer {
+            Ok(MlsReply::Ack { ct_hash: acked })
+                if acked == ct_hash && self.grant_authorized(&grant) =>
+            {
+                HandoffOutcome::Acked {
+                    receiver: grant.installation,
+                }
+            }
+            Ok(MlsReply::DecryptFailed { class, epoch }) if self.grant_authorized(&grant) => {
+                HandoffOutcome::Stop { class, epoch }
+            }
+            _ => HandoffOutcome::Retry,
+        };
+        let op = MailboxDbOp::HandoffResult {
+            origin,
+            conversation,
+            msg_id,
+            ct_hash,
+            outcome,
+            now: self.schedule_now(),
+            wall: self.services.clock.wall_ms(),
+        };
+        let _ = self.mailbox_db(op, request).await;
+    }
+
+    /// Ruling 1: a mailbox's `HandoffStop` about a message this device sent. Its peer could not
+    /// open the ciphertext handed over, which is taken as this device's own `DecryptFailed`
+    /// (M5 rules: re-encrypted here, counted against the cap of 3); the new ciphertext goes to
+    /// the mailbox with the next handoff.
+    async fn handoff_stopped(
+        &mut self,
+        conversation: ConversationId,
+        msg_id: MessageId,
+        (class, epoch): (u8, u64),
+        request: Request,
+    ) -> Result<(), CoreError> {
+        let local = self.local()?;
+        let own = local.keys.peer_id();
+        let key = MessageKey {
+            conversation,
+            sender: own,
+            installation: local.device.installation_id(),
+            id: msg_id,
+        };
+        let Some(peer) = self.conversation_peer(conversation, own) else {
+            return Ok(());
+        };
+        match self
+            .after_decrypt_failed(key, peer, class, epoch, request)
+            .await
+        {
+            Err(error) if fatal(&error) => Err(error),
+            _ => Ok(()),
+        }
     }
 
     /// Starts a pull of `holder`'s log from where this device stopped.
@@ -652,6 +1006,19 @@ impl Manager {
             conn,
             step,
         } = event;
+        let step = match step {
+            Step::Handoff {
+                key,
+                ct_hash,
+                grant,
+                answer,
+            } => {
+                self.handoff_answered(ticket, key, ct_hash, grant, answer)
+                    .await;
+                return;
+            }
+            step => step,
+        };
         // Only the answer of the pull running over that session counts.
         if self
             .messages
@@ -717,6 +1084,7 @@ impl Manager {
                 }
                 (page.next_seq, page.more)
             }
+            Step::Handoff { .. } => unreachable!("taken above"),
         };
         let pulled = MailboxDbOp::Pulled { holder, next_seq };
         if self.mailbox_db(pulled, request).await.is_err() {
@@ -770,8 +1138,7 @@ impl Manager {
             body,
         } = entry;
         // Notes are always processed, whoever logged them: a note about this device's own
-        // message is how it learns what another device did with it. HandoffStop comes with
-        // Task 9.
+        // message is how it learns what another device did with it.
         let inner = match body {
             EntryBody::Frame(inner) => inner,
             body @ EntryBody::Delivered { .. } => {
@@ -792,7 +1159,18 @@ impl Manager {
                     _ => Ok(Entry::Taken),
                 };
             }
-            EntryBody::HandoffStop { .. } => return Ok(Entry::Taken),
+            // Only the device that sent the message acts on it (Ruling 1).
+            EntryBody::HandoffStop {
+                msg_id,
+                class,
+                epoch,
+            } => {
+                if sender_install == own && sender_peer == self.local()?.keys.peer_id() {
+                    self.handoff_stopped(conversation, msg_id, (class, epoch), request)
+                        .await?;
+                }
+                return Ok(Entry::Taken);
+            }
         };
         // Ruling 1: a frame this device sent is in its own state already.
         if sender_install == own {
