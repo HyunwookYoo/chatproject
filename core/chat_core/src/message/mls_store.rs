@@ -14,7 +14,7 @@ use super::store::{
 };
 use super::types::*;
 use super::wire::ReceiptKind;
-use crate::mailbox::wire::EntryBody;
+use crate::mailbox::wire::{EntryBody, PlainRecord};
 use crate::mls::{
     MlsProvider,
     group::{self, OpenFailure, Opened},
@@ -1287,6 +1287,57 @@ fn store_text(
     )
     .map_err(sql)?;
     Ok(Stored::New)
+}
+
+/// A text another own device handed over as plaintext (M6 spec 6.3) because this device could
+/// not open the logged ciphertext hashing to `ct_hash`. Stored under its logical key by the
+/// rules `open_app` stores an opened text with (`store_text`: a copy of my own text as sent and
+/// seen, the other account's as unread, what `mailbox_status_ahead` kept applied), and with the
+/// ciphertext hash as its payload hash like every text received over MLS. Nothing else
+/// `open_app` writes: no `processed_ct` row, no log entry, no receipt (the peer has its
+/// `Delivered` from the other device). `peer` is the conversation's other account. True when it
+/// was stored just now; false when it is here already or not taken.
+pub(super) fn store_plain(
+    tx: &Transaction<'_>,
+    identity: Identity,
+    record: &PlainRecord,
+    peer: PeerId,
+    ct_hash: &[u8; 32],
+    now: u64,
+) -> R<bool> {
+    let own = record.sender_peer == identity.peer;
+    if record.kind != 1
+        || record.sender_install == identity.installation
+        || (!own && peer != record.sender_peer)
+        || super::store::conversation_id(identity.peer, peer)? != record.conversation
+    {
+        return Ok(false);
+    }
+    // My other device's copy may be the first message of the conversation here.
+    if own {
+        ensure_conversation(tx, record.conversation, peer)?;
+    }
+    let message = ChatMessage {
+        msg_id: record.msg_id,
+        lamport: record.lamport,
+        prev_hash: record.prev_hash,
+        sent_at_ms: record.sent_at_ms,
+        content: Content::Text {
+            body: record.body.clone(),
+        },
+    };
+    let stored = store_text(
+        tx,
+        record.sender_peer,
+        record.sender_install,
+        record.conversation,
+        &message,
+        &record.body,
+        ct_hash,
+        integer(now)?,
+        own,
+    )?;
+    Ok(matches!(stored, Stored::New))
 }
 
 // ---- test-hooks fixtures -------------------------------------------------------------------

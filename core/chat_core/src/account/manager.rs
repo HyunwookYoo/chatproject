@@ -3919,3 +3919,5 @@ pub use messages::{MessageMutation,MessagePause,MessagePoint};
 pub(super) mod mls;
 pub use mls::GroupState;
 pub(super) mod mailbox;
+#[cfg(all(feature="test-hooks",debug_assertions))]
+pub use mailbox::MailboxCounters;

@@ -1,4 +1,4 @@
-//! Own-device sync of the account actor (M6, spec 6.1–6.2, frame kind 18).
+//! Own-device sync of the account actor (M6, spec 6.1–6.3, frame kind 18).
 //!
 //! Every device logs the kind 17 frames it accepted or sent (`message/mailbox_store.rs`). When a
 //! session with another device of this account becomes ready (whichever side dialed), when that
@@ -7,6 +7,11 @@
 //! receive paths (`receive_app`, `mls_request`) under the device that originally sent them. The
 //! holder's cursor (`Pulled`) moves only once a whole page is processed and stored; a page cut
 //! short is pulled again, and what it stored already is filtered by `processed_ct`.
+//!
+//! An `App` entry this device cannot open (spec 6.3) is asked for as plaintext (`PlainReq`) once
+//! its page is processed; the holder answers only a current device of this account. The record
+//! is stored under the message's logical key, with no receipt; `NoPlain` (the holder no longer
+//! has it) skips the entry. The page is done only when every such entry is resolved.
 //!
 //! The requests run in spawned tasks and come back as `Input::Mailbox`, like kind 17 requests:
 //! both devices pull from each other at once, so an actor turn waiting on the other would wait
@@ -23,13 +28,14 @@ use crate::account::{
     auth,
     connection::{Input, Session},
 };
-use crate::mailbox::wire::{EntryBody, LogEntry, MailboxFrame, MailboxReply};
+use crate::mailbox::wire::{EntryBody, LogEntry, MailboxFrame, MailboxReply, PlainRecord};
 use crate::message::{
     mailbox_store::{MailboxDbOp, MailboxDbReply},
     store::{MessageDbOp, MessageDbReply},
     types::{ConversationId, MessageKey},
 };
 use crate::mls::wire::{MlsFrame, MlsReply};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -62,6 +68,9 @@ pub(crate) struct Runtime {
     stored: u64,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     halted: bool,
+    /// Entries skipped because their holder had no plaintext record for them (`NoPlain`).
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    missing: u64,
     /// Sync is paused: no upkeep, pulls or `Notify`, and requests are answered `Busy`.
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     held: bool,
@@ -110,19 +119,58 @@ struct Pull {
     again: bool,
 }
 
-/// The answer to one `SyncReq` of a running pull.
+/// The answer to one exchange of a running pull.
 pub(crate) struct MailboxEvent {
     ticket: u64,
     holder: InstallationId,
     conn: usize,
-    since: u64,
-    answer: Result<MailboxReply, ErrorCode>,
+    step: Step,
+}
+
+enum Step {
+    /// The answer to `SyncReq { since_seq: since }`.
+    Page {
+        since: u64,
+        answer: Result<MailboxReply, ErrorCode>,
+    },
+    /// The answers to the `PlainReq`s for a processed page's unopened entries, in order, up to
+    /// the first one that did not resolve its entry.
+    Plain {
+        page: Resolving,
+        answers: Vec<Result<MailboxReply, ErrorCode>>,
+    },
+}
+
+/// A processed page waiting for the plaintext records of the entries it could not open.
+struct Resolving {
+    next_seq: u64,
+    more: bool,
+    unopened: Vec<Unopened>,
 }
 
 /// What one processed page left.
 pub(super) struct PullSummary {
-    /// Seqs of the `App` entries this device could not open (spec 6.3, Task 7).
-    pub unopened: Vec<u64>,
+    /// The `App` entries this device could not open (spec 6.3).
+    pub unopened: Vec<Unopened>,
+}
+
+/// An `App` entry this device could not open: what its plaintext record must match.
+pub(super) struct Unopened {
+    seq: u64,
+    conversation: ConversationId,
+    sender_peer: PeerId,
+    sender_install: InstallationId,
+    /// SHA-256 of its ciphertext, the payload hash of the text it carries.
+    ct_hash: [u8; 32],
+}
+
+impl Unopened {
+    /// The holder's record is of the message this entry carries, as far as the entry tells.
+    fn matches(&self, record: &PlainRecord) -> bool {
+        record.conversation == self.conversation
+            && record.sender_peer == self.sender_peer
+            && record.sender_install == self.sender_install
+    }
 }
 
 /// What became of one log entry.
@@ -130,7 +178,7 @@ enum Entry {
     /// Processed: stored, applied, already known, or nothing this device can use.
     Taken,
     /// An `App` frame this device could not open.
-    Unopened(u64),
+    Unopened(Unopened),
 }
 
 /// One kind 18 request/response exchange on an authenticated session.
@@ -180,6 +228,14 @@ fn page_in_order(entries: &[LogEntry], since: u64, next_seq: u64, more: bool) ->
     }
 }
 
+/// A storage failure that ends the request rather than being answered `Busy`.
+fn fatal(error: &CoreError) -> bool {
+    matches!(
+        error.code,
+        ErrorCode::AccountRestricted | ErrorCode::StorageLocked
+    )
+}
+
 /// This account's devices other than this one that are not revoked, sorted.
 fn other_devices(local: &LocalAccount) -> Option<Vec<InstallationId>> {
     let record = local.records.accepted.as_ref()?;
@@ -210,11 +266,22 @@ pub(crate) enum MailboxTest {
     HaltAfter(u64),
     /// Pauses (or resumes) sync: no upkeep, pulls or `Notify`; requests answered `Busy`.
     Hold(bool),
+    Counters,
 }
 #[cfg(all(feature = "test-hooks", debug_assertions))]
 pub(crate) enum MailboxTestReply {
     Reply(MailboxReply),
     Done,
+    Counters(MailboxCounters),
+}
+
+/// What own-device sync counted since this core started (for the M6 results).
+#[cfg(all(feature = "test-hooks", debug_assertions))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MailboxCounters {
+    /// Entries this device could not open whose holder had no plaintext record (spec 6.3: the
+    /// message is missing here).
+    pub missing: u64,
 }
 
 #[cfg(all(feature = "test-hooks", debug_assertions))]
@@ -234,7 +301,13 @@ impl AccountHandle {
             .await?
         {
             MailboxTestReply::Reply(reply) => Ok(reply),
-            MailboxTestReply::Done => unreachable!(),
+            _ => unreachable!(),
+        }
+    }
+    pub async fn mailbox_test_counters(&self) -> Result<MailboxCounters, CoreError> {
+        match self.mailbox_test(MailboxTest::Counters).await? {
+            MailboxTestReply::Counters(counters) => Ok(counters),
+            _ => unreachable!(),
         }
     }
     /// A crash in the middle of a sync: once pulls stored `texts` texts, this core stops
@@ -289,6 +362,9 @@ impl Manager {
                 self.messages.mailbox.held = hold;
                 MailboxTestReply::Done
             }
+            MailboxTest::Counters => MailboxTestReply::Counters(MailboxCounters {
+                missing: self.messages.mailbox.missing,
+            }),
         })
     }
 
@@ -394,14 +470,7 @@ impl Manager {
                         more: page.more,
                     },
                     Ok(_) => MailboxReply::Busy,
-                    Err(error)
-                        if matches!(
-                            error.code,
-                            ErrorCode::AccountRestricted | ErrorCode::StorageLocked
-                        ) =>
-                    {
-                        return Err(error);
-                    }
+                    Err(error) if fatal(&error) => return Err(error),
                     Err(_) => MailboxReply::Busy,
                 }
             }
@@ -409,8 +478,23 @@ impl Manager {
                 self.messages.mailbox.schedule(installation);
                 MailboxReply::Ok
             }
-            // Plaintext hand-over, send hand-over and mailbox announcements come with Tasks 7,
-            // 9 and 10; until then (and for anything undecodable) the asker tries later.
+            // Spec 6.3: a plaintext record leaves this device only for a current device of
+            // this account, over its authenticated session; checked again right before the
+            // read, so a revoke applied since the request came in is never passed.
+            Ok(MailboxFrame::PlainReq { seq }) => {
+                if self.mailbox_peer(conn) != Some(installation) {
+                    return Ok(MailboxReply::Refused.encode().to_vec());
+                }
+                match self.mailbox_db(MailboxDbOp::Plain { seq }, request).await {
+                    Ok(MailboxDbReply::Plain(Some(record))) => MailboxReply::Plain(record),
+                    Ok(MailboxDbReply::Plain(None)) => MailboxReply::NoPlain,
+                    Ok(_) => MailboxReply::Busy,
+                    Err(error) if fatal(&error) => return Err(error),
+                    Err(_) => MailboxReply::Busy,
+                }
+            }
+            // Send hand-over and mailbox announcements come with Tasks 9 and 10; until then
+            // (and for anything undecodable) the asker tries later.
             Ok(_) | Err(_) => MailboxReply::Busy,
         };
         // The device may have been revoked while the page was read: it gets nothing.
@@ -553,21 +637,20 @@ impl Manager {
                     ticket,
                     holder: session.grant.installation,
                     conn: session.conn.stable_id(),
-                    since,
-                    answer,
+                    step: Step::Page { since, answer },
                 }))
                 .await;
         });
     }
 
-    /// A page (or the failure) of a running pull came back.
+    /// A page (or the failure) of a running pull came back, or the plaintext records for what
+    /// it could not open.
     pub(super) async fn mailbox_event(&mut self, event: MailboxEvent) {
         let MailboxEvent {
             ticket,
             holder,
             conn,
-            since,
-            answer,
+            step,
         } = event;
         // Only the answer of the pull running over that session counts.
         if self
@@ -583,37 +666,58 @@ impl Manager {
             self.messages.mailbox.pulls.remove(&holder);
             return;
         };
-        let (entries, next_seq, more) = match answer {
-            Ok(MailboxReply::SyncResp {
-                entries,
-                next_seq,
-                more,
-            }) if page_in_order(&entries, since, next_seq, more) => (entries, next_seq, more),
-            // Not now: the next sync asks again.
-            Ok(MailboxReply::Busy) | Err(_) => {
-                self.end_pull(holder, request).await;
-                return;
+        let (next_seq, more) = match step {
+            Step::Page { since, answer } => {
+                let (entries, next_seq, more) = match answer {
+                    Ok(MailboxReply::SyncResp {
+                        entries,
+                        next_seq,
+                        more,
+                    }) if page_in_order(&entries, since, next_seq, more) => {
+                        (entries, next_seq, more)
+                    }
+                    // Not now: the next sync asks again.
+                    Ok(MailboxReply::Busy) | Err(_) => {
+                        self.end_pull(holder, request).await;
+                        return;
+                    }
+                    // `Refused`, or a page out of order: no more syncing over this session.
+                    Ok(_) => {
+                        self.messages.mailbox.stopped.insert(conn);
+                        self.end_pull(holder, request).await;
+                        return;
+                    }
+                };
+                let summary = self.pull_page(holder, entries, request).await;
+                if self.messages.mailbox.halted() {
+                    self.messages.mailbox.pulls.remove(&holder);
+                    return;
+                }
+                let Ok(summary) = summary else {
+                    self.end_pull(holder, request).await;
+                    return;
+                };
+                if !summary.unopened.is_empty() {
+                    let page = Resolving {
+                        next_seq,
+                        more,
+                        unopened: summary.unopened,
+                    };
+                    self.resolve_unopened(holder, conn, page, request).await;
+                    return;
+                }
+                (next_seq, more)
             }
-            // `Refused`, or a page out of order: no more syncing over this session.
-            Ok(_) => {
-                self.messages.mailbox.stopped.insert(conn);
-                self.end_pull(holder, request).await;
-                return;
+            Step::Plain { page, answers } => {
+                if !self
+                    .take_plain(holder, conn, &page.unopened, answers, request)
+                    .await
+                {
+                    return;
+                }
+                (page.next_seq, page.more)
             }
         };
-        let summary = self.pull_page(holder, entries, request).await;
-        if self.messages.mailbox.halted() {
-            self.messages.mailbox.pulls.remove(&holder);
-            return;
-        }
-        let Ok(summary) = summary else {
-            self.end_pull(holder, request).await;
-            return;
-        };
-        if !summary.unopened.is_empty() && !self.resolve_unopened(holder, &summary.unopened) {
-            self.end_pull(holder, request).await;
-            return;
-        }
         let pulled = MailboxDbOp::Pulled { holder, next_seq };
         if self.mailbox_db(pulled, request).await.is_err() {
             self.end_pull(holder, request).await;
@@ -643,8 +747,8 @@ impl Manager {
             if self.messages.mailbox.halted() {
                 break;
             }
-            if let Entry::Unopened(seq) = self.pull_entry(holder, entry, own, request).await? {
-                unopened.push(seq);
+            if let Entry::Unopened(entry) = self.pull_entry(holder, entry, own, request).await? {
+                unopened.push(entry);
             }
         }
         Ok(PullSummary { unopened })
@@ -703,13 +807,24 @@ impl Manager {
             Ok(MlsFrame::App {
                 conversation: id,
                 ciphertext,
-            }) if id == conversation => self
-                .receive_app(from, id, ciphertext, &via, request)
-                .await
-                .map(|reply| match reply {
-                    Some(MlsReply::DecryptFailed { .. }) => Entry::Unopened(seq),
-                    _ => Entry::Taken,
-                }),
+            }) if id == conversation => {
+                let ct_hash: [u8; 32] = Sha256::digest(&ciphertext).into();
+                // Whatever kept it from opening (no group: a Welcome or Commit this device did
+                // not take from the log; an old or far-ahead state), it goes to the plaintext
+                // hand-over.
+                self.receive_app(from, id, ciphertext, &via, request)
+                    .await
+                    .map(|reply| match reply {
+                        Some(MlsReply::DecryptFailed { .. }) => Entry::Unopened(Unopened {
+                            seq,
+                            conversation,
+                            sender_peer,
+                            sender_install,
+                            ct_hash,
+                        }),
+                        _ => Entry::Taken,
+                    })
+            }
             Ok(
                 frame @ (MlsFrame::Commit {
                     conversation: id, ..
@@ -732,11 +847,145 @@ impl Manager {
         }
     }
 
-    /// The `App` entries of a page this device could not open (spec 6.3): Task 7 asks the
-    /// holder for their plaintext records. Until then they stay unresolved, so the page's cursor
-    /// does not move (Ruling 5) and the page is pulled again at the next sync.
-    fn resolve_unopened(&mut self, _holder: InstallationId, _unopened: &[u64]) -> bool {
-        false
+    /// The `App` entries of a page this device could not open (spec 6.3): the holder is asked
+    /// for their plaintext records, one `PlainReq` after another in a spawned task (Ruling 17),
+    /// and the answers come back as `Step::Plain`. Until every entry is resolved the page's
+    /// cursor does not move (Ruling 5).
+    async fn resolve_unopened(
+        &mut self,
+        holder: InstallationId,
+        conn: usize,
+        page: Resolving,
+        request: Request,
+    ) {
+        let Some(session) = self
+            .own_sessions()
+            .into_iter()
+            .find(|s| s.conn.stable_id() == conn)
+        else {
+            // The session is gone: the page is pulled again over the next one.
+            self.end_pull(holder, request).await;
+            return;
+        };
+        let mailbox = self.auth.send.clone();
+        let ticket = request.ticket;
+        tokio::spawn(async move {
+            let mut answers = Vec::new();
+            for entry in &page.unopened {
+                let body = MailboxFrame::PlainReq { seq: entry.seq }.encode();
+                let answer = exchange(&session, &body).await;
+                let resolved = matches!(answer, Ok(MailboxReply::Plain(_) | MailboxReply::NoPlain));
+                answers.push(answer);
+                if !resolved {
+                    break;
+                }
+            }
+            let _ = mailbox
+                .send(Input::Mailbox(MailboxEvent {
+                    ticket,
+                    holder,
+                    conn,
+                    step: Step::Plain { page, answers },
+                }))
+                .await;
+        });
+    }
+
+    /// Takes the holder's answers to the `PlainReq`s for `unopened`, in order: a record is
+    /// stored, `NoPlain` skips its entry (the message is missing here). True when every entry
+    /// was resolved so the page is done; otherwise the pull ended and the page is pulled again
+    /// later (a failed request, storage), or no more over this session (`Refused`, a record
+    /// of another message).
+    async fn take_plain(
+        &mut self,
+        holder: InstallationId,
+        conn: usize,
+        unopened: &[Unopened],
+        answers: Vec<Result<MailboxReply, ErrorCode>>,
+        request: Request,
+    ) -> bool {
+        let complete = answers.len() == unopened.len();
+        for (entry, answer) in unopened.iter().zip(answers) {
+            match answer {
+                Ok(MailboxReply::Plain(record)) if entry.matches(&record) => {
+                    let stored = self.store_plain(holder, entry, record, request).await;
+                    if self.messages.mailbox.halted() {
+                        self.messages.mailbox.pulls.remove(&holder);
+                        return false;
+                    }
+                    if stored.is_err() {
+                        self.end_pull(holder, request).await;
+                        return false;
+                    }
+                }
+                Ok(MailboxReply::NoPlain) => {
+                    #[cfg(all(feature = "test-hooks", debug_assertions))]
+                    {
+                        self.messages.mailbox.missing += 1;
+                    }
+                }
+                // Not now: the page is pulled (and its entries asked for) again.
+                Ok(MailboxReply::Busy) | Err(_) => {
+                    self.end_pull(holder, request).await;
+                    return false;
+                }
+                Ok(_) => {
+                    self.messages.mailbox.stopped.insert(conn);
+                    self.end_pull(holder, request).await;
+                    return false;
+                }
+            }
+        }
+        if !complete {
+            self.end_pull(holder, request).await;
+        }
+        complete
+    }
+
+    /// Stores one handed-over plaintext record of `entry` in the conversation it belongs to
+    /// here, under the rules its ciphertext would have been taken by (`receive_app`). A text
+    /// from the other account stored just now is notified with the rest of the pull.
+    async fn store_plain(
+        &mut self,
+        holder: InstallationId,
+        entry: &Unopened,
+        record: PlainRecord,
+        request: Request,
+    ) -> Result<(), CoreError> {
+        let own = record.sender_peer == self.local()?.keys.peer_id();
+        let Some(peer) = self
+            .conversation_peer(record.conversation, record.sender_peer)
+            .filter(|peer| own || *peer == record.sender_peer)
+        else {
+            // No longer a conversation this device takes texts in.
+            return Ok(());
+        };
+        let key = MessageKey {
+            conversation: record.conversation,
+            sender: record.sender_peer,
+            installation: record.sender_install,
+            id: record.msg_id,
+        };
+        let op = MailboxDbOp::StorePlain {
+            record,
+            peer,
+            ct_hash: entry.ct_hash,
+            now: self.services.clock.wall_ms(),
+        };
+        match self.mailbox_db(op, request).await {
+            Ok(MailboxDbReply::Stored(true)) if !own => {
+                let via = Via::Mailbox {
+                    holder,
+                    seq: entry.seq,
+                };
+                self.text_stored(key, &via, request).await;
+                Ok(())
+            }
+            // A record that contradicts this device's state is not taken.
+            Ok(_) => Ok(()),
+            Err(error) if error.code == ErrorCode::InvalidMessage => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     /// A text from the other account was stored just now: notified at once when it came

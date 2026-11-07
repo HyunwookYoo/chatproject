@@ -50,4 +50,4 @@ pub use pair::PairTestStop;
 pub use connection::RemoteRecordView;
 
 #[cfg(all(feature="test-hooks",debug_assertions))]
-pub use manager::{MessageMutation,MessagePause,MessagePoint};
+pub use manager::{MailboxCounters,MessageMutation,MessagePause,MessagePoint};

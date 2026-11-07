@@ -854,7 +854,7 @@ impl Manager {
 
     /// The peer of a conversation a request may concern: the sending account itself when it is
     /// a contact, or, for this account's other devices, the contact the conversation is with.
-    fn conversation_peer(&self, conversation: ConversationId, sender: PeerId) -> Option<PeerId> {
+    pub(super) fn conversation_peer(&self, conversation: ConversationId, sender: PeerId) -> Option<PeerId> {
         let local = self.local().ok()?;
         let own = local.keys.peer_id();
         if sender == own {

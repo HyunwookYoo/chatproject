@@ -302,6 +302,9 @@ pub(crate) fn execute(
                 MessageDbOp::Mailbox(super::mailbox_store::MailboxDbOp::ApplyNote { entry, .. }) => {
                     Some(entry.conversation)
                 }
+                MessageDbOp::Mailbox(super::mailbox_store::MailboxDbOp::StorePlain { record, .. }) => {
+                    Some(record.conversation)
+                }
                 _ => key.map(|k| k.conversation),
             };
             let reply = execute(c, identity, local, *op, #[cfg(all(feature="test-hooks",debug_assertions))] fault)?;
@@ -806,6 +809,9 @@ pub(crate) enum FixtureOp {
     ),
     /// Device, handoff and status-ahead rows of an installation at a time.
     MailboxSeed(InstallationId, u64, tokio::sync::oneshot::Sender<R<()>>),
+    /// Deletes one message row and the jobs that refer to it (as deleting its conversation
+    /// would).
+    DropMessage(MessageKey, tokio::sync::oneshot::Sender<R<()>>),
 }
 #[cfg(all(feature = "test-hooks", debug_assertions))]
 pub(crate) fn fixture(c: &mut Connection, op: FixtureOp) {
@@ -934,6 +940,12 @@ pub(crate) fn fixture(c: &mut Connection, op: FixtureOp) {
         }
         FixtureOp::MailboxSeed(installation, at, reply) => {
             let _ = reply.send(super::mailbox_store::fixture_seed(c, installation, at));
+        }
+        FixtureOp::DropMessage(k, reply) => {
+            let result = ["receipt_job", "mls_receipt", "outbox", "message"].iter().try_for_each(|table| {
+                c.execute(&format!("DELETE FROM {table} WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4"), params![k.conversation.0.as_slice(), k.sender.0.as_slice(), k.installation.0.as_slice(), k.id.0.as_slice()]).map(|_| ()).map_err(sql_error)
+            });
+            let _ = reply.send(result);
         }
         FixtureOp::MlsSetDelivery(id, recipient, kind, epoch, row, reply) => {
             let result = (|| {

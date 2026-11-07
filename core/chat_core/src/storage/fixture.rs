@@ -388,6 +388,27 @@ impl Messages {
             _ => unreachable!(),
         }
     }
+    /// The plaintext record this device hands over for entry `seq` of its log.
+    pub async fn mailbox_plain(&self, seq: u64) -> Result<Option<PlainRecord>, CoreError> {
+        match self.mailbox(MailboxDbOp::Plain { seq }).await? {
+            MailboxDbReply::Plain(record) => Ok(record),
+            _ => unreachable!(),
+        }
+    }
+    /// Stores a handed-over plaintext record (conversation peer, ciphertext hash); whether it
+    /// was stored just now.
+    pub async fn mailbox_store_plain(
+        &self,
+        record: PlainRecord,
+        peer: crate::account::PeerId,
+        ct_hash: [u8; 32],
+        now: u64,
+    ) -> Result<bool, CoreError> {
+        match self.mailbox(MailboxDbOp::StorePlain { record, peer, ct_hash, now }).await? {
+            MailboxDbReply::Stored(stored) => Ok(stored),
+            _ => unreachable!(),
+        }
+    }
     pub fn local_peer(&self) -> crate::account::PeerId {
         self.0.local_peer()
     }
@@ -895,6 +916,12 @@ impl Fixture {
     pub async fn mailbox_seed(&self, installation: crate::account::InstallationId, at: u64) -> Result<(), CoreError> {
         let (tx, rx) = oneshot::channel();
         self.handle.0.test(TestOp::Message(FixtureOp::MailboxSeed(installation, at, tx))).await;
+        rx.await.unwrap()
+    }
+    /// Deletes the message and what refers to it, as deleting its conversation would.
+    pub async fn drop_message(&self, key: MessageKey) -> Result<(), CoreError> {
+        let (tx, rx) = oneshot::channel();
+        self.handle.0.test(TestOp::Message(FixtureOp::DropMessage(key, tx))).await;
         rx.await.unwrap()
     }
     pub async fn due_hint(&self, now: u64) -> Result<bool, CoreError> {

@@ -252,7 +252,8 @@ async fn foreign_account_sync_request_is_refused() {
 }
 
 /// A logged entry this device cannot open is never answered to its sender: B1 sends nothing
-/// again and A1 sends B1 nothing. The page waits for the plaintext hand-over (its cursor stays).
+/// again and A1 sends B1 nothing. It goes to the plaintext hand-over instead, where the holder
+/// has no record of it (it names no message): it is skipped and counted, and the cursor passes.
 #[tokio::test]
 async fn mailbox_entry_failure_sends_no_decrypt_failed_to_sender() {
     let (mut a, b1, net, conv) = accounts(&[A1, A2], &[B1]).await;
@@ -281,7 +282,7 @@ async fn mailbox_entry_failure_sends_no_decrypt_failed_to_sender() {
     let a1 = on(dir, &net, &[&a2, &b1]).await;
     settle!(
         [&a1, &a2, &b1],
-        texts_from(&a1, conv, b1.peer).await.len() == 1
+        texts_from(&a1, conv, b1.peer).await.len() == 1 && caught_up(&a1, &a2).await
     );
     quiet(&[&a1, &a2, &b1]).await;
     assert_eq!(texts_from(&a1, conv, b1.peer).await[0].key, key);
@@ -304,8 +305,6 @@ async fn mailbox_entry_failure_sends_no_decrypt_failed_to_sender() {
         .iter()
         .find(|(i, _)| *i == a2_id)
         .map_or(0, |(_, since)| *since);
-    assert!(
-        since <= seq,
-        "the page with the unopened entry is not passed"
-    );
+    assert!(since > seq, "the unopened entry is passed");
+    assert_eq!(a1.account.mailbox_test_counters().await.unwrap().missing, 1);
 }

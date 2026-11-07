@@ -7,14 +7,14 @@
 //! and this device keeps how far it took each of theirs (`mailbox_pull`). Entries every cursor
 //! has passed, and entries older than `MAILBOX_RETENTION_MS`, are pruned.
 use super::mls_group::sql;
-use super::mls_store::{Fault, finish};
+use super::mls_store::{Fault, finish, store_plain};
 use super::store::{Identity, MessageDbReply, bump, bytes, integer, invalid, uint};
 use super::types::{ConversationId, MessageId};
 use crate::CoreError;
 use crate::account::{InstallationId, PeerId};
 use crate::mailbox::{
     MAILBOX_RETENTION_MS, PAGE_MAX_ENTRIES,
-    wire::{EntryBody, LogEntry, MAX_ENTRY_BODY, decode_note, note_body, page},
+    wire::{EntryBody, LogEntry, MAX_ENTRY_BODY, PlainRecord, decode_note, note_body, page},
 };
 use crate::mls::wire::MlsFrame;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -156,10 +156,23 @@ pub(crate) enum MailboxDbOp {
     Prune(u64),
     /// A note pulled from another own device's log, applied (and logged here) at `now`.
     ApplyNote { entry: LogEntry, now: u64 },
+    /// The plaintext record of entry `seq` of this device's log, for another own device that
+    /// could not open it (spec 6.3; the caller checked the device): only an App Text entry
+    /// whose message is still here has one.
+    Plain { seq: u64 },
+    /// A plaintext record another own device handed over for an entry of its log this device
+    /// could not open, whose ciphertext hashes to `ct_hash`; `peer` is the conversation's other
+    /// account. Stored like an opened text, without `processed_ct` row, log entry or receipt.
+    StorePlain {
+        record: PlainRecord,
+        peer: PeerId,
+        ct_hash: [u8; 32],
+        now: u64,
+    },
 }
 impl MailboxDbOp {
     pub(crate) fn writes(&self) -> bool {
-        !matches!(self, Self::PullFrom(_))
+        !matches!(self, Self::PullFrom(_) | Self::Plain { .. })
     }
 }
 
@@ -176,6 +189,9 @@ pub(crate) enum MailboxDbReply {
     Since(u64),
     /// Log entries pruned.
     Count(u64),
+    Plain(Option<PlainRecord>),
+    /// The handed-over text was stored just now (false: already here, or not taken).
+    Stored(bool),
 }
 
 pub(super) fn mailbox_op(
@@ -265,6 +281,18 @@ pub(super) fn mailbox_op(
             let pruned = prune(&tx, now)?;
             finish(tx, fault)?;
             MailboxDbReply::Count(pruned)
+        }
+        MailboxDbOp::Plain { seq } => MailboxDbReply::Plain(plain_record(c, seq)?),
+        MailboxDbOp::StorePlain {
+            record,
+            peer,
+            ct_hash,
+            now,
+        } => {
+            let tx = c.transaction().map_err(sql)?;
+            let stored = store_plain(&tx, identity, &record, peer, &ct_hash, now)?;
+            finish(tx, fault)?;
+            MailboxDbReply::Stored(stored)
         }
     };
     Ok(MessageDbReply::Mailbox(reply))
@@ -476,6 +504,55 @@ fn apply_note(tx: &Transaction, identity: Identity, entry: &LogEntry, now: u64) 
         )?;
     }
     Ok(changed)
+}
+
+/// The text logged as entry `seq` (only an App Text entry names its message), from its message
+/// row: `None` for any other entry, an entry no longer kept, or a message no longer here (its
+/// conversation was deleted).
+fn plain_record(c: &Connection, seq: u64) -> R<Option<PlainRecord>> {
+    let Some((conversation, sender_peer, sender_install, msg_id)) = c
+        .query_row(
+            "SELECT conversation,sender_peer,sender_install,msg_id FROM mailbox_store WHERE seq=?1 AND kind=1 AND msg_id IS NOT NULL",
+            params![integer(seq)?],
+            |r| {
+                Ok((
+                    bytes::<32>(r, 0)?,
+                    bytes::<32>(r, 1)?,
+                    bytes::<32>(r, 2)?,
+                    bytes::<16>(r, 3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(sql)?
+    else {
+        return Ok(None);
+    };
+    c.query_row(
+        "SELECT lamport,prev_hash,sent_at_ms,body FROM message WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",
+        params![
+            conversation.as_slice(),
+            sender_peer.as_slice(),
+            sender_install.as_slice(),
+            msg_id.as_slice()
+        ],
+        |r| {
+            Ok(PlainRecord {
+                conversation: ConversationId(conversation),
+                sender_peer: PeerId(sender_peer),
+                sender_install: InstallationId(sender_install),
+                msg_id: MessageId(msg_id),
+                lamport: uint(r, 0)?,
+                prev_hash: bytes(r, 1)?,
+                sent_at_ms: uint(r, 2)?,
+                // Text, the only kind of message an entry names.
+                kind: 1,
+                body: r.get(3)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(sql)
 }
 
 /// Spec 5.2: an entry goes once every (not revoked) other device's cursor passed it, or when it
