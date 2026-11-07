@@ -329,6 +329,51 @@ pub(super) fn seal_pending(
     Ok(MessageDbReply::Count(ids.len() as u64))
 }
 
+/// Holds the conversation's own texts that wait for a group (codec 3, not cancelled, not
+/// delivered, not in flight) as `Blocked(reason)`, in one transaction, as an M4 refusal holds
+/// one text; the user's retry releases them (`release_blocked`). Receipt jobs are not touched.
+pub(super) fn block_pending(
+    c: &mut Connection,
+    identity: Identity,
+    conversation: ConversationId,
+    reason: BlockReason,
+    fault: Fault,
+) -> R<MessageDbReply> {
+    let reason = match reason {
+        BlockReason::Account => 1,
+        BlockReason::ContactRequired => 2,
+        BlockReason::Storage => 3,
+    };
+    let tx = c.transaction().map_err(sql)?;
+    let args = params![
+        conversation.0.as_slice(),
+        identity.peer.0.as_slice(),
+        identity.installation.0.as_slice(),
+        reason
+    ];
+    let held = tx
+        .execute(
+            "UPDATE message SET outcome=2,block_reason=?4 WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND outgoing=1 AND cancel_requested=0 AND delivered_at_ms IS NULL AND outcome IN (0,1) AND EXISTS(SELECT 1 FROM outbox o WHERE o.conversation=message.conversation AND o.sender_peer=message.sender_peer AND o.sender_install=message.sender_install AND o.msg_id=message.msg_id AND o.codec=3 AND o.dispatch_state=0)",
+            args,
+        )
+        .map_err(sql)?;
+    if held > 0 {
+        tx.execute(
+            "UPDATE outbox SET dispatch_state=2 WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND codec=3 AND dispatch_state=0 AND EXISTS(SELECT 1 FROM message m WHERE m.conversation=outbox.conversation AND m.sender_peer=outbox.sender_peer AND m.sender_install=outbox.sender_install AND m.msg_id=outbox.msg_id AND m.outcome=2 AND m.block_reason=?4)",
+            args,
+        )
+        .map_err(sql)?;
+        let revision = bump(&tx)?;
+        tx.execute(
+            "UPDATE conversation SET change_revision=?2 WHERE id=?1",
+            params![conversation.0.as_slice(), integer(revision)?],
+        )
+        .map_err(sql)?;
+    }
+    finish(tx, fault)?;
+    Ok(MessageDbReply::Count(held as u64))
+}
+
 /// Seals a sent message again after the receiver could not open the first ciphertext. The
 /// message id, lamport and everything else stay; only the ciphertext is new. The third
 /// `counted` time the message is given up on (a user `Retry` starts the count over). Not

@@ -915,3 +915,103 @@ async fn same_ciphertext_via_origin_and_mailbox_acks_twice_stores_once() {
         .count();
     assert_eq!(delivered, 1);
 }
+
+/// Waits in real time, without moving any clock, until the text shows `expected`.
+async fn shows(f: &Fixture, key: MessageKey, expected: DeliveryState) -> MessageView {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if let Some(view) = message(f, key).await
+                && view.state == expected
+            {
+                return view;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("never {expected:?}"))
+}
+
+/// M4's contact hold is kept (M5 spec: states as in M4; a peer that has not allowed you is
+/// held `ContactRequired`): a text to an account that has not added this one ends `Blocked`,
+/// not waiting for a group forever, and after it adds this one the user's retry delivers it.
+/// No clock moves, as in the e2e m4 scenario. With `a2` A's second device is asked too and
+/// hands a KeyPackage; an own device's answer does not lift the hold.
+async fn held_until_retry(a2: bool) {
+    let own: &[u8] = if a2 { &[A1, A2] } else { &[A1] };
+    let (ra, rb) = (record(A, own, 0), record(B, &[B1], 0));
+    let net = backend(&[(A, ra.clone()), (B, rb.clone())]);
+    let a1 = device(A, A1, &ra, &net).await;
+    let b1 = device(B, B1, &rb, &net).await;
+    link(&a1, &b1).await;
+    let second = if a2 {
+        let a2 = device(A, A2, &ra, &net).await;
+        link(&a1, &a2).await;
+        a1.account.connect_account(a1.peer).await.unwrap();
+        Some(a2)
+    } else {
+        None
+    };
+    // A has B as a contact; B does not have A.
+    befriend(&a1, &b1).await;
+    a1.account.connect_account(b1.peer).await.unwrap();
+    let service = a1.account.messages();
+    let sent = service
+        .send_text(b1.peer, MessageId([7; 16]), "private text".into())
+        .await
+        .unwrap();
+    let held = shows(&a1, sent.key, DeliveryState::Blocked).await;
+    assert_eq!(held.block, Some(BlockReason::ContactRequired));
+    if let Some(a2) = &second {
+        let asked = a1
+            .account
+            .mls_test_sent_frames_to(installation(a2).await)
+            .await
+            .unwrap();
+        assert!(asked.iter().any(|f| f == "key_package_request"));
+    }
+    befriend(&b1, &a1).await;
+    service.retry_send(sent.key).await.unwrap();
+    shows(&a1, sent.key, DeliveryState::Delivered).await;
+    let got = message(&b1, sent.key).await.expect("stored by B");
+    assert_eq!(got.body, "private text");
+}
+
+#[tokio::test]
+async fn text_to_account_without_us_is_held_until_retry() {
+    held_until_retry(false).await;
+}
+
+#[tokio::test]
+async fn own_device_key_package_does_not_lift_the_contact_hold() {
+    held_until_retry(true).await;
+}
+
+/// The user's retry restarts a group setup that is backing off: without it a stopped clock
+/// would never end the back-off, and the retried text would wait forever.
+#[tokio::test]
+async fn retry_restarts_a_group_setup_that_backs_off() {
+    let (ra, rb) = (record(A, &[A1], 0), record(B, &[B1], 0));
+    let net = backend(&[(A, ra.clone()), (B, rb.clone())]);
+    let a1 = device(A, A1, &ra, &net).await;
+    let b1 = device(B, B1, &rb, &net).await;
+    link(&a1, &b1).await;
+    befriend(&a1, &b1).await;
+    a1.account.connect_account(b1.peer).await.unwrap();
+    let service = a1.account.messages();
+    let sent = service
+        .send_text(b1.peer, MessageId([8; 16]), "private text".into())
+        .await
+        .unwrap();
+    shows(&a1, sent.key, DeliveryState::Blocked).await;
+    befriend(&b1, &a1).await;
+    // With no session to B, asking for the group backs off (until a time that never comes).
+    a1.account
+        .mls_test_close_session(installation(&b1).await)
+        .await
+        .unwrap();
+    assert_eq!(ensure(&a1, b1.peer).await, GroupState::WaitingForPeer);
+    a1.account.connect_account(b1.peer).await.unwrap();
+    service.retry_send(sent.key).await.unwrap();
+    shows(&a1, sent.key, DeliveryState::Delivered).await;
+}

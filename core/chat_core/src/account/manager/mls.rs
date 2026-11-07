@@ -29,7 +29,7 @@ use crate::message::mls_group::{
     Committed, Delivery, DueDelivery, GroupOp, GroupReply, Outcome, OwnWelcome,
 };
 use crate::message::store::{MessageDbOp, MessageDbReply, OpenFrom, conversation_id};
-use crate::message::types::ConversationId;
+use crate::message::types::{BlockReason, ConversationId};
 use crate::message::wire::{Frame, RejectReason};
 use crate::mls::{
     group::{CLASS_FUTURE_EPOCH, CLASS_OTHER, CLASS_OUT_OF_ORDER, inspect_key_package},
@@ -98,6 +98,11 @@ enum Phase {
         peer: PeerId,
         waiting: BTreeSet<InstallationId>,
         key_packages: Vec<Vec<u8>>,
+        /// The peer account's installations asked; whether one of them sent a KeyPackage, and
+        /// whether one answered `ContactRequired` (it has not added this account).
+        peer_devices: BTreeSet<InstallationId>,
+        peer_answered: bool,
+        peer_refused: bool,
     },
     Joining {
         since: u64,
@@ -1104,6 +1109,17 @@ impl Manager {
         Ok(GroupState::WaitingForPeer)
     }
 
+    /// The user retried a text of the conversation: a group setup that is backing off asks
+    /// again at the text's next attempt instead of after the back-off.
+    pub(super) fn retry_group_now(&mut self, conversation: ConversationId) {
+        if matches!(
+            self.messages.mls.phases.get(&conversation),
+            Some(Phase::Idle { .. })
+        ) {
+            self.messages.mls.phases.remove(&conversation);
+        }
+    }
+
     fn idle(&mut self, conversation: ConversationId) {
         let until = self.schedule_now().saturating_add(RETRY_MS);
         self.messages
@@ -1200,6 +1216,13 @@ impl Manager {
                 peer,
                 waiting: sessions.iter().map(|s| s.grant.installation).collect(),
                 key_packages: Vec::new(),
+                peer_devices: sessions
+                    .iter()
+                    .filter(|s| s.grant.peer == peer)
+                    .map(|s| s.grant.installation)
+                    .collect(),
+                peer_answered: false,
+                peer_refused: false,
             },
         );
         let body = MlsFrame::KeyPackageRequest.encode().to_vec();
@@ -1224,24 +1247,54 @@ impl Manager {
         let Some(Phase::Collecting {
             waiting,
             key_packages,
+            peer_devices,
+            peer_answered,
+            peer_refused,
             ..
         }) = self.messages.mls.phases.get_mut(&conversation)
         else {
             return Ok(());
         };
         waiting.remove(&installation);
-        if let Ok(MlsReply::KeyPackage(bytes)) = result {
-            key_packages.push(bytes);
+        let of_peer = peer_devices.contains(&installation);
+        match result {
+            Ok(MlsReply::KeyPackage(bytes)) => {
+                key_packages.push(bytes);
+                *peer_answered |= of_peer;
+            }
+            Ok(MlsReply::ContactRequired) => *peer_refused |= of_peer,
+            _ => {}
         }
         if !waiting.is_empty() {
             return Ok(());
         }
         let Some(Phase::Collecting {
-            peer, key_packages, ..
+            peer,
+            key_packages,
+            peer_answered,
+            peer_refused,
+            ..
         }) = self.messages.mls.phases.remove(&conversation)
         else {
             return Ok(());
         };
+        if peer_refused && !peer_answered {
+            // The peer has not added this account: M4's contact hold (spec 3, 4.4a). Nothing is
+            // asked again; the texts waiting for the group stay held until the user's retry.
+            match self
+                .message_db(
+                    MessageDbOp::BlockPending(conversation, BlockReason::ContactRequired),
+                    request,
+                )
+                .await
+            {
+                Ok(_) => {
+                    self.messages.mls.wanted.remove(&conversation);
+                }
+                Err(_) => self.idle(conversation),
+            }
+            return Ok(());
+        }
         if key_packages.is_empty() {
             self.idle(conversation);
             return Ok(());

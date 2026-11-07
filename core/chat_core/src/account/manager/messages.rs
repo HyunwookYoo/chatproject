@@ -622,6 +622,10 @@ impl Manager {
         use crate::message::service::{MessageReply as A, MessageRequest as Q};
         let request = self.ready()?;
         let local = self.local()?;
+        let retried = match &operation {
+            Q::Retry(key) => Some(key.conversation),
+            _ => None,
+        };
         // local() requires this owning actor to be Active; Candidate and PendingImport cannot enqueue.
         let op = match operation {
             Q::Open(peer) => MessageDbOp::Open(local.keys.peer_id(), peer),
@@ -642,7 +646,11 @@ impl Manager {
                 self.services.clock.wall_ms(),
             ),
         };
-        Ok(match self.message_db(op, request).await? {
+        let reply = self.message_db(op, request).await?;
+        if let Some(conversation) = retried {
+            self.retry_group_now(conversation);
+        }
+        Ok(match reply {
             MessageDbReply::Conversation(v) => A::Conversation(v),
             MessageDbReply::Conversations(v) => A::Conversations(v),
             MessageDbReply::Messages(v) => A::Messages(v),

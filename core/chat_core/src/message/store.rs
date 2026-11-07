@@ -58,6 +58,9 @@ pub(crate) enum MessageDbOp {
     Seal(MessageKey, u64),
     /// Seals every codec 3 row of the conversation, in lamport order.
     SealPending(ConversationId, u64),
+    /// Holds every own text of the conversation that waits for a group (codec 3): `Blocked`
+    /// until the user's retry. Receipts are not held.
+    BlockPending(ConversationId, BlockReason),
     /// Seals a codec 2 row again. Counted (`reencrypts += 1`, the third time it fails) after a
     /// decrypt failure; not counted when only the epoch moved on under it (C1).
     Reencrypt(MessageKey, u64, bool),
@@ -307,7 +310,7 @@ pub(crate) fn execute(
                 MessageDbOp::Open(local, peer) => Some(conversation_id(*local, *peer)?),
                 MessageDbOp::ReleasePeer(peer, _) => Some(conversation_id(identity.peer, *peer)?),
                 MessageDbOp::MarkRead(id, ..) => Some(*id),
-                MessageDbOp::SealPending(id, _) => Some(*id),
+                MessageDbOp::SealPending(id, _) | MessageDbOp::BlockPending(id, _) => Some(*id),
                 // Group operations that span conversations (deliveries, holds) pass a zero id.
                 MessageDbOp::MlsGroupOp(id, _) => (id.0 != [0; 32]).then_some(*id),
                 MessageDbOp::OpenApp(_, id, _, _) => Some(*id),
@@ -583,6 +586,7 @@ pub(crate) fn execute(
         }
         MessageDbOp::Seal(key, now) => super::mls_store::seal(c, identity, local, key, now, mls_fault!(fault)),
         MessageDbOp::SealPending(id, now) => super::mls_store::seal_pending(c, identity, local, id, now, mls_fault!(fault)),
+        MessageDbOp::BlockPending(id, reason) => super::mls_store::block_pending(c, identity, id, reason, mls_fault!(fault)),
         MessageDbOp::Reencrypt(key, now, counted) => super::mls_store::reencrypt(c, identity, local, key, now, counted, mls_fault!(fault)),
         MessageDbOp::OpenApp(from, id, ciphertext, now) => super::mls_store::open_app(c, identity, &from, id, ciphertext, now, mls_fault!(fault)),
         MessageDbOp::MarkWaitingPeerUpdate(key, waiting) => super::mls_store::mark_waiting(c, identity, key, waiting, mls_fault!(fault)),
@@ -1220,7 +1224,7 @@ impl MessageDbOp {
     pub(crate) fn faultable(&self, identity: Identity) -> R<bool> {
         Ok(match self {
             Self::Observed(op) => return op.faultable(identity),
-            Self::SealPending(..) | Self::OpenApp(..) => true,
+            Self::SealPending(..) | Self::BlockPending(..) | Self::OpenApp(..) => true,
             // The M4-peer fixture's frame is what its enqueue would have stored: not a step
             // of the attempt that fault tests interrupt.
             #[cfg(all(feature = "test-hooks", debug_assertions))]
