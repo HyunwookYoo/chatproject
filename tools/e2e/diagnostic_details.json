@@ -33,6 +33,7 @@
     "Airplane participant is not owned",
     "Android CI requires the exact job-owned GRADLE_USER_HOME",
     "Android SDK not found. Set ANDROID_HOME.",
+    "Android launch did not start the activity",
     "Android owned activity exited",
     "Cannot find the home folder for AVDs. Set ANDROID_AVD_HOME.",
     "Disconnect retained outgoing intent",

@@ -51,6 +51,50 @@ void main() {
     await expectLater(result, throwsA(isA<StateError>()));
     expect(saved, isTrue);
   });
+  test('a launch that only brought an old task to the front fails', () async {
+    final activity = <String, Object?>{'serial': 'owned-test'};
+    final result =
+        library.invoke(
+              MirrorSystem.getSymbol('_captureAndroidLaunch', library),
+              [
+                ProcessResult(
+                  1,
+                  0,
+                  'Starting: Intent { cmp=x/.MainActivity }\n'
+                      'Warning: Activity not started, its current task has been '
+                      'brought to the front\n',
+                  '',
+                ),
+                () async => ProcessResult(2, 0, '', ''),
+                activity,
+                () {},
+              ],
+            ).reflectee
+            as Future;
+    await expectLater(
+      result,
+      throwsA(
+        isA<StateError>().having(
+          (e) => e.message,
+          'fixed detail',
+          'Android launch did not start the activity',
+        ),
+      ),
+    );
+    expect(activity.containsKey('pid'), isFalse);
+  });
+  test('Android installs grant the runtime permissions', () {
+    final args =
+        library.invoke(MirrorSystem.getSymbol('_androidInstall', library), [
+              ['-s', 'owned-test'],
+              'app.apk',
+            ]).reflectee
+            as List<String>;
+    // A notification prompt over the app would survive a force-stop and
+    // take the next launch (and m6 needs notifications allowed).
+    expect(args, ['-s', 'owned-test', 'install', '-r', '-g', 'app.apk']);
+  });
+
   late Directory logs;
   test(
     'Android build environment selection validates and composes only child overrides',

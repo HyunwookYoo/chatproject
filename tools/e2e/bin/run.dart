@@ -361,20 +361,22 @@ Future<void> main(List<String> arguments) async {
           // A restored snapshot may carry an older crash buffer.
           await run.command(sdk.adb, [...adb, 'logcat', '-b', 'crash', '-c']);
         }
-        await run.command(sdk.adb, [
-          ...adb,
-          'install',
-          '-r',
-          p.join(
-            root,
-            'app',
-            'build',
-            'app',
-            'outputs',
-            'flutter-apk',
-            'app-debug.apk',
+        await run.command(
+          sdk.adb,
+          _androidInstall(
+            adb,
+            p.join(
+              root,
+              'app',
+              'build',
+              'app',
+              'outputs',
+              'flutter-apk',
+              'app-debug.apk',
+            ),
           ),
-        ], timeout: const Duration(minutes: 2));
+          timeout: const Duration(minutes: 2),
+        );
         const package = 'dev.chatproject.chat_app';
         final activity = <String, Object?>{
           'serial': spec.serial,
@@ -1350,6 +1352,17 @@ class _Managed implements OwnedProcess {
   Future<void> stop() => _stopping ??= run.stop(process);
 }
 
+/// `-g` grants the runtime permissions: the notification prompt an active
+/// account opens (M6) would otherwise stay over the task after a force-stop,
+/// and the next launch would only bring that task to the front.
+List<String> _androidInstall(List<String> adb, String apk) => [
+  ...adb,
+  'install',
+  '-r',
+  '-g',
+  apk,
+];
+
 Future<void> _captureAndroidLaunch(
   ProcessResult launch,
   Future<ProcessResult> Function() samplePid,
@@ -1363,4 +1376,9 @@ Future<void> _captureAndroidLaunch(
     save();
   }
   if (launch.exitCode != 0) throw _CommandFailure(launch.exitCode, 'adb');
+  // `am start` exits 0 when it only brought an existing task to the front or
+  // handed the intent to a running activity; no new app process runs then.
+  if ((launch.stdout as String).contains('Activity not started')) {
+    throw StateError('Android launch did not start the activity');
+  }
 }
