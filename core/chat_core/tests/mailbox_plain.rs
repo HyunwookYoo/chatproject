@@ -7,6 +7,7 @@
 include!("support/mailbox_network.rs");
 
 use chat_core::storage_fixture::{HandoffEntry, PlainRecord};
+use sha2::Digest;
 
 async fn unread(f: &Fixture, conv: ConversationId) -> u64 {
     f.account
@@ -55,22 +56,18 @@ async fn back_without_group(
     f
 }
 
-/// Frames `f` sent over kind 17 that carried a receipt.
+/// MLS application frames (kind 17 `App`) `f` sent: A1 sends no text in these tests, so these
+/// are its receipts.
 async fn receipts_sent(f: &Fixture) -> usize {
-    f.account
-        .mls_test_sent_frames()
-        .await
-        .unwrap()
-        .iter()
-        .filter(|label| label.contains("receipt"))
-        .count()
+    app_ciphertexts(f).await.len()
 }
 
 /// Spec 6.3: A1 lost the conversation's group while it was off, so the text B1 sent to A2
 /// meanwhile cannot be opened from A2's log. A1 asks A2 for its plaintext and stores it under
 /// the same key, body, lamport and chain position (and the same payload hash, the ciphertext's,
 /// as a text opened from it would have): unread, notified once, no receipt sent or queued, and
-/// neither `processed_ct` nor A1's own log records it.
+/// not in A1's own log. Its ciphertext counts as processed (Ruling 24): when it comes again it
+/// is answered as already taken and nothing changes.
 #[tokio::test]
 async fn unopenable_entry_is_stored_from_plaintext() {
     let (mut a, b1, net, conv) = accounts(&[A1, A2], &[B1]).await;
@@ -115,8 +112,8 @@ async fn unopenable_entry_is_stored_from_plaintext() {
     assert_eq!(receipts_sent(&a1).await, 0, "no receipt sent");
     assert_eq!(
         state(&a1, conv).await.processed_mls,
-        processed,
-        "no processed_ct row"
+        processed + 1,
+        "its ciphertext's processed_ct row"
     );
     assert!(
         !mailbox(&a1)
@@ -127,6 +124,84 @@ async fn unopenable_entry_is_stored_from_plaintext() {
         "not in A1's log"
     );
     assert_eq!(a1.account.mailbox_test_counters().await.unwrap().missing, 0);
+    // The ciphertext itself arrives after all: already taken, though A1 has no group to open it.
+    let ciphertext = app_ciphertexts(&b1).await.pop().unwrap();
+    let ct_hash: [u8; 32] = sha2::Sha256::digest(&ciphertext).into();
+    assert_eq!(facts.hash, ct_hash);
+    let b1_id = installation(&b1).await;
+    let reply = fixture(&a1)
+        .messages()
+        .await
+        .unwrap()
+        .mls_open_app(b1.peer, b1_id, conv, ciphertext, NOW * 1000)
+        .await
+        .unwrap();
+    assert!(reply == MlsReply::Ack { ct_hash }, "already taken");
+    assert_eq!(texts_from(&a1, conv, b1.peer).await.len(), 1);
+    assert_eq!(unread(&a1, conv).await, 1);
+}
+
+/// Ruling 24: a text stored from plaintext is one received over MLS. Read later, its receipt
+/// never leaves as an M4 (kind 16) frame: it is sealed in the group, which A1 gets again.
+#[tokio::test]
+async fn plaintext_stored_text_is_read_over_mls() {
+    let (mut a, b1, net, conv) = accounts(&[A1, A2], &[B1]).await;
+    let a2 = a.pop().unwrap();
+    let dir = stop(a.pop().unwrap());
+    let key = delivered(&b1, &a2, &[], 1).await;
+    let a1 = back_without_group(dir, &net, conv, &[&a2, &b1]).await;
+    settle!(
+        [&a1, &a2, &b1],
+        message(&a1, key).await.is_some() && caught_up(&a1, &a2).await
+    );
+    a1.account
+        .messages()
+        .mark_read(conv, vec![key])
+        .await
+        .unwrap();
+    settle!(
+        [&a1, &a2, &b1],
+        delivery(&b1, key).await == DeliveryState::Read
+    );
+    assert!(receipts_sent(&a1).await >= 1, "a sealed (kind 17) receipt");
+    assert!(
+        !frames(&a1).await.iter().any(|frame| kind(frame) == 16),
+        "no M4 receipt"
+    );
+}
+
+/// Reviewer check: a text the holder sent itself is handed over too. The copy is stored as A1's
+/// own sent message, with the payload hash of the logged ciphertext (as an opened copy has).
+#[tokio::test]
+async fn own_sent_text_is_handed_over() {
+    let (mut a, b1, net, conv) = accounts(&[A1, A2], &[B1]).await;
+    let a2 = a.pop().unwrap();
+    let dir = stop(a.pop().unwrap());
+    let key = delivered(&a2, &b1, &[], 1).await;
+    let a1 = back_without_group(dir, &net, conv, &[&a2, &b1]).await;
+    settle!(
+        [&a1, &a2, &b1],
+        message(&a1, key).await.is_some() && caught_up(&a1, &a2).await
+    );
+    let (got, sent) = (
+        message(&a1, key).await.unwrap(),
+        message(&a2, key).await.unwrap(),
+    );
+    assert!(got.outgoing);
+    assert_eq!((got.body, got.lamport), (sent.body, sent.lamport));
+    let ciphertext = app_ciphertexts(&a2).await.pop().unwrap();
+    let ct_hash: [u8; 32] = sha2::Sha256::digest(&ciphertext).into();
+    let fixture = |f: &Fixture| f.account.storage_test_fixture();
+    let (facts, held) = (
+        fixture(&a1).message_facts(key).await.unwrap(),
+        fixture(&a2).message_facts(key).await.unwrap(),
+    );
+    assert_eq!(facts.hash, ct_hash);
+    assert_eq!(facts.prev_hash, held.prev_hash);
+    // The sender's own row keeps the canonical M4 text hash (store.rs `Enqueue`), not the
+    // ciphertext's: the holder finds the record by the entry's logical key, never by hash.
+    assert_ne!(held.hash, ct_hash);
+    assert_eq!(notify_count(&a1), 0, "my own text is not notified");
 }
 
 /// A plaintext record of a message this device already has changes nothing: neither the same
@@ -302,6 +377,20 @@ async fn missing_plaintext_is_counted_not_fatal() {
 /// hand-over instead of being dropped, and A1 ends with them.
 #[tokio::test]
 async fn conversation_created_while_device_was_off_ends_with_text() {
+    created_while_off(true).await;
+}
+
+/// Ruling 25: as above, but A1 never fetched B's record. A2's own Commit adding A1, in A2's
+/// log, cannot be vetted on A1: it is held for a record lookup and the log goes on behind it.
+#[tokio::test]
+async fn logged_commit_without_peer_record_does_not_hold_up_the_log() {
+    created_while_off(false).await;
+}
+
+/// B1 and A2 make the conversation while A1 is off; A1 comes back and pulls A2's log only once
+/// A2's own Commit adding A1 is in it (A2 delivers nothing to A1 directly). `record_known`: A1 had
+/// B's record before it went off (as a device with B as a contact does).
+async fn created_while_off(record_known: bool) {
     let (ra, rb) = (record(A, &[A1, A2], 0), record(B, &[B1], 0));
     let net = backend(&[(A, ra.clone()), (B, rb.clone())]);
     let a1 = device(A, A1, &ra, &net).await;
@@ -313,10 +402,11 @@ async fn conversation_created_while_device_was_off_ends_with_text() {
         befriend(x, &b1).await;
     }
     befriend(&b1, &a2).await;
-    // A1 has B's record, as a device with B as a contact does (it vets B's leaves with it).
-    a1.account.connect_account(b1.peer).await.unwrap();
+    if record_known {
+        a1.account.connect_account(b1.peer).await.unwrap();
+    }
     // A2 keeps A1's place in its log from before anything is logged.
-    let a1_id = installation(&a1).await;
+    let (a1_id, a2_id) = (installation(&a1).await, installation(&a2).await);
     settle!(
         [&a1, &a2, &b1],
         mailbox(&a2).await.cursors.iter().any(|(i, _)| *i == a1_id)
@@ -328,7 +418,22 @@ async fn conversation_created_while_device_was_off_ends_with_text() {
     ensure(&b1, a2.peer).await;
     settle!([&a2, &b1], agreed(&a2, &b1, conv).await);
     let key = delivered(&b1, &a2, &[], 1).await;
-    let a1 = on(dir, &net, &[&a2, &b1]).await;
+    a2.account.mls_test_hold_delivery(true).await.unwrap();
+    let a1 = start(dir, net.clone()).await;
+    a1.account.mailbox_test_hold(true).await.unwrap();
+    link(&a1, &a2).await;
+    link(&a1, &b1).await;
+    a1.account.mailbox_sync_now().await.unwrap();
+    settle!(
+        [&a1, &a2, &b1],
+        mailbox(&a2)
+            .await
+            .entries
+            .iter()
+            .any(|e| e.sender_install == a2_id)
+    );
+    a1.account.mailbox_test_hold(false).await.unwrap();
+    a1.account.mailbox_sync_now().await.unwrap();
     settle!(
         [&a1, &a2, &b1],
         message(&a1, key).await.is_some() && caught_up(&a1, &a2).await

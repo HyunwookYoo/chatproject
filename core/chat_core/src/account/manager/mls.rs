@@ -2192,6 +2192,10 @@ impl Manager {
                     });
                 };
                 let ct_hash = sha256(&commit);
+                // Ruling 25: a logged Commit that cannot be vetted because the peer's record is
+                // not here is held and the record looked up (as for a missing device), so the
+                // log behind it goes on.
+                let logged = matches!(via, Via::Mailbox { .. }).then(|| commit.clone());
                 let op = GroupOp::ApplyCommit {
                     peer,
                     sender_peer: sender,
@@ -2199,8 +2203,20 @@ impl Manager {
                     commit,
                     now,
                 };
-                let GroupReply::Outcome(outcome) = self.group_db(conversation, op, request).await?
-                else {
+                let result = match (self.group_db(conversation, op, request).await, logged) {
+                    (Err(error), Some(commit)) if error.code == ErrorCode::RecordUnavailable => {
+                        let op = GroupOp::HoldCommit {
+                            peer,
+                            sender_peer: sender,
+                            epoch,
+                            commit,
+                            now,
+                        };
+                        self.group_db(conversation, op, request).await
+                    }
+                    (result, _) => result,
+                };
+                let GroupReply::Outcome(outcome) = result? else {
                     return Ok(MlsReply::Busy);
                 };
                 match outcome {

@@ -100,6 +100,16 @@ pub(crate) enum GroupOp {
         commit: Vec<u8>,
         now: u64,
     },
+    /// A Commit from another own device's log (M6) that cannot be vetted because `peer`'s
+    /// record is not here: held, like one naming a missing device, until the record is looked
+    /// up (`Held(peer)`); `Failed` when it cannot be held.
+    HoldCommit {
+        peer: PeerId,
+        sender_peer: PeerId,
+        epoch: u64,
+        commit: Vec<u8>,
+        now: u64,
+    },
     /// What `diff_members` says the group needs, and whether an own Commit is unacknowledged.
     Plan { peer: PeerId },
     /// One own Commit adding `add` and removing `remove`; queues it for every other member
@@ -719,6 +729,37 @@ pub(super) fn group_op(
             &commit,
             fault,
         )?),
+        GroupOp::HoldCommit {
+            peer,
+            sender_peer,
+            epoch,
+            commit,
+            now,
+        } => {
+            check_conversation(identity, peer, conversation)?;
+            let arrival = Arrival {
+                peer,
+                sender_peer,
+                hold: true,
+                now,
+                wall: now,
+            };
+            let inner = MlsFrame::Commit {
+                conversation,
+                epoch,
+                commit,
+            }
+            .inner();
+            let body = hold_body(HOLD_COMMIT, [0; 32], &arrival, &inner);
+            GroupReply::Outcome(if hold(c, conversation, peer, &body, now)? {
+                Outcome::Held(peer)
+            } else {
+                Outcome::Failed {
+                    class: group::CLASS_OTHER,
+                    epoch: 0,
+                }
+            })
+        }
         GroupOp::JoinRequest {
             peer,
             sender_peer,

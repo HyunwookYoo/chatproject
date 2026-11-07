@@ -1293,10 +1293,11 @@ fn store_text(
 /// not open the logged ciphertext hashing to `ct_hash`. Stored under its logical key by the
 /// rules `open_app` stores an opened text with (`store_text`: a copy of my own text as sent and
 /// seen, the other account's as unread, what `mailbox_status_ahead` kept applied), and with the
-/// ciphertext hash as its payload hash like every text received over MLS. Nothing else
-/// `open_app` writes: no `processed_ct` row, no log entry, no receipt (the peer has its
-/// `Delivered` from the other device). `peer` is the conversation's other account. True when it
-/// was stored just now; false when it is here already or not taken.
+/// ciphertext hash as its payload hash like every text received over MLS, and its `processed_ct`
+/// row (codec 2). Nothing else `open_app` writes: no log entry, no receipt now (the peer has its
+/// `Delivered` from the other device; a later Read follows spec 6.4). `peer` is the
+/// conversation's other account. True when it was stored just now; false when it is here
+/// already or not taken.
 pub(super) fn store_plain(
     tx: &Transaction<'_>,
     identity: Identity,
@@ -1337,7 +1338,24 @@ pub(super) fn store_plain(
         integer(now)?,
         own,
     )?;
-    Ok(matches!(stored, Stored::New))
+    if !matches!(stored, Stored::New) {
+        return Ok(false);
+    }
+    // Ruling 24: the ciphertext counts as taken here (codec 2), as `open_app` would have
+    // recorded it. The row is then a text received over MLS (`received_over_mls`), so a later
+    // Read is sealed in the group or waits for one, never sent as an M4 receipt; and the same
+    // ciphertext arriving again is answered as already processed.
+    tx.execute(
+        "INSERT OR IGNORE INTO processed_ct VALUES(2,?1,?2,?3,?4)",
+        params![
+            record.sender_peer.0.as_slice(),
+            record.sender_install.0.as_slice(),
+            ct_hash.as_slice(),
+            integer(now)?
+        ],
+    )
+    .map_err(sql)?;
+    Ok(true)
 }
 
 // ---- test-hooks fixtures -------------------------------------------------------------------

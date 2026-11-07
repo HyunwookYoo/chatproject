@@ -162,7 +162,8 @@ pub(crate) enum MailboxDbOp {
     Plain { seq: u64 },
     /// A plaintext record another own device handed over for an entry of its log this device
     /// could not open, whose ciphertext hashes to `ct_hash`; `peer` is the conversation's other
-    /// account. Stored like an opened text, without `processed_ct` row, log entry or receipt.
+    /// account. Stored like an opened text (with its `processed_ct` row), without log entry or
+    /// receipt.
     StorePlain {
         record: PlainRecord,
         peer: PeerId,
