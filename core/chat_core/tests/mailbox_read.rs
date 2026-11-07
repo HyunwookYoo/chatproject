@@ -226,11 +226,10 @@ async fn copy_status_follows_peer_receipts_and_never_regresses() {
     let (mut a, b1, _net, conv) = accounts(&[A1, A2], &[B1]).await;
     let a2 = a.pop().unwrap();
     let a1 = a.pop().unwrap();
+    // A2 pulls nothing until A1's note is looked at: once A2 has pulled past it, A1 prunes it.
+    a2.account.mailbox_test_hold(true).await.unwrap();
     let key = delivered(&a1, &b1, &[&a2], 1).await;
-    settle!(
-        [&a1, &a2, &b1],
-        has(&a2, key).await && delivery(&a2, key).await == DeliveryState::Delivered
-    );
+    settle!([&a1, &a2, &b1], has(&a2, key).await);
     // A1 logged the delivery as a note about its message.
     let note = mailbox(&a1)
         .await
@@ -241,6 +240,13 @@ async fn copy_status_follows_peer_receipts_and_never_regresses() {
     assert_eq!(
         (note.msg_id, note.sender_install),
         (Some(key.id), key.installation)
+    );
+    assert_ne!(delivery(&a2, key).await, DeliveryState::Delivered);
+    a2.account.mailbox_test_hold(false).await.unwrap();
+    a2.account.mailbox_sync_now().await.unwrap();
+    settle!(
+        [&a1, &a2, &b1],
+        delivery(&a2, key).await == DeliveryState::Delivered
     );
 
     b1.account
