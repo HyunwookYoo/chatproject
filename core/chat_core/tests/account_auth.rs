@@ -506,6 +506,8 @@ async fn real_revoke_closes_target_then_confirms_remaining_peer_before_public_mu
     let a = Fixture::new(3, 21, &signed, backend.clone()).await;
     let b = Fixture::new(3, 22, &signed, backend.clone()).await;
     let c = Fixture::new(3, 23, &signed, backend.clone()).await;
+    // The three are devices of one account: B's own-device sync (M6) would use its store too.
+    b.account.mailbox_test_hold(true).await.unwrap();
     b.route(&a).await;
     b.route(&c).await;
     c.route(&a).await;

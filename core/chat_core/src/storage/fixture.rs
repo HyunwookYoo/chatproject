@@ -240,7 +240,7 @@ impl Messages {
     ) -> Result<crate::mls::wire::MlsReply, CoreError> {
         let op = MessageDbOp::OpenApp(sender, installation, conversation, ciphertext, now);
         match self.mls(op).await? {
-            MessageDbReply::Opened(reply) | MessageDbReply::OpenedText(reply, _) => Ok(reply),
+            MessageDbReply::Opened(reply) | MessageDbReply::OpenedText(reply, ..) => Ok(reply),
             // Without the actor no new epoch is made: the sender is told it is out of order.
             MessageDbReply::FarAhead { epoch } => Ok(crate::mls::wire::MlsReply::DecryptFailed {
                 class: crate::mls::group::CLASS_OUT_OF_ORDER,
@@ -864,6 +864,21 @@ impl Fixture {
     pub async fn mailbox_record(&self, body: Vec<u8>, now: u64) -> Result<Option<u64>, CoreError> {
         let (tx, rx) = oneshot::channel();
         self.handle.0.test(TestOp::Message(FixtureOp::MailboxRecord(body, now, tx))).await;
+        rx.await.unwrap()
+    }
+    /// Records a `Frame` entry with `body` as sent by `sender_install` of `sender_peer` in
+    /// `conversation`; its seq, or `None` if refused.
+    pub async fn mailbox_record_as(
+        &self,
+        conversation: ConversationId,
+        sender_peer: crate::account::PeerId,
+        sender_install: crate::account::InstallationId,
+        body: Vec<u8>,
+        now: u64,
+    ) -> Result<Option<u64>, CoreError> {
+        let (tx, rx) = oneshot::channel();
+        let op = FixtureOp::MailboxRecordAs(conversation, sender_peer, sender_install, body, now, tx);
+        self.handle.0.test(TestOp::Message(op)).await;
         rx.await.unwrap()
     }
     /// A `mailbox_device` and a `mailbox_handoff` row of `installation`, and a

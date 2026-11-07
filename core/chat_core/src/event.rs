@@ -31,6 +31,21 @@ pub enum CoreEvent {
     NetworkChanged(NetworkInfo),
     PeerChanged { revision: u64, peer: PeerInfo },
     ProbeTextReceived { peer_id: String, text: String },
+    /// New messages to notify about, grouped by conversation (M6): one event per directly
+    /// received text, and one per own-device sync once it ends.
+    Notify { items: Vec<NotifyItem> },
+}
+
+/// One conversation of a [`CoreEvent::Notify`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotifyItem {
+    pub conversation: crate::message::ConversationId,
+    pub peer: crate::account::PeerId,
+    /// Messages from the other account stored by this processing and still unread at its end.
+    pub new_messages: u32,
+    /// The conversation's unread count; with `new_messages == 0` the app only updates (or, at 0,
+    /// clears) the conversation's notification.
+    pub unread: u64,
 }
 
 /// Receives core events. Return `false` once the receiver is gone; the bus then drops it.

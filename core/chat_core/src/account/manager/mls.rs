@@ -255,6 +255,28 @@ enum Answer {
     Dial(Result<(iroh::endpoint::Connection, auth::AuthGrant), CoreError>),
 }
 
+/// Who made a received kind 17 request: the account and installation that sent it (its MLS
+/// sender), which for an entry of another own device's log (M6) is not the session's device.
+#[derive(Clone, Copy)]
+pub(super) struct Origin {
+    pub peer: PeerId,
+    pub installation: InstallationId,
+}
+
+/// How a received kind 17 request reached this device.
+pub(super) enum Via {
+    /// Over an authenticated session with the device that sent it; it waits for the answer.
+    Direct(Session),
+    /// Entry `seq` of own device `holder`'s log (M6 sync): nobody waits for an answer, and
+    /// nothing is sent to the original sender.
+    Mailbox {
+        holder: InstallationId,
+        // Names the entry for the plaintext hand-over (Task 7).
+        #[allow(dead_code)]
+        seq: u64,
+    },
+}
+
 /// The answer to one kind 17 request, or one record lookup, this actor started.
 pub(crate) struct MlsEvent {
     ticket: u64,
@@ -1614,7 +1636,12 @@ impl Manager {
 
     /// Spawns the dial of `peer`'s device `installation` under the record this device holds;
     /// false when there is no record to dial it under.
-    fn start_dial(&mut self, peer: PeerId, installation: InstallationId, request: Request) -> bool {
+    pub(super) fn start_dial(
+        &mut self,
+        peer: PeerId,
+        installation: InstallationId,
+        request: Request,
+    ) -> bool {
         if !self.local_authorized() {
             return false;
         }
@@ -1995,12 +2022,17 @@ impl Manager {
                 .envelope()
                 .to_vec());
         }
+        let from = Origin {
+            peer: session.grant.peer,
+            installation: session.grant.installation,
+        };
+        let via = Via::Direct(session);
         let reply = match MlsFrame::decode(inner) {
             Ok(MlsFrame::App {
                 conversation,
                 ciphertext,
             }) => match self
-                .receive_app(&session, conversation, ciphertext, request)
+                .receive_app(from, conversation, ciphertext, &via, request)
                 .await
             {
                 Ok(Some(reply)) => reply,
@@ -2021,7 +2053,7 @@ impl Manager {
                 }
                 Err(_) => MlsReply::Busy,
             },
-            Ok(frame) => match self.mls_request(&session, frame, request).await {
+            Ok(frame) => match self.mls_request(from, frame, &via, request).await {
                 Ok(reply) => reply,
                 Err(error)
                     if matches!(
@@ -2042,13 +2074,17 @@ impl Manager {
         Ok(reply.encode().to_vec())
     }
 
-    async fn mls_request(
+    /// A kind 17 request other than `App`, made by `from`. Authority (contact rule, member
+    /// leaves) is decided by `from`, however it came; what needs the session (asking the sender
+    /// back) runs only `Via::Direct`.
+    pub(super) async fn mls_request(
         &mut self,
-        session: &Session,
+        from: Origin,
         frame: MlsFrame,
+        via: &Via,
         request: Request,
     ) -> Result<MlsReply, CoreError> {
-        let sender = session.grant.peer;
+        let sender = from.peer;
         let now = self.schedule_now();
         // An authenticated kind 17 request from another account shows it speaks MLS (for the
         // M4-refusal decision only; the downgrade guard needs an accepted App/Commit/Welcome).
@@ -2056,7 +2092,7 @@ impl Manager {
             .local()
             .is_ok_and(|local| local.keys.peer_id() != sender)
         {
-            self.speaks_mls(session.grant.installation);
+            self.speaks_mls(from.installation);
         }
         Ok(match frame {
             MlsFrame::GroupQuery { conversation } => {
@@ -2082,7 +2118,7 @@ impl Manager {
                 }
                 // Each KeyPackage keeps private keys here until it is used: an installation gets
                 // at most one per `KEY_PACKAGE_GAP_MS`, and only its newest few are kept.
-                let asker = session.grant.installation;
+                let asker = from.installation;
                 let (handed, last) = self
                     .messages
                     .mls
@@ -2123,8 +2159,7 @@ impl Manager {
                     .ok()
                     .and_then(|info| MlsCredential::decode(&info.credential).ok());
                 if !asker.is_some_and(|credential| {
-                    credential.peer == sender
-                        && credential.installation == session.grant.installation
+                    credential.peer == sender && credential.installation == from.installation
                 }) {
                     return Ok(MlsReply::Busy);
                 }
@@ -2181,7 +2216,7 @@ impl Manager {
                     }
                 }
                 if sender == peer && matches!(outcome, Outcome::Ack | Outcome::Adopted) {
-                    self.peer_spoke(conversation, session.grant.installation, request)
+                    self.peer_spoke(conversation, from.installation, request)
                         .await?;
                 }
                 let reply = match outcome {
@@ -2204,10 +2239,10 @@ impl Manager {
                 welcome,
                 sender_install,
             } => {
-                let Some(from) = self.welcome_peer(conversation, sender) else {
+                let Some(welcome_from) = self.welcome_peer(conversation, sender) else {
                     return Ok(MlsReply::ContactRequired);
                 };
-                if sender_install != session.grant.installation {
+                if sender_install != from.installation {
                     return Ok(MlsReply::Busy);
                 }
                 let ct_hash = sha256(&welcome);
@@ -2218,12 +2253,14 @@ impl Manager {
                     .remove(&(conversation, sender_install))
                 else {
                     // Learn the group's first-Commit hash from the sender; its next attempt
-                    // is joined.
-                    if self
-                        .messages
-                        .mls
-                        .learning
-                        .insert((conversation, sender_install))
+                    // is joined. A logged Welcome has no sender to ask: the sender's own
+                    // delivery of it is joined instead.
+                    if let Via::Direct(session) = via
+                        && self
+                            .messages
+                            .mls
+                            .learning
+                            .insert((conversation, sender_install))
                     {
                         let body = MlsFrame::GroupQuery { conversation }.encode().to_vec();
                         let task = Task::Learn {
@@ -2234,7 +2271,7 @@ impl Manager {
                     }
                     return Ok(MlsReply::Busy);
                 };
-                let peer = match from {
+                let peer = match welcome_from {
                     WelcomeFrom::Contact(peer) => peer,
                     WelcomeFrom::OwnDevice => match self
                         .own_welcome_peer(conversation, &welcome, sender_install, request)
@@ -2280,7 +2317,7 @@ impl Manager {
                     _ => {}
                 }
                 if sender == peer && matches!(outcome, Outcome::Ack | Outcome::Joined) {
-                    self.peer_spoke(conversation, session.grant.installation, request)
+                    self.peer_spoke(conversation, from.installation, request)
                         .await?;
                 }
                 self.after_outcome(conversation, peer, outcome, request)
@@ -2364,16 +2401,20 @@ impl Manager {
         self.group_db(conversation, op, request).await.map(|_| ())
     }
 
-    /// A received application message (spec 5.2): opened and stored in one transaction. `None`
-    /// when it carried a text M4 would refuse (nothing stored; the ratchet still moved).
-    async fn receive_app(
+    /// A received application message (spec 5.2): opened and stored in one transaction, under
+    /// `from` (its MLS sender must be that installation). `None` when it carried a text M4
+    /// would refuse (nothing stored; the ratchet still moved). A text from the other account
+    /// stored just now is notified: at once `Via::Direct`, with the rest of the sync
+    /// `Via::Mailbox`.
+    pub(super) async fn receive_app(
         &mut self,
-        session: &Session,
+        from: Origin,
         conversation: ConversationId,
         ciphertext: Vec<u8>,
+        via: &Via,
         request: Request,
     ) -> Result<Option<MlsReply>, CoreError> {
-        let sender = session.grant.peer;
+        let sender = from.peer;
         // Application messages come from the conversation's peer account, or (spec 5.3) are a
         // copy of what another device of this account sent in a conversation with a contact.
         let own = sender == self.local()?.keys.peer_id();
@@ -2385,29 +2426,39 @@ impl Manager {
         };
         let op = MessageDbOp::OpenApp(
             sender,
-            session.grant.installation,
+            from.installation,
             conversation,
             ciphertext,
             self.services.clock.wall_ms(),
         );
         let result = self.message_db(op, request).await;
         if result.is_ok() && !own {
-            self.speaks_mls(session.grant.installation);
+            self.speaks_mls(from.installation);
         }
         match result {
             Ok(MessageDbReply::Opened(reply)) => Ok(Some(reply)),
-            Ok(MessageDbReply::OpenedText(reply, _key)) => {
+            Ok(MessageDbReply::OpenedText(reply, key, new)) => {
                 // The keyed response checkpoint of tests: the Ack that stores this text.
                 #[cfg(all(feature = "test-hooks", debug_assertions))]
-                {
-                    self.messages.ack_key = Some(_key);
+                if matches!(via, Via::Direct(_)) {
+                    self.messages.ack_key = Some(key);
+                }
+                if new {
+                    self.text_stored(key, via, request).await;
                 }
                 Ok(Some(reply))
             }
             Ok(MessageDbReply::Rejected) => Ok(None),
-            Ok(MessageDbReply::FarAhead { epoch }) => Ok(Some(
-                self.move_epoch(conversation, peer, epoch, request).await?,
-            )),
+            Ok(MessageDbReply::FarAhead { epoch }) => match via {
+                Via::Direct(_) => Ok(Some(
+                    self.move_epoch(conversation, peer, epoch, request).await?,
+                )),
+                // No sender waits to seal it again in a new epoch: it is not opened here.
+                Via::Mailbox { .. } => Ok(Some(MlsReply::DecryptFailed {
+                    class: CLASS_OUT_OF_ORDER,
+                    epoch,
+                })),
+            },
             Ok(_) => Err(unavailable(ErrorCode::InvalidMessage)),
             // The MLS sender is not the authenticated device, or the message conflicts.
             Err(error)

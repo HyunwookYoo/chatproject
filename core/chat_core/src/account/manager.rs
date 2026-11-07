@@ -78,6 +78,9 @@ enum Command {
     MessageAttempt(crate::message::types::MessageKey,bool,MessageMutation,oneshot::Sender<Result<(),CoreError>>),
     #[cfg(all(feature="test-hooks",debug_assertions))]
     Mls(mls::MlsTest,oneshot::Sender<Result<mls::MlsTestReply,CoreError>>),
+    #[cfg(all(feature="test-hooks",debug_assertions))]
+    MailboxTest(mailbox::MailboxTest,oneshot::Sender<Result<mailbox::MailboxTestReply,CoreError>>),
+    MailboxSyncNow(oneshot::Sender<Result<(),CoreError>>),
     Retry(oneshot::Sender<Result<u64, CoreError>>),
     #[cfg(all(feature="test-hooks",debug_assertions))]
     PairTestStop(super::PairTestStop,oneshot::Sender<Result<(),CoreError>>),
@@ -147,6 +150,9 @@ impl Command {
             Self::MessageAttempt(_,_,_,reply)=>{let _=reply.send(Err(error));}
             #[cfg(all(feature="test-hooks",debug_assertions))]
             Self::Mls(_,reply)=>{let _=reply.send(Err(error));}
+            #[cfg(all(feature="test-hooks",debug_assertions))]
+            Self::MailboxTest(_,reply)=>{let _=reply.send(Err(error));}
+            Self::MailboxSyncNow(reply)=>{let _=reply.send(Err(error));}
             Self::Retry(reply) => { let _ = reply.send(Err(error)); }
             #[cfg(all(feature="test-hooks",debug_assertions))]
             Self::PairTestStop(_,reply)=>{let _=reply.send(Err(error));}
@@ -394,6 +400,11 @@ impl AccountHandle {
     }
     pub async fn connect_account(&self, peer: PeerId) -> Result<(), CoreError> {
         self.send(|reply| Command::Connect(peer, reply)).await
+    }
+    /// The app came to the foreground (M6): dials this account's other devices that have no
+    /// session, and pulls what every connected one logged since the last sync.
+    pub async fn mailbox_sync_now(&self) -> Result<(), CoreError> {
+        self.send(Command::MailboxSyncNow).await
     }
     pub async fn refresh_record(&self, peer: PeerId) -> Result<(), CoreError> {
         self.send(|reply| Command::Refresh(peer, reply)).await
@@ -1209,6 +1220,9 @@ impl Manager {
                         Command::MessageAttempt(key,receipt,mutation,reply)=>{self.message_attempt(key,receipt,mutation,reply).await;}
                         #[cfg(all(feature="test-hooks",debug_assertions))]
                         Command::Mls(test,reply)=>{let result=self.mls_test(test).await;let _=reply.send(result);}
+                        #[cfg(all(feature="test-hooks",debug_assertions))]
+                        Command::MailboxTest(test,reply)=>{let result=self.mailbox_test(test).await;let _=reply.send(result);}
+                        Command::MailboxSyncNow(reply)=>{let result=self.mailbox_sync_now().await;let _=reply.send(result);}
                         Command::Retry(reply) => { let result = self.retry_open(); let _ = reply.send(result); }
                         #[cfg(all(feature="test-hooks",debug_assertions))]
                         Command::PairTestStop(stop,reply)=>{self.pair.stop=Some(stop);self.pair.reached=None;let _=reply.send(Ok(()));}
@@ -3060,6 +3074,8 @@ impl Manager {
             ready: true,
         });
         super::connection::reader(conn, self.auth.send.clone(), self.auth.cancel.child_token());
+        // Either side of a session with another own device pulls the other's log (M6).
+        self.mailbox_session_ready(&grant);
         Ok(())
     }
     async fn auth_input(&mut self, input: super::connection::Input) {
@@ -3070,6 +3086,7 @@ impl Manager {
             Input::MessageLookup(key,ticket,result)=>self.message_lookup(key,ticket,result).await,
             Input::MessageProof(result)=>self.message_proof(result).await,
             Input::Mls(event)=>self.mls_event(event).await,
+            Input::Mailbox(event)=>self.mailbox_event(event).await,
             Input::Incoming(conn) => {
                 let result = async {
                     let request = self.ready()?;
@@ -3257,6 +3274,11 @@ impl Manager {
         if body == [0x83, 1, 4, 0xf6] {
             conn.close(0u32.into(), b"fresh account proof required");
             return Err(unavailable(ErrorCode::AccountRestricted));
+        }
+        // Kind 18: own-device sync (manager/mailbox.rs). A session that is not with a current
+        // device of this account is answered `Refused`, not closed.
+        if let Ok(inner) = super::auth::payload(body, crate::mailbox::KIND) {
+            return self.receive_mailbox(conn, &inner, request).await;
         }
         if !ready || !self.grant_authorized(&grant) {
             return Err(unavailable(ErrorCode::AccountRestricted));
@@ -3896,3 +3918,4 @@ pub(super) mod messages;
 pub use messages::{MessageMutation,MessagePause,MessagePoint};
 pub(super) mod mls;
 pub use mls::GroupState;
+pub(super) mod mailbox;

@@ -163,6 +163,8 @@ pub(crate) enum Input {
     MessageLookup(crate::message::types::MessageKey,u64,Result<super::Lookup,CoreError>),
     MessageProof(super::manager::messages::ProofResult),
     Mls(super::manager::mls::MlsEvent),
+    /// A page (or failure) of an own-device sync request (M6).
+    Mailbox(super::manager::mailbox::MailboxEvent),
     Incoming(Connection),
     Control {
         connection: Connection,

@@ -777,6 +777,7 @@ pub(super) fn open_app(
                         installation: sender_install,
                         id: MessageId(id),
                     },
+                    false,
                 ),
                 None => ack,
             });
@@ -854,7 +855,7 @@ pub(super) fn open_app(
         "INSERT INTO processed_ct VALUES(?1,?2,?3,?4,?5)",
         params![
             match stored {
-                Stored::Yes => 2,
+                Stored::Yes | Stored::New => 2,
                 Stored::Rejected => REJECTED_CT,
             },
             sender_peer.0.as_slice(),
@@ -865,7 +866,7 @@ pub(super) fn open_app(
     )
     .map_err(sql)?;
     // A taken frame goes into the device log as received, under the leaf that sent it.
-    if matches!(stored, Stored::Yes) {
+    if matches!(stored, Stored::Yes | Stored::New) {
         let app = MlsFrame::App {
             conversation,
             ciphertext,
@@ -885,8 +886,14 @@ pub(super) fn open_app(
     finish(tx, fault)?;
     Ok(match (stored, text) {
         (Stored::Rejected, _) => MessageDbReply::Rejected,
-        (Stored::Yes, Some(key)) => MessageDbReply::OpenedText(MlsReply::Ack { ct_hash }, key),
-        (Stored::Yes, None) => ack,
+        // Only a text stored just now from the other account is new for a notification.
+        (Stored::New, Some(key)) => {
+            MessageDbReply::OpenedText(MlsReply::Ack { ct_hash }, key, !own)
+        }
+        (Stored::Yes, Some(key)) => {
+            MessageDbReply::OpenedText(MlsReply::Ack { ct_hash }, key, false)
+        }
+        (Stored::Yes | Stored::New, None) => ack,
     })
 }
 
@@ -914,6 +921,8 @@ pub(super) fn mark_peer_mls(
 /// store) or refused the way M4 refuses a text frame.
 enum Stored {
     Yes,
+    /// Taken, and its text was inserted just now.
+    New,
     Rejected,
 }
 
@@ -1078,7 +1087,7 @@ fn store_text(
         params![conversation.0.as_slice(), lamport, integer(revision)?, i64::from(!own)],
     )
     .map_err(sql)?;
-    Ok(Stored::Yes)
+    Ok(Stored::New)
 }
 
 // ---- test-hooks fixtures -------------------------------------------------------------------

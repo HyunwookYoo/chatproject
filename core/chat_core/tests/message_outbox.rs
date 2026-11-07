@@ -336,6 +336,8 @@ async fn reopen(f: Fixture, backend: Arc<Backend>, now: u64) -> Fixture {
     assert_eq!(observer.live_connections(), 0);
     let slot = CoreSlot::new();
     let bus = EventBus::new();
+    let events = Arc::new(Events::default());
+    bus.subscribe(events.clone());
     slot.start(
         CoreConfig {
             data_dir: _dir.path().into(),
@@ -367,6 +369,7 @@ async fn reopen(f: Fixture, backend: Arc<Backend>, now: u64) -> Fixture {
         _dir,
         slot,
         bus,
+        events,
         account,
         peer,
         clock,

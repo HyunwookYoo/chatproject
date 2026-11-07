@@ -63,6 +63,9 @@ pub(crate) enum MessageDbOp {
     MlsGroupOp(ConversationId, super::mls_group::GroupOp),
     /// The device log: pages, cursors, retention (M6).
     Mailbox(super::mailbox_store::MailboxDbOp),
+    /// Notification items (M6) for texts just stored: per conversation, those of the keys that
+    /// came from the other account and are still not seen here.
+    NotifyItems(Vec<MessageKey>),
     Messages(ConversationId, Option<MessageCursor>, u32),
     Conversations(Option<ConversationCursor>, u32),
 }
@@ -299,6 +302,9 @@ pub(crate) fn execute(
             };
             let reply = execute(c, identity, local, *op, #[cfg(all(feature="test-hooks",debug_assertions))] fault)?;
             let after = revision(c)?;
+            // The device log's head after the operation: the actor tells the other own devices
+            // when it moved (M6 `Notify`).
+            let head = super::mailbox_store::high_water(c)?;
             let mut events = Vec::new();
             if after > before && let Some(conversation) = cid {
                 events.push(crate::CoreEvent::MessagesChanged { revision: after, conversation });
@@ -307,7 +313,7 @@ pub(crate) fn execute(
                     events.push(crate::CoreEvent::MessageStateChanged { revision: after, key, state: view.state, cancel_requested: view.cancel_requested });
                 }
             }
-            Ok(MessageDbReply::Observed(Box::new(reply), events))
+            Ok(MessageDbReply::Observed(Box::new(reply), events, head))
         }
         MessageDbOp::MarkRead(id, keys, now) => mark_read(c, identity, id, keys, now, #[cfg(all(feature="test-hooks",debug_assertions))] fault),
         #[cfg(all(feature="test-hooks",debug_assertions))]
@@ -554,6 +560,7 @@ pub(crate) fn execute(
         MessageDbOp::M4Encode(key) => super::mls_store::m4_encode(c, identity, key),
         MessageDbOp::MlsGroupOp(id, op) => super::mls_group::group_op(c, identity, local, id, op, mls_fault!(fault)),
         MessageDbOp::Mailbox(op) => super::mailbox_store::mailbox_op(c, identity, op, mls_fault!(fault)),
+        MessageDbOp::NotifyItems(keys) => Ok(MessageDbReply::Notify(notify_items(c, &keys)?)),
         MessageDbOp::Messages(id, before, n) => {
             let take = limit(n)?;
             let (lamport, install, msg) = match before {
@@ -778,6 +785,15 @@ pub(crate) enum FixtureOp {
     MailboxState(tokio::sync::oneshot::Sender<R<super::mailbox_store::MailboxState>>),
     /// Records a `Frame` entry with this body at this time.
     MailboxRecord(Vec<u8>, u64, tokio::sync::oneshot::Sender<R<Option<u64>>>),
+    /// Records a `Frame` entry of this conversation, sender account and installation.
+    MailboxRecordAs(
+        ConversationId,
+        PeerId,
+        InstallationId,
+        Vec<u8>,
+        u64,
+        tokio::sync::oneshot::Sender<R<Option<u64>>>,
+    ),
     /// Device, handoff and status-ahead rows of an installation at a time.
     MailboxSeed(InstallationId, u64, tokio::sync::oneshot::Sender<R<()>>),
 }
@@ -901,6 +917,10 @@ pub(crate) fn fixture(c: &mut Connection, op: FixtureOp) {
         FixtureOp::MailboxRecord(body, now, reply) => {
             let _ = reply.send(super::mailbox_store::fixture_record(c, &body, now));
         }
+        FixtureOp::MailboxRecordAs(conversation, peer, installation, body, now, reply) => {
+            let ids = (conversation, peer, installation);
+            let _ = reply.send(super::mailbox_store::fixture_record_as(c, ids, &body, now));
+        }
         FixtureOp::MailboxSeed(installation, at, reply) => {
             let _ = reply.send(super::mailbox_store::fixture_seed(c, installation, at));
         }
@@ -1009,7 +1029,8 @@ fn fill(c: &mut Connection, key: MessageKey, count: u64, target: Option<u64>) ->
     tx.commit().map_err(sql_error)
 }
 pub(crate) enum MessageDbReply {
-    Observed(Box<MessageDbReply>, Vec<crate::CoreEvent>),
+    /// The reply, its events, and the device log's head (largest seq handed out) afterwards.
+    Observed(Box<MessageDbReply>, Vec<crate::CoreEvent>, u64),
     Due(
         Vec<super::scheduler::Dispatch>,
         Vec<super::scheduler::Dispatch>,
@@ -1027,13 +1048,15 @@ pub(crate) enum MessageDbReply {
     Opened(crate::mls::wire::MlsReply),
     /// A received MLS text that M4 would refuse: answered with an M4 `Reject(InvalidMessage)`.
     Rejected,
-    /// The reply for a received MLS ciphertext that carried (or carried before) this text.
-    OpenedText(crate::mls::wire::MlsReply, MessageKey),
+    /// The reply for a received MLS ciphertext that carried (or carried before) this text; true
+    /// when the text came from the other account and was stored just now.
+    OpenedText(crate::mls::wire::MlsReply, MessageKey, bool),
     /// A received MLS ciphertext of the current epoch (`epoch`) whose sender's ratchet is too far
     /// ahead of this device's view of it (C1). Nothing changed; only a new epoch can help.
     FarAhead { epoch: u64 },
     Group(super::mls_group::GroupReply),
     Mailbox(super::mailbox_store::MailboxDbReply),
+    Notify(Vec<crate::event::NotifyItem>),
     Conversation(ConversationView),
     Message(MessageView),
     Messages(MessagePage),
@@ -1174,6 +1197,42 @@ impl MessageDbOp {
             _ => None,
         })
     }
+}
+/// Of `keys` (texts just stored), those received from the other account and still not seen here,
+/// counted per conversation, with the conversation's peer and unread count.
+fn notify_items(c: &Connection, keys: &[MessageKey]) -> R<Vec<crate::event::NotifyItem>> {
+    let keys: std::collections::BTreeSet<MessageKey> = keys.iter().copied().collect();
+    let mut counts: std::collections::BTreeMap<ConversationId, u32> = Default::default();
+    for k in keys {
+        let unseen: bool = c
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM message WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4 AND outgoing=0 AND seen_local=0)",
+                params![k.conversation.0.as_slice(), k.sender.0.as_slice(), k.installation.0.as_slice(), k.id.0.as_slice()],
+                |r| r.get(0),
+            )
+            .map_err(sql_error)?;
+        if unseen {
+            *counts.entry(k.conversation).or_default() += 1;
+        }
+    }
+    counts
+        .into_iter()
+        .map(|(conversation, new_messages)| {
+            let (peer, unread) = c
+                .query_row(
+                    "SELECT peer,unread FROM conversation WHERE id=?1",
+                    params![conversation.0.as_slice()],
+                    |r| Ok((bytes::<32>(r, 0)?, uint(r, 1)?)),
+                )
+                .map_err(sql_error)?;
+            Ok(crate::event::NotifyItem {
+                conversation,
+                peer: PeerId(peer),
+                new_messages,
+                unread,
+            })
+        })
+        .collect()
 }
 impl MessageRepo {
     pub(crate) async fn operation(&self, op: MessageDbOp) -> R<MessageDbReply> {

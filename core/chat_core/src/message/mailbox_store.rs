@@ -232,7 +232,7 @@ pub(super) fn mailbox_op(
 
 /// The largest seq ever handed out (`AUTOINCREMENT` never reuses one, even after the log was
 /// pruned empty); 0 before the first entry.
-fn high_water(c: &Connection) -> R<u64> {
+pub(super) fn high_water(c: &Connection) -> R<u64> {
     c.query_row(
         "SELECT seq FROM sqlite_sequence WHERE name='mailbox_store'",
         [],
@@ -455,13 +455,29 @@ pub(super) fn fixture_state(c: &Connection) -> R<MailboxState> {
 /// Records a `Frame` entry with fixed ids and the given body.
 #[cfg(all(feature = "test-hooks", debug_assertions))]
 pub(super) fn fixture_record(c: &mut Connection, body: &[u8], now: u64) -> R<Option<u64>> {
+    let ids = (
+        ConversationId([1; 32]),
+        PeerId([2; 32]),
+        InstallationId([3; 32]),
+    );
+    fixture_record_as(c, ids, body, now)
+}
+
+/// Records a `Frame` entry of the given conversation, sender account and installation.
+#[cfg(all(feature = "test-hooks", debug_assertions))]
+pub(super) fn fixture_record_as(
+    c: &mut Connection,
+    (conversation, sender_peer, sender_install): (ConversationId, PeerId, InstallationId),
+    body: &[u8],
+    now: u64,
+) -> R<Option<u64>> {
     let tx = c.transaction().map_err(sql)?;
     let seq = record(
         &tx,
         &NewEntry {
-            conversation: ConversationId([1; 32]),
-            sender_peer: PeerId([2; 32]),
-            sender_install: InstallationId([3; 32]),
+            conversation,
+            sender_peer,
+            sender_install,
             kind: EntryKind::Frame,
             msg_id: None,
             body,

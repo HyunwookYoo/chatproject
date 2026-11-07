@@ -67,6 +67,8 @@ pub(super) struct Runtime {
     recovered: bool,
     /// MLS group lifecycle state (`manager/mls.rs`).
     pub(super) mls: super::mls::Runtime,
+    /// Own-device sync state (`manager/mailbox.rs`).
+    pub(super) mailbox: super::mailbox::Runtime,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     writes: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
@@ -756,7 +758,9 @@ impl Manager {
             self.message_storage_failure(e.code, request);
         }
         match result {
-            Ok(MessageDbReply::Observed(reply, events)) => {
+            Ok(MessageDbReply::Observed(reply, events, head)) => {
+                let mailbox = &mut self.messages.mailbox;
+                mailbox.head = mailbox.head.max(head);
                 self.ensure_ready(request)?;
                 for event in events { self.bus.publish(event); }
                 Ok(*reply)
@@ -1753,6 +1757,8 @@ impl Manager {
         // MLS group upkeep and its Commit/Welcome deliveries share this tick.
         self.poll_mls().await;
         self.poll_epoch_waits().await;
+        // Own-device sync: device list, retention, pulls and `Notify`s (`manager/mailbox.rs`).
+        self.poll_mailbox().await;
         #[cfg(all(feature = "test-hooks", debug_assertions))]
         if self.messages.scheduler_held {
             return;

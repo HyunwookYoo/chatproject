@@ -59,6 +59,7 @@ extension ChatEventPatterns on ChatEvent {
     TResult Function(ChatEvent_NetworkChanged value)? networkChanged,
     TResult Function(ChatEvent_PeerChanged value)? peerChanged,
     TResult Function(ChatEvent_ProbeTextReceived value)? probeTextReceived,
+    TResult Function(ChatEvent_Notify value)? notify,
     required TResult orElse(),
   }) {
     final _that = this;
@@ -83,6 +84,8 @@ extension ChatEventPatterns on ChatEvent {
         return peerChanged(_that);
       case ChatEvent_ProbeTextReceived() when probeTextReceived != null:
         return probeTextReceived(_that);
+      case ChatEvent_Notify() when notify != null:
+        return notify(_that);
       case _:
         return orElse();
     }
@@ -117,6 +120,7 @@ extension ChatEventPatterns on ChatEvent {
     required TResult Function(ChatEvent_PeerChanged value) peerChanged,
     required TResult Function(ChatEvent_ProbeTextReceived value)
     probeTextReceived,
+    required TResult Function(ChatEvent_Notify value) notify,
   }) {
     final _that = this;
     switch (_that) {
@@ -140,6 +144,8 @@ extension ChatEventPatterns on ChatEvent {
         return peerChanged(_that);
       case ChatEvent_ProbeTextReceived():
         return probeTextReceived(_that);
+      case ChatEvent_Notify():
+        return notify(_that);
     }
   }
 
@@ -167,6 +173,7 @@ extension ChatEventPatterns on ChatEvent {
     TResult? Function(ChatEvent_NetworkChanged value)? networkChanged,
     TResult? Function(ChatEvent_PeerChanged value)? peerChanged,
     TResult? Function(ChatEvent_ProbeTextReceived value)? probeTextReceived,
+    TResult? Function(ChatEvent_Notify value)? notify,
   }) {
     final _that = this;
     switch (_that) {
@@ -190,6 +197,8 @@ extension ChatEventPatterns on ChatEvent {
         return peerChanged(_that);
       case ChatEvent_ProbeTextReceived() when probeTextReceived != null:
         return probeTextReceived(_that);
+      case ChatEvent_Notify() when notify != null:
+        return notify(_that);
       case _:
         return null;
     }
@@ -227,6 +236,7 @@ extension ChatEventPatterns on ChatEvent {
     TResult Function(NetworkInfo info)? networkChanged,
     TResult Function(BigInt revision, PeerInfo peer)? peerChanged,
     TResult Function(String peerId, String text)? probeTextReceived,
+    TResult Function(List<NotifyItem> items)? notify,
     required TResult orElse(),
   }) {
     final _that = this;
@@ -264,6 +274,8 @@ extension ChatEventPatterns on ChatEvent {
         return peerChanged(_that.revision, _that.peer);
       case ChatEvent_ProbeTextReceived() when probeTextReceived != null:
         return probeTextReceived(_that.peerId, _that.text);
+      case ChatEvent_Notify() when notify != null:
+        return notify(_that.items);
       case _:
         return orElse();
     }
@@ -303,6 +315,7 @@ extension ChatEventPatterns on ChatEvent {
     required TResult Function(NetworkInfo info) networkChanged,
     required TResult Function(BigInt revision, PeerInfo peer) peerChanged,
     required TResult Function(String peerId, String text) probeTextReceived,
+    required TResult Function(List<NotifyItem> items) notify,
   }) {
     final _that = this;
     switch (_that) {
@@ -339,6 +352,8 @@ extension ChatEventPatterns on ChatEvent {
         return peerChanged(_that.revision, _that.peer);
       case ChatEvent_ProbeTextReceived():
         return probeTextReceived(_that.peerId, _that.text);
+      case ChatEvent_Notify():
+        return notify(_that.items);
     }
   }
 
@@ -374,6 +389,7 @@ extension ChatEventPatterns on ChatEvent {
     TResult? Function(NetworkInfo info)? networkChanged,
     TResult? Function(BigInt revision, PeerInfo peer)? peerChanged,
     TResult? Function(String peerId, String text)? probeTextReceived,
+    TResult? Function(List<NotifyItem> items)? notify,
   }) {
     final _that = this;
     switch (_that) {
@@ -410,6 +426,8 @@ extension ChatEventPatterns on ChatEvent {
         return peerChanged(_that.revision, _that.peer);
       case ChatEvent_ProbeTextReceived() when probeTextReceived != null:
         return probeTextReceived(_that.peerId, _that.text);
+      case ChatEvent_Notify() when notify != null:
+        return notify(_that.items);
       case _:
         return null;
     }
@@ -1216,6 +1234,79 @@ class _$ChatEvent_ProbeTextReceivedCopyWithImpl<$Res>
             ? _self.text
             : text // ignore: cast_nullable_to_non_nullable
                   as String,
+      ),
+    );
+  }
+}
+
+/// @nodoc
+
+class ChatEvent_Notify extends ChatEvent {
+  const ChatEvent_Notify({required final List<NotifyItem> items})
+    : _items = items,
+      super._();
+
+  final List<NotifyItem> _items;
+  List<NotifyItem> get items {
+    if (_items is EqualUnmodifiableListView) return _items;
+    // ignore: implicit_dynamic_type
+    return EqualUnmodifiableListView(_items);
+  }
+
+  /// Create a copy of ChatEvent
+  /// with the given fields replaced by the non-null parameter values.
+  @JsonKey(includeFromJson: false, includeToJson: false)
+  @pragma('vm:prefer-inline')
+  $ChatEvent_NotifyCopyWith<ChatEvent_Notify> get copyWith =>
+      _$ChatEvent_NotifyCopyWithImpl<ChatEvent_Notify>(this, _$identity);
+
+  @override
+  bool operator ==(Object other) {
+    return identical(this, other) ||
+        (other.runtimeType == runtimeType &&
+            other is ChatEvent_Notify &&
+            const DeepCollectionEquality().equals(other._items, _items));
+  }
+
+  @override
+  int get hashCode =>
+      Object.hash(runtimeType, const DeepCollectionEquality().hash(_items));
+
+  @override
+  String toString() {
+    return 'ChatEvent.notify(items: $items)';
+  }
+}
+
+/// @nodoc
+abstract mixin class $ChatEvent_NotifyCopyWith<$Res>
+    implements $ChatEventCopyWith<$Res> {
+  factory $ChatEvent_NotifyCopyWith(
+    ChatEvent_Notify value,
+    $Res Function(ChatEvent_Notify) _then,
+  ) = _$ChatEvent_NotifyCopyWithImpl;
+  @useResult
+  $Res call({List<NotifyItem> items});
+}
+
+/// @nodoc
+class _$ChatEvent_NotifyCopyWithImpl<$Res>
+    implements $ChatEvent_NotifyCopyWith<$Res> {
+  _$ChatEvent_NotifyCopyWithImpl(this._self, this._then);
+
+  final ChatEvent_Notify _self;
+  final $Res Function(ChatEvent_Notify) _then;
+
+  /// Create a copy of ChatEvent
+  /// with the given fields replaced by the non-null parameter values.
+  @pragma('vm:prefer-inline')
+  $Res call({Object? items = null}) {
+    return _then(
+      ChatEvent_Notify(
+        items: null == items
+            ? _self._items
+            : items // ignore: cast_nullable_to_non_nullable
+                  as List<NotifyItem>,
       ),
     );
   }

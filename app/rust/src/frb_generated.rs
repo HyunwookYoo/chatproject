@@ -1930,6 +1930,10 @@ impl SseDecode for crate::api::chat::ChatEvent {
                     text: var_text,
                 };
             }
+            10 => {
+                let mut var_items = <Vec<crate::api::chat::NotifyItem>>::sse_decode(deserializer);
+                return crate::api::chat::ChatEvent::Notify { items: var_items };
+            }
             _ => {
                 unimplemented!("");
             }
@@ -2223,6 +2227,18 @@ impl SseDecode for Vec<crate::api::message::MessageView> {
     }
 }
 
+impl SseDecode for Vec<crate::api::chat::NotifyItem> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut len_ = <i32>::sse_decode(deserializer);
+        let mut ans_ = vec![];
+        for idx_ in 0..len_ {
+            ans_.push(<crate::api::chat::NotifyItem>::sse_decode(deserializer));
+        }
+        return ans_;
+    }
+}
+
 impl SseDecode for Vec<crate::api::account::PairResumeView> {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
@@ -2399,6 +2415,22 @@ impl SseDecode for crate::api::chat::NetworkState {
             2 => crate::api::chat::NetworkState::Online,
             3 => crate::api::chat::NetworkState::Failed,
             _ => unreachable!("Invalid variant for NetworkState: {}", inner),
+        };
+    }
+}
+
+impl SseDecode for crate::api::chat::NotifyItem {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut var_conversation = <Vec<u8>>::sse_decode(deserializer);
+        let mut var_peer = <Vec<u8>>::sse_decode(deserializer);
+        let mut var_newMessages = <u32>::sse_decode(deserializer);
+        let mut var_unread = <u64>::sse_decode(deserializer);
+        return crate::api::chat::NotifyItem {
+            conversation: var_conversation,
+            peer: var_peer,
+            new_messages: var_newMessages,
+            unread: var_unread,
         };
     }
 }
@@ -3127,6 +3159,9 @@ impl flutter_rust_bridge::IntoDart for crate::api::chat::ChatEvent {
                 text.into_into_dart().into_dart(),
             ]
             .into_dart(),
+            crate::api::chat::ChatEvent::Notify { items } => {
+                [10.into_dart(), items.into_into_dart().into_dart()].into_dart()
+            }
             _ => {
                 unimplemented!("");
             }
@@ -3542,6 +3577,26 @@ impl flutter_rust_bridge::IntoIntoDart<crate::api::chat::NetworkState>
     for crate::api::chat::NetworkState
 {
     fn into_into_dart(self) -> crate::api::chat::NetworkState {
+        self
+    }
+}
+// Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::api::chat::NotifyItem {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        [
+            self.conversation.into_into_dart().into_dart(),
+            self.peer.into_into_dart().into_dart(),
+            self.new_messages.into_into_dart().into_dart(),
+            self.unread.into_into_dart().into_dart(),
+        ]
+        .into_dart()
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive for crate::api::chat::NotifyItem {}
+impl flutter_rust_bridge::IntoIntoDart<crate::api::chat::NotifyItem>
+    for crate::api::chat::NotifyItem
+{
+    fn into_into_dart(self) -> crate::api::chat::NotifyItem {
         self
     }
 }
@@ -4108,6 +4163,10 @@ impl SseEncode for crate::api::chat::ChatEvent {
                 <String>::sse_encode(peer_id, serializer);
                 <String>::sse_encode(text, serializer);
             }
+            crate::api::chat::ChatEvent::Notify { items } => {
+                <i32>::sse_encode(10, serializer);
+                <Vec<crate::api::chat::NotifyItem>>::sse_encode(items, serializer);
+            }
             _ => {
                 unimplemented!("");
             }
@@ -4353,6 +4412,16 @@ impl SseEncode for Vec<crate::api::message::MessageView> {
     }
 }
 
+impl SseEncode for Vec<crate::api::chat::NotifyItem> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <i32>::sse_encode(self.len() as _, serializer);
+        for item in self {
+            <crate::api::chat::NotifyItem>::sse_encode(item, serializer);
+        }
+    }
+}
+
 impl SseEncode for Vec<crate::api::account::PairResumeView> {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
@@ -4481,6 +4550,16 @@ impl SseEncode for crate::api::chat::NetworkState {
             },
             serializer,
         );
+    }
+}
+
+impl SseEncode for crate::api::chat::NotifyItem {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <Vec<u8>>::sse_encode(self.conversation, serializer);
+        <Vec<u8>>::sse_encode(self.peer, serializer);
+        <u32>::sse_encode(self.new_messages, serializer);
+        <u64>::sse_encode(self.unread, serializer);
     }
 }
 

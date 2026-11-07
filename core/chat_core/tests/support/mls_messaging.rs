@@ -152,6 +152,8 @@ fn stop(f: Fixture) -> tempfile::TempDir {
 async fn start(dir: tempfile::TempDir, backend: Arc<Backend>) -> Fixture {
     let slot = CoreSlot::new();
     let bus = EventBus::new();
+    let events = Arc::new(Events::default());
+    bus.subscribe(events.clone());
     slot.start(
         CoreConfig {
             data_dir: dir.path().into(),
@@ -174,6 +176,7 @@ async fn start(dir: tempfile::TempDir, backend: Arc<Backend>) -> Fixture {
         _dir: dir,
         slot,
         bus,
+        events,
         account,
         peer: peer_of(A),
         clock,

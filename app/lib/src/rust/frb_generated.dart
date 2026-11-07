@@ -1838,6 +1838,8 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           peerId: dco_decode_String(raw[1]),
           text: dco_decode_String(raw[2]),
         );
+      case 10:
+        return ChatEvent_Notify(items: dco_decode_list_notify_item(raw[1]));
       default:
         throw Exception("unreachable");
     }
@@ -2017,6 +2019,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  List<NotifyItem> dco_decode_list_notify_item(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return (raw as List<dynamic>).map(dco_decode_notify_item).toList();
+  }
+
+  @protected
   List<PairResumeView> dco_decode_list_pair_resume_view(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return (raw as List<dynamic>).map(dco_decode_pair_resume_view).toList();
@@ -2135,6 +2143,20 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   NetworkState dco_decode_network_state(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return NetworkState.values[raw as int];
+  }
+
+  @protected
+  NotifyItem dco_decode_notify_item(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 4)
+      throw Exception('unexpected arr length: expect 4 but see ${arr.length}');
+    return NotifyItem(
+      conversation: dco_decode_list_prim_u_8_strict(arr[0]),
+      peer: dco_decode_list_prim_u_8_strict(arr[1]),
+      newMessages: dco_decode_u_32(arr[2]),
+      unread: dco_decode_u_64(arr[3]),
+    );
   }
 
   @protected
@@ -2681,6 +2703,9 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
         var var_peerId = sse_decode_String(deserializer);
         var var_text = sse_decode_String(deserializer);
         return ChatEvent_ProbeTextReceived(peerId: var_peerId, text: var_text);
+      case 10:
+        var var_items = sse_decode_list_notify_item(deserializer);
+        return ChatEvent_Notify(items: var_items);
       default:
         throw UnimplementedError('');
     }
@@ -2905,6 +2930,18 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  List<NotifyItem> sse_decode_list_notify_item(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    var len_ = sse_decode_i_32(deserializer);
+    var ans_ = <NotifyItem>[];
+    for (var idx_ = 0; idx_ < len_; ++idx_) {
+      ans_.add(sse_decode_notify_item(deserializer));
+    }
+    return ans_;
+  }
+
+  @protected
   List<PairResumeView> sse_decode_list_pair_resume_view(
     SseDeserializer deserializer,
   ) {
@@ -3072,6 +3109,21 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     // Codec=Sse (Serialization based), see doc to use other codecs
     var inner = sse_decode_i_32(deserializer);
     return NetworkState.values[inner];
+  }
+
+  @protected
+  NotifyItem sse_decode_notify_item(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_conversation = sse_decode_list_prim_u_8_strict(deserializer);
+    var var_peer = sse_decode_list_prim_u_8_strict(deserializer);
+    var var_newMessages = sse_decode_u_32(deserializer);
+    var var_unread = sse_decode_u_64(deserializer);
+    return NotifyItem(
+      conversation: var_conversation,
+      peer: var_peer,
+      newMessages: var_newMessages,
+      unread: var_unread,
+    );
   }
 
   @protected
@@ -3722,6 +3774,9 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
         sse_encode_i_32(9, serializer);
         sse_encode_String(peerId, serializer);
         sse_encode_String(text, serializer);
+      case ChatEvent_Notify(items: final items):
+        sse_encode_i_32(10, serializer);
+        sse_encode_list_notify_item(items, serializer);
     }
   }
 
@@ -3907,6 +3962,18 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_list_notify_item(
+    List<NotifyItem> self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_i_32(self.length, serializer);
+    for (final item in self) {
+      sse_encode_notify_item(item, serializer);
+    }
+  }
+
+  @protected
   void sse_encode_list_pair_resume_view(
     List<PairResumeView> self,
     SseSerializer serializer,
@@ -4040,6 +4107,15 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   void sse_encode_network_state(NetworkState self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_i_32(self.index, serializer);
+  }
+
+  @protected
+  void sse_encode_notify_item(NotifyItem self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_list_prim_u_8_strict(self.conversation, serializer);
+    sse_encode_list_prim_u_8_strict(self.peer, serializer);
+    sse_encode_u_32(self.newMessages, serializer);
+    sse_encode_u_64(self.unread, serializer);
   }
 
   @protected

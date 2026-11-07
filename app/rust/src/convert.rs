@@ -1,7 +1,8 @@
 //! Conversions between chat_core types and the types Dart sees.
 
 use crate::api::chat::{
-    ChatEvent, CoreError, CoreInfo, ErrorCode, NetworkInfo, NetworkState, PeerInfo, PeerPath, PeerPhase,
+    ChatEvent, CoreError, CoreInfo, ErrorCode, NetworkInfo, NetworkState, NotifyItem, PeerInfo, PeerPath,
+    PeerPhase,
 };
 use crate::frb_generated::StreamSink;
 
@@ -136,6 +137,20 @@ impl From<chat_core::CoreEvent> for ChatEvent {
             chat_core::CoreEvent::ProbeTextReceived { peer_id, text } => {
                 Self::ProbeTextReceived { peer_id, text }
             }
+            chat_core::CoreEvent::Notify { items } => {
+                Self::Notify { items: items.into_iter().map(NotifyItem::from).collect() }
+            }
+        }
+    }
+}
+
+impl From<chat_core::NotifyItem> for NotifyItem {
+    fn from(item: chat_core::NotifyItem) -> Self {
+        Self {
+            conversation: item.conversation.0.to_vec(),
+            peer: item.peer.0.to_vec(),
+            new_messages: item.new_messages,
+            unread: item.unread,
         }
     }
 }
@@ -459,6 +474,25 @@ mod tests {
             ChatEvent::ProbeTextReceived {
                 peer_id: "d".repeat(64),
                 text: "\u{c548}\u{b155} \u{1f30f}".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn notify_keeps_every_conversation_item() {
+        let item = |n: u8, new_messages, unread| chat_core::NotifyItem {
+            conversation: chat_core::ConversationId([n; 32]),
+            peer: chat_core::account::PeerId([n + 1; 32]),
+            new_messages,
+            unread,
+        };
+        assert_eq!(
+            ChatEvent::from(chat_core::CoreEvent::Notify { items: vec![item(1, 5, 7), item(3, 0, 0)] }),
+            ChatEvent::Notify {
+                items: vec![
+                    NotifyItem { conversation: vec![1; 32], peer: vec![2; 32], new_messages: 5, unread: 7 },
+                    NotifyItem { conversation: vec![3; 32], peer: vec![4; 32], new_messages: 0, unread: 0 },
+                ],
             }
         );
     }

@@ -149,6 +149,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   List<MessageView> dco_decode_list_message_view(dynamic raw);
 
   @protected
+  List<NotifyItem> dco_decode_list_notify_item(dynamic raw);
+
+  @protected
   List<PairResumeView> dco_decode_list_pair_resume_view(dynamic raw);
 
   @protected
@@ -186,6 +189,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   NetworkState dco_decode_network_state(dynamic raw);
+
+  @protected
+  NotifyItem dco_decode_notify_item(dynamic raw);
 
   @protected
   String? dco_decode_opt_String(dynamic raw);
@@ -427,6 +433,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   List<MessageView> sse_decode_list_message_view(SseDeserializer deserializer);
 
   @protected
+  List<NotifyItem> sse_decode_list_notify_item(SseDeserializer deserializer);
+
+  @protected
   List<PairResumeView> sse_decode_list_pair_resume_view(
     SseDeserializer deserializer,
   );
@@ -472,6 +481,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   NetworkState sse_decode_network_state(SseDeserializer deserializer);
+
+  @protected
+  NotifyItem sse_decode_notify_item(SseDeserializer deserializer);
 
   @protected
   String? sse_decode_opt_String(SseDeserializer deserializer);
@@ -779,6 +791,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_list_notify_item(
+    List<NotifyItem> self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_list_pair_resume_view(
     List<PairResumeView> self,
     SseSerializer serializer,
@@ -831,6 +849,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_network_state(NetworkState self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_notify_item(NotifyItem self, SseSerializer serializer);
 
   @protected
   void sse_encode_opt_String(String? self, SseSerializer serializer);

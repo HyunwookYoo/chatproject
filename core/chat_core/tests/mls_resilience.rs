@@ -70,6 +70,10 @@ async fn three() -> (Vec<Fixture>, Arc<Backend>, ConversationId) {
     let a2 = device(A, A2, &ra, &net).await;
     let b1 = device(B, B1, &rb, &net).await;
     let devices = vec![a1, a2, b1];
+    // The test carries the application messages: A1 and A2 do not sync their logs (M6) either.
+    for f in &devices {
+        f.account.mailbox_test_hold(true).await.unwrap();
+    }
     befriend(&devices[DA1], &devices[DB1]).await;
     befriend(&devices[DA2], &devices[DB1]).await;
     befriend(&devices[DB1], &devices[DA1]).await;
@@ -113,6 +117,7 @@ async fn restart(f: Fixture, account: u8, net: &Arc<Backend>) -> Fixture {
     let mut f = start(stop(f), net.clone()).await;
     f.peer = peer_of(account);
     f.account.message_test_hold_scheduler(true).await.unwrap();
+    f.account.mailbox_test_hold(true).await.unwrap();
     f
 }
 
