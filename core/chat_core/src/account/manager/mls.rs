@@ -1801,38 +1801,37 @@ impl Manager {
     }
 
     /// The current devices of `peer` as this device holds its record: those its accepted
-    /// record lists, and for this account without the ones it revoked.
+    /// record lists, and for this account without the ones it revoked (by installation or
+    /// transport key, as the group's leaf vetting drops them).
     fn current_installations(&self, peer: PeerId) -> Vec<InstallationId> {
         let Ok(local) = self.local() else {
             return Vec::new();
         };
-        let devices = |record: &crate::account::publication::SignedRecord| {
-            record
-                .record
-                .devices
+        let record = if peer == local.keys.peer_id() {
+            local.records.accepted.as_ref()
+        } else {
+            local
+                .remote
                 .iter()
-                .map(|d| d.installation_id)
-                .collect::<Vec<_>>()
+                .find(|r| r.peer == peer)
+                .map(|r| &r.accepted)
         };
-        if peer == local.keys.peer_id() {
-            let Some(accepted) = &local.records.accepted else {
-                return Vec::new();
-            };
-            let mut devices = devices(accepted);
-            devices.retain(|d| {
-                !local
-                    .records
-                    .tombstones
-                    .iter()
-                    .any(|t| t.target_installation == *d)
-            });
-            return devices;
-        }
-        local
-            .remote
+        let Some(record) = record else {
+            return Vec::new();
+        };
+        let own = peer == local.keys.peer_id();
+        record
+            .record
+            .devices
             .iter()
-            .find(|r| r.peer == peer)
-            .map_or_else(Vec::new, |r| devices(&r.accepted))
+            .filter(|d| {
+                !own || !local.records.tombstones.iter().any(|t| {
+                    t.target_installation == d.installation_id
+                        || t.target_transport == d.transport_public_key
+                })
+            })
+            .map(|d| d.installation_id)
+            .collect()
     }
 
     fn mls_fingerprint(&self) -> [u8; 32] {

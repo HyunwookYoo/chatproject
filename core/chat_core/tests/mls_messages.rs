@@ -841,28 +841,32 @@ async fn revoked_or_foreign_leaf_via_mailbox_is_rejected() {
             false
         }
     );
+    // Then A1 has a new session with B1 (B1 dropped A's sessions when it took the record).
     settle!(
         all,
-        !state(&b1, conv).await.members.contains(&ia3) || {
-            let renewed = net.packets.lock().unwrap()[&a1.peer].clone();
-            if b1.account.refresh_record(a1.peer).await.is_err() {
-                let _ = b1
-                    .account
-                    .confirm_remote_record(a1.peer, chat_core::account::record_hash(&renewed))
-                    .await;
+        (!state(&b1, conv).await.members.contains(&ia3)
+            && a1.account.connect_account(b1.peer).await.is_ok())
+            || {
+                let renewed = net.packets.lock().unwrap()[&a1.peer].clone();
+                if b1.account.refresh_record(a1.peer).await.is_err() {
+                    let _ = b1
+                        .account
+                        .confirm_remote_record(a1.peer, chat_core::account::record_hash(&renewed))
+                        .await;
+                }
+                false
             }
-            false
-        }
     );
-    // A1 hands A3's ciphertext over (in a new session: B1 took A's new record). It is from the
-    // epoch before the removal, which B1 still opens.
-    a1.account.connect_account(b1.peer).await.unwrap();
+    // A1 hands A3's ciphertext over. It is from the epoch before the removal, which B1 still
+    // opens.
     let before = state(&b1, conv).await;
     let error = hand_over(a1, &b1, conv, &ct).await.err().unwrap();
     assert_eq!(error.code, ErrorCode::InvalidMessage);
     assert!(message(&b1, revoked).await.is_none());
+    // Opened, then refused for its leaf (B1's group state itself may move on meanwhile with
+    // the Commits after the removal, so only what this ciphertext would add is compared).
     let after = state(&b1, conv).await;
-    assert_eq!(kept(&after), kept(&before));
+    assert_eq!(after.processed_mls, before.processed_mls);
     assert_eq!(after.open_calls, before.open_calls + 1);
 }
 

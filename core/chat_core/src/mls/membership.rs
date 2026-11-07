@@ -539,7 +539,9 @@ mod tests {
     fn talks(from: &Dev, to: &Dev, gid: &[u8], n: u8) {
         let ct = from.seal(gid, n);
         match to.open(gid, &ct).unwrap() {
-            Opened::Application { sender, message } => {
+            Opened::Application {
+                sender, message, ..
+            } => {
                 assert_eq!(sender, from.installation());
                 assert_eq!(message, chat(n));
             }

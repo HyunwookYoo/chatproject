@@ -830,14 +830,20 @@ pub(super) fn open_app(
         }
         Err(failure) => return Ok(decrypt_failed(failure.class, group.epoch)),
     };
-    // The leaf that sealed it: a current device of the account, which is the sender here.
-    let (sender_install, message) = match opened {
-        Opened::Application { sender, message } => (sender, Some(message)),
-        Opened::Undecodable { sender } => (sender, None),
+    // The leaf that sealed it: a current device of the account, which is the sender here. Its
+    // credential must name that account too (an installation id is unique only within one
+    // record, so another account's record could list it).
+    let (account, sender_install, message) = match opened {
+        Opened::Application {
+            account,
+            sender,
+            message,
+        } => (account, sender, Some(message)),
+        Opened::Undecodable { account, sender } => (account, sender, None),
         // A Commit is applied through the group protocol (with its members vetted), never here.
         Opened::Commit { .. } => return Ok(decrypt_failed(group::CLASS_OTHER, group.epoch)),
     };
-    if !from.allowed.contains(&sender_install) {
+    if account != sender_peer || !from.allowed.contains(&sender_install) {
         return Err(invalid());
     }
     let mut stored = Stored::Yes;

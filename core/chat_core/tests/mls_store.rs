@@ -668,6 +668,50 @@ async fn a_leaf_outside_the_senders_current_devices_is_rejected() {
     ack(&open(&b, &a, conversation, &ct).await);
 }
 
+/// Installation ids are unique only within one record: an account whose record lists another
+/// account's installation id still cannot bring that device's leaf as its own. Here B's own
+/// record "lists" A1's id and a device of B's carries A1's ciphertext as B's.
+#[tokio::test]
+async fn a_listed_installation_of_another_account_is_rejected() {
+    let (a, b, conversation) = linked().await;
+    let key = send(&a, &b, 1, "A1's text, claimed by B").await;
+    a.m.mls_seal(key, NOW).await.unwrap().unwrap();
+    let ct = ciphertext(&a, key).await;
+    let before = b.f.mls_state(conversation).await.unwrap();
+    let counts = b.f.message_counts().await.unwrap();
+    let log = b.f.mailbox_state().await.unwrap();
+
+    let error =
+        b.m.mls_open_app_from(
+            b.peer,
+            A2,
+            vec![b.install, A2, a.install],
+            conversation,
+            ct.clone(),
+            NOW,
+        )
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.code, ErrorCode::InvalidMessage);
+
+    let after = b.f.mls_state(conversation).await.unwrap();
+    assert_eq!(
+        (after.kv_digest, after.processed_mls, after.peer_mls),
+        (before.kv_digest, 0, before.peer_mls)
+    );
+    assert_eq!(b.f.message_counts().await.unwrap(), counts);
+    assert_eq!(b.f.mailbox_state().await.unwrap(), log);
+    assert!(
+        b.m.load_messages(conversation, None, 50)
+            .await
+            .unwrap()
+            .items
+            .is_empty()
+    );
+    ack(&open(&b, &a, conversation, &ct).await);
+}
+
 #[tokio::test]
 async fn waiting_peer_update_is_a_flag_on_the_outbox_row() {
     let (a, b, _) = linked().await;

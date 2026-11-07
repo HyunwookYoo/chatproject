@@ -14,7 +14,7 @@ use super::identity::MlsCredential;
 use super::kv::KvError;
 use super::payload::ChatMessage;
 use super::{MAX_FORWARD, MAX_PAST_EPOCHS, MlsProvider, OUT_OF_ORDER};
-use crate::account::InstallationId;
+use crate::account::{InstallationId, PeerId};
 use crate::message::types::ConversationId;
 use crate::{CoreError, ErrorCode};
 
@@ -287,7 +287,9 @@ pub(crate) fn seal(
 }
 
 pub(crate) enum Opened {
+    /// `account` and `sender` are the account and installation of the leaf's credential.
     Application {
+        account: PeerId,
         sender: InstallationId,
         message: ChatMessage,
     },
@@ -295,21 +297,30 @@ pub(crate) enum Opened {
     Commit { epoch: u64 },
     /// An authenticated application message whose plaintext cannot be decoded into a
     /// `ChatMessage`. The ratchet has advanced; the caller acknowledges and drops it.
-    Undecodable { sender: InstallationId },
+    Undecodable {
+        account: PeerId,
+        sender: InstallationId,
+    },
 }
 
 impl std::fmt::Debug for Opened {
     /// Never prints message content.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Application { sender, message } => f
+            Self::Application {
+                account,
+                sender,
+                message,
+            } => f
                 .debug_struct("Application")
+                .field("account", account)
                 .field("sender", sender)
                 .field("message", message)
                 .finish(),
             Self::Commit { epoch } => f.debug_struct("Commit").field("epoch", epoch).finish(),
-            Self::Undecodable { sender } => f
+            Self::Undecodable { account, sender } => f
                 .debug_struct("Undecodable")
+                .field("account", account)
                 .field("sender", sender)
                 .finish(),
         }
@@ -410,22 +421,21 @@ pub(crate) fn open(
     match processed.into_content() {
         ProcessedMessageContent::ApplicationMessage(application) => {
             let plaintext = Zeroizing::new(application.into_bytes());
-            let installation = BasicCredential::try_from(sender)
+            let credential = BasicCredential::try_from(sender)
                 .ok()
                 .and_then(|basic| MlsCredential::decode(basic.identity()).ok())
-                .map(|credential| credential.installation)
                 .ok_or(fail(CLASS_OTHER))?;
+            let (account, sender) = (credential.peer, credential.installation);
             // The message already decrypted and authenticated, so a payload that does not
             // parse is not a decrypt failure: reporting one would make the sender re-encrypt
             // the same plaintext forever.
             Ok(match ChatMessage::decode_padded(&plaintext) {
                 Ok(message) => Opened::Application {
-                    sender: installation,
+                    account,
+                    sender,
                     message,
                 },
-                Err(_) => Opened::Undecodable {
-                    sender: installation,
-                },
+                Err(_) => Opened::Undecodable { account, sender },
             })
         }
         ProcessedMessageContent::StagedCommitMessage(staged) => {
@@ -617,7 +627,9 @@ mod tests {
 
         let ct = a.seal(&gid, &chat(1));
         match b.open(&gid, &ct).unwrap() {
-            Opened::Application { sender, message } => {
+            Opened::Application {
+                sender, message, ..
+            } => {
                 assert_eq!(sender, a.installation());
                 assert_eq!(message, chat(1));
             }
@@ -632,7 +644,9 @@ mod tests {
         };
         let ct2 = b.seal(&gid, &reply);
         match a.open(&gid, &ct2).unwrap() {
-            Opened::Application { sender, message } => {
+            Opened::Application {
+                sender, message, ..
+            } => {
                 assert_eq!(sender, b.installation());
                 assert_eq!(message, reply);
             }
@@ -733,7 +747,7 @@ mod tests {
         for (name, plaintext) in plaintexts {
             let ct = seal_raw(&a, &gid, &plaintext);
             match b.open(&gid, &ct) {
-                Ok(Opened::Undecodable { sender }) => {
+                Ok(Opened::Undecodable { sender, .. }) => {
                     assert_eq!(sender, a.installation(), "{name}")
                 }
                 other => panic!("{name}: expected Undecodable, got {other:?}"),
