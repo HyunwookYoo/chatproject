@@ -21,7 +21,13 @@
 //! Notifications (`CoreEvent::Notify`): a pull, once it ends, reports per conversation the texts
 //! from the other account it stored that are still unread, and the conversations whose messages
 //! it found read on another own device (spec 6.4: the app clears or updates their notification);
-//! a text received directly, or my read sent directly, is reported on its own at once.
+//! a text received directly, or my read sent directly, is reported on its own at once. Each
+//! text a pull stores is marked for that in the transaction that stores it (Ruling 35), so what
+//! a run stored and died before reporting is reported after it starts again: with the next pull
+//! from that device that ends, or `RESTART_NOTIFY_MS` after the start.
+//!
+//! A pull that fails short of the end of the log (no answer, `Busy`, storage) is tried again
+//! after a back-off, `PULL_RETRY_MIN_MS` doubling to `PULL_RETRY_MAX_MS` (final review I1).
 //!
 //! Outbox handoff (spec 7): when the app goes to the background (`mailbox_background`), and
 //! once a session with another own device is ready and its pull is done, this device hands the
@@ -69,6 +75,10 @@ const UPTIME_EVERY_MS: u64 = 60_000;
 /// with each failure in a row up to `PULL_RETRY_MAX_MS`.
 const PULL_RETRY_MIN_MS: u64 = 1_000;
 const PULL_RETRY_MAX_MS: u64 = 30_000;
+/// Texts a run stored from another own device's log and died before notifying (Ruling 35) are
+/// notified with the next pull from that device that ends, or this long after the start when no
+/// pull from it runs by then.
+const RESTART_NOTIFY_MS: u64 = 60_000;
 
 /// A handed-off ciphertext's row: the device that handed it over, conversation, message.
 type HandoffKey = (InstallationId, ConversationId, MessageId);
@@ -93,6 +103,9 @@ pub(crate) struct Runtime {
     devices: Option<Vec<InstallationId>>,
     /// Scheduler time of the next prune.
     prune_at: u64,
+    /// Scheduler time the texts marked for notification by an earlier run are notified, those
+    /// of holders no pull runs from then (`None`: not started; `u64::MAX`: done).
+    restart_notify_at: Option<u64>,
     /// A session with another own device became ready: what is not delivered goes to the
     /// mailboxes among them once no pull runs (what a pull brings may settle some of it first).
     handoff_due: bool,
@@ -128,6 +141,11 @@ pub(crate) struct Runtime {
     halt_after: Option<u64>,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     stored: u64,
+    /// After this many pages stored by pulls, processing stops as if the device died there.
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    halt_after_pages: Option<u64>,
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    pages: u64,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     halted: bool,
     /// Entries skipped because their holder had no plaintext record for them (`NoPlain`).
@@ -193,8 +211,6 @@ impl Runtime {
 struct Pull {
     /// The session's connection.
     conn: usize,
-    /// Texts from the other account this pull stored, for its notification.
-    fresh: Vec<MessageKey>,
     /// Conversations whose messages this pull found read on another own device.
     read: BTreeSet<ConversationId>,
     /// Another pull was asked for while this one ran.
@@ -365,6 +381,8 @@ pub(crate) enum MailboxTest {
     Exchange(InstallationId, MailboxFrame),
     /// Stops all sync processing after this many texts stored by pulls.
     HaltAfter(u64),
+    /// Stops all sync processing once pulls stored this many pages (their cursors moved).
+    HaltAfterPages(u64),
     /// Pauses (or resumes) sync: no upkeep, pulls or `Notify`; requests answered `Busy`.
     Hold(bool),
     /// The next this many page requests of pulls fail as timed out, without being sent.
@@ -429,6 +447,13 @@ impl AccountHandle {
     /// processing them (no cursor moves, no notification) until it is restarted.
     pub async fn mailbox_test_halt_after(&self, texts: u64) -> Result<(), CoreError> {
         self.mailbox_test(MailboxTest::HaltAfter(texts))
+            .await
+            .map(|_| ())
+    }
+    /// A crash between pages: once pulls stored `pages` pages (and moved their cursors), this
+    /// core stops processing (no further page, no notification) until it is restarted.
+    pub async fn mailbox_test_halt_after_pages(&self, pages: u64) -> Result<(), CoreError> {
+        self.mailbox_test(MailboxTest::HaltAfterPages(pages))
             .await
             .map(|_| ())
     }
@@ -501,6 +526,10 @@ impl Manager {
                 let mailbox = &mut self.messages.mailbox;
                 mailbox.halt_after = Some(texts);
                 mailbox.halted = mailbox.stored >= texts;
+                MailboxTestReply::Done
+            }
+            MailboxTest::HaltAfterPages(pages) => {
+                self.messages.mailbox.halt_after_pages = Some(pages);
                 MailboxTestReply::Done
             }
             MailboxTest::Hold(hold) => {
@@ -961,6 +990,23 @@ impl Manager {
                 }
             }
         }
+        // Ruling 35: what an earlier run stored from a log and did not notify before it died,
+        // for holders no pull runs from now (a running one notifies it when it ends).
+        let mailbox = &mut self.messages.mailbox;
+        let at = *mailbox
+            .restart_notify_at
+            .get_or_insert(now.saturating_add(RESTART_NOTIFY_MS));
+        if now >= at {
+            let op = MailboxDbOp::TakeNotify {
+                holder: None,
+                running: mailbox.pulls.keys().copied().collect(),
+                read: Vec::new(),
+            };
+            if let Ok(MailboxDbReply::Notify(items)) = self.mailbox_db(op, request).await {
+                self.messages.mailbox.restart_notify_at = Some(u64::MAX);
+                self.publish_notify(items);
+            }
+        }
         let mailbox = &mut self.messages.mailbox;
         let head = mailbox.head;
         for session in &usable {
@@ -1247,7 +1293,6 @@ impl Manager {
             installation,
             Pull {
                 conn: holder.conn.stable_id(),
-                fresh: Vec::new(),
                 read: BTreeSet::new(),
                 again: false,
             },
@@ -1380,6 +1425,16 @@ impl Manager {
         if self.mailbox_db(pulled, request).await.is_err() {
             self.end_pull(holder, Ended::Failed, request).await;
             return;
+        }
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        {
+            let mailbox = &mut self.messages.mailbox;
+            mailbox.pages += 1;
+            if mailbox.halt_after_pages.is_some_and(|n| mailbox.pages >= n) {
+                mailbox.halted = true;
+                mailbox.pulls.remove(&holder);
+                return;
+            }
         }
         let session = self
             .own_sessions()
@@ -1637,9 +1692,10 @@ impl Manager {
             id: record.msg_id,
         };
         let op = MailboxDbOp::StorePlain {
-            record,
+            record: Box::new(record),
             peer,
             ct_hash: entry.ct_hash,
+            holder,
             now: self.services.clock.wall_ms(),
         };
         match self.mailbox_db(op, request).await {
@@ -1659,17 +1715,15 @@ impl Manager {
     }
 
     /// A text from the other account was stored just now: notified at once when it came
-    /// directly, with the rest of its pull when it came from another own device's log.
+    /// directly, with the rest of its pull when it came from another own device's log (the
+    /// storing transaction marked it for that, Ruling 35).
     pub(super) async fn text_stored(&mut self, key: MessageKey, via: &Via, request: Request) {
         match via {
             Via::Direct(_) => self.notify(vec![key], Vec::new(), request).await,
-            Via::Mailbox { holder, .. } => {
-                let mailbox = &mut self.messages.mailbox;
-                if let Some(pull) = mailbox.pulls.get_mut(holder) {
-                    pull.fresh.push(key);
-                }
+            Via::Mailbox { .. } => {
                 #[cfg(all(feature = "test-hooks", debug_assertions))]
                 {
+                    let mailbox = &mut self.messages.mailbox;
                     mailbox.stored += 1;
                     if mailbox.halt_after.is_some_and(|n| mailbox.stored >= n) {
                         mailbox.halted = true;
@@ -1697,8 +1751,9 @@ impl Manager {
         }
     }
 
-    /// The pull from `holder` is over: what it stored and is still unread is notified, per
-    /// conversation, in one event, with the conversations it found read elsewhere. A pull that
+    /// The pull from `holder` is over: what pulls from it stored and is still unread is
+    /// notified, per conversation, in one event, with the conversations it found read
+    /// elsewhere; also what a run that died before its pull ended stored (Ruling 35). A pull that
     /// failed is tried again after a back-off (final review I1: nothing else may come to pull
     /// again); one that got to the end of the log ends the back-off.
     async fn end_pull(&mut self, holder: InstallationId, ended: Ended, request: Request) {
@@ -1717,9 +1772,14 @@ impl Manager {
         if pull.again {
             mailbox.due.insert(holder);
         }
-        if !pull.fresh.is_empty() || !pull.read.is_empty() {
-            self.notify(pull.fresh, pull.read.into_iter().collect(), request)
-                .await;
+        let op = MailboxDbOp::TakeNotify {
+            holder: Some(holder),
+            running: Vec::new(),
+            read: pull.read.into_iter().collect(),
+        };
+        // A failure leaves the marks for the next pull from it, or the next start.
+        if let Ok(MailboxDbReply::Notify(items)) = self.mailbox_db(op, request).await {
+            self.publish_notify(items);
         }
     }
 
@@ -1727,16 +1787,22 @@ impl Manager {
         if let Ok(MessageDbReply::Notify(items)) = self
             .message_db(MessageDbOp::NotifyItems(keys, read), request)
             .await
-            && !items.is_empty()
         {
-            #[cfg(all(feature = "test-hooks", debug_assertions))]
-            {
-                let new: u64 = items.iter().map(|i| u64::from(i.new_messages)).sum();
-                let mailbox = &mut self.messages.mailbox;
-                mailbox.alerts += u64::from(new > 0);
-                mailbox.alerted_messages += new;
-            }
-            self.bus.publish(crate::CoreEvent::Notify { items });
+            self.publish_notify(items);
         }
+    }
+
+    fn publish_notify(&mut self, items: Vec<crate::event::NotifyItem>) {
+        if items.is_empty() {
+            return;
+        }
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        {
+            let new: u64 = items.iter().map(|i| u64::from(i.new_messages)).sum();
+            let mailbox = &mut self.messages.mailbox;
+            mailbox.alerts += u64::from(new > 0);
+            mailbox.alerted_messages += new;
+        }
+        self.bus.publish(crate::CoreEvent::Notify { items });
     }
 }

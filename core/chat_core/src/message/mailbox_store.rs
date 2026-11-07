@@ -20,7 +20,7 @@ use super::scheduler::retry_delay_capped;
 use super::store::{
     Identity, MessageDbReply, bump, bytes, conversation_id, integer, invalid, uint,
 };
-use super::types::{ConversationId, MessageId};
+use super::types::{ConversationId, MessageId, MessageKey};
 use crate::CoreError;
 use crate::account::{InstallationId, PeerId};
 use crate::mailbox::{
@@ -56,6 +56,71 @@ pub(crate) struct NewEntry<'a> {
     pub msg_id: Option<MessageId>,
     pub body: &'a [u8],
     pub now: u64,
+}
+
+/// Ruling 35: text `key` of the other account, stored just now from `holder`'s log, waits to be
+/// notified with the end of that pull. Written in the transaction that stores it, so a device
+/// that dies first still notifies it (`take_notify`, after it starts again).
+pub(super) fn mark_notify(tx: &Transaction, key: MessageKey, holder: InstallationId) -> R<()> {
+    tx.execute(
+        "INSERT OR IGNORE INTO mailbox_notify VALUES(?1,?2,?3,?4,?5)",
+        params![
+            key.conversation.0.as_slice(),
+            key.sender.0.as_slice(),
+            key.installation.0.as_slice(),
+            key.id.0.as_slice(),
+            holder.0.as_slice()
+        ],
+    )
+    .map_err(sql)?;
+    Ok(())
+}
+
+/// The marked texts of `holder`'s pulls (`None`: of every holder but `running`'s), unmarked;
+/// returns the notification for them (those still unread, per conversation) and for `read`.
+fn take_notify(
+    tx: &Transaction,
+    holder: Option<InstallationId>,
+    running: &[InstallationId],
+    read: &[ConversationId],
+) -> R<Vec<crate::event::NotifyItem>> {
+    let mut q = tx
+        .prepare("SELECT conversation,sender_peer,sender_install,msg_id,holder FROM mailbox_notify")
+        .map_err(sql)?;
+    let marked: Vec<(MessageKey, InstallationId)> = q
+        .query_map([], |r| {
+            Ok((
+                MessageKey {
+                    conversation: ConversationId(bytes::<32>(r, 0)?),
+                    sender: PeerId(bytes::<32>(r, 1)?),
+                    installation: InstallationId(bytes::<32>(r, 2)?),
+                    id: MessageId(bytes::<16>(r, 3)?),
+                },
+                InstallationId(bytes::<32>(r, 4)?),
+            ))
+        })
+        .map_err(sql)?
+        .collect::<Result<_, _>>()
+        .map_err(sql)?;
+    drop(q);
+    let keys: Vec<MessageKey> = marked
+        .into_iter()
+        .filter(|(_, from)| holder.map_or(!running.contains(from), |h| h == *from))
+        .map(|(key, _)| key)
+        .collect();
+    for key in &keys {
+        tx.execute(
+            "DELETE FROM mailbox_notify WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",
+            params![
+                key.conversation.0.as_slice(),
+                key.sender.0.as_slice(),
+                key.installation.0.as_slice(),
+                key.id.0.as_slice()
+            ],
+        )
+        .map_err(sql)?;
+    }
+    super::store::notify_items(tx, &keys, read)
 }
 
 /// Appends one entry; `None` when the same body is already logged, or when it is too large to
@@ -177,12 +242,23 @@ pub(crate) enum MailboxDbOp {
     /// A plaintext record another own device handed over for an entry of its log this device
     /// could not open, whose ciphertext hashes to `ct_hash`; `peer` is the conversation's other
     /// account. Stored like an opened text (with its `processed_ct` row), without log entry or
-    /// receipt.
+    /// receipt; a text of the other account is marked for the notification of the pull from
+    /// `holder` (Ruling 35).
     StorePlain {
-        record: PlainRecord,
+        record: Box<PlainRecord>,
         peer: PeerId,
         ct_hash: [u8; 32],
+        holder: InstallationId,
         now: u64,
+    },
+    /// Ruling 35: the texts pulls stored and marked for notification (those from `holder`'s
+    /// log; with `None`, those of every holder but `running`'s), taken in one transaction: the
+    /// marks go, and the reply is what to notify of them (`notify_items`, with the conversations
+    /// of `read` found read on another own device).
+    TakeNotify {
+        holder: Option<InstallationId>,
+        running: Vec<InstallationId>,
+        read: Vec<ConversationId>,
     },
     /// This account's devices recorded as mailboxes (`mailbox_device.mailbox = 1`), the only
     /// ones unsent ciphertexts are handed to (spec 7, Ruling 12).
@@ -303,6 +379,7 @@ pub(crate) enum MailboxDbReply {
     },
     /// This device is not a mailbox: the handoff was not taken.
     Disabled,
+    Notify(Vec<crate::event::NotifyItem>),
 }
 
 pub(super) fn mailbox_op(
@@ -398,12 +475,32 @@ pub(super) fn mailbox_op(
             record,
             peer,
             ct_hash,
+            holder,
             now,
         } => {
             let tx = c.transaction().map_err(sql)?;
             let stored = store_plain(&tx, identity, &record, peer, &ct_hash, now)?;
+            if stored && record.sender_peer != identity.peer {
+                let key = MessageKey {
+                    conversation: record.conversation,
+                    sender: record.sender_peer,
+                    installation: record.sender_install,
+                    id: record.msg_id,
+                };
+                mark_notify(&tx, key, holder)?;
+            }
             finish(tx, fault)?;
             MailboxDbReply::Stored(stored)
+        }
+        MailboxDbOp::TakeNotify {
+            holder,
+            running,
+            read,
+        } => {
+            let tx = c.transaction().map_err(sql)?;
+            let items = take_notify(&tx, holder, &running, &read)?;
+            finish(tx, fault)?;
+            MailboxDbReply::Notify(items)
         }
         MailboxDbOp::Mailboxes => MailboxDbReply::Installations(
             column(c, "SELECT installation FROM mailbox_device WHERE mailbox=1 ORDER BY installation", [])?

@@ -64,6 +64,17 @@ CREATE TABLE mailbox_uptime (
     ended_at_ms INTEGER NOT NULL CHECK(ended_at_ms>=started_at_ms)
 ) STRICT;
 
+-- 다른 내 기기 기록에서 가져와 저장한, 아직 알리지 않은 상대 텍스트 (Ruling 35). 그 가져오기가
+-- 끝나면(또는 다시 켜진 뒤) 알리고 지운다.
+CREATE TABLE mailbox_notify (
+    conversation BLOB NOT NULL CHECK(length(conversation)=32),
+    sender_peer BLOB NOT NULL CHECK(length(sender_peer)=32),
+    sender_install BLOB NOT NULL CHECK(length(sender_install)=32),
+    msg_id BLOB NOT NULL CHECK(length(msg_id)=16),
+    holder BLOB NOT NULL CHECK(length(holder)=32),  -- 가져온 기록의 기기
+    PRIMARY KEY(conversation,sender_peer,sender_install,msg_id)
+) STRICT;
+
 -- storage_meta: only the schema_version CHECK changes, so the table is rebuilt.
 CREATE TABLE storage_meta_v3 (
     singleton INTEGER PRIMARY KEY NOT NULL CHECK(singleton = 1),

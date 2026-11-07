@@ -963,6 +963,11 @@ pub(super) fn open_app(
         let id = text.map(|key| key.id);
         record_frame(&tx, sender_peer, sender_install, id, &app, now as u64)?;
     }
+    // Ruling 35: a new text from the other account that a pull brought is notified at that
+    // pull's end; marked here so that a device dying first still notifies it.
+    if let (Stored::New, Some(key), false, Some(holder)) = (&stored, text, own, from.pull) {
+        super::mailbox_store::mark_notify(&tx, key, holder)?;
+    }
     if !own {
         tx.execute(
             "UPDATE mls_conversation SET peer_mls=1 WHERE conversation=?1 AND peer_mls=0",
@@ -1718,6 +1723,7 @@ mod tests {
                     peer: a_peer,
                     transport: a_device.installation_id(),
                     allowed: vec![a_device.installation_id()],
+                    pull: None,
                 },
                 conversation,
                 ciphertext.clone(),

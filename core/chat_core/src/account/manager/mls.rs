@@ -2577,6 +2577,10 @@ impl Manager {
             peer: sender,
             transport: from.installation,
             allowed: self.current_installations(sender),
+            pull: match via {
+                Via::Mailbox { holder, .. } => Some(*holder),
+                Via::Direct(_) => None,
+            },
         };
         let op = MessageDbOp::OpenApp(
             open,

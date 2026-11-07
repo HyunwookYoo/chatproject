@@ -128,7 +128,8 @@ struct Run {
     reads: usize,
     halts: usize,
     toggles: usize,
-    /// B's texts stored by a run that then died mid-page (stored, never notified).
+    /// B's texts stored by a run that then died mid-page (stored; the next run notifies them,
+    /// Ruling 35).
     halted_texts: u64,
     epoch: Option<u64>,
 }
@@ -269,6 +270,9 @@ impl Run {
                 "it stops right after the texts it was allowed"
             );
             self.halted_texts += stored.len() as u64;
+            // Ruling 35: the next run notifies what this one stored, unless read by then.
+            self.devices[i].expected +=
+                stored.iter().filter(|k| !self.read.contains(k)).count() as u64;
             self.devices[i].have.extend(stored);
             assert_eq!(self.devices[i].have.len() as u64, before + missed / 2);
             let id = self.devices[i].id;
@@ -395,8 +399,8 @@ impl Run {
 /// The seeded run (see the file comment). Afterwards every device is on, and each:
 /// - shows every text once, in the order they were sent (also B1);
 /// - has each of B's texts read exactly when some device of A read it (and B1 shows it `Read`);
-/// - was notified of exactly the texts it first stored while they were unread everywhere, less
-///   those a run stored and then died mid-page (stored, but that run never got to notify);
+/// - was notified of exactly the texts it first stored while they were unread everywhere, also
+///   those a run stored and then died mid-page (the next run notifies them, Ruling 35);
 ///   nothing it stored after the read;
 /// - is on B1's epoch after the Commit, and lacks nothing (`missing` 0).
 #[tokio::test]

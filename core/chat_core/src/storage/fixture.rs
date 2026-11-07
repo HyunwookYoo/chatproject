@@ -254,7 +254,7 @@ impl Messages {
         ciphertext: Vec<u8>,
         now: u64,
     ) -> Result<crate::mls::wire::MlsReply, CoreError> {
-        let from = crate::message::store::OpenFrom { peer: sender, transport, allowed };
+        let from = crate::message::store::OpenFrom { peer: sender, transport, allowed, pull: None };
         let op = MessageDbOp::OpenApp(from, conversation, ciphertext, now);
         match self.mls(op).await? {
             MessageDbReply::Opened(reply)
@@ -423,7 +423,8 @@ impl Messages {
         ct_hash: [u8; 32],
         now: u64,
     ) -> Result<bool, CoreError> {
-        match self.mailbox(MailboxDbOp::StorePlain { record, peer, ct_hash, now }).await? {
+        let holder = crate::account::InstallationId([0; 32]);
+        match self.mailbox(MailboxDbOp::StorePlain { record: Box::new(record), peer, ct_hash, holder, now }).await? {
             MailboxDbReply::Stored(stored) => Ok(stored),
             _ => unreachable!(),
         }
@@ -546,6 +547,7 @@ DROP TABLE mailbox_handoff;
 DROP TABLE mailbox_local;
 DROP TABLE mailbox_device;
 DROP TABLE mailbox_uptime;
+DROP TABLE mailbox_notify;
 CREATE TABLE storage_meta_v2 (
     singleton INTEGER PRIMARY KEY NOT NULL CHECK(singleton = 1),
     schema_version INTEGER NOT NULL CHECK(schema_version = 2),

@@ -123,6 +123,7 @@ fn schema_enforces_version_one_bounds() {
             "mailbox_device",
             "mailbox_handoff",
             "mailbox_local",
+            "mailbox_notify",
             "mailbox_pull",
             "mailbox_status_ahead",
             "mailbox_store",

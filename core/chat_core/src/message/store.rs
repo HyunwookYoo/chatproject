@@ -27,6 +27,9 @@ pub(crate) struct OpenFrom {
     pub peer: PeerId,
     pub transport: InstallationId,
     pub allowed: Vec<InstallationId>,
+    /// The own device whose log it came from (a pull), if it did: a text from the other account
+    /// stored just now is marked for that pull's notification (Ruling 35).
+    pub pull: Option<InstallationId>,
 }
 pub(crate) enum MessageDbOp {
     Observed(Box<MessageDbOp>),
@@ -1267,7 +1270,7 @@ impl MessageDbOp {
 /// counted per conversation, with the conversation's peer and unread count. Each conversation of
 /// `read` (read on another own device) gets an item too, with no new message if none counted: the
 /// app clears or updates what it shows for it.
-fn notify_items(
+pub(super) fn notify_items(
     c: &Connection,
     keys: &[MessageKey],
     read: &[ConversationId],

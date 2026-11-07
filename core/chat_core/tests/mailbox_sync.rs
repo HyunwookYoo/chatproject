@@ -175,6 +175,118 @@ async fn restart_mid_page_resumes_without_duplicates_or_second_notification() {
         .collect();
     assert_eq!(got, shown(&b1, conv).await, "each once, in order");
     assert_eq!(first_run + notify_count(&a1), 1, "one notification in all");
+    let new: u32 = notify_events(&a1).iter().map(|i| i.new_messages).sum();
+    assert_eq!(new, 5, "the texts the run that died stored too (Ruling 35)");
+}
+
+/// A = [A1, A2], B = [B1]. While A1 is off, A2 logs B1's texts 1–3, then entries nothing is
+/// taken from, then texts 4–5: A1's pull from A2 takes two pages, texts 1–3 on the first. A1
+/// comes back, stores the first page (its cursor moves past it) and dies before the pull ends.
+/// Returns A1's data directory, A2, B1 and the five texts.
+async fn died_after_first_of_two_pages() -> (
+    tempfile::TempDir,
+    Fixture,
+    Fixture,
+    Arc<Backend>,
+    ConversationId,
+    Vec<MessageKey>,
+) {
+    let (mut a, b1, net, conv) = accounts(&[A1, A2], &[B1]).await;
+    let a2 = a.pop().unwrap();
+    let dir = stop(a.pop().unwrap());
+    let mut keys = Vec::new();
+    for n in 1..=3 {
+        keys.push(delivered(&b1, &a2, &[], n).await);
+    }
+    let b1_id = installation(&b1).await;
+    let store = a2.account.storage_test_fixture();
+    for n in 0..64u8 {
+        store
+            .mailbox_record_as(conv, b1.peer, b1_id, vec![0xff, n], NOW * 1000)
+            .await
+            .unwrap()
+            .expect("recorded");
+    }
+    for n in 4..=5 {
+        keys.push(delivered(&b1, &a2, &[], n).await);
+    }
+    let a1 = start(dir, net.clone()).await;
+    a1.account.mailbox_test_halt_after_pages(1).await.unwrap();
+    link(&a1, &a2).await;
+    link(&a1, &b1).await;
+    a1.account.mailbox_sync_now().await.unwrap();
+    settle!(
+        [&a1, &a2, &b1],
+        texts_from(&a1, conv, b1.peer).await.len() == 3
+    );
+    quiet(&[&a1, &a2, &b1]).await;
+    let got: Vec<MessageKey> = texts_from(&a1, conv, b1.peer)
+        .await
+        .iter()
+        .map(|m| m.key)
+        .collect();
+    assert_eq!(got, keys[..3], "the first page");
+    assert_eq!(notify_count(&a1), 0, "it died before the pull ended");
+    (stop(a1), a2, b1, net, conv, keys)
+}
+
+/// Final review I4 (Ruling 35): A1 died after the first of two pages. Restarted, the user reads
+/// text 1 before the sync resumes; the pull that resumes takes the second page. Then one
+/// notification covers what both pages brought, except text 1: nothing is lost, nothing twice.
+#[tokio::test]
+async fn sync_killed_after_a_page_notifies_its_texts_after_restart() {
+    let (dir, a2, b1, net, conv, keys) = died_after_first_of_two_pages().await;
+    let a1 = start(dir, net.clone()).await;
+    a1.account.mailbox_test_hold(true).await.unwrap();
+    a1.account
+        .messages()
+        .mark_read(conv, vec![keys[0]])
+        .await
+        .unwrap();
+    link(&a1, &a2).await;
+    link(&a1, &b1).await;
+    a1.account.mailbox_sync_now().await.unwrap();
+    settle!([&a1, &a2, &b1], own_session(&a1, &a2).await);
+    a1.account.mailbox_test_hold(false).await.unwrap();
+    settle!(
+        [&a1, &a2, &b1],
+        texts_from(&a1, conv, b1.peer).await.len() == 5 && caught_up(&a1, &a2).await
+    );
+    quiet(&[&a1, &a2, &b1]).await;
+    assert_eq!(notify_count(&a1), 1, "one notification");
+    assert_eq!(
+        notify_events(&a1),
+        vec![NotifyItem {
+            conversation: conv,
+            peer: b1.peer,
+            new_messages: 4,
+            unread: 4
+        }]
+    );
+}
+
+/// Final review I4 (Ruling 35): A1 died after the first of two pages, and comes back where A2
+/// cannot be reached. It is still notified, once, of the texts it stored before it died.
+#[tokio::test]
+async fn sync_killed_after_a_page_notifies_after_restart_without_its_holder() {
+    let (dir, a2, b1, net, conv, keys) = died_after_first_of_two_pages().await;
+    drop(stop(a2));
+    let a1 = start(dir, net.clone()).await;
+    for _ in 0..3 {
+        quiet(&[&a1, &b1]).await;
+    }
+    assert_eq!(notify_count(&a1), 1, "one notification");
+    assert_eq!(
+        notify_events(&a1),
+        vec![NotifyItem {
+            conversation: conv,
+            peer: b1.peer,
+            new_messages: 3,
+            unread: 3
+        }]
+    );
+    assert_eq!(texts_from(&a1, conv, b1.peer).await.len(), 3);
+    assert!(message(&a1, keys[3]).await.is_none());
 }
 
 /// Final review I1: A1 comes back and its first exchange with A2 fails (as a timeout would),

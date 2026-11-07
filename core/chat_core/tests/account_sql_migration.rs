@@ -516,7 +516,7 @@ async fn v2_database(root: &Path, p: Arc<dyn KeyProtector>) {
     Fixture::seed_v2_rows(root, p.clone()).unwrap();
     Fixture::downgrade_to_v2(root, p).unwrap();
 }
-const MAILBOX_TABLES: [&str; 8] = [
+const MAILBOX_TABLES: [&str; 9] = [
     "mailbox_store",
     "mailbox_cursor",
     "mailbox_pull",
@@ -525,6 +525,7 @@ const MAILBOX_TABLES: [&str; 8] = [
     "mailbox_local",
     "mailbox_device",
     "mailbox_uptime",
+    "mailbox_notify",
 ];
 
 #[tokio::test]
