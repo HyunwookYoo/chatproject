@@ -89,7 +89,6 @@ void main() {
   testWidgets('tray, power request, close to tray and autostart', (
     tester,
   ) async {
-    expect(Platform.isWindows, isTrue);
     // Leave this machine as it was: no tray icon, the Run value and the
     // remembered mailbox setting it had before.
     final original = await _runValue();
@@ -171,5 +170,5 @@ void main() {
     expect(await _channel.invokeMethod<bool>('autostart'), isFalse);
     expect(await _runValue(), isNull);
     expect((await _probe())['autostart'], isNull);
-  });
+  }, skip: !Platform.isWindows);
 }
