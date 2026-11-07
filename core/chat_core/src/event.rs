@@ -88,8 +88,26 @@ impl EventBus {
         state.sinks.push(sink);
     }
 
-    pub fn publish(&self, mut event: CoreEvent) {
+    pub fn publish(&self, event: CoreEvent) {
         let mut state = self.state.lock().expect("event bus lock poisoned");
+        Self::publish_locked(&mut state, event);
+    }
+
+    /// The account actor's word on `mailbox_ok`: a change is published at once with the rest of
+    /// the latest snapshot, and every later snapshot (the transport's) carries it. Read and sent
+    /// under one lock: the transport publishes from its own task, and a snapshot it replaced
+    /// must not be sent again (or kept for late subscribers).
+    pub(crate) fn set_mailbox_ok(&self, ok: bool) {
+        let mut state = self.state.lock().expect("event bus lock poisoned");
+        if state.mailbox_ok == ok {
+            return;
+        }
+        state.mailbox_ok = ok;
+        let snapshot = state.last_connection.unwrap_or(ConnectionSnapshot::OFFLINE);
+        Self::publish_locked(&mut state, CoreEvent::ConnectionState(snapshot));
+    }
+
+    fn publish_locked(state: &mut BusState, mut event: CoreEvent) {
         if let CoreEvent::ConnectionState(snapshot) = &mut event {
             snapshot.mailbox_ok = state.mailbox_ok;
             state.last_connection = Some(*snapshot);
@@ -98,20 +116,6 @@ impl EventBus {
             state.last_account = Some(event.clone());
         }
         state.sinks.retain(|sink| sink.send(event.clone()));
-    }
-
-    /// The account actor's word on `mailbox_ok`: a change is published at once with the rest of
-    /// the latest snapshot, and every later snapshot (the transport's) carries it.
-    pub(crate) fn set_mailbox_ok(&self, ok: bool) {
-        let snapshot = {
-            let mut state = self.state.lock().expect("event bus lock poisoned");
-            if state.mailbox_ok == ok {
-                return;
-            }
-            state.mailbox_ok = ok;
-            state.last_connection.unwrap_or(ConnectionSnapshot::OFFLINE)
-        };
-        self.publish(CoreEvent::ConnectionState(snapshot));
     }
 
     pub fn subscriber_count(&self) -> usize {
@@ -235,6 +239,53 @@ mod tests {
             CoreEvent::ConnectionState(ConnectionSnapshot { direct_peers, mailbox_ok, queue_ok: None })
         };
         assert_eq!(sink.events(), vec![ok(2, false), ok(2, true), ok(3, true), ok(3, false)]);
+    }
+
+    /// The transport publishes from its own task while the account actor sets `mailbox_ok`: a
+    /// snapshot the transport replaced is never published again, and the one kept for late
+    /// subscribers is the transport's latest with the latest `mailbox_ok`.
+    #[test]
+    fn mailbox_ok_never_republishes_a_replaced_snapshot() {
+        const LAST: u32 = 20_000;
+        let bus = EventBus::new();
+        let sink = Arc::new(RecordingSink::default());
+        bus.subscribe(sink.clone());
+        let transport = {
+            let bus = bus.clone();
+            std::thread::spawn(move || {
+                for direct_peers in 1..=LAST {
+                    bus.publish(state(direct_peers));
+                }
+            })
+        };
+        let mut ok = false;
+        while !transport.is_finished() {
+            ok = !ok;
+            bus.set_mailbox_ok(ok);
+        }
+        transport.join().unwrap();
+        let peers: Vec<u32> = sink
+            .events()
+            .into_iter()
+            .filter_map(|event| match event {
+                CoreEvent::ConnectionState(snapshot) => Some(snapshot.direct_peers),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            peers.windows(2).all(|w| w[0] <= w[1]),
+            "direct_peers went backwards"
+        );
+        let late = Arc::new(RecordingSink::default());
+        bus.subscribe(late.clone());
+        assert_eq!(
+            late.events(),
+            vec![CoreEvent::ConnectionState(ConnectionSnapshot {
+                direct_peers: LAST,
+                mailbox_ok: ok,
+                queue_ok: None
+            })]
+        );
     }
 
     #[test]
