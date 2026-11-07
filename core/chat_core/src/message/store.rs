@@ -64,8 +64,9 @@ pub(crate) enum MessageDbOp {
     /// The device log: pages, cursors, retention (M6).
     Mailbox(super::mailbox_store::MailboxDbOp),
     /// Notification items (M6) for texts just stored: per conversation, those of the keys that
-    /// came from the other account and are still not seen here.
-    NotifyItems(Vec<MessageKey>),
+    /// came from the other account and are still not seen here; and an item (maybe with no new
+    /// message) for each conversation whose messages were read on another own device.
+    NotifyItems(Vec<MessageKey>, Vec<ConversationId>),
     Messages(ConversationId, Option<MessageCursor>, u32),
     Conversations(Option<ConversationCursor>, u32),
 }
@@ -298,6 +299,9 @@ pub(crate) fn execute(
                 // Group operations that span conversations (deliveries, holds) pass a zero id.
                 MessageDbOp::MlsGroupOp(id, _) => (id.0 != [0; 32]).then_some(*id),
                 MessageDbOp::OpenApp(_, _, id, _, _) => Some(*id),
+                MessageDbOp::Mailbox(super::mailbox_store::MailboxDbOp::ApplyNote { entry, .. }) => {
+                    Some(entry.conversation)
+                }
                 _ => key.map(|k| k.conversation),
             };
             let reply = execute(c, identity, local, *op, #[cfg(all(feature="test-hooks",debug_assertions))] fault)?;
@@ -396,8 +400,12 @@ pub(crate) fn execute(
             #[cfg(all(feature = "test-hooks", debug_assertions))]
             fault,
         ),
-        MessageDbOp::Target(key, receipt) => {
-            target(c, identity, key, receipt).map(MessageDbReply::Peer)
+        MessageDbOp::Target(key, true) => {
+            let peer = target(c, identity, key, true)?;
+            Ok(MessageDbReply::ReceiptPeer(peer, super::mls_store::received_over_mls(c, key)?))
+        }
+        MessageDbOp::Target(key, false) => {
+            target(c, identity, key, false).map(MessageDbReply::Peer)
         }
         // A receipt for a message that came over MLS is sealed and goes back over MLS.
         MessageDbOp::Prepare(key, receiver, true, wall, now, _)
@@ -560,7 +568,7 @@ pub(crate) fn execute(
         MessageDbOp::M4Encode(key) => super::mls_store::m4_encode(c, identity, key),
         MessageDbOp::MlsGroupOp(id, op) => super::mls_group::group_op(c, identity, local, id, op, mls_fault!(fault)),
         MessageDbOp::Mailbox(op) => super::mailbox_store::mailbox_op(c, identity, op, mls_fault!(fault)),
-        MessageDbOp::NotifyItems(keys) => Ok(MessageDbReply::Notify(notify_items(c, &keys)?)),
+        MessageDbOp::NotifyItems(keys, read) => Ok(MessageDbReply::Notify(notify_items(c, &keys, &read)?)),
         MessageDbOp::Messages(id, before, n) => {
             let take = limit(n)?;
             let (lamport, install, msg) = match before {
@@ -755,6 +763,8 @@ pub struct MessageFacts {
     pub dispatch_state: Option<u64>,
     pub retry: Option<(u64, u64, u64)>,
     pub receipt_retry: Option<(u64, u64)>,
+    /// The user saw the message on this device (or on another own device, M6).
+    pub seen_local: bool,
 }
 #[cfg(all(feature = "test-hooks", debug_assertions))]
 pub(crate) enum FixtureOp {
@@ -824,6 +834,7 @@ pub(crate) fn fixture(c: &mut Connection, op: FixtureOp) {
                     receipt_jobs,
                     processed,
                     dispatch_state,
+                    seen_local: c.query_row("SELECT seen_local FROM message WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",params![key.conversation.0.as_slice(),key.sender.0.as_slice(),key.installation.0.as_slice(),key.id.0.as_slice()],|r|r.get(0)).map_err(sql_error)?,
                     messages,
                     jobs,
                     quota_bytes,
@@ -1051,6 +1062,12 @@ pub(crate) enum MessageDbReply {
     /// The reply for a received MLS ciphertext that carried (or carried before) this text; true
     /// when the text came from the other account and was stored just now.
     OpenedText(crate::mls::wire::MlsReply, MessageKey, bool),
+    /// The reply for my `Read` receipt from another of my devices that made messages of the
+    /// conversation read here just now (M6, spec 6.4).
+    OpenedRead(crate::mls::wire::MlsReply, ConversationId),
+    /// The account a receipt goes to, and whether the message came over MLS (its receipt may
+    /// then go to any device of that account in the group).
+    ReceiptPeer(PeerId, bool),
     /// A received MLS ciphertext of the current epoch (`epoch`) whose sender's ratchet is too far
     /// ahead of this device's view of it (C1). Nothing changed; only a new epoch can help.
     FarAhead { epoch: u64 },
@@ -1199,10 +1216,17 @@ impl MessageDbOp {
     }
 }
 /// Of `keys` (texts just stored), those received from the other account and still not seen here,
-/// counted per conversation, with the conversation's peer and unread count.
-fn notify_items(c: &Connection, keys: &[MessageKey]) -> R<Vec<crate::event::NotifyItem>> {
+/// counted per conversation, with the conversation's peer and unread count. Each conversation of
+/// `read` (read on another own device) gets an item too, with no new message if none counted: the
+/// app clears or updates what it shows for it.
+fn notify_items(
+    c: &Connection,
+    keys: &[MessageKey],
+    read: &[ConversationId],
+) -> R<Vec<crate::event::NotifyItem>> {
     let keys: std::collections::BTreeSet<MessageKey> = keys.iter().copied().collect();
-    let mut counts: std::collections::BTreeMap<ConversationId, u32> = Default::default();
+    let mut counts: std::collections::BTreeMap<ConversationId, u32> =
+        read.iter().map(|id| (*id, 0)).collect();
     for k in keys {
         let unseen: bool = c
             .query_row(

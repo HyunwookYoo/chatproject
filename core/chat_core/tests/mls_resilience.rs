@@ -1138,7 +1138,13 @@ async fn actor_path_two_receiving_devices_seeded() {
             if *from == d {
                 assert_eq!(m.state, DeliveryState::Delivered);
             } else if own_account {
-                assert_eq!(m.state, DeliveryState::SentDirect, "a copy shows sent");
+                // A copy shows sent, or delivered once the sender's delivery note came
+                // through the device log (M6, spec 6.4).
+                assert!(
+                    matches!(m.state, DeliveryState::SentDirect | DeliveryState::Delivered),
+                    "a copy shows sent or delivered: {:?}",
+                    m.state
+                );
             }
         }
     }

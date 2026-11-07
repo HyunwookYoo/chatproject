@@ -14,8 +14,9 @@
 //! sent a page out of order, is not pulled from again over that session.
 //!
 //! Notifications (`CoreEvent::Notify`): a pull, once it ends, reports per conversation the texts
-//! from the other account it stored that are still unread; a text received directly is reported
-//! on its own as soon as it is stored.
+//! from the other account it stored that are still unread, and the conversations whose messages
+//! it found read on another own device (spec 6.4: the app clears or updates their notification);
+//! a text received directly, or my read sent directly, is reported on its own at once.
 use super::mls::{Origin, Via};
 use super::*;
 use crate::account::{
@@ -26,7 +27,7 @@ use crate::mailbox::wire::{EntryBody, LogEntry, MailboxFrame, MailboxReply};
 use crate::message::{
     mailbox_store::{MailboxDbOp, MailboxDbReply},
     store::{MessageDbOp, MessageDbReply},
-    types::MessageKey,
+    types::{ConversationId, MessageKey},
 };
 use crate::mls::wire::{MlsFrame, MlsReply};
 use std::collections::{BTreeMap, BTreeSet};
@@ -103,6 +104,8 @@ struct Pull {
     conn: usize,
     /// Texts from the other account this pull stored, for its notification.
     fresh: Vec<MessageKey>,
+    /// Conversations whose messages this pull found read on another own device.
+    read: BTreeSet<ConversationId>,
     /// Another pull was asked for while this one ran.
     again: bool,
 }
@@ -530,6 +533,7 @@ impl Manager {
             Pull {
                 conn: holder.conn.stable_id(),
                 fresh: Vec::new(),
+                read: BTreeSet::new(),
                 again: false,
             },
         );
@@ -658,13 +662,33 @@ impl Manager {
             conversation,
             sender_peer,
             sender_install,
+            recorded_at_ms,
             body,
-            ..
         } = entry;
-        // Delivered and HandoffStop notes come with Tasks 6 and 9 (and are always processed,
-        // whoever logged them).
-        let EntryBody::Frame(inner) = body else {
-            return Ok(Entry::Taken);
+        // Notes are always processed, whoever logged them: a note about this device's own
+        // message is how it learns what another device did with it. HandoffStop comes with
+        // Task 9.
+        let inner = match body {
+            EntryBody::Frame(inner) => inner,
+            body @ EntryBody::Delivered { .. } => {
+                let entry = LogEntry {
+                    seq,
+                    conversation,
+                    sender_peer,
+                    sender_install,
+                    recorded_at_ms,
+                    body,
+                };
+                let op = MailboxDbOp::ApplyNote {
+                    entry,
+                    now: self.services.clock.wall_ms(),
+                };
+                return match self.mailbox_db(op, request).await {
+                    Err(error) if error.code != ErrorCode::InvalidMessage => Err(error),
+                    _ => Ok(Entry::Taken),
+                };
+            }
+            EntryBody::HandoffStop { .. } => return Ok(Entry::Taken),
         };
         // Ruling 1: a frame this device sent is in its own state already.
         if sender_install == own {
@@ -719,7 +743,7 @@ impl Manager {
     /// directly, with the rest of its pull when it came from another own device's log.
     pub(super) async fn text_stored(&mut self, key: MessageKey, via: &Via, request: Request) {
         match via {
-            Via::Direct(_) => self.notify(vec![key], request).await,
+            Via::Direct(_) => self.notify(vec![key], Vec::new(), request).await,
             Via::Mailbox { holder, .. } => {
                 let mailbox = &mut self.messages.mailbox;
                 if let Some(pull) = mailbox.pulls.get_mut(holder) {
@@ -736,8 +760,26 @@ impl Manager {
         }
     }
 
+    /// My `Read` receipt from another own device made messages of `conversation` read here:
+    /// notified at once when it came directly, at the end of its pull when it came from a log.
+    pub(super) async fn read_synced(
+        &mut self,
+        conversation: ConversationId,
+        via: &Via,
+        request: Request,
+    ) {
+        match via {
+            Via::Direct(_) => self.notify(Vec::new(), vec![conversation], request).await,
+            Via::Mailbox { holder, .. } => {
+                if let Some(pull) = self.messages.mailbox.pulls.get_mut(holder) {
+                    pull.read.insert(conversation);
+                }
+            }
+        }
+    }
+
     /// The pull from `holder` is over: what it stored and is still unread is notified, per
-    /// conversation, in one event.
+    /// conversation, in one event, with the conversations it found read elsewhere.
     async fn end_pull(&mut self, holder: InstallationId, request: Request) {
         let Some(pull) = self.messages.mailbox.pulls.remove(&holder) else {
             return;
@@ -745,14 +787,15 @@ impl Manager {
         if pull.again {
             self.messages.mailbox.due.insert(holder);
         }
-        if !pull.fresh.is_empty() {
-            self.notify(pull.fresh, request).await;
+        if !pull.fresh.is_empty() || !pull.read.is_empty() {
+            self.notify(pull.fresh, pull.read.into_iter().collect(), request)
+                .await;
         }
     }
 
-    async fn notify(&mut self, keys: Vec<MessageKey>, request: Request) {
+    async fn notify(&mut self, keys: Vec<MessageKey>, read: Vec<ConversationId>, request: Request) {
         if let Ok(MessageDbReply::Notify(items)) = self
-            .message_db(MessageDbOp::NotifyItems(keys), request)
+            .message_db(MessageDbOp::NotifyItems(keys, read), request)
             .await
             && !items.is_empty()
         {

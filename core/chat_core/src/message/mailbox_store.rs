@@ -8,13 +8,13 @@
 //! has passed, and entries older than `MAILBOX_RETENTION_MS`, are pruned.
 use super::mls_group::sql;
 use super::mls_store::{Fault, finish};
-use super::store::{Identity, MessageDbReply, bytes, integer, invalid, uint};
+use super::store::{Identity, MessageDbReply, bump, bytes, integer, invalid, uint};
 use super::types::{ConversationId, MessageId};
 use crate::CoreError;
 use crate::account::{InstallationId, PeerId};
 use crate::mailbox::{
     MAILBOX_RETENTION_MS, PAGE_MAX_ENTRIES,
-    wire::{EntryBody, LogEntry, MAX_ENTRY_BODY, page},
+    wire::{EntryBody, LogEntry, MAX_ENTRY_BODY, decode_note, note_body, page},
 };
 use crate::mls::wire::MlsFrame;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -97,6 +97,38 @@ pub(super) fn record_frame(
     )
 }
 
+/// Logs a note (`Delivered`) about message `msg_id` that `sender_install` of `sender_peer` sent.
+pub(super) fn record_note(
+    tx: &Transaction,
+    conversation: ConversationId,
+    sender_peer: PeerId,
+    sender_install: InstallationId,
+    body: &EntryBody,
+    now: u64,
+) -> R<Option<u64>> {
+    let msg_id = match body {
+        EntryBody::Delivered { msg_id, .. } | EntryBody::HandoffStop { msg_id, .. } => *msg_id,
+        EntryBody::Frame(_) => return Err(invalid()),
+    };
+    let kind = match body {
+        EntryBody::HandoffStop { .. } => EntryKind::HandoffStop,
+        _ => EntryKind::Delivered,
+    };
+    let bytes = note_body(body).ok_or_else(invalid)?;
+    record(
+        tx,
+        &NewEntry {
+            conversation,
+            sender_peer,
+            sender_install,
+            kind,
+            msg_id: Some(msg_id),
+            body: &bytes,
+            now,
+        },
+    )
+}
+
 /// Log, cursor and retention operations, each one SQL transaction.
 pub(crate) enum MailboxDbOp {
     /// The page another own device `puller` asked for with `SyncReq { since_seq }`. A device
@@ -122,6 +154,8 @@ pub(crate) enum MailboxDbOp {
     },
     /// Drops what every cursor passed and what is older than the retention (now).
     Prune(u64),
+    /// A note pulled from another own device's log, applied (and logged here) at `now`.
+    ApplyNote { entry: LogEntry, now: u64 },
 }
 impl MailboxDbOp {
     pub(crate) fn writes(&self) -> bool {
@@ -220,6 +254,12 @@ pub(super) fn mailbox_op(
             finish(tx, fault)?;
             MailboxDbReply::Count(pruned)
         }
+        MailboxDbOp::ApplyNote { entry, now } => {
+            let tx = c.transaction().map_err(sql)?;
+            let changed = apply_note(&tx, identity, &entry, now)?;
+            finish(tx, fault)?;
+            MailboxDbReply::Count(changed)
+        }
         MailboxDbOp::Prune(now) => {
             let tx = c.transaction().map_err(sql)?;
             let pruned = prune(&tx, now)?;
@@ -313,21 +353,26 @@ fn serve_page(
             },
         )
         .map_err(sql)?
-        .map(|row| {
-            let (seq, conversation, peer, install, kind, body, at) = row.map_err(sql)?;
-            // Only frames are logged so far; the note kinds get their body codec with the
-            // tasks that record them.
-            if kind != EntryKind::Frame as u64 {
-                return Err(invalid());
-            }
-            Ok(LogEntry {
+        .filter_map(|row| {
+            let (seq, conversation, peer, install, kind, body, at) = match row {
+                Ok(row) => row,
+                Err(error) => return Some(Err(sql(error))),
+            };
+            let body = if kind == EntryKind::Frame as u64 {
+                EntryBody::Frame(body)
+            } else {
+                // A note row this version cannot read back is skipped rather than holding
+                // up every entry after it.
+                decode_note(kind, &body).ok()?
+            };
+            Some(Ok(LogEntry {
                 seq,
                 conversation: ConversationId(conversation),
                 sender_peer: PeerId(peer),
                 sender_install: InstallationId(install),
                 recorded_at_ms: at,
-                body: EntryBody::Frame(body),
-            })
+                body,
+            }))
         })
         .collect::<R<_>>()?
     };
@@ -347,6 +392,90 @@ fn serve_page(
         next_seq,
         more,
     })
+}
+
+/// A note pulled from another own device's log (spec 6.4, 7). `Delivered`: the message of this
+/// account it names is delivered (never undone; `Read` stays), and this device's own outbox row
+/// of it is done; a message not here yet keeps the delivery in `mailbox_status_ahead` for when it
+/// comes. What changed something here is logged here too, so a third own device gets it from
+/// this one; a repeat changes nothing and is not logged again. `HandoffStop` comes with Task 9.
+/// Returns the message rows changed.
+fn apply_note(tx: &Transaction, identity: Identity, entry: &LogEntry, now: u64) -> R<u64> {
+    let EntryBody::Delivered { msg_id, at_ms, .. } = entry.body else {
+        return Ok(0);
+    };
+    // Only this account's own sent messages have a delivery to learn.
+    if entry.sender_peer != identity.peer {
+        return Ok(0);
+    }
+    let key = params![
+        entry.conversation.0.as_slice(),
+        entry.sender_peer.0.as_slice(),
+        entry.sender_install.0.as_slice(),
+        msg_id.0.as_slice()
+    ];
+    let exists: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM message WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4 AND outgoing=1)",
+            key,
+            |r| r.get(0),
+        )
+        .map_err(sql)?;
+    let (changed, new) = if exists {
+        let changed = tx
+            .execute(
+                "UPDATE message SET delivered_at_ms=?5 WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4 AND outgoing=1 AND delivered_at_ms IS NULL",
+                params![
+                    entry.conversation.0.as_slice(),
+                    entry.sender_peer.0.as_slice(),
+                    entry.sender_install.0.as_slice(),
+                    msg_id.0.as_slice(),
+                    integer(at_ms)?
+                ],
+            )
+            .map_err(sql)?;
+        // This device's own message, delivered by another device it was handed to.
+        if entry.sender_install == identity.installation {
+            tx.execute(
+                "DELETE FROM outbox WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",
+                key,
+            )
+            .map_err(sql)?;
+        }
+        if changed > 0 {
+            let revision = bump(tx)?;
+            tx.execute(
+                "UPDATE conversation SET change_revision=?2 WHERE id=?1",
+                params![entry.conversation.0.as_slice(), integer(revision)?],
+            )
+            .map_err(sql)?;
+        }
+        (changed as u64, changed > 0)
+    } else {
+        let ahead = tx
+            .execute(
+                "INSERT OR IGNORE INTO mailbox_status_ahead VALUES(?1,?2,?3,2,?4)",
+                params![
+                    entry.conversation.0.as_slice(),
+                    entry.sender_peer.0.as_slice(),
+                    msg_id.0.as_slice(),
+                    integer(at_ms)?
+                ],
+            )
+            .map_err(sql)?;
+        (0, ahead > 0)
+    };
+    if new {
+        record_note(
+            tx,
+            entry.conversation,
+            entry.sender_peer,
+            entry.sender_install,
+            &entry.body,
+            now,
+        )?;
+    }
+    Ok(changed)
 }
 
 /// Spec 5.2: an entry goes once every (not revoked) other device's cursor passed it, or when it

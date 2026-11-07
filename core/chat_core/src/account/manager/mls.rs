@@ -2405,7 +2405,7 @@ impl Manager {
     /// `from` (its MLS sender must be that installation). `None` when it carried a text M4
     /// would refuse (nothing stored; the ratchet still moved). A text from the other account
     /// stored just now is notified: at once `Via::Direct`, with the rest of the sync
-    /// `Via::Mailbox`.
+    /// `Via::Mailbox`; so is my read on another own device.
     pub(super) async fn receive_app(
         &mut self,
         from: Origin,
@@ -2446,6 +2446,11 @@ impl Manager {
                 if new {
                     self.text_stored(key, via, request).await;
                 }
+                Ok(Some(reply))
+            }
+            // My read on another own device: shown here as read, its notification cleared.
+            Ok(MessageDbReply::OpenedRead(reply, conversation)) => {
+                self.read_synced(conversation, via, request).await;
                 Ok(Some(reply))
             }
             Ok(MessageDbReply::Rejected) => Ok(None),

@@ -223,7 +223,10 @@ fn encode_entry(e: &mut Encoder<Vec<u8>>, entry: &LogEntry) {
         .unwrap()
         .u64(entry.recorded_at_ms)
         .unwrap();
-    match &entry.body {
+    encode_body(e, &entry.body);
+}
+fn encode_body(e: &mut Encoder<Vec<u8>>, body: &EntryBody) {
+    match body {
         EntryBody::Frame(inner) => {
             e.array(2)
                 .unwrap()
@@ -275,8 +278,19 @@ fn decode_entry(d: &mut Decoder<'_>) -> R<LogEntry> {
     let sender_peer = peer(d)?;
     let sender_install = install(d)?;
     let recorded_at_ms = int(d)?;
+    let body = decode_body(d)?;
+    Ok(LogEntry {
+        seq,
+        conversation,
+        sender_peer,
+        sender_install,
+        recorded_at_ms,
+        body,
+    })
+}
+fn decode_body(d: &mut Decoder<'_>) -> R<EntryBody> {
     let items = array(d, 4)?;
-    let body = match (d.u64().map_err(|_| invalid())?, items) {
+    Ok(match (d.u64().map_err(|_| invalid())?, items) {
         (BODY_FRAME, 2) => EntryBody::Frame(blob(d, MAX_ENTRY_BODY)?),
         (BODY_DELIVERED, 4) => EntryBody::Delivered {
             msg_id: msg_id(d)?,
@@ -289,15 +303,37 @@ fn decode_entry(d: &mut Decoder<'_>) -> R<LogEntry> {
             epoch: int(d)?,
         },
         _ => return Err(invalid()),
-    };
-    Ok(LogEntry {
-        seq,
-        conversation,
-        sender_peer,
-        sender_install,
-        recorded_at_ms,
-        body,
     })
+}
+
+/// The `mailbox_store.body` of a note (kind 2 `Delivered`, kind 3 `HandoffStop`): the canonical
+/// CBOR of its `EntryBody` exactly as a `SyncResp` entry carries it, `[tag, ...]` with the tag
+/// equal to the row's kind. `None` for a `Frame`, whose row body is the kind 17 inner itself.
+pub(crate) fn note_body(body: &EntryBody) -> Option<Vec<u8>> {
+    if matches!(body, EntryBody::Frame(_)) {
+        return None;
+    }
+    let mut e = Encoder::new(Vec::new());
+    encode_body(&mut e, body);
+    Some(e.into_writer())
+}
+
+/// Reads back a note row: `kind` must be its tag and `bytes` exactly its canonical encoding.
+pub(crate) fn decode_note(kind: u64, bytes: &[u8]) -> R<EntryBody> {
+    if kind == BODY_FRAME {
+        return Err(invalid());
+    }
+    let mut d = Decoder::new(bytes);
+    let body = decode_body(&mut d)?;
+    let tag = match body {
+        EntryBody::Frame(_) => BODY_FRAME,
+        EntryBody::Delivered { .. } => BODY_DELIVERED,
+        EntryBody::HandoffStop { .. } => BODY_HANDOFF_STOP,
+    };
+    if tag != kind || d.position() != bytes.len() || note_body(&body).as_deref() != Some(bytes) {
+        return Err(invalid());
+    }
+    Ok(body)
 }
 
 impl MailboxFrame {
@@ -521,4 +557,36 @@ pub(crate) fn page(entries: impl Iterator<Item = LogEntry>) -> (Vec<LogEntry>, b
         page.extend(entries.next());
     }
     (page, false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn note_bodies_round_trip_under_their_kind_only() {
+        let delivered = EntryBody::Delivered {
+            msg_id: MessageId([7; 16]),
+            receiver: InstallationId([9; 32]),
+            at_ms: 1_800_000_000_000,
+        };
+        let bytes = note_body(&delivered).unwrap();
+        assert_eq!(bytes[..2], [0x84, 0x02], "[2, msg_id, receiver, at_ms]");
+        assert!(decode_note(2, &bytes).unwrap() == delivered);
+        // The tag is the row's kind: the same bytes are no other kind.
+        assert!(decode_note(3, &bytes).is_err());
+        assert!(decode_note(1, &bytes).is_err());
+        // Trailing bytes, or anything not canonical, are refused.
+        let mut longer = bytes.clone();
+        longer.push(0);
+        assert!(decode_note(2, &longer).is_err());
+        assert!(decode_note(2, &bytes[..bytes.len() - 1]).is_err());
+        let stop = EntryBody::HandoffStop {
+            msg_id: MessageId([7; 16]),
+            class: 2,
+            epoch: 5,
+        };
+        assert!(decode_note(3, &note_body(&stop).unwrap()).unwrap() == stop);
+        assert!(note_body(&EntryBody::Frame(vec![1])).is_none());
+    }
 }

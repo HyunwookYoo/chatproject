@@ -309,7 +309,11 @@ async fn texts_reach_the_other_devices_of_both_accounts() {
     }
     let copy = message(&a_s, sent.key).await.unwrap();
     assert!(copy.outgoing);
-    assert_eq!(copy.state, DeliveryState::SentDirect);
+    // Sent; Delivered once A1's delivery note came through the device log (M6, spec 6.4).
+    assert!(matches!(
+        copy.state,
+        DeliveryState::SentDirect | DeliveryState::Delivered
+    ));
     assert_eq!(
         (copy.body.as_str(), copy.lamport),
         ("to every device", sent.lamport)
@@ -338,11 +342,19 @@ async fn texts_reach_the_other_devices_of_both_accounts() {
     }
     let copy = message(&bs, back.key).await.unwrap();
     assert!(copy.outgoing);
-    assert_eq!(copy.state, DeliveryState::SentDirect);
-    // Copies changed no status: each sender's message is Delivered, A2's copy still sent.
+    assert!(matches!(
+        copy.state,
+        DeliveryState::SentDirect | DeliveryState::Delivered
+    ));
+    // Copies changed no status: each sender's message is Delivered. A2's copy follows A1's
+    // (M6, spec 6.4: the delivery note in A1's log), never past it.
+    settle!(
+        all,
+        delivery(&a_s, sent.key).await == DeliveryState::Delivered
+    );
     idle(&all, 5).await;
     assert_eq!(delivery(&af, sent.key).await, DeliveryState::Delivered);
-    assert_eq!(delivery(&a_s, sent.key).await, DeliveryState::SentDirect);
+    assert_eq!(delivery(&a_s, sent.key).await, DeliveryState::Delivered);
     assert_eq!(page(&a_s, conv).await.len(), 2);
 }
 

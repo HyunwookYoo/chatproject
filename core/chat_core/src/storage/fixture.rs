@@ -240,7 +240,9 @@ impl Messages {
     ) -> Result<crate::mls::wire::MlsReply, CoreError> {
         let op = MessageDbOp::OpenApp(sender, installation, conversation, ciphertext, now);
         match self.mls(op).await? {
-            MessageDbReply::Opened(reply) | MessageDbReply::OpenedText(reply, ..) => Ok(reply),
+            MessageDbReply::Opened(reply)
+            | MessageDbReply::OpenedText(reply, ..)
+            | MessageDbReply::OpenedRead(reply, _) => Ok(reply),
             // Without the actor no new epoch is made: the sender is told it is out of order.
             MessageDbReply::FarAhead { epoch } => Ok(crate::mls::wire::MlsReply::DecryptFailed {
                 class: crate::mls::group::CLASS_OUT_OF_ORDER,
@@ -375,6 +377,13 @@ impl Messages {
     }
     pub async fn mailbox_prune(&self, now: u64) -> Result<u64, CoreError> {
         match self.mailbox(MailboxDbOp::Prune(now)).await? {
+            MailboxDbReply::Count(n) => Ok(n),
+            _ => unreachable!(),
+        }
+    }
+    /// Applies a note as if it was pulled from another own device's log; rows it changed.
+    pub async fn mailbox_apply_note(&self, entry: LogEntry, now: u64) -> Result<u64, CoreError> {
+        match self.mailbox(MailboxDbOp::ApplyNote { entry, now }).await? {
             MailboxDbReply::Count(n) => Ok(n),
             _ => unreachable!(),
         }
