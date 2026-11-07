@@ -3089,9 +3089,35 @@ impl Manager {
             conn.close(0u32.into(), b"account restricted");
             return Err(unavailable(ErrorCode::AccountRestricted));
         }
+        // Two devices that dialed each other at once each get both connections (Ruling 21):
+        // the one dialed by the device with the smaller installation id wins on both sides,
+        // and the other device closes its own dial, the loser. The smaller device cannot tell
+        // that loser from a dial of a device that restarted (its own older connection to it is
+        // dead then), so it keeps both, the newer first, until one closes. Any other older
+        // connection with the device is replaced, as is one from the same dialer (reconnect).
+        let dialed = conn.side().is_client();
+        let smaller = self
+            .local()
+            .is_ok_and(|local| local.device.installation_id() < grant.installation);
+        let same = |s: &super::connection::Session| {
+            s.grant.peer == grant.peer && s.grant.installation == grant.installation
+        };
+        let wins = |s: &super::connection::Session| {
+            let other = s.conn.side().is_client();
+            same(s)
+                && s.ready
+                && s.conn.close_reason().is_none()
+                && other != dialed
+                && other == smaller
+        };
         let mut sessions = self.auth.registry.0.lock().unwrap();
+        if dialed && sessions.iter().any(wins) {
+            drop(sessions);
+            conn.close(0u32.into(), b"simultaneous dial");
+            return Ok(());
+        }
         sessions.retain(|s| {
-            if s.grant.peer == grant.peer && s.grant.installation == grant.installation {
+            if same(s) && !wins(s) {
                 s.conn.close(0u32.into(), b"new account proof");
                 false
             } else {
@@ -3102,12 +3128,16 @@ impl Manager {
             conn.close(0u32.into(), b"account capacity");
             return Err(unavailable(ErrorCode::Busy));
         }
-        sessions.push(super::connection::Session {
-            conn: conn.clone(),
-            grant: grant.clone(),
-            ready: true,
-            cached: self.auth.cached_lookups.contains(&grant.peer),
-        });
+        let at = sessions.iter().position(same).unwrap_or(sessions.len());
+        sessions.insert(
+            at,
+            super::connection::Session {
+                conn: conn.clone(),
+                grant: grant.clone(),
+                ready: true,
+                cached: self.auth.cached_lookups.contains(&grant.peer),
+            },
+        );
         drop(sessions);
         self.bus.publish(crate::CoreEvent::AccountAuthChanged {
             peer_id: grant.peer.to_string(),
@@ -3162,6 +3192,10 @@ impl Manager {
                 if result.is_err() {
                     conn.close(0u32.into(), b"account authentication failed");
                 }
+                #[cfg(all(feature = "test-hooks", debug_assertions))]
+                {
+                    self.messages.mls.settled += 1;
+                }
             }
             Input::Control {
                 connection,
@@ -3177,18 +3211,23 @@ impl Manager {
             }
             Input::Closed(id) => {
                 let mut sessions = self.auth.registry.0.lock().unwrap();
-                sessions.retain(|s| {
-                    if s.conn.stable_id() == id {
+                if let Some(at) = sessions.iter().position(|s| s.conn.stable_id() == id) {
+                    let closed = sessions.remove(at).grant;
+                    // After a simultaneous dial another session with the device may be left
+                    // (`install_grant`): it stays ready.
+                    if !sessions.iter().any(|s| {
+                        s.grant.peer == closed.peer
+                            && s.grant.installation == closed.installation
+                            && s.ready
+                            && s.conn.close_reason().is_none()
+                    }) {
                         self.bus.publish(crate::CoreEvent::AccountAuthChanged {
-                            peer_id: s.grant.peer.to_string(),
-                            installation_id: s.grant.installation.to_string(),
+                            peer_id: closed.peer.to_string(),
+                            installation_id: closed.installation.to_string(),
                             ready: false,
                         });
-                        false
-                    } else {
-                        true
                     }
-                });
+                }
             }
         }
     }

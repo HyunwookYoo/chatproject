@@ -192,6 +192,13 @@ pub(crate) struct Runtime {
     rejoined: u64,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     recovered: u64,
+    /// While true, the dials `start_dial` spawns wait before they connect.
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    dial_hold: tokio::sync::watch::Sender<bool>,
+    /// How many connections this actor finished with: results of the dials `start_dial`
+    /// spawned, and accepted ones.
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    pub(super) settled: u64,
 }
 
 /// Back-off of an installation that refused kind 17.
@@ -389,6 +396,9 @@ pub(crate) enum MlsTest {
     M4Close(bool),
     Frames,
     Exchange(InstallationId, MlsFrame),
+    HoldDials(bool),
+    Dial(PeerId, InstallationId),
+    Sessions,
 }
 #[cfg(all(feature = "test-hooks", debug_assertions))]
 pub(crate) enum MlsTestReply {
@@ -400,6 +410,7 @@ pub(crate) enum MlsTestReply {
     Count(u64),
     Answers(Vec<(InstallationId, bool)>),
     Frames(Vec<Vec<u8>>),
+    Sessions(u64, Vec<(InstallationId, bool)>),
 }
 
 #[cfg(all(feature = "test-hooks", debug_assertions))]
@@ -527,6 +538,31 @@ impl AccountHandle {
             _ => unreachable!(),
         }
     }
+    /// Holds the dials this core spawns (`start_dial`) before they connect, or lets them go.
+    pub async fn mls_test_hold_dials(&self, hold: bool) -> Result<(), CoreError> {
+        self.mls_test(MlsTest::HoldDials(hold)).await.map(|_| ())
+    }
+    /// Spawns a dial of `peer`'s device `installation` (`start_dial`); false when there is no
+    /// record to dial it under.
+    pub async fn mls_test_dial(
+        &self,
+        peer: PeerId,
+        installation: InstallationId,
+    ) -> Result<bool, CoreError> {
+        match self.mls_test(MlsTest::Dial(peer, installation)).await? {
+            MlsTestReply::Allowed(started) => Ok(started),
+            _ => unreachable!(),
+        }
+    }
+    /// How many connections this core finished with so far (results of the dials it spawned,
+    /// and connections it accepted), and its live ready sessions: with which installation, and
+    /// whether this device dialed it.
+    pub async fn mls_test_sessions(&self) -> Result<(u64, Vec<(InstallationId, bool)>), CoreError> {
+        match self.mls_test(MlsTest::Sessions).await? {
+            MlsTestReply::Sessions(settled, sessions) => Ok((settled, sessions)),
+            _ => unreachable!(),
+        }
+    }
 }
 
 impl Manager {
@@ -599,6 +635,26 @@ impl Manager {
             MlsTest::Held => MlsTestReply::Count(self.messages.mls.held),
             MlsTest::Rejoined => MlsTestReply::Count(self.messages.mls.rejoined),
             MlsTest::Recovered => MlsTestReply::Count(self.messages.mls.recovered),
+            MlsTest::HoldDials(hold) => {
+                self.messages.mls.dial_hold.send_replace(hold);
+                MlsTestReply::Done
+            }
+            MlsTest::Dial(peer, installation) => {
+                let request = self.ready()?;
+                MlsTestReply::Allowed(self.start_dial(peer, installation, request))
+            }
+            MlsTest::Sessions => MlsTestReply::Sessions(
+                self.messages.mls.settled,
+                self.auth
+                    .registry
+                    .0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|s| s.ready && s.conn.close_reason().is_none())
+                    .map(|s| (s.grant.installation, s.conn.side().is_client()))
+                    .collect(),
+            ),
             MlsTest::AskKeyPackage(peer) => {
                 // Test only: this actor waits on the answers.
                 let body = MlsFrame::KeyPackageRequest.encode().to_vec();
@@ -1692,7 +1748,14 @@ impl Manager {
         let cancel = self.auth.cancel.child_token();
         let mailbox = self.auth.send.clone();
         let ticket = request.ticket;
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        let mut hold = self.messages.mls.dial_hold.subscribe();
         tokio::spawn(async move {
+            #[cfg(all(feature = "test-hooks", debug_assertions))]
+            tokio::select! {biased;
+                _ = cancel.cancelled() => {},
+                _ = hold.wait_for(|held| !*held) => {},
+            }
             let mut conn = None;
             let work = async {
                 if !super::messages::acquisition_current(&shared, ticket) {
@@ -1768,6 +1831,10 @@ impl Manager {
         &mut self,
         dialed: Result<(iroh::endpoint::Connection, auth::AuthGrant), CoreError>,
     ) {
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        {
+            self.messages.mls.settled += 1;
+        }
         if let Ok((conn, grant)) = dialed {
             let _ = self.install_grant(conn, grant, None).await;
         }

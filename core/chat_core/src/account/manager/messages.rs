@@ -101,6 +101,9 @@ pub(super) struct Runtime {
     /// The recipient epoch each message was last answered class 2 from behind (M2): a repeat at
     /// the same epoch means the Commit carried ahead did not help, and it is counted.
     behind: BTreeMap<MessageKey, u64>,
+    /// Receipts whose last attempt to the message's sender went unanswered, and the connection
+    /// it went out on: while that session lasts their attempts do not prefer it (Ruling 23).
+    unanswered: BTreeMap<MessageKey, usize>,
     /// The text the `Ack` about to be written stores (keys the response checkpoint).
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     pub(super) ack_key: Option<MessageKey>,
@@ -976,13 +979,22 @@ impl Manager {
             let session = if (receipt && !mls_receipt) || m4 {
                 candidates.into_iter().next()
             } else if receipt {
-                let candidates = candidates
+                let candidates: Vec<Session> = candidates
                     .into_iter()
                     .filter(|s| {
                         s.grant.installation == key.installation
                             || members.contains(&s.grant.installation)
                     })
                     .collect();
+                // Not again to a sender that left the last attempt unanswered on this session,
+                // while another device is there.
+                let unanswered = self.messages.unanswered.get(&key);
+                let stale = |s: &Session| Some(&s.conn.stable_id()) == unanswered;
+                let candidates = if candidates.iter().all(stale) {
+                    candidates
+                } else {
+                    candidates.into_iter().filter(|s| !stale(s)).collect()
+                };
                 choose_session(candidates, &members, Some(key.installation), |i| {
                     self.outdated_now(i)
                 })
@@ -1157,6 +1169,34 @@ impl Manager {
         }
         let mut pending = self.messages.pending.remove(&result.key).unwrap();
         pending.completed = true;
+        // Ruling 23: a receipt the message's sender did not answer is not preferred to it on
+        // that session again; an answer from it, or the job done elsewhere, ends that.
+        if pending.receipt.is_some() {
+            let session = &result.lease.session;
+            if session.grant.installation != result.key.installation {
+                if matches!(
+                    result.outcome,
+                    AttemptOutcome::Acked | AttemptOutcome::ReceiptApplied(_)
+                ) {
+                    self.messages.unanswered.remove(&result.key);
+                }
+            } else if matches!(
+                result.outcome,
+                AttemptOutcome::Written
+                    | AttemptOutcome::NoReply
+                    | AttemptOutcome::Transient(
+                        ErrorCode::NetworkTimeout
+                            | ErrorCode::TransportFailed
+                            | ErrorCode::PeerNotConnected
+                    )
+            ) {
+                self.messages
+                    .unanswered
+                    .insert(result.key, session.conn.stable_id());
+            } else {
+                self.messages.unanswered.remove(&result.key);
+            }
+        }
         let outcome = async {
             let request = self.ready()?;
             if request.ticket != result.lease.ticket {
