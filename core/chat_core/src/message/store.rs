@@ -1114,6 +1114,9 @@ pub(crate) enum MessageDbReply {
     /// A received MLS ciphertext of the current epoch (`epoch`) whose sender's ratchet is too far
     /// ahead of this device's view of it (C1). Nothing changed; only a new epoch can help.
     FarAhead { epoch: u64 },
+    /// A received MLS ciphertext of the right account sealed by a leaf that is not one of its
+    /// current devices (revoked or no longer listed since). Nothing changed; it is not taken.
+    NotCurrent,
     Group(super::mls_group::GroupReply),
     Mailbox(super::mailbox_store::MailboxDbReply),
     Notify(Vec<crate::event::NotifyItem>),

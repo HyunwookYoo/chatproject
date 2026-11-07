@@ -372,6 +372,43 @@ async fn missing_plaintext_is_counted_not_fatal() {
     assert_eq!(a1.account.mailbox_test_counters().await.unwrap().missing, 1);
 }
 
+/// Final review I3: while A1 is off, A3 sends a text and A2 takes its copy; then A3 is revoked
+/// (a lost device), and A1 learns it before it pulls. A1 can still open the logged ciphertext,
+/// but not take it: A3 is not a current device. It is not skipped either: A2 took it while A3
+/// was current and hands it over as plaintext (not logged on A1, nothing counted missing).
+#[tokio::test]
+async fn text_sealed_by_since_revoked_device_comes_as_plaintext() {
+    let (mut a, b1, net, _conv) = accounts(&[A1, A2, A3], &[B1]).await;
+    let a3 = a.pop().unwrap();
+    let a2 = a.pop().unwrap();
+    let dir = stop(a.pop().unwrap());
+    let key = delivered(&a3, &b1, &[&a2], 1).await;
+    settle!([&a2, &a3, &b1], message(&a2, key).await.is_some());
+    let a3_id = installation(&a3).await;
+    drop(stop(a3));
+    let a1 = start(dir, net.clone()).await;
+    a1.account.revoke_device(a3_id).await.unwrap();
+    link(&a1, &a2).await;
+    link(&a1, &b1).await;
+    a1.account.mailbox_sync_now().await.unwrap();
+    settle!(
+        [&a1, &a2, &b1],
+        message(&a1, key).await.is_some() && caught_up(&a1, &a2).await
+    );
+    let got = message(&a1, key).await.unwrap();
+    assert_eq!(got.body, "text 1");
+    assert!(got.outgoing, "my own text");
+    assert!(
+        !mailbox(&a1)
+            .await
+            .entries
+            .iter()
+            .any(|e| e.kind == 1 && e.msg_id == Some(key.id)),
+        "stored from plaintext, not opened"
+    );
+    assert_eq!(a1.account.mailbox_test_counters().await.unwrap().missing, 0);
+}
+
 /// Task 5 carry-over: the conversation was made while A1 was off, so A1 has no group for it
 /// (a logged Welcome is not joined from a log). The texts in A2's log reach the plaintext
 /// hand-over instead of being dropped, and A1 ends with them.

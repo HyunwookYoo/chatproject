@@ -267,6 +267,8 @@ impl Messages {
             }),
             // Answered with the M4 `Reject(InvalidMessage)` on the wire.
             MessageDbReply::Rejected => Err(CoreError::new(ErrorCode::InvalidMessage, "mls_text_rejected")),
+            // Refused for its leaf, as the actor does on a direct session.
+            MessageDbReply::NotCurrent => Err(CoreError::new(ErrorCode::InvalidMessage, "mls_leaf_not_current")),
             _ => unreachable!(),
         }
     }

@@ -1480,8 +1480,8 @@ impl Manager {
             }) if id == conversation => {
                 let ct_hash: [u8; 32] = Sha256::digest(&ciphertext).into();
                 // Whatever kept it from opening (no group: a Welcome or Commit this device did
-                // not take from the log; an old or far-ahead state), it goes to the plaintext
-                // hand-over.
+                // not take from the log; an old or far-ahead state) or from being taken (its
+                // leaf no longer a current device here), it goes to the plaintext hand-over.
                 self.receive_app(from, id, ciphertext, &via, request)
                     .await
                     .map(|reply| match reply {

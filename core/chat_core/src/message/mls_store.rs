@@ -843,8 +843,13 @@ pub(super) fn open_app(
         // A Commit is applied through the group protocol (with its members vetted), never here.
         Opened::Commit { .. } => return Ok(decrypt_failed(group::CLASS_OTHER, group.epoch)),
     };
-    if account != sender_peer || !from.allowed.contains(&sender_install) {
+    if account != sender_peer {
         return Err(invalid());
+    }
+    // A leaf of the account that is not (any more) a current device: nothing kept, whatever
+    // path brought it (the caller decides what that means).
+    if !from.allowed.contains(&sender_install) {
+        return Ok(MessageDbReply::NotCurrent);
     }
     let mut stored = Stored::Yes;
     let mut text = None;

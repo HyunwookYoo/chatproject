@@ -2607,6 +2607,18 @@ impl Manager {
                 Ok(Some(reply))
             }
             Ok(MessageDbReply::Rejected) => Ok(None),
+            // Sealed by a device of the account that is not current here. Directly: refused,
+            // whoever carries it. From another own device's log (final review I3): that device
+            // took it while the leaf was current (it was a member of the group the message
+            // opened in), so it is not taken from the ciphertext but goes to the plaintext
+            // hand-over (spec 6.3), not skipped.
+            Ok(MessageDbReply::NotCurrent) => match via {
+                Via::Direct(_) => Ok(None),
+                Via::Mailbox { .. } => Ok(Some(MlsReply::DecryptFailed {
+                    class: CLASS_OTHER,
+                    epoch: 0,
+                })),
+            },
             Ok(MessageDbReply::FarAhead { epoch }) => match via {
                 Via::Direct(_) => Ok(Some(
                     self.move_epoch(conversation, peer, epoch, request).await?,
