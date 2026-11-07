@@ -907,6 +907,12 @@ impl Fixture {
         self.handle.0.test(TestOp::Message(FixtureOp::MailboxState(tx))).await;
         rx.await.unwrap()
     }
+    /// The database size in bytes, `page_count × page_size`.
+    pub async fn db_bytes(&self) -> Result<u64, CoreError> {
+        let (tx, rx) = oneshot::channel();
+        self.handle.0.test(TestOp::Message(FixtureOp::DbBytes(tx))).await;
+        rx.await.unwrap()
+    }
     /// Records a `Frame` entry (fixed ids) with `body` at `now`; its seq, or `None` if refused.
     pub async fn mailbox_record(&self, body: Vec<u8>, now: u64) -> Result<Option<u64>, CoreError> {
         let (tx, rx) = oneshot::channel();

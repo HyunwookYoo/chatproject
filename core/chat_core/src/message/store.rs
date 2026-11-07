@@ -812,6 +812,8 @@ pub(crate) enum FixtureOp {
     /// lists the labels of every global-scope row.
     MlsGlobalRows(Option<(Vec<u8>, Vec<u8>)>, tokio::sync::oneshot::Sender<R<Vec<String>>>),
     MailboxState(tokio::sync::oneshot::Sender<R<super::mailbox_store::MailboxState>>),
+    /// The database size: `page_count × page_size` (the M6 per-entry size measurement).
+    DbBytes(tokio::sync::oneshot::Sender<R<u64>>),
     /// Records a `Frame` entry with this body at this time.
     MailboxRecord(Vec<u8>, u64, tokio::sync::oneshot::Sender<R<Option<u64>>>),
     /// Records a `Frame` entry of this conversation, sender account and installation.
@@ -948,6 +950,14 @@ pub(crate) fn fixture(c: &mut Connection, op: FixtureOp) {
         }
         FixtureOp::MailboxState(reply) => {
             let _ = reply.send(super::mailbox_store::fixture_state(c));
+        }
+        FixtureOp::DbBytes(reply) => {
+            // SQLCipher answers `PRAGMA page_size` itself; the table-valued forms read SQLite's.
+            let _ = reply.send(
+                c.query_row("SELECT page_count*page_size FROM pragma_page_count(),pragma_page_size()", [], |r| r.get::<_, i64>(0))
+                    .map(|v| v as u64)
+                    .map_err(sql_error),
+            );
         }
         FixtureOp::MailboxRecord(body, now, reply) => {
             let _ = reply.send(super::mailbox_store::fixture_record(c, &body, now));
