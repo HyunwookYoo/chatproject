@@ -20,6 +20,14 @@ pub(crate) struct MessageRepo {
     storage: StorageHandle,
     identity: Identity,
 }
+/// Who a received application ciphertext came from (M6 spec 7): the account and device whose
+/// session (or log entry) carried it, and that account's current devices. Any of those may have
+/// sealed it; the MLS leaf that did is its sender.
+pub(crate) struct OpenFrom {
+    pub peer: PeerId,
+    pub transport: InstallationId,
+    pub allowed: Vec<InstallationId>,
+}
 pub(crate) enum MessageDbOp {
     Observed(Box<MessageDbOp>),
     MarkRead(ConversationId, Vec<MessageKey>, u64),
@@ -48,9 +56,8 @@ pub(crate) enum MessageDbOp {
     /// Seals a codec 2 row again. Counted (`reencrypts += 1`, the third time it fails) after a
     /// decrypt failure; not counted when only the epoch moved on under it (C1).
     Reencrypt(MessageKey, u64, bool),
-    /// A received MLS application ciphertext: sender peer, sender installation, conversation,
-    /// ciphertext, now.
-    OpenApp(PeerId, InstallationId, ConversationId, Vec<u8>, u64),
+    /// A received MLS application ciphertext: who it came from, conversation, ciphertext, now.
+    OpenApp(OpenFrom, ConversationId, Vec<u8>, u64),
     MarkWaitingPeerUpdate(MessageKey, bool),
     /// The recipient installation `Ack`ed a sent `App` frame: delivered (now).
     MlsAcked(MessageKey, InstallationId, u64),
@@ -298,7 +305,7 @@ pub(crate) fn execute(
                 MessageDbOp::SealPending(id, _) => Some(*id),
                 // Group operations that span conversations (deliveries, holds) pass a zero id.
                 MessageDbOp::MlsGroupOp(id, _) => (id.0 != [0; 32]).then_some(*id),
-                MessageDbOp::OpenApp(_, _, id, _, _) => Some(*id),
+                MessageDbOp::OpenApp(_, id, _, _) => Some(*id),
                 MessageDbOp::Mailbox(super::mailbox_store::MailboxDbOp::ApplyNote { entry, .. }) => {
                     Some(entry.conversation)
                 }
@@ -563,7 +570,7 @@ pub(crate) fn execute(
         MessageDbOp::Seal(key, now) => super::mls_store::seal(c, identity, local, key, now, mls_fault!(fault)),
         MessageDbOp::SealPending(id, now) => super::mls_store::seal_pending(c, identity, local, id, now, mls_fault!(fault)),
         MessageDbOp::Reencrypt(key, now, counted) => super::mls_store::reencrypt(c, identity, local, key, now, counted, mls_fault!(fault)),
-        MessageDbOp::OpenApp(peer, install, id, ciphertext, now) => super::mls_store::open_app(c, identity, peer, install, id, ciphertext, now, mls_fault!(fault)),
+        MessageDbOp::OpenApp(from, id, ciphertext, now) => super::mls_store::open_app(c, identity, &from, id, ciphertext, now, mls_fault!(fault)),
         MessageDbOp::MarkWaitingPeerUpdate(key, waiting) => super::mls_store::mark_waiting(c, identity, key, waiting, mls_fault!(fault)),
         MessageDbOp::MlsAcked(key, recipient, now) => super::mls_store::acked(c, identity, key, recipient, now, mls_fault!(fault)),
         MessageDbOp::ResealReceipt(key) => super::mls_store::reseal_receipt(c, key, mls_fault!(fault)),

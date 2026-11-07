@@ -28,7 +28,7 @@ use crate::account::{
 use crate::message::mls_group::{
     Committed, Delivery, DueDelivery, GroupOp, GroupReply, Outcome, OwnWelcome,
 };
-use crate::message::store::{MessageDbOp, MessageDbReply, conversation_id};
+use crate::message::store::{MessageDbOp, MessageDbReply, OpenFrom, conversation_id};
 use crate::message::types::ConversationId;
 use crate::message::wire::{Frame, RejectReason};
 use crate::mls::{
@@ -257,6 +257,7 @@ enum Answer {
 
 /// Who made a received kind 17 request: the account and installation that sent it (its MLS
 /// sender), which for an entry of another own device's log (M6) is not the session's device.
+/// An `App` it carries may have been sealed by any current device of that account (M6 spec 7).
 #[derive(Clone, Copy)]
 pub(super) struct Origin {
     pub peer: PeerId,
@@ -387,10 +388,12 @@ pub(crate) enum MlsTest {
     M4Peer(bool),
     M4Close(bool),
     Frames,
+    Exchange(InstallationId, MlsFrame),
 }
 #[cfg(all(feature = "test-hooks", debug_assertions))]
 pub(crate) enum MlsTestReply {
     State(GroupState),
+    Reply(MlsReply),
     Allowed(bool),
     Done,
     Sent(Vec<String>),
@@ -509,6 +512,21 @@ impl AccountHandle {
             _ => unreachable!(),
         }
     }
+    /// Sends `frame` as is to `installation` (any account) over the ready session with it and
+    /// returns the answer; a kind 16 refusal is its error code.
+    pub async fn mls_test_exchange(
+        &self,
+        installation: InstallationId,
+        frame: MlsFrame,
+    ) -> Result<MlsReply, CoreError> {
+        match self
+            .mls_test(MlsTest::Exchange(installation, frame))
+            .await?
+        {
+            MlsTestReply::Reply(reply) => Ok(reply),
+            _ => unreachable!(),
+        }
+    }
 }
 
 impl Manager {
@@ -565,6 +583,18 @@ impl Manager {
             }
             MlsTest::Frames => {
                 MlsTestReply::Frames(self.messages.mls.frames.lock().unwrap().clone())
+            }
+            MlsTest::Exchange(installation, frame) => {
+                // Test only: this actor waits on the answer.
+                let session = self
+                    .mls_sessions()
+                    .into_iter()
+                    .find(|s| s.grant.installation == installation)
+                    .ok_or_else(|| unavailable(ErrorCode::PeerNotConnected))?;
+                let reply = exchange(&session, &frame.encode())
+                    .await
+                    .map_err(unavailable)?;
+                MlsTestReply::Reply(reply)
             }
             MlsTest::Held => MlsTestReply::Count(self.messages.mls.held),
             MlsTest::Rejoined => MlsTestReply::Count(self.messages.mls.rejoined),
@@ -1770,6 +1800,41 @@ impl Manager {
             .map(|_| peer)
     }
 
+    /// The current devices of `peer` as this device holds its record: those its accepted
+    /// record lists, and for this account without the ones it revoked.
+    fn current_installations(&self, peer: PeerId) -> Vec<InstallationId> {
+        let Ok(local) = self.local() else {
+            return Vec::new();
+        };
+        let devices = |record: &crate::account::publication::SignedRecord| {
+            record
+                .record
+                .devices
+                .iter()
+                .map(|d| d.installation_id)
+                .collect::<Vec<_>>()
+        };
+        if peer == local.keys.peer_id() {
+            let Some(accepted) = &local.records.accepted else {
+                return Vec::new();
+            };
+            let mut devices = devices(accepted);
+            devices.retain(|d| {
+                !local
+                    .records
+                    .tombstones
+                    .iter()
+                    .any(|t| t.target_installation == *d)
+            });
+            return devices;
+        }
+        local
+            .remote
+            .iter()
+            .find(|r| r.peer == peer)
+            .map_or_else(Vec::new, |r| devices(&r.accepted))
+    }
+
     fn mls_fingerprint(&self) -> [u8; 32] {
         let mut hash = Sha256::new();
         if let Ok(local) = self.local() {
@@ -2417,8 +2482,10 @@ impl Manager {
         self.group_db(conversation, op, request).await.map(|_| ())
     }
 
-    /// A received application message (spec 5.2): opened and stored in one transaction, under
-    /// `from` (its MLS sender must be that installation). `None` when it carried a text M4
+    /// A received application message (spec 5.2): opened and stored in one transaction. Its MLS
+    /// sender may be any current device of `from`'s account, not only the one that carried it
+    /// (M6 spec 7: a mailbox hands it over as is); that leaf is its sender. `None` when it
+    /// carried a text M4
     /// would refuse (nothing stored; the ratchet still moved). A text from the other account
     /// stored just now is notified: at once `Via::Direct`, with the rest of the sync
     /// `Via::Mailbox`; so is my read on another own device.
@@ -2440,9 +2507,13 @@ impl Manager {
         else {
             return Ok(Some(MlsReply::ContactRequired));
         };
+        let open = OpenFrom {
+            peer: sender,
+            transport: from.installation,
+            allowed: self.current_installations(sender),
+        };
         let op = MessageDbOp::OpenApp(
-            sender,
-            from.installation,
+            open,
             conversation,
             ciphertext,
             self.services.clock.wall_ms(),

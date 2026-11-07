@@ -9,8 +9,8 @@
 use super::mailbox_store::{record_frame, record_note};
 use super::mls_group::{check_own, group_row, signer_of, sql};
 use super::store::{
-    Identity, MessageDbReply, bump, bytes, commit, ensure_conversation, find, integer, invalid,
-    missing, receipt_for, schedule_retry, target, uint,
+    Identity, MessageDbReply, OpenFrom, bump, bytes, commit, ensure_conversation, find, integer,
+    invalid, missing, receipt_for, schedule_retry, target, uint,
 };
 use super::types::*;
 use super::wire::ReceiptKind;
@@ -730,11 +730,13 @@ fn decrypt_failed(class: u8, epoch: u64) -> MessageDbReply {
 }
 
 /// Opens one received application ciphertext and stores the message it carries, in one
-/// transaction. `sender_peer`/`sender_install` are what the authenticated transport says; the
-/// MLS credential must agree.
+/// transaction. `from` is the account the authenticated transport (or log entry) names and its
+/// current devices; the MLS leaf that sealed it must be one of them (M6 spec 7: another device
+/// of the account may hand it over as is), and is its sender here.
 ///
-/// * the device's own ciphertext coming back, or one already in `processed_ct`, is acknowledged
-///   without opening (a replay would only fail with secret reuse);
+/// * the device's own ciphertext coming back, or one already in `processed_ct` from that
+///   account (whichever of its devices carried it), is acknowledged without opening (a replay
+///   would only fail with secret reuse);
 /// * a ciphertext that cannot be opened changes nothing and answers `DecryptFailed`;
 /// * an undecodable plaintext or unknown content still advances the ratchet and is
 ///   acknowledged, so its sender stops retrying;
@@ -748,12 +750,10 @@ fn decrypt_failed(class: u8, epoch: u64) -> MessageDbReply {
 /// * a `Read` receipt another device of this account sent means the user read those messages
 ///   there (spec 6.4): they are read here too, and no receipt goes from here. Its `Delivered`
 ///   receipt says nothing to this device and is dropped.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn open_app(
     c: &mut Connection,
     identity: Identity,
-    sender_peer: PeerId,
-    sender_install: InstallationId,
+    from: &OpenFrom,
     conversation: ConversationId,
     ciphertext: Vec<u8>,
     now: u64,
@@ -761,9 +761,10 @@ pub(super) fn open_app(
 ) -> R<MessageDbReply> {
     let ct_hash: [u8; 32] = Sha256::digest(&ciphertext).into();
     let ack = MessageDbReply::Opened(MlsReply::Ack { ct_hash });
-    if sender_install == identity.installation {
+    if from.transport == identity.installation {
         return Ok(ack);
     }
+    let sender_peer = from.peer;
     // A copy from another device of this account: the conversation must have a group here,
     // which the caller checked is one with a contact.
     let own = sender_peer == identity.peer;
@@ -772,34 +773,36 @@ pub(super) fn open_app(
     }
     let now = integer(now)?;
     let tx = c.transaction().map_err(sql)?;
-    // Seen before: answered as it was answered then. A ciphertext whose text was refused stays
-    // refused (never an `Ack`, which would mean stored).
+    // Seen before, from whichever device of the account carried it then: answered as it was
+    // answered then. A ciphertext whose text was refused stays refused (never an `Ack`, which
+    // would mean stored).
     let seen: Option<u8> = tx
         .query_row(
-            "SELECT max(codec) FROM processed_ct WHERE codec IN (2,3) AND sender_peer=?1 AND sender_install=?2 AND hash=?3",
-            params![sender_peer.0.as_slice(), sender_install.0.as_slice(), ct_hash.as_slice()],
+            "SELECT max(codec) FROM processed_ct WHERE codec IN (2,3) AND sender_peer=?1 AND hash=?2",
+            params![sender_peer.0.as_slice(), ct_hash.as_slice()],
             |r| r.get(0),
         )
         .map_err(sql)?;
     match seen {
         Some(REJECTED_CT) => return Ok(MessageDbReply::Rejected),
         Some(_) => {
-            // The text it carried, if any (its first ciphertext is its payload hash).
-            let text: Option<[u8; 16]> = tx
+            // The text it carried, if any (its first ciphertext is its payload hash), under the
+            // leaf that sealed it.
+            let text: Option<([u8; 32], [u8; 16])> = tx
                 .query_row(
-                    "SELECT msg_id FROM message WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND payload_hash=?4",
-                    params![conversation.0.as_slice(), sender_peer.0.as_slice(), sender_install.0.as_slice(), ct_hash.as_slice()],
-                    |r| bytes::<16>(r, 0),
+                    "SELECT sender_install,msg_id FROM message WHERE conversation=?1 AND sender_peer=?2 AND payload_hash=?3",
+                    params![conversation.0.as_slice(), sender_peer.0.as_slice(), ct_hash.as_slice()],
+                    |r| Ok((bytes::<32>(r, 0)?, bytes::<16>(r, 1)?)),
                 )
                 .optional()
                 .map_err(sql)?;
             return Ok(match text {
-                Some(id) => MessageDbReply::OpenedText(
+                Some((installation, id)) => MessageDbReply::OpenedText(
                     MlsReply::Ack { ct_hash },
                     MessageKey {
                         conversation,
                         sender: sender_peer,
-                        installation: sender_install,
+                        installation: InstallationId(installation),
                         id: MessageId(id),
                     },
                     false,
@@ -827,22 +830,16 @@ pub(super) fn open_app(
         }
         Err(failure) => return Ok(decrypt_failed(failure.class, group.epoch)),
     };
-    let message = match opened {
-        Opened::Application { sender, message } => {
-            if sender != sender_install {
-                return Err(invalid());
-            }
-            Some(message)
-        }
-        Opened::Undecodable { sender } => {
-            if sender != sender_install {
-                return Err(invalid());
-            }
-            None
-        }
+    // The leaf that sealed it: a current device of the account, which is the sender here.
+    let (sender_install, message) = match opened {
+        Opened::Application { sender, message } => (sender, Some(message)),
+        Opened::Undecodable { sender } => (sender, None),
         // A Commit is applied through the group protocol (with its members vetted), never here.
         Opened::Commit { .. } => return Ok(decrypt_failed(group::CLASS_OTHER, group.epoch)),
     };
+    if !from.allowed.contains(&sender_install) {
+        return Err(invalid());
+    }
     let mut stored = Stored::Yes;
     let mut text = None;
     let mut read = false;
@@ -1658,8 +1655,11 @@ mod tests {
             open_app(
                 c,
                 identity,
-                a_peer,
-                a_device.installation_id(),
+                &OpenFrom {
+                    peer: a_peer,
+                    transport: a_device.installation_id(),
+                    allowed: vec![a_device.installation_id()],
+                },
                 conversation,
                 ciphertext.clone(),
                 5,

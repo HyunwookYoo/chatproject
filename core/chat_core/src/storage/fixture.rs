@@ -230,6 +230,8 @@ impl Messages {
             _ => unreachable!(),
         }
     }
+    /// A ciphertext `installation` of `sender` carried itself, the one current device of its
+    /// account here.
     pub async fn mls_open_app(
         &self,
         sender: crate::account::PeerId,
@@ -238,7 +240,22 @@ impl Messages {
         ciphertext: Vec<u8>,
         now: u64,
     ) -> Result<crate::mls::wire::MlsReply, CoreError> {
-        let op = MessageDbOp::OpenApp(sender, installation, conversation, ciphertext, now);
+        self.mls_open_app_from(sender, installation, vec![installation], conversation, ciphertext, now)
+            .await
+    }
+    /// `mls_open_app` carried by `transport` of `sender`'s account, whose current devices are
+    /// `allowed` (any of them may have sealed it, M6 spec 7).
+    pub async fn mls_open_app_from(
+        &self,
+        sender: crate::account::PeerId,
+        transport: crate::account::InstallationId,
+        allowed: Vec<crate::account::InstallationId>,
+        conversation: ConversationId,
+        ciphertext: Vec<u8>,
+        now: u64,
+    ) -> Result<crate::mls::wire::MlsReply, CoreError> {
+        let from = crate::message::store::OpenFrom { peer: sender, transport, allowed };
+        let op = MessageDbOp::OpenApp(from, conversation, ciphertext, now);
         match self.mls(op).await? {
             MessageDbReply::Opened(reply)
             | MessageDbReply::OpenedText(reply, ..)

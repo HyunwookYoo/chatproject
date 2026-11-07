@@ -564,40 +564,107 @@ async fn decrypt_failures_report_a_class_and_change_nothing() {
     ack(&open(&b, &a, conversation, &ct).await);
 }
 
+/// Another device of A's account (A's record lists it); it never ran here.
+const A2: InstallationId = InstallationId([9; 32]);
+
+/// M6 spec 7: a ciphertext is taken from any current device of its sender's account, sealed by
+/// any other; the MLS leaf that sealed it is the sender here.
 #[tokio::test]
-async fn a_message_from_another_sender_than_its_transport_is_rejected() {
+async fn a_leaf_of_another_current_device_is_recorded_as_that_device() {
     let (a, b, conversation) = linked().await;
-    let key = send(&a, &b, 1, "claimed by someone else").await;
+    let key = send(&a, &b, 1, "handed over as is").await;
     a.m.mls_seal(key, NOW).await.unwrap().unwrap();
     let ct = ciphertext(&a, key).await;
-    let before = b.f.mls_state(conversation).await.unwrap();
+    let logged = b.f.mailbox_state().await.unwrap().entries.len();
 
-    // Transport says the sender is another installation of A's account.
-    let error =
-        b.m.mls_open_app(
+    // A2 carries what A1 sealed.
+    let reply =
+        b.m.mls_open_app_from(
             a.peer,
-            InstallationId([9; 32]),
+            A2,
+            vec![a.install, A2],
             conversation,
             ct.clone(),
             NOW,
         )
         .await
-        .err()
         .unwrap();
-    assert_eq!(error.code, ErrorCode::InvalidMessage);
-    // Transport says the sender is not in this conversation.
-    let error =
+    assert_eq!(ack(&reply), hash(&ct));
+    let page = b.m.load_messages(conversation, None, 50).await.unwrap();
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].key, key);
+    assert_eq!(page.items[0].key.installation, a.install);
+    // The device log and the downgrade guard name A1 too.
+    let log = b.f.mailbox_state().await.unwrap().entries;
+    assert_eq!(log.len(), logged + 1);
+    let entry = log.last().unwrap();
+    assert_eq!(
+        (entry.sender_peer, entry.sender_install),
+        (a.peer, a.install)
+    );
+    let state = b.f.mls_state(conversation).await.unwrap();
+    assert_eq!((state.processed_mls, state.peer_mls), (1, Some(true)));
+
+    // A1 sending the same ciphertext itself is the same message: acknowledged, not opened.
+    let counts = b.f.message_counts().await.unwrap();
+    assert_eq!(ack(&open(&b, &a, conversation, &ct).await), hash(&ct));
+    assert_eq!(b.f.message_counts().await.unwrap(), counts);
+    let again = b.f.mls_state(conversation).await.unwrap();
+    assert_eq!(
+        (again.open_calls, again.kv_digest),
+        (state.open_calls, state.kv_digest)
+    );
+}
+
+/// M6 spec 7 and 11: a leaf that is no current device of the account that sent it is refused
+/// after opening, and nothing it opened is kept.
+#[tokio::test]
+async fn a_leaf_outside_the_senders_current_devices_is_rejected() {
+    let (a, b, conversation) = linked().await;
+    let key = send(&a, &b, 1, "sealed by a leaf not listed").await;
+    a.m.mls_seal(key, NOW).await.unwrap().unwrap();
+    let ct = ciphertext(&a, key).await;
+    let before = b.f.mls_state(conversation).await.unwrap();
+    let counts = b.f.message_counts().await.unwrap();
+    let log = b.f.mailbox_state().await.unwrap();
+    let refused = |reply: Result<MlsReply, chat_core::CoreError>| {
+        assert_eq!(reply.err().unwrap().code, ErrorCode::InvalidMessage)
+    };
+
+    // A's record no longer lists A1 (revoked): neither A1 itself nor A2 may bring its leaf.
+    refused(
+        b.m.mls_open_app_from(a.peer, a.install, vec![A2], conversation, ct.clone(), NOW)
+            .await,
+    );
+    refused(
+        b.m.mls_open_app_from(a.peer, A2, vec![A2], conversation, ct.clone(), NOW)
+            .await,
+    );
+    // A device of B's own account brings a leaf of A's account as B's own.
+    refused(
+        b.m.mls_open_app_from(
+            b.peer,
+            A2,
+            vec![b.install, A2],
+            conversation,
+            ct.clone(),
+            NOW,
+        )
+        .await,
+    );
+    // The transport names an account that is not in this conversation.
+    refused(
         b.m.mls_open_app(PeerId([8; 32]), a.install, conversation, ct.clone(), NOW)
-            .await
-            .err()
-            .unwrap();
-    assert_eq!(error.code, ErrorCode::InvalidMessage);
+            .await,
+    );
 
     let after = b.f.mls_state(conversation).await.unwrap();
     assert_eq!(
-        (after.kv_digest, after.processed_mls),
-        (before.kv_digest, 0)
+        (after.kv_digest, after.processed_mls, after.peer_mls),
+        (before.kv_digest, 0, before.peer_mls)
     );
+    assert_eq!(b.f.message_counts().await.unwrap(), counts);
+    assert_eq!(b.f.mailbox_state().await.unwrap(), log);
     ack(&open(&b, &a, conversation, &ct).await);
 }
 
