@@ -1,13 +1,14 @@
 import 'dart:async';
-import 'dart:typed_data';
 
 import 'package:chat_app/account/account_model.dart';
 import 'package:chat_app/account/screens/contact_preview_screen.dart';
+import 'package:chat_app/mailbox/mailbox_platform.dart';
 import 'package:chat_app/mailbox/notifier.dart';
 import 'package:chat_app/main.dart';
 import 'package:chat_app/message/screens/conversation_screen.dart';
 import 'package:chat_app/src/rust/api/account.dart' as a;
 import 'package:chat_app/src/rust/api/chat.dart' as r;
+import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -29,6 +30,7 @@ r.NotifyItem _item(int conversation, int newMessages, int unread) =>
 const _id1 = 0x01010101;
 
 void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
   late StreamController<r.ChatEvent> bus;
   late FakeMailboxPlatform platform;
   late Notifier notifier;
@@ -64,7 +66,7 @@ void main() {
   test('new messages notify once with the alias and the unread count', () {
     notify([_item(1, 3, 3)]);
     expect(platform.notifications, [
-      (id: _id1, title: isolatedName('Alice'), body: '새 메시지 3개'),
+      (id: _id1, title: isolatedName('Alice'), body: '새 메시지 3개', update: false),
     ]);
     expect(platform.notifications.single.title.runes.first, 0x2068);
     expect(platform.cancelled, isEmpty);
@@ -93,7 +95,45 @@ void main() {
     );
     notify([_item(1, 3, 3)]);
     notify([_item(1, 0, 1)]);
-    expect(platform.notifications.map((n) => n.body), ['새 메시지 3개', '새 메시지 1개']);
+    // The count change is sent as an update: the platform never alerts for
+    // it and drops it when the notification was dismissed (Ruling 31).
+    expect(platform.notifications.map((n) => (n.body, n.update)), [
+      ('새 메시지 3개', false),
+      ('새 메시지 1개', true),
+    ]);
+    notify([_item(1, 2, 3)]);
+    expect(platform.notifications.last.update, isFalse, reason: 'new messages');
+  });
+
+  test('the channel sends update with every notify', () async {
+    final sent = <Object?>[];
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(const MethodChannel('chat_app/mailbox'), (
+          call,
+        ) async {
+          sent.add([call.method, call.arguments]);
+          return null;
+        });
+    addTearDown(
+      () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(
+            const MethodChannel('chat_app/mailbox'),
+            null,
+          ),
+    );
+    const channel = ChannelMailboxPlatform();
+    await channel.notify(id: -2, title: 't', body: 'b');
+    await channel.notify(id: 5, title: 't', body: 'b', update: true);
+    expect(sent, [
+      [
+        'notify',
+        {'id': -2, 'title': 't', 'body': 'b', 'update': false},
+      ],
+      [
+        'notify',
+        {'id': 5, 'title': 't', 'body': 'b', 'update': true},
+      ],
+    ]);
   });
 
   test(

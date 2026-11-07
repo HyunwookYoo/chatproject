@@ -69,7 +69,7 @@ class FakeMailboxPlatform implements MailboxPlatform {
   bool autostartValue = false;
   bool permissionResult = true;
   final calls = <String>[];
-  final notifications = <({int id, String title, String body})>[];
+  final notifications = <({int id, String title, String body, bool update})>[];
   final cancelled = <int>[];
   Future<void> Function()? onExitRequested;
   void Function(int)? onOpenConversation;
@@ -95,7 +95,9 @@ class FakeMailboxPlatform implements MailboxPlatform {
     required int id,
     required String title,
     required String body,
-  }) async => notifications.add((id: id, title: title, body: body));
+    bool update = false,
+  }) async =>
+      notifications.add((id: id, title: title, body: body, update: update));
 
   @override
   Future<void> cancelNotification(int id) async => cancelled.add(id);

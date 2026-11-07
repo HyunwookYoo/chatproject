@@ -33,7 +33,10 @@ class MailboxHost {
   void OnPowerBroadcast();
   bool SetAutostart(bool on);
   bool Autostart();
-  void Notify(int id, const std::wstring& title, const std::wstring& body);
+  // update: a count change of the notification showing for `id`; never
+  // alerts and never re-shows a dismissed one.
+  void Notify(int id, const std::wstring& title, const std::wstring& body,
+              bool update);
   void Cancel(int id);
 
   // WM_CLOSE. Returns true when the window should be destroyed.

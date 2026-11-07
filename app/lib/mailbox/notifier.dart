@@ -87,6 +87,7 @@ class Notifier {
         id: id,
         title: alias == null ? '새 메시지' : isolatedName(alias),
         body: '새 메시지 ${item.unread}개',
+        update: item.newMessages == 0,
       ),
     );
   }

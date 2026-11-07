@@ -151,6 +151,18 @@ void main() {
     expect(state['closeAction'], 'destroy');
     expect(state['visible'], isTrue);
 
+    // A count update of a notification that is not showing shows nothing
+    // (Ruling 31): no balloon, so no icon either.
+    await _channel.invokeMethod<void>('notify', {
+      'id': 8,
+      'title': 'PUBLIC MAILBOX FIXTURE',
+      'body': 'PUBLIC MAILBOX FIXTURE',
+      'update': true,
+    });
+    state = await _probe();
+    expect(state['tray'], isFalse);
+    expect(state['balloon'], isNull);
+
     // A notification with the mailbox off adds an icon only while it is shown.
     await _channel.invokeMethod<void>('notify', {
       'id': 7,
@@ -159,6 +171,13 @@ void main() {
     });
     expect((await _probe())['tray'], isTrue);
     await _channel.invokeMethod<void>('cancelNotification', 7);
+    expect((await _probe())['tray'], isFalse);
+    await _channel.invokeMethod<void>('notify', {
+      'id': 7,
+      'title': 'PUBLIC MAILBOX FIXTURE',
+      'body': 'PUBLIC MAILBOX FIXTURE',
+      'update': true,
+    });
     expect((await _probe())['tray'], isFalse);
 
     expect(await _channel.invokeMethod<bool>('setAutostart', true), isTrue);

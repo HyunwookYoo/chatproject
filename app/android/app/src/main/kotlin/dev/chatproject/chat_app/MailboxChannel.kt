@@ -6,6 +6,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.ActivityNotFoundException
+import android.content.Context
 import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
@@ -83,8 +84,12 @@ class MailboxChannel(private val activity: FlutterActivity, messenger: BinaryMes
                 val id = intValue(map?.get("id"))
                 val title = map?.get("title") as? String
                 val body = map?.get("body") as? String
-                if (id == null || title == null || body == null) return result.error("invalid_argument", null, null)
-                notify(id, title, body)
+                // Optional: a count update of a shown notification.
+                val update = map?.get("update")
+                if (id == null || title == null || body == null || (update != null && update !is Boolean)) {
+                    return result.error("invalid_argument", null, null)
+                }
+                notify(id, title, body, update == true)
                 result.success(null)
             }
             "cancelNotification" -> {
@@ -102,6 +107,7 @@ class MailboxChannel(private val activity: FlutterActivity, messenger: BinaryMes
                     "channelImportance" to notifications.getNotificationChannel(MailboxService.CHANNEL_ID)?.importance,
                     "messagesImportance" to notifications.getNotificationChannel(MESSAGES_CHANNEL)?.importance,
                     "fgsType" to if (service != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) service.foregroundServiceType else 0,
+                    "activeMessages" to notifications.activeNotifications.filter { it.tag == MESSAGES_TAG }.map { it.id },
                 ))
             }
             else -> result.notImplemented()
@@ -149,11 +155,19 @@ class MailboxChannel(private val activity: FlutterActivity, messenger: BinaryMes
         }
         // One system prompt at a time.
         if (pendingPermission != null) return result.success(false)
+        // Asked once, on the first run with an active account; later runs
+        // answer the current state without a prompt.
+        val prefs = activity.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        if (prefs.getBoolean(PERMISSION_ASKED, false)) return result.success(false)
+        prefs.edit().putBoolean(PERMISSION_ASKED, true).apply()
         pendingPermission = result
         activity.requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), PERMISSION_REQUEST)
     }
 
-    private fun notify(id: Int, title: String, body: String) {
+    // update: a count change of the notification shown for `id`. It never
+    // alerts and never brings back one the user dismissed.
+    private fun notify(id: Int, title: String, body: String, update: Boolean) {
+        if (update && notifications.activeNotifications.none { it.tag == MESSAGES_TAG && it.id == id }) return
         notifications.createNotificationChannel(
             NotificationChannel(MESSAGES_CHANNEL, "메시지", NotificationManager.IMPORTANCE_DEFAULT),
         )
@@ -170,6 +184,7 @@ class MailboxChannel(private val activity: FlutterActivity, messenger: BinaryMes
             .setContentText(body)
             .setContentIntent(open)
             .setAutoCancel(true)
+            .setOnlyAlertOnce(update)
             .setCategory(Notification.CATEGORY_MESSAGE)
             .build()
         notifications.notify(MESSAGES_TAG, id, notification)
@@ -181,6 +196,8 @@ class MailboxChannel(private val activity: FlutterActivity, messenger: BinaryMes
         // A tag keeps message ids apart from the service's own notification id.
         private const val MESSAGES_TAG = "message"
         private const val PERMISSION_REQUEST = 6001
+        private const val PREFS = "chat_app_mailbox"
+        private const val PERMISSION_ASKED = "notification_permission_asked"
 
         fun conversationOf(intent: Intent?): Int? =
             if (intent?.hasExtra(EXTRA_CONVERSATION) == true) intent.getIntExtra(EXTRA_CONVERSATION, 0) else null

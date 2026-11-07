@@ -12,17 +12,23 @@ abstract interface class MailboxPlatform {
 
   /// Windows.
   Future<bool> autostart();
+
+  /// [update]: only the count of the notification shown for [id] changes.
+  /// The platform never alerts for it and drops it when that notification is
+  /// no longer shown (dismissed or replaced).
   Future<void> notify({
     required int id,
     required String title,
     required String body,
+    bool update = false,
   });
   Future<void> cancelNotification(int id);
 
   /// Android.
   Future<void> requestBatteryExemption();
 
-  /// Android 13+.
+  /// Android 13+. Prompts only the first time ever; later calls answer the
+  /// current state.
   Future<bool> requestNotificationPermission();
 
   /// Windows: ends the app after an `exitRequested`.
@@ -64,7 +70,13 @@ class ChannelMailboxPlatform implements MailboxPlatform {
     required int id,
     required String title,
     required String body,
-  }) => _call<void>('notify', {'id': id, 'title': title, 'body': body});
+    bool update = false,
+  }) => _call<void>('notify', {
+    'id': id,
+    'title': title,
+    'body': body,
+    'update': update,
+  });
   @override
   Future<void> cancelNotification(int id) =>
       _call<void>('cancelNotification', id);

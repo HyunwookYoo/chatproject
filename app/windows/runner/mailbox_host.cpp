@@ -176,8 +176,14 @@ void MailboxHost::HandleCall(
     const auto id = map ? IntValue(Field(*map, "id")) : std::nullopt;
     const auto* title = map ? std::get_if<std::string>(Field(*map, "title")) : nullptr;
     const auto* body = map ? std::get_if<std::string>(Field(*map, "body")) : nullptr;
-    if (!id || !title || !body) { result->Error("invalid_argument"); return; }
-    Notify(*id, Utf16FromUtf8(*title), Utf16FromUtf8(*body));
+    // Optional: a count update of a shown notification.
+    const auto* update_value = map ? Field(*map, "update") : nullptr;
+    const auto* update = update_value ? std::get_if<bool>(update_value) : nullptr;
+    if (!id || !title || !body || (update_value && !update)) {
+      result->Error("invalid_argument");
+      return;
+    }
+    Notify(*id, Utf16FromUtf8(*title), Utf16FromUtf8(*body), update && *update);
     result->Success();
     return;
   }
@@ -307,7 +313,11 @@ bool MailboxHost::SetAutostart(bool on) {
 
 bool MailboxHost::Autostart() { return RunValue().has_value(); }
 
-void MailboxHost::Notify(int id, const std::wstring& title, const std::wstring& body) {
+void MailboxHost::Notify(int id, const std::wstring& title, const std::wstring& body,
+                         bool update) {
+  // An update changes only the balloon showing for that id, silently; a
+  // dismissed or replaced one does not come back.
+  if (update && balloon_id_ != id) return;
   balloon_id_ = id;
   UpdateIcon();
   if (!icon_added_) return;
@@ -317,7 +327,7 @@ void MailboxHost::Notify(int id, const std::wstring& title, const std::wstring& 
   data.uFlags = NIF_INFO;
   wcsncpy_s(data.szInfoTitle, title.c_str(), _TRUNCATE);
   wcsncpy_s(data.szInfo, body.empty() ? L" " : body.c_str(), _TRUNCATE);
-  data.dwInfoFlags = NIIF_USER | NIIF_LARGE_ICON;
+  data.dwInfoFlags = NIIF_USER | NIIF_LARGE_ICON | (update ? NIIF_NOSOUND : 0);
   data.hBalloonIcon = AppIcon(SM_CXICON, SM_CYICON);
   Shell_NotifyIconW(NIM_MODIFY, &data);
 }
@@ -468,6 +478,8 @@ flutter::EncodableValue MailboxHost::ProbeState(bool hold, const char* close_act
       {flutter::EncodableValue("remembered"),
        remembered ? flutter::EncodableValue(*remembered) : flutter::EncodableValue()},
       {flutter::EncodableValue("tray"), flutter::EncodableValue(icon_added_)},
+      {flutter::EncodableValue("balloon"),
+       balloon_id_ ? flutter::EncodableValue(*balloon_id_) : flutter::EncodableValue()},
       {flutter::EncodableValue("powerHeld"), flutter::EncodableValue(power_held_)},
       {flutter::EncodableValue("hold"), flutter::EncodableValue(hold)},
       {flutter::EncodableValue("autostart"),

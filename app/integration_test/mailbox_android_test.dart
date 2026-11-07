@@ -70,7 +70,16 @@ void main() {
         'body': 'PUBLIC MAILBOX FIXTURE',
       });
       await _channel.invokeMethod<void>('cancelNotification', 7);
+      // A count update of a notification that is not shown posts nothing
+      // (Ruling 31).
+      await _channel.invokeMethod<void>('notify', {
+        'id': 8,
+        'title': 'PUBLIC MAILBOX FIXTURE',
+        'body': 'PUBLIC MAILBOX FIXTURE',
+        'update': true,
+      });
       state = await _probe();
+      expect(state['activeMessages'], isNot(contains(8)));
       expect(state['messagesImportance'], _importanceDefault);
       expect(state['serviceRunning'], isFalse);
     },
