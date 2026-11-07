@@ -354,3 +354,93 @@ async fn cancel_withdraws_the_handed_off_ciphertext() {
         "A2 does not log it again"
     );
 }
+
+/// A `Handoff` frame of `key`'s ciphertext from `from` to `to`, sent by hand (a late frame).
+async fn late_handoff(from: &Fixture, to: &Fixture, peer: PeerId, key: MessageKey, ct: Vec<u8>) {
+    let frame = MailboxFrame::Handoff {
+        entries: vec![HandoffEntry {
+            conversation: key.conversation,
+            peer,
+            msg_id: key.id,
+            ciphertext: ct,
+        }],
+    };
+    let reply = from
+        .account
+        .mailbox_test_exchange(installation(to).await, frame)
+        .await
+        .unwrap();
+    assert!(
+        reply == MailboxReply::Ok,
+        "a settled entry is skipped, not refused"
+    );
+}
+
+/// Ruling 27: A2 pulls A1's withdrawal before A1's `Handoff` frame of that message arrives
+/// (the send was under way when the user cancelled). The late frame creates no row, and A2
+/// never tries the message.
+#[tokio::test]
+async fn withdraw_pulled_before_the_handoff_frame_keeps_it_out() {
+    let (mut a, b1, _net, _conv) = accounts(&[A1, A2], &[B1]).await;
+    let a2 = a.pop().unwrap();
+    let a1 = a.pop().unwrap();
+    a1.account.message_test_hold_scheduler(true).await.unwrap();
+    b1.account.message_test_m4_peer(true).await.unwrap();
+    let key = send(&a1, &b1, 1, "cancelled while handed over").await.key;
+    a1.account
+        .storage_test_fixture()
+        .messages()
+        .await
+        .unwrap()
+        .mls_seal(key, NOW * 1000)
+        .await
+        .unwrap()
+        .unwrap();
+    let ct = sealed(&a1, key).await;
+    a1.account.messages().cancel_send(key).await.unwrap();
+    // A2 has the withdrawal (kept, as nothing was handed over yet).
+    settle!(
+        [&a1, &a2, &b1],
+        mailbox(&a2).await.status_ahead == 1 && caught_up(&a2, &a1).await
+    );
+    assert!(handoffs(&a2).await.is_empty());
+
+    late_handoff(&a1, &a2, b1.peer, key, ct).await;
+    quiet(&[&a1, &a2, &b1]).await;
+    assert!(handoffs(&a2).await.is_empty(), "no row");
+    assert!(sends(&a2).await.is_empty(), "no attempt");
+}
+
+/// Ruling 27: A2 already shows the message delivered (A1 delivered it and A2 pulled the note)
+/// when a late `Handoff` frame of it arrives: no row, no attempt.
+#[tokio::test]
+async fn delivered_pulled_before_the_handoff_frame_keeps_it_out() {
+    let (mut a, b1, _net, _conv) = accounts(&[A1, A2], &[B1]).await;
+    let a2 = a.pop().unwrap();
+    let a1 = a.pop().unwrap();
+    a1.account.message_test_hold_scheduler(true).await.unwrap();
+    let key = send(&a1, &b1, 1, "delivered meanwhile").await.key;
+    a1.account
+        .storage_test_fixture()
+        .messages()
+        .await
+        .unwrap()
+        .mls_seal(key, NOW * 1000)
+        .await
+        .unwrap()
+        .unwrap();
+    let ct = sealed(&a1, key).await;
+    a1.account.message_test_hold_scheduler(false).await.unwrap();
+    settle!(
+        [&a1, &a2, &b1],
+        delivery(&a1, key).await == DeliveryState::Delivered
+            && message(&a2, key).await.map(|m| m.state) == Some(DeliveryState::Delivered)
+    );
+    // From here B1 would never ack: a row, if made, would stay and be tried.
+    b1.account.message_test_m4_peer(true).await.unwrap();
+
+    late_handoff(&a1, &a2, b1.peer, key, ct).await;
+    quiet(&[&a1, &a2, &b1]).await;
+    assert!(handoffs(&a2).await.is_empty(), "no row");
+    assert!(sends(&a2).await.is_empty(), "no attempt");
+}

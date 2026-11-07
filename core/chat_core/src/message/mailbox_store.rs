@@ -191,8 +191,9 @@ pub(crate) enum MailboxDbOp {
     HandoffRows,
     /// Ciphertexts own device `origin` handed over, each due at `now`. Another ciphertext of a
     /// message already here replaces the one kept (its attempts start over); the same one again
-    /// changes nothing. Entries whose conversation is not this account's with `peer` are not
-    /// taken.
+    /// changes nothing. Not taken (Ruling 27): entries whose conversation is not this account's
+    /// with `peer`, and messages already settled here — withdrawn (cancelled by the origin),
+    /// or delivered or read (this device's copy, or a status kept for a copy not here yet).
     TakeHandoff {
         origin: InstallationId,
         entries: Vec<HandoffEntry>,
@@ -398,7 +399,9 @@ pub(super) fn mailbox_op(
             let tx = c.transaction().map_err(sql)?;
             let mut taken = 0;
             for entry in entries {
-                if conversation_id(identity.peer, entry.peer).ok() != Some(entry.conversation) {
+                if conversation_id(identity.peer, entry.peer).ok() != Some(entry.conversation)
+                    || settled(&tx, identity, origin, entry.conversation, entry.msg_id)?
+                {
                     continue;
                 }
                 taken += tx
@@ -454,6 +457,28 @@ pub(super) fn mailbox_op(
         }
     };
     Ok(MessageDbReply::Mailbox(reply))
+}
+
+/// Whether this device already knows message `msg_id` that `origin` sent in `conversation` to be
+/// done with: withdrawn by the origin, or delivered or read (Ruling 27).
+fn settled(
+    tx: &Transaction,
+    identity: Identity,
+    origin: InstallationId,
+    conversation: ConversationId,
+    msg_id: MessageId,
+) -> R<bool> {
+    tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM mailbox_status_ahead WHERE conversation=?1 AND sender_peer=?2 AND msg_id=?4 AND kind IN (2,3,4)) OR EXISTS(SELECT 1 FROM message WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4 AND outgoing=1 AND (delivered_at_ms IS NOT NULL OR read_at_ms IS NOT NULL))",
+        params![
+            conversation.0.as_slice(),
+            identity.peer.0.as_slice(),
+            origin.0.as_slice(),
+            msg_id.0.as_slice()
+        ],
+        |r| r.get(0),
+    )
+    .map_err(sql)
 }
 
 /// The 32-byte values of the first column of `query`.
@@ -762,8 +787,9 @@ fn serve_page(
 /// comes. What changed something here is logged here too, so a third own device gets it from
 /// this one; a repeat changes nothing and is not logged again. A ciphertext of the message handed
 /// over to this device is not tried any more. `HandoffWithdraw` (Ruling 26: the origin cancelled
-/// the message) only drops the ciphertext of it the origin handed over to this device, if any; it
-/// is not logged again. `HandoffStop` is the origin's alone to act on (the account actor does,
+/// the message) drops the ciphertext of it the origin handed over to this device, if any, and is
+/// kept in `mailbox_status_ahead` (kind 4) so a handoff of it that comes later is refused
+/// (Ruling 27); it is not logged again. `HandoffStop` is the origin's alone to act on (the account actor does,
 /// Ruling 1): nothing here. Returns the rows changed (messages, or the withdrawn ciphertext).
 fn apply_note(tx: &Transaction, identity: Identity, entry: &LogEntry, now: u64) -> R<u64> {
     // Only this account's own sent messages have a delivery or a withdrawal to learn.
@@ -773,6 +799,17 @@ fn apply_note(tx: &Transaction, identity: Identity, entry: &LogEntry, now: u64) 
     let (msg_id, at_ms) = match entry.body {
         EntryBody::Delivered { msg_id, at_ms, .. } => (msg_id, at_ms),
         EntryBody::HandoffWithdraw { msg_id } => {
+            // Remembered, so a handoff of it arriving after this note is not taken (Ruling 27).
+            tx.execute(
+                "INSERT OR IGNORE INTO mailbox_status_ahead VALUES(?1,?2,?3,4,?4)",
+                params![
+                    entry.conversation.0.as_slice(),
+                    entry.sender_peer.0.as_slice(),
+                    msg_id.0.as_slice(),
+                    integer(now)?
+                ],
+            )
+            .map_err(sql)?;
             return drop_handoff(tx, entry.sender_install, entry.conversation, msg_id);
         }
         _ => return Ok(0),

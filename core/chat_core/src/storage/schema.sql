@@ -192,12 +192,12 @@ CREATE TABLE mailbox_pull (
     since_seq INTEGER NOT NULL CHECK(since_seq>=0)
 ) STRICT;
 
--- 메시지보다 먼저 온 상태: 1 내가 읽음, 2 상대 전달, 3 상대 읽음
+-- 메시지보다 먼저 온 상태: 1 내가 읽음, 2 상대 전달, 3 상대 읽음, 4 송신 인계 철회 (Ruling 27)
 CREATE TABLE mailbox_status_ahead (
     conversation BLOB NOT NULL CHECK(length(conversation)=32),
     sender_peer BLOB NOT NULL CHECK(length(sender_peer)=32),
     msg_id BLOB NOT NULL CHECK(length(msg_id)=16),
-    kind INTEGER NOT NULL CHECK(kind IN (1,2,3)),
+    kind INTEGER NOT NULL CHECK(kind IN (1,2,3,4)),
     at_ms INTEGER NOT NULL CHECK(at_ms>=0),
     PRIMARY KEY(conversation,sender_peer,msg_id,kind)
 ) STRICT;

@@ -1269,7 +1269,8 @@ fn store_text(
     }
     if !ahead.is_empty() {
         tx.execute(
-            "DELETE FROM mailbox_status_ahead WHERE conversation=?1 AND sender_peer=?2 AND msg_id=?3",
+            // A withdrawal (kind 4) stays: it keeps a late handoff of the message out (Ruling 27).
+            "DELETE FROM mailbox_status_ahead WHERE conversation=?1 AND sender_peer=?2 AND msg_id=?3 AND kind<>4",
             params![
                 conversation.0.as_slice(),
                 sender_peer.0.as_slice(),
