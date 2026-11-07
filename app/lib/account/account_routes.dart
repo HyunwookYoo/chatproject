@@ -2,6 +2,9 @@ import 'record_review.dart';
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart' show listEquals;
+import '../mailbox/first_link_screen.dart';
+import '../mailbox/mailbox_model.dart';
+import '../mailbox/mailbox_settings_screen.dart';
 import '../src/rust/api/account.dart' as a;
 import 'account_model.dart';
 import 'sensitive_screen.dart';
@@ -26,11 +29,13 @@ class AccountRoutes extends StatefulWidget {
     required this.child,
     this.onPair,
     this.onOpenConversation,
+    this.mailbox,
   });
   final AccountModel model;
   final Widget child;
   final VoidCallback? onPair;
   final ValueChanged<List<int>>? onOpenConversation;
+  final MailboxModel? mailbox;
   @override
   State<AccountRoutes> createState() => _AccountRoutesState();
 }
@@ -57,6 +62,7 @@ class _AccountRoutesState extends State<AccountRoutes>
     super.initState();
     model.addListener(_changed);
     WidgetsBinding.instance.addObserver(this);
+    _mailboxActive();
     unawaited(
       _links.start((payload) {
         _incomingInvite = payload;
@@ -67,6 +73,7 @@ class _AccountRoutesState extends State<AccountRoutes>
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
+    widget.mailbox?.lifecycle(state);
     // Before a display exists there is no SensitiveScreen observer yet.
     if (state != AppLifecycleState.resumed && _page == _Page.home && _working) {
       unawaited(_cancel());
@@ -98,8 +105,15 @@ class _AccountRoutesState extends State<AccountRoutes>
     WidgetsBinding.instance.scheduleFrame();
   }
 
+  void _mailboxActive() {
+    if (model.snapshot?.phase == a.AccountPhase.active) {
+      unawaited(widget.mailbox?.accountActive());
+    }
+  }
+
   void _changed() {
     if (!mounted) return;
+    _mailboxActive();
     _consumeInvite();
     setState(() {
       final safety = _safety;
@@ -316,6 +330,11 @@ class _AccountRoutesState extends State<AccountRoutes>
       builder: (_) => DevicesScreen(model: model, onPair: _pair),
     ),
   );
+  void _mailboxSettings(MailboxModel mailbox) => Navigator.of(context).push(
+    MaterialPageRoute<void>(
+      builder: (_) => MailboxSettingsScreen(model: mailbox),
+    ),
+  );
   Widget _contactDetail() {
     final selectedPeer = List<int>.of(_contact!.peerId);
     final remote = model.snapshot?.remoteRecords
@@ -372,6 +391,12 @@ class _AccountRoutesState extends State<AccountRoutes>
     crossAxisAlignment: CrossAxisAlignment.stretch,
     children: [
       TextButton(onPressed: _devices, child: const Text('내 기기')),
+      if (widget.mailbox case final MailboxModel mailbox
+          when MailboxModel.supported)
+        TextButton(
+          onPressed: () => _mailboxSettings(mailbox),
+          child: const Text('메일박스'),
+        ),
       Text('연락처', style: Theme.of(context).textTheme.headlineMedium),
       const SizedBox(height: 16),
       if (view.phase == a.AccountPhase.publishPending ||
@@ -497,7 +522,7 @@ class _AccountRoutesState extends State<AccountRoutes>
       _Page.recover,
     ].contains(_page);
     final body = _bounded(content);
-    return PopScope(
+    final page = PopScope(
       canPop: _page == _Page.home,
       onPopInvokedWithResult: (didPop, result) {
         if (!didPop) unawaited(_cancel());
@@ -553,5 +578,7 @@ class _AccountRoutesState extends State<AccountRoutes>
         ),
       ),
     );
+    final mailbox = widget.mailbox;
+    return mailbox == null ? page : FirstLinkGate(model: mailbox, child: page);
   }
 }

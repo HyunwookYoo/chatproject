@@ -1,3 +1,6 @@
+import 'dart:async';
+
+import 'package:flutter/foundation.dart' show listEquals;
 import 'package:flutter/material.dart';
 
 import 'bootstrap.dart';
@@ -6,6 +9,10 @@ import 'account/account_routes.dart';
 import 'account/invite_links.dart';
 import 'core_client.dart';
 import 'home/home_screen.dart';
+import 'mailbox/mailbox_client.dart';
+import 'mailbox/mailbox_model.dart';
+import 'mailbox/mailbox_platform.dart';
+import 'mailbox/notifier.dart';
 import 'message/message_client.dart';
 import 'message/message_model.dart';
 import 'message/screens/conversation_screen.dart';
@@ -36,11 +43,15 @@ class ChatApp extends StatefulWidget {
     this.network,
     this.account,
     this.messages,
+    this.mailbox,
+    this.mailboxPlatform = const ChannelMailboxPlatform(),
   });
 
   final CoreClient core;
   final AccountModel? account;
   final MessageClient? messages;
+  final MailboxClient? mailbox;
+  final MailboxPlatform mailboxPlatform;
   final ProbeHost? probe;
   final NetworkClient? network;
 
@@ -50,12 +61,54 @@ class ChatApp extends StatefulWidget {
 
 class _ChatAppState extends State<ChatApp> {
   bool _roomOpen = false;
+  final _navigator = GlobalKey<NavigatorState>();
+  MailboxModel? _mailbox;
+  Notifier? _notifier;
+
+  @override
+  void initState() {
+    super.initState();
+    final client = widget.mailbox;
+    final account = widget.account;
+    if (client == null || account == null) return;
+    final platform = widget.mailboxPlatform;
+    final mailbox = _mailbox = MailboxModel(client, platform);
+    final messages = widget.messages;
+    if (messages != null) {
+      _notifier =
+          Notifier(
+              events: messages.events(),
+              platform: platform,
+              aliasOf: (peer) => account.snapshot?.contacts
+                  .where((c) => listEquals(c.peerId, peer))
+                  .firstOrNull
+                  ?.alias,
+              findPeer: (id) => conversationPeer(messages, id),
+            )
+            ..onOpen = (peer) {
+              final context = _navigator.currentContext;
+              if (context != null) unawaited(_openConversation(context, peer));
+            };
+    }
+    platform.listen(
+      onExitRequested: mailbox.exit,
+      onOpenConversation: (id) => unawaited(_notifier?.open(id)),
+    );
+  }
+
+  @override
+  void dispose() {
+    unawaited(_notifier?.dispose());
+    _mailbox?.dispose();
+    super.dispose();
+  }
 
   Future<void> _openConversation(BuildContext context, List<int> peer) async {
     final account = widget.account;
     final messages = widget.messages;
     if (_roomOpen || account == null || messages == null) return;
     _roomOpen = true;
+    _notifier?.openPeer = List.of(peer);
     try {
       await Navigator.of(context).push(
         MaterialPageRoute<void>(
@@ -68,12 +121,14 @@ class _ChatAppState extends State<ChatApp> {
       );
     } finally {
       _roomOpen = false;
+      _notifier?.openPeer = null;
     }
   }
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
+      navigatorKey: _navigator,
       title: 'ChatProject',
       theme: buildAppTheme(),
       home: Builder(
@@ -90,6 +145,7 @@ class _ChatAppState extends State<ChatApp> {
               ? home
               : AccountRoutes(
                   model: widget.account!,
+                  mailbox: _mailbox,
                   onOpenConversation: widget.messages == null
                       ? null
                       : (peer) => _openConversation(context, peer),

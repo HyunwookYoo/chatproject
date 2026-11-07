@@ -5,6 +5,7 @@
 
 import 'api/account.dart';
 import 'api/chat.dart';
+import 'api/mailbox.dart';
 import 'api/message.dart';
 import 'dart:async';
 import 'dart:convert';
@@ -169,6 +170,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   List<RevocationView> dco_decode_list_revocation_view(dynamic raw);
+
+  @protected
+  MailboxStateView dco_decode_mailbox_state_view(dynamic raw);
 
   @protected
   MessageCursor dco_decode_message_cursor(dynamic raw);
@@ -461,6 +465,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   List<RevocationView> sse_decode_list_revocation_view(
     SseDeserializer deserializer,
   );
+
+  @protected
+  MailboxStateView sse_decode_mailbox_state_view(SseDeserializer deserializer);
 
   @protected
   MessageCursor sse_decode_message_cursor(SseDeserializer deserializer);
@@ -827,6 +834,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   @protected
   void sse_encode_list_revocation_view(
     List<RevocationView> self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_mailbox_state_view(
+    MailboxStateView self,
     SseSerializer serializer,
   );
 

@@ -498,6 +498,21 @@ mod tests {
     }
 
     #[test]
+    fn mailbox_state_keeps_every_field() {
+        use crate::api::mailbox::MailboxStateView;
+        for (enabled, first_link_shown, uptime_7d_permille) in [(true, false, 1000), (false, true, 0)] {
+            assert_eq!(
+                MailboxStateView::from(chat_core::account::MailboxStateView {
+                    enabled,
+                    first_link_shown,
+                    uptime_7d_permille,
+                }),
+                MailboxStateView { enabled, first_link_shown, uptime_7d_permille }
+            );
+        }
+    }
+
+    #[test]
     fn every_network_enum_keeps_its_variant() {
         for (core, ffi) in [
             (chat_core::NetworkState::Stopped, NetworkState::Stopped),
@@ -659,5 +674,11 @@ mod message_event_tests {
         for (from, to) in [(C::Queued,D::Queued),(C::SentDirect,D::SentDirect),(C::Delivered,D::Delivered),(C::Read,D::Read),(C::Blocked,D::Blocked),(C::Failed,D::Failed),(C::Cancelled,D::Cancelled)] {
             assert_eq!(ChatEvent::from(chat_core::CoreEvent::MessageStateChanged { revision: u64::MAX, key, state: from, cancel_requested: true }), ChatEvent::MessageStateChanged { revision: u64::MAX, key: crate::api::chat::MessageKey { conversation: vec![1; 32], sender: vec![2; 32], installation: vec![3; 32], id: vec![4; 16] }, state: to, cancel_requested: true });
         }
+    }
+}
+
+impl From<chat_core::account::MailboxStateView> for crate::api::mailbox::MailboxStateView {
+    fn from(v: chat_core::account::MailboxStateView) -> Self {
+        Self { enabled: v.enabled, first_link_shown: v.first_link_shown, uptime_7d_permille: v.uptime_7d_permille }
     }
 }

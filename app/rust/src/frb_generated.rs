@@ -37,7 +37,7 @@ flutter_rust_bridge::frb_generated_boilerplate!(
     default_rust_auto_opaque = RustAutoOpaqueMoi,
 );
 pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_VERSION: &str = "2.11.1";
-pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = -1289420996;
+pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = -160845324;
 
 // Section: executor
 
@@ -762,6 +762,146 @@ fn wire__crate__api__message__load_messages_impl(
                             api_limit,
                         )
                         .await?;
+                        Ok(output_ok)
+                    })()
+                    .await,
+                )
+            }
+        },
+    )
+}
+fn wire__crate__api__mailbox__mailbox_background_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_async::<flutter_rust_bridge::for_generated::SseCodec, _, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "mailbox_background",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            deserializer.end();
+            move |context| async move {
+                transform_result_sse::<_, crate::api::chat::CoreError>(
+                    (move || async move {
+                        let output_ok = crate::api::mailbox::mailbox_background().await?;
+                        Ok(output_ok)
+                    })()
+                    .await,
+                )
+            }
+        },
+    )
+}
+fn wire__crate__api__mailbox__mailbox_foreground_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_async::<flutter_rust_bridge::for_generated::SseCodec, _, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "mailbox_foreground",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            deserializer.end();
+            move |context| async move {
+                transform_result_sse::<_, crate::api::chat::CoreError>(
+                    (move || async move {
+                        let output_ok = crate::api::mailbox::mailbox_foreground().await?;
+                        Ok(output_ok)
+                    })()
+                    .await,
+                )
+            }
+        },
+    )
+}
+fn wire__crate__api__mailbox__mailbox_state_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_async::<flutter_rust_bridge::for_generated::SseCodec, _, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "mailbox_state",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            deserializer.end();
+            move |context| async move {
+                transform_result_sse::<_, crate::api::chat::CoreError>(
+                    (move || async move {
+                        let output_ok = crate::api::mailbox::mailbox_state().await?;
+                        Ok(output_ok)
+                    })()
+                    .await,
+                )
+            }
+        },
+    )
+}
+fn wire__crate__api__mailbox__mark_first_link_shown_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_async::<flutter_rust_bridge::for_generated::SseCodec, _, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "mark_first_link_shown",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            deserializer.end();
+            move |context| async move {
+                transform_result_sse::<_, crate::api::chat::CoreError>(
+                    (move || async move {
+                        let output_ok = crate::api::mailbox::mark_first_link_shown().await?;
                         Ok(output_ok)
                     })()
                     .await,
@@ -1603,6 +1743,42 @@ fn wire__crate__api__message__send_text_impl(
         },
     )
 }
+fn wire__crate__api__mailbox__set_mailbox_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_async::<flutter_rust_bridge::for_generated::SseCodec, _, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "set_mailbox",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_enabled = <bool>::sse_decode(&mut deserializer);
+            deserializer.end();
+            move |context| async move {
+                transform_result_sse::<_, crate::api::chat::CoreError>(
+                    (move || async move {
+                        let output_ok = crate::api::mailbox::set_mailbox(api_enabled).await?;
+                        Ok(output_ok)
+                    })()
+                    .await,
+                )
+            }
+        },
+    )
+}
 fn wire__crate__api__account__snapshot_impl(
     port_: flutter_rust_bridge::for_generated::MessagePort,
     ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
@@ -2319,6 +2495,20 @@ impl SseDecode for Vec<crate::api::account::RevocationView> {
     }
 }
 
+impl SseDecode for crate::api::mailbox::MailboxStateView {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut var_enabled = <bool>::sse_decode(deserializer);
+        let mut var_firstLinkShown = <bool>::sse_decode(deserializer);
+        let mut var_uptime7DPermille = <u32>::sse_decode(deserializer);
+        return crate::api::mailbox::MailboxStateView {
+            enabled: var_enabled,
+            first_link_shown: var_firstLinkShown,
+            uptime_7d_permille: var_uptime7DPermille,
+        };
+    }
+}
+
 impl SseDecode for crate::api::message::MessageCursor {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
@@ -2925,37 +3115,44 @@ fn pde_ffi_dispatcher_primary_impl(
         18 => wire__crate__api__chat__init_app_impl(port, ptr, rust_vec_len, data_len),
         19 => wire__crate__api__message__list_conversations_impl(port, ptr, rust_vec_len, data_len),
         20 => wire__crate__api__message__load_messages_impl(port, ptr, rust_vec_len, data_len),
-        21 => wire__crate__api__message__mark_read_impl(port, ptr, rust_vec_len, data_len),
-        22 => wire__crate__api__chat__network_info_impl(port, ptr, rust_vec_len, data_len),
-        23 => wire__crate__api__chat__network_start_impl(port, ptr, rust_vec_len, data_len),
-        24 => wire__crate__api__chat__network_stop_impl(port, ptr, rust_vec_len, data_len),
-        25 => wire__crate__api__account__open_account_impl(port, ptr, rust_vec_len, data_len),
-        26 => wire__crate__api__message__open_dm_impl(port, ptr, rust_vec_len, data_len),
-        27 => wire__crate__api__account__pair_approve_impl(port, ptr, rust_vec_len, data_len),
-        28 => wire__crate__api__account__pair_begin_impl(port, ptr, rust_vec_len, data_len),
-        29 => wire__crate__api__account__pair_cancel_impl(port, ptr, rust_vec_len, data_len),
-        30 => wire__crate__api__account__pair_confirm_code_impl(port, ptr, rust_vec_len, data_len),
-        31 => wire__crate__api__account__pair_scan_impl(port, ptr, rust_vec_len, data_len),
-        32 => wire__crate__api__account__pair_view_impl(port, ptr, rust_vec_len, data_len),
-        33 => wire__crate__api__account__parse_invite_impl(port, ptr, rust_vec_len, data_len),
-        34 => wire__crate__api__account__prepare_candidate_impl(port, ptr, rust_vec_len, data_len),
-        35 => wire__crate__api__account__recover_impl(port, ptr, rust_vec_len, data_len),
-        36 => wire__crate__api__account__refresh_record_impl(port, ptr, rust_vec_len, data_len),
-        37 => wire__crate__api__account__republish_accepted_record_impl(
+        21 => wire__crate__api__mailbox__mailbox_background_impl(port, ptr, rust_vec_len, data_len),
+        22 => wire__crate__api__mailbox__mailbox_foreground_impl(port, ptr, rust_vec_len, data_len),
+        23 => wire__crate__api__mailbox__mailbox_state_impl(port, ptr, rust_vec_len, data_len),
+        24 => {
+            wire__crate__api__mailbox__mark_first_link_shown_impl(port, ptr, rust_vec_len, data_len)
+        }
+        25 => wire__crate__api__message__mark_read_impl(port, ptr, rust_vec_len, data_len),
+        26 => wire__crate__api__chat__network_info_impl(port, ptr, rust_vec_len, data_len),
+        27 => wire__crate__api__chat__network_start_impl(port, ptr, rust_vec_len, data_len),
+        28 => wire__crate__api__chat__network_stop_impl(port, ptr, rust_vec_len, data_len),
+        29 => wire__crate__api__account__open_account_impl(port, ptr, rust_vec_len, data_len),
+        30 => wire__crate__api__message__open_dm_impl(port, ptr, rust_vec_len, data_len),
+        31 => wire__crate__api__account__pair_approve_impl(port, ptr, rust_vec_len, data_len),
+        32 => wire__crate__api__account__pair_begin_impl(port, ptr, rust_vec_len, data_len),
+        33 => wire__crate__api__account__pair_cancel_impl(port, ptr, rust_vec_len, data_len),
+        34 => wire__crate__api__account__pair_confirm_code_impl(port, ptr, rust_vec_len, data_len),
+        35 => wire__crate__api__account__pair_scan_impl(port, ptr, rust_vec_len, data_len),
+        36 => wire__crate__api__account__pair_view_impl(port, ptr, rust_vec_len, data_len),
+        37 => wire__crate__api__account__parse_invite_impl(port, ptr, rust_vec_len, data_len),
+        38 => wire__crate__api__account__prepare_candidate_impl(port, ptr, rust_vec_len, data_len),
+        39 => wire__crate__api__account__recover_impl(port, ptr, rust_vec_len, data_len),
+        40 => wire__crate__api__account__refresh_record_impl(port, ptr, rust_vec_len, data_len),
+        41 => wire__crate__api__account__republish_accepted_record_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        38 => wire__crate__api__account__retry_open_impl(port, ptr, rust_vec_len, data_len),
-        39 => wire__crate__api__message__retry_send_impl(port, ptr, rust_vec_len, data_len),
-        40 => wire__crate__api__account__revoke_device_impl(port, ptr, rust_vec_len, data_len),
-        41 => wire__crate__api__account__safety_display_impl(port, ptr, rust_vec_len, data_len),
-        42 => wire__crate__api__chat__send_probe_text_impl(port, ptr, rust_vec_len, data_len),
-        43 => wire__crate__api__message__send_text_impl(port, ptr, rust_vec_len, data_len),
-        44 => wire__crate__api__account__snapshot_impl(port, ptr, rust_vec_len, data_len),
-        45 => wire__crate__api__chat__test_hooks_start_impl(port, ptr, rust_vec_len, data_len),
-        46 => wire__crate__api__account__test_storage_start_impl(port, ptr, rust_vec_len, data_len),
+        42 => wire__crate__api__account__retry_open_impl(port, ptr, rust_vec_len, data_len),
+        43 => wire__crate__api__message__retry_send_impl(port, ptr, rust_vec_len, data_len),
+        44 => wire__crate__api__account__revoke_device_impl(port, ptr, rust_vec_len, data_len),
+        45 => wire__crate__api__account__safety_display_impl(port, ptr, rust_vec_len, data_len),
+        46 => wire__crate__api__chat__send_probe_text_impl(port, ptr, rust_vec_len, data_len),
+        47 => wire__crate__api__message__send_text_impl(port, ptr, rust_vec_len, data_len),
+        48 => wire__crate__api__mailbox__set_mailbox_impl(port, ptr, rust_vec_len, data_len),
+        49 => wire__crate__api__account__snapshot_impl(port, ptr, rust_vec_len, data_len),
+        50 => wire__crate__api__chat__test_hooks_start_impl(port, ptr, rust_vec_len, data_len),
+        51 => wire__crate__api__account__test_storage_start_impl(port, ptr, rust_vec_len, data_len),
         _ => unreachable!(),
     }
 }
@@ -3442,6 +3639,28 @@ impl flutter_rust_bridge::IntoIntoDart<crate::api::account::InvitePreview>
     for crate::api::account::InvitePreview
 {
     fn into_into_dart(self) -> crate::api::account::InvitePreview {
+        self
+    }
+}
+// Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::api::mailbox::MailboxStateView {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        [
+            self.enabled.into_into_dart().into_dart(),
+            self.first_link_shown.into_into_dart().into_dart(),
+            self.uptime_7d_permille.into_into_dart().into_dart(),
+        ]
+        .into_dart()
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive
+    for crate::api::mailbox::MailboxStateView
+{
+}
+impl flutter_rust_bridge::IntoIntoDart<crate::api::mailbox::MailboxStateView>
+    for crate::api::mailbox::MailboxStateView
+{
+    fn into_into_dart(self) -> crate::api::mailbox::MailboxStateView {
         self
     }
 }
@@ -4479,6 +4698,15 @@ impl SseEncode for Vec<crate::api::account::RevocationView> {
         for item in self {
             <crate::api::account::RevocationView>::sse_encode(item, serializer);
         }
+    }
+}
+
+impl SseEncode for crate::api::mailbox::MailboxStateView {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <bool>::sse_encode(self.enabled, serializer);
+        <bool>::sse_encode(self.first_link_shown, serializer);
+        <u32>::sse_encode(self.uptime_7d_permille, serializer);
     }
 }
 
