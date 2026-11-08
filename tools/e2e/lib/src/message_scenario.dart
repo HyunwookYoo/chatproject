@@ -51,12 +51,9 @@ Future<void> runMessageScenario(
     throw TimeoutException('Message scenario deadline: $phase');
   }
 
-  Future<Map<String, Object?>> create(Participant p) async {
-    await until(
-      () => snapshot(p),
-      (v) => v['phase'] == 'Unconfigured',
-      'initial_account',
-    );
+  // `phase` names which create a deadline was (the first or the fresh-store one).
+  Future<Map<String, Object?>> create(Participant p, String phase) async {
+    await until(() => snapshot(p), (v) => v['phase'] == 'Unconfigured', phase);
     final display = object(await call(p, 'account_local_begin_create'));
     final words = (display['words'] as List).cast<String>();
     final answers = (display['positions'] as List)
@@ -151,7 +148,8 @@ Future<void> runMessageScenario(
     );
   }
 
-  var av = await create(a), bv = await create(b);
+  var av = await create(a, 'initial_account'),
+      bv = await create(b, 'initial_account');
   var aPeer = av['public_peer_id'], bPeer = bv['public_peer_id'];
   require(!same(aPeer, bPeer), 'distinct_accounts');
   await contact(b, a);
@@ -193,8 +191,8 @@ Future<void> runMessageScenario(
     a.instance != contactA.instance && b.instance != contactB.instance,
     'fresh_store_instances',
   );
-  av = await create(a);
-  bv = await create(b);
+  av = await create(a, 'fresh_initial_account');
+  bv = await create(b, 'fresh_initial_account');
   aPeer = av['public_peer_id'];
   bPeer = bv['public_peer_id'];
   require(

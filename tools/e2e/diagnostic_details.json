@@ -72,6 +72,7 @@
     "Mailbox scenario: phone_no_duplicate",
     "Mailbox scenario: phone_order_once",
     "Message scenario deadline: created",
+    "Message scenario deadline: fresh_initial_account",
     "Message scenario deadline: initial_account",
     "Message scenario deadline: lost_ack_restart",
     "Message scenario deadline: message_state",
