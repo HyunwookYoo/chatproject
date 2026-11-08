@@ -154,7 +154,22 @@ Future<void> runAccountScenario(
     }
     final target = object(await owner.call('network_info', {}))['ticket'];
     await call(scanner, 'route', {'ticket': target});
-    final scanned = await call(scanner, 'pair_scan', {'qr': display['qr']});
+    final Object? scanned;
+    try {
+      scanned = await call(scanner, 'pair_scan', {'qr': display['qr']});
+    } on RpcError {
+      await notePairSide(
+        'owner',
+        () => snapshot(owner),
+        () => owner.call('network_info', {}),
+      );
+      await notePairSide(
+        'scanner',
+        () => snapshot(scanner),
+        () => scanner.call('network_info', {}),
+      );
+      rethrow;
+    }
     display.clear();
     require(same(flow, scanned), 'pair flow mismatch');
     final av = await until(

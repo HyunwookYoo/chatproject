@@ -867,6 +867,7 @@ Future<void> main(List<String> arguments) async {
             'last_view': run.lastView,
             'participant': run.lastParticipant,
             'rpc_op': run.rpcOp,
+            'facts': run.facts(),
             'android': run.android,
           }),
           flush: true,
@@ -992,6 +993,8 @@ class _Run extends IoProcessRunner {
   final safeDetails = loadSafeDetails();
   final safeViews = loadSafeValues('last_view');
   final safeParticipants = loadSafeValues('participants');
+  final safeFactValues = loadSafeFacts();
+  Map<String, String>? facts() => safeFacts(failureFacts, safeFactValues);
 
   void recordFailure(
     Object? error, {

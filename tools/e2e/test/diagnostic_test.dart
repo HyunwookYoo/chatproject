@@ -98,6 +98,54 @@ void main() {
     );
   });
 
+  test('a failed pairing notes both sides only as fixed values', () async {
+    failureFacts.clear();
+    await notePairSide(
+      'owner',
+      () async => {
+        'phase': 'Active',
+        'public_peer_id': 'PRIVATE_TOKEN',
+        'pair': {'phase': 'WaitingQr', 'sas': 'PRIVATE_TOKEN'},
+        'publication': {'state': 'Observed'},
+      },
+      () async => {'state': 'Online', 'ticket': 'PRIVATE_TOKEN'},
+    );
+    await notePairSide(
+      'scanner',
+      () async => throw StateError('PRIVATE'),
+      () async => {'state': 'PRIVATE_TOKEN'},
+    );
+    expect(failureFacts, {
+      'owner_phase': 'Active',
+      'owner_pair': 'WaitingQr',
+      'owner_publication': 'Observed',
+      'owner_network': 'Online',
+      'scanner_network': 'unknown',
+      'scanner_phase': 'unknown',
+      'scanner_pair': 'unknown',
+      'scanner_publication': 'unknown',
+    });
+    await notePairSide(
+      'scanner',
+      () async => {
+        'phase': 'Candidate',
+        'pair': null,
+        'publication': 'PRIVATE',
+      },
+      () async => throw StateError('PRIVATE'),
+    );
+    expect(failureFacts['scanner_pair'], 'none');
+    expect(failureFacts['scanner_phase'], 'Candidate');
+    final allowed = loadSafeFacts();
+    expect(safeFacts(failureFacts, allowed), failureFacts);
+    expect(
+      safeFacts({'owner_pair': 'PRIVATE_TOKEN', 'PRIVATE': 'Active'}, allowed),
+      isNull,
+    );
+    expect(safeFacts({}, allowed), isNull);
+    failureFacts.clear();
+  });
+
   test('every fixed scenario code, deadline and failure text is listed', () {
     final missing = <String>{};
     void need(String text) {

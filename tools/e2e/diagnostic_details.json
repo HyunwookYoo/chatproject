@@ -275,5 +275,85 @@
     ],
     "lifecycle_limit": 32,
     "config_limit": 8
+  },
+  "facts": {
+    "owner_phase": [
+      "Unconfigured",
+      "Candidate",
+      "PendingImport",
+      "LocalReady",
+      "PublishPending",
+      "Active",
+      "Conflict",
+      "Locked",
+      "unknown"
+    ],
+    "owner_pair": [
+      "WaitingQr",
+      "Comparing",
+      "Approved",
+      "AwaitingApproval",
+      "DisclosurePossible",
+      "ReceiptReady",
+      "ReceiptVerified",
+      "PublishPending",
+      "Active",
+      "Observed",
+      "none",
+      "unknown"
+    ],
+    "owner_publication": [
+      "LocalBlocked",
+      "Pending",
+      "Observed",
+      "Conflict",
+      "unknown"
+    ],
+    "scanner_phase": [
+      "Unconfigured",
+      "Candidate",
+      "PendingImport",
+      "LocalReady",
+      "PublishPending",
+      "Active",
+      "Conflict",
+      "Locked",
+      "unknown"
+    ],
+    "scanner_pair": [
+      "WaitingQr",
+      "Comparing",
+      "Approved",
+      "AwaitingApproval",
+      "DisclosurePossible",
+      "ReceiptReady",
+      "ReceiptVerified",
+      "PublishPending",
+      "Active",
+      "Observed",
+      "none",
+      "unknown"
+    ],
+    "scanner_publication": [
+      "LocalBlocked",
+      "Pending",
+      "Observed",
+      "Conflict",
+      "unknown"
+    ],
+    "owner_network": [
+      "Stopped",
+      "Starting",
+      "Online",
+      "Failed",
+      "unknown"
+    ],
+    "scanner_network": [
+      "Stopped",
+      "Starting",
+      "Online",
+      "Failed",
+      "unknown"
+    ]
   }
 }

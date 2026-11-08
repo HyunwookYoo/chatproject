@@ -124,9 +124,24 @@ Future<void> runMailboxScenario(
     );
     final flow = display['flow'];
     await call(mailbox, 'account_local_route', {'ticket': await ticket(phone)});
-    final scanned = await call(mailbox, 'account_local_pair_scan', {
-      'qr': display['qr'],
-    });
+    final Object? scanned;
+    try {
+      scanned = await call(mailbox, 'account_local_pair_scan', {
+        'qr': display['qr'],
+      });
+    } on RpcError {
+      await notePairSide(
+        'owner',
+        () => snapshot(phone),
+        () => call(phone, 'network_info'),
+      );
+      await notePairSide(
+        'scanner',
+        () => snapshot(mailbox),
+        () => call(mailbox, 'network_info'),
+      );
+      rethrow;
+    }
     display.clear();
     require(same(flow, scanned), 'pair_flow');
     bool coded(Map<String, Object?> v) =>

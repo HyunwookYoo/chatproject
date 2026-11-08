@@ -28,6 +28,8 @@ SHARED = json.loads(
 DETAILS = frozenset(SHARED['details'])
 LAST_VIEWS = frozenset(SHARED['last_view'])
 PARTICIPANTS = frozenset(SHARED['participants'])
+# Facts a scenario noted about a failure's state: fixed keys -> fixed values.
+FACTS = {key: frozenset(values) for key, values in SHARED['facts'].items()}
 # One owned emulator's state (tools/e2e/lib/src/android_probe.dart): key -> check.
 ANDROID = SHARED['android']
 
@@ -80,6 +82,12 @@ PROBE = {
 RPC_OP = re.compile(r'(?:account|message|mailbox)_local_[a-z_]{1,48}')
 
 
+def _facts(value):
+    return value is None or (isinstance(value, dict) and value
+                             and all(key in FACTS and isinstance(v, str) and v in FACTS[key]
+                                     for key, v in value.items()))
+
+
 def _android(value, profile):
     if value is None:
         return True
@@ -112,14 +120,15 @@ def main():
                 peak = int(match[1])
     safe = {'phase': None, 'failure_kind': None, 'command_exit_code': None,
             'detail': None, 'scenario': None, 'android_crash': None,
-            'last_view': None, 'participant': None, 'rpc_op': None, 'android': None}
+            'last_view': None, 'participant': None, 'rpc_op': None, 'facts': None,
+            'android': None}
     if args.diagnostic_file and args.diagnostic_file.is_file():
         try:
             diagnostic = json.loads(args.diagnostic_file.read_text(encoding='utf-8'))
             if not isinstance(diagnostic, dict) or set(diagnostic) != set(safe):
                 raise ValueError()
-            phase, kind, code, detail, scenario, crash, view, participant, op, android = (
-                diagnostic[key] for key in safe)
+            (phase, kind, code, detail, scenario, crash, view, participant, op, facts,
+             android) = (diagnostic[key] for key in safe)
             if not isinstance(phase, str) or phase not in PHASES:
                 raise ValueError()
             if kind is not None and (not isinstance(kind, str) or kind not in FAILURE_KINDS):
@@ -143,16 +152,18 @@ def main():
                 raise ValueError()
             if op is not None and (not isinstance(op, str) or not RPC_OP.fullmatch(op)):
                 raise ValueError()
+            if not _facts(facts):
+                raise ValueError()
             if not _android(android, args.profile):
                 raise ValueError()
             safe = {'phase': phase, 'failure_kind': kind, 'command_exit_code': code,
                     'detail': detail, 'scenario': scenario, 'android_crash': crash,
                     'last_view': view, 'participant': participant, 'rpc_op': op,
-                    'android': android}
+                    'facts': facts, 'android': android}
         except (OSError, ValueError):
             parser.error('Invalid safe diagnostic')
     # Reconstruct only fixed keys and validated values; never copy log/error text.
-    value = {'schema_version': 6, 'profile': args.profile, 'stage': args.stage,
+    value = {'schema_version': 7, 'profile': args.profile, 'stage': args.stage,
              'outcome': args.outcome, 'exitCode': args.exit_code, 'peak_rss_kib': peak,
              **safe}
     args.output.write_text(json.dumps(value, indent=2) + '\n', encoding='utf-8')

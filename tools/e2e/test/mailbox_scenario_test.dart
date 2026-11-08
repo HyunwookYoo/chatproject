@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:chat_e2e/src/controller.dart';
+import 'package:chat_e2e/src/diagnostic.dart';
 import 'package:chat_e2e/src/mailbox_scenario.dart';
 import 'package:chat_e2e/src/protocol.dart';
 import 'package:test/test.dart';
@@ -157,6 +158,40 @@ void main() {
       expect(fixture.actions, ['airplane on', 'airplane off', 'foreground']);
       expect(fixture.texts['phone']!.length, 4);
     } finally {
+      await fixture.close();
+    }
+  });
+  test('a failed pair scan notes both sides as fixed facts', () async {
+    final fixture = MailboxFixture()..fault = 'pair_scan';
+    await fixture.start();
+    failureFacts.clear();
+    try {
+      await expectLater(
+        runMailboxScenario(
+          fixture.controller,
+          fixture.ordered,
+          airplane: fixture.airplane,
+          foreground: fixture.foreground,
+          timeout: const Duration(seconds: 2),
+        ),
+        throwsA(
+          isA<RpcError>()
+              .having((e) => e.code, 'code', 'AuthFailed')
+              .having((e) => e.op, 'op', 'account_local_pair_scan'),
+        ),
+      );
+      expect(failureFacts, {
+        'owner_phase': 'Active',
+        'owner_pair': 'none',
+        'owner_publication': 'Observed',
+        'owner_network': 'unknown',
+        'scanner_network': 'unknown',
+        'scanner_phase': 'Candidate',
+        'scanner_pair': 'none',
+        'scanner_publication': 'Observed',
+      });
+    } finally {
+      failureFacts.clear();
       await fixture.close();
     }
   });
@@ -371,6 +406,17 @@ class MailboxFixture {
     socket.listen((raw) {
       final request = jsonDecode(raw as String) as Map;
       if (request['type'] != 'cmd') return;
+      if (fault == 'pair_scan' && request['op'] == 'account_local_pair_scan') {
+        socket.add(
+          jsonEncode({
+            'type': 'result',
+            'id': request['id'],
+            'ok': false,
+            'error': {'code': 'AuthFailed', 'detail': privateMarker},
+          }),
+        );
+        return;
+      }
       final result = handle(
         name,
         request['op'] as String,
