@@ -110,7 +110,10 @@ void main() {
         final failure = expectLater(
           participant.call('mailbox_local_$op', {}),
           throwsA(
-            isA<RpcError>().having((e) => e.detail, 'detail', '[redacted]'),
+            isA<RpcError>()
+                .having((e) => e.detail, 'detail', '[redacted]')
+                .having((e) => e.op, 'op', 'mailbox_local_$op')
+                .having((e) => e.participant, 'participant', 'node'),
           ),
         );
         final next = await peer.next();

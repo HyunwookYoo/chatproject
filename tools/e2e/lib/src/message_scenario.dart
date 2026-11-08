@@ -43,14 +43,15 @@ Future<void> runMessageScenario(
   Future<Map<String, Object?>> until(
     Future<Map<String, Object?>> Function() read,
     bool Function(Map<String, Object?>) matches,
-    String phase,
-  ) async {
+    String phase, {
+    String Function(Map<String, Object?>) observe = observedView,
+  }) async {
     final deadline = DateTime.now().add(timeout);
     String? last;
     while (DateTime.now().isBefore(deadline)) {
       try {
         final view = await read();
-        last = observedView(view);
+        last = observe(view);
         if (matches(view)) return view;
       } on RpcError catch (error) {
         if (error.code != 'NotAvailable') rethrow;
@@ -142,10 +143,12 @@ Future<void> runMessageScenario(
       'limit': 50,
     }),
   );
+  // `phase` names the wait; a deadline reports the message's last state.
   Future<Map<String, Object?>> state(
     Participant p,
     Map<String, Object?> key,
     Set<String> states,
+    String phase,
   ) async {
     final result = await until(
       () => page(p, key['conversation']),
@@ -153,7 +156,12 @@ Future<void> runMessageScenario(
         (item) =>
             same((item as Map)['key'], key) && states.contains(item['state']),
       ),
-      'message_state',
+      phase,
+      observe: (v) => observedState(
+        (v['items'] as List)
+            .where((item) => same((item as Map)['key'], key))
+            .firstOrNull,
+      ),
     );
     return object(
       (result['items'] as List).singleWhere(
@@ -177,10 +185,10 @@ Future<void> runMessageScenario(
     }),
   );
   final blockedKey = object(blocked['key']);
-  await state(a, blockedKey, {'Blocked'});
+  await state(a, blockedKey, {'Blocked'}, 'contact_blocked');
   await contact(a, b);
   await call(a, 'message_local_retry_send', {'key': blockedKey});
-  await state(a, blockedKey, {'Delivered'});
+  await state(a, blockedKey, {'Delivered'}, 'contact_delivered');
   final contactRows =
       (await page(b, blockedKey['conversation']))['items'] as List;
   require(
@@ -274,7 +282,11 @@ Future<void> runMessageScenario(
         same(reopened['installation'], av['installation']),
     'same_store_identity',
   );
-  final retained = await state(a, key, {'Queued', 'Blocked', 'SentDirect'});
+  final retained = await state(a, key, {
+    'Queued',
+    'Blocked',
+    'SentDirect',
+  }, 'restart_retained');
   require(
     retained['body'] == retainedBody && retained['lamport'] == sent['lamport'],
     'retained_message',
@@ -340,7 +352,7 @@ Future<void> runMessageScenario(
   );
   final ackHeld = object(await call(b, 'message_local_test_write_counts'));
   require(!receiptJob || same(ackHeld, ackBaseline), 'ack_written_before_kill');
-  await state(a, key, {'Queued', 'SentDirect'});
+  await state(a, key, {'Queued', 'SentDirect'}, 'ack_lost_pending');
   final firstWrites = object(await call(a, 'message_local_test_write_counts'));
   require(firstWrites['payload_writes'] == 1, 'first_actual_payload');
   final beforeDuplicate = object(
@@ -373,7 +385,7 @@ Future<void> runMessageScenario(
   await routes();
   await call(a, 'account_local_connect_account', {'peer': bPeer});
   await wakeSenderBackoff();
-  await state(a, key, {'Delivered'});
+  await state(a, key, {'Delivered'}, 'retransmit_delivered');
   final secondWrites = object(await call(a, 'message_local_test_write_counts'));
   require(
     (secondWrites['payload_writes'] as int) >= 1,
@@ -421,7 +433,7 @@ Future<void> runMessageScenario(
     'conversation': key['conversation'],
     'keys': [key],
   });
-  await state(a, key, {'Read'});
+  await state(a, key, {'Read'}, 'read');
   evidence?.call('durable_ack_and_read', {
     'key': key,
     'receiver_rows': matching.length,

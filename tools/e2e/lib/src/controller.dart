@@ -446,7 +446,12 @@ class Controller {
                         ) ==
                         true,
                   )
-                  ? RpcError(record.error!.code, '[redacted]')
+                  ? RpcError(
+                      record.error!.code,
+                      '[redacted]',
+                      op: participant._operations[record.id],
+                      participant: participant.name,
+                    )
                   : record.error!,
             );
           } else {

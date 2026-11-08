@@ -71,14 +71,19 @@
     "Mailbox scenario: phone_isolated",
     "Mailbox scenario: phone_no_duplicate",
     "Mailbox scenario: phone_order_once",
+    "Message scenario deadline: ack_lost_pending",
+    "Message scenario deadline: contact_blocked",
+    "Message scenario deadline: contact_delivered",
     "Message scenario deadline: created",
     "Message scenario deadline: fresh_initial_account",
     "Message scenario deadline: initial_account",
     "Message scenario deadline: lost_ack_restart",
-    "Message scenario deadline: message_state",
     "Message scenario deadline: proof_after_clock",
+    "Message scenario deadline: read",
     "Message scenario deadline: receiver_commit",
     "Message scenario deadline: restart_account",
+    "Message scenario deadline: restart_retained",
+    "Message scenario deadline: retransmit_delivered",
     "Message scenario deadline: route",
     "Message scenario: ack_checkpoints",
     "Message scenario: ack_written_before_kill",
@@ -183,7 +188,15 @@
     "Conflict",
     "Locked",
     "NotAvailable",
-    "other"
+    "other",
+    "Queued",
+    "SentDirect",
+    "Delivered",
+    "Read",
+    "Blocked",
+    "Failed",
+    "Cancelled",
+    "absent"
   ],
   "participants": [
     "android-1",
@@ -255,9 +268,12 @@
       "wm_on_destroy_called",
       "wm_finish_activity",
       "wm_destroy_activity",
+      "wm_relaunch_activity",
+      "wm_relaunch_resume_activity",
       "screen_off",
       "screen_on"
     ],
-    "lifecycle_limit": 32
+    "lifecycle_limit": 32,
+    "config_limit": 8
   }
 }

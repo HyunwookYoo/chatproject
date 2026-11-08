@@ -7,6 +7,7 @@ import 'package:test/test.dart';
 import 'package:chat_e2e/src/diagnostic.dart';
 import 'package:chat_e2e/src/emulators.dart';
 import 'package:chat_e2e/src/process_runner.dart';
+import 'package:chat_e2e/src/protocol.dart';
 
 import '../bin/run.dart' as cli;
 import 'emulators_test.dart' as fixtures;
@@ -690,6 +691,38 @@ void main() { Timer.periodic(const Duration(seconds: 1), (_) {}); }
     expect(run.getField(const Symbol('lastView')).reflectee, isNull);
     expect(run.getField(const Symbol('lastParticipant')).reflectee, isNull);
   });
+  test('a failed RPC keeps its fixed op name and participant', () {
+    phase('scenario');
+    run.invoke(const Symbol('recordFailure'), [
+      const RpcError(
+        'AuthFailed',
+        '[redacted]',
+        op: 'account_local_pair_scan',
+        participant: 'android-2',
+      ),
+    ]);
+    expect(projection()['detail'], 'RPC failed: AuthFailed');
+    expect(
+      run.getField(const Symbol('rpcOp')).reflectee,
+      'account_local_pair_scan',
+    );
+    expect(
+      run.getField(const Symbol('lastParticipant')).reflectee,
+      'android-2',
+    );
+    run = type('_Run').newInstance(const Symbol(''), [logs]);
+    run.invoke(const Symbol('recordFailure'), [
+      const RpcError(
+        'AuthFailed',
+        'x',
+        op: 'account_local_PRIVATE',
+        participant: 'PRIVATE',
+      ),
+    ]);
+    expect(run.getField(const Symbol('rpcOp')).reflectee, isNull);
+    expect(run.getField(const Symbol('lastParticipant')).reflectee, isNull);
+  });
+
   test('a run without owned emulators keeps no Android state', () async {
     Future<Object?> probeAll(
       List<Future<Map<String, Object?>> Function()> probes,

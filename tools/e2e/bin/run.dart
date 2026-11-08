@@ -13,6 +13,7 @@ import 'package:chat_e2e/src/message_scenario.dart';
 import 'package:chat_e2e/src/emulators.dart';
 import 'package:chat_e2e/src/owned_resources.dart';
 import 'package:chat_e2e/src/process_runner.dart';
+import 'package:chat_e2e/src/protocol.dart';
 import 'package:chat_e2e/src/scenario.dart';
 import 'package:path/path.dart' as p;
 
@@ -504,6 +505,23 @@ Future<void> main(List<String> arguments) async {
         }
 
         final first = await launch(null);
+        int? launchSkew;
+        try {
+          final date = await run.command(sdk.adb, [
+            ...adb,
+            'shell',
+            'date',
+            '+%s',
+          ], requireSuccess: false);
+          launchSkew = date.exitCode == 0
+              ? clockSkew(
+                  date.stdout as String,
+                  DateTime.now().millisecondsSinceEpoch ~/ 1000,
+                )
+              : null;
+        } on StateError {
+          /* An unread launch clock stays null. */
+        }
         androidProbes.add(
           () => probeAndroid(
             (args) => run.command(
@@ -515,6 +533,7 @@ Future<void> main(List<String> arguments) async {
             name: name,
             package: package,
             ownedPid: appPid,
+            launchSkew: launchSkew,
           ),
         );
         appRestarts[name] = (old, {bool freshStore = false}) =>
@@ -847,6 +866,7 @@ Future<void> main(List<String> arguments) async {
             'android_crash': run.androidCrash,
             'last_view': run.lastView,
             'participant': run.lastParticipant,
+            'rpc_op': run.rpcOp,
             'android': run.android,
           }),
           flush: true,
@@ -967,6 +987,7 @@ class _Run extends IoProcessRunner {
   bool? androidCrash;
   String? lastView;
   String? lastParticipant;
+  String? rpcOp;
   List<Map<String, Object?>>? android;
   final safeDetails = loadSafeDetails();
   final safeViews = loadSafeValues('last_view');
@@ -979,6 +1000,13 @@ class _Run extends IoProcessRunner {
   }) {
     if (safeFailure == null && error is ScenarioDeadline) {
       lastView = safeViews.contains(error.lastView) ? error.lastView : null;
+      lastParticipant = safeParticipants.contains(error.participant)
+          ? error.participant
+          : null;
+    }
+    if (safeFailure == null && error is RpcError) {
+      final op = error.op;
+      rpcOp = op != null && _rpcOp.hasMatch(op) ? op : null;
       lastParticipant = safeParticipants.contains(error.participant)
           ? error.participant
           : null;
@@ -1404,6 +1432,9 @@ class _Managed implements OwnedProcess {
   @override
   Future<void> stop() => _stopping ??= run.stop(process);
 }
+
+/// A fixed scenario op name (tools/ci/write_e2e_summary.py `RPC_OP`).
+final _rpcOp = RegExp(r'^(?:account|message|mailbox)_local_[a-z_]{1,48}$');
 
 /// Probes every owned emulator; one that cannot be read is left out. A run
 /// without emulators (Windows) has no Android state.

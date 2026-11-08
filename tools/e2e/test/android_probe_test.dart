@@ -143,6 +143,22 @@ void main() {
     expect(lifecycle(events, package), hasLength(androidLifecycleLimit));
   });
 
+  test('configuration change masks and clock skew', () {
+    const events =
+        '11-08 08:30:00.000  500  520 I configuration_changed: 536870912\n'
+        '11-08 08:30:00.100 4321 4321 I wm_relaunch_resume_activity: [0,1,$package.MainActivity,3,0]\n'
+        '11-08 08:30:01.000  500  520 I configuration_changed: 3\n'
+        '11-08 08:30:01.000  500  520 I configuration_changed: PRIVATE\n';
+    expect(configMasks(events), [536870912, 3]);
+    expect(lifecycle(events, package), ['wm_relaunch_resume_activity']);
+    expect(
+      configMasks(List.filled(12, 'I configuration_changed: 4').join('\n')),
+      hasLength(androidConfigLimit),
+    );
+    expect(clockSkew('1700000100\n', 1700000000), 100);
+    expect(clockSkew('PRIVATE', 1), isNull);
+  });
+
   test('lmkd kills and memory', () {
     const lmk =
         "11-08 08:31:12.000  300  300 I lowmemorykiller: Kill '$package' (4321), uid 10190, oom_score_adj 900 to free 100000kB\n";
@@ -180,6 +196,7 @@ void main() {
       'logcat -b events -d': ProcessResult(1, 0, 'I screen_toggled: 0\n', ''),
       'logcat -b main -d -s lowmemorykiller lmkd': ProcessResult(1, 0, '', ''),
       'shell cat /proc/meminfo': ProcessResult(1, 0, 'MemTotal: 2048 kB\n', ''),
+      'shell date +%s': ProcessResult(1, 0, '1000\n', ''),
       'shell settings get system screen_off_timeout': ProcessResult(
         1,
         1,
@@ -192,6 +209,8 @@ void main() {
       name: 'android-2',
       package: package,
       ownedPid: '4321',
+      launchSkew: -3,
+      hostSeconds: () => 1090,
     );
     expect(probe, {
       'name': 'android-2',
@@ -206,11 +225,14 @@ void main() {
       'exit_importance': 400,
       'exit_owned': true,
       'lifecycle': ['screen_off'],
+      'config_masks': [],
       'low_memory': false,
       'lmk_killed_app': false,
       'mem_total_mib': 2,
       'mem_available_mib': null,
       'screen_off_timeout_ms': null,
+      'clock_skew_s': -90,
+      'launch_clock_skew_s': -3,
     });
     expect(jsonEncode(probe), isNot(contains('PRIVATE')));
   });
@@ -228,5 +250,6 @@ void main() {
     expect(list('exit_reason'), androidExitReasons.values.toSet());
     expect(list('lifecycle'), androidLifecycle);
     expect(shared['lifecycle_limit'], androidLifecycleLimit);
+    expect(shared['config_limit'], androidConfigLimit);
   });
 }

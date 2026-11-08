@@ -61,12 +61,17 @@ const androidLifecycle = {
   'wm_on_destroy_called',
   'wm_finish_activity',
   'wm_destroy_activity',
+  'wm_relaunch_activity',
+  'wm_relaunch_resume_activity',
   'screen_off',
   'screen_on',
 };
 
 /// The newest lifecycle entries kept.
 const androidLifecycleLimit = 32;
+
+/// The newest configuration-change masks kept.
+const androidConfigLimit = 8;
 
 /// `dumpsys power`: the global wakefulness.
 String screenState(String dumpsysPower) {
@@ -180,6 +185,27 @@ List<String> lifecycle(String events, String package) {
       : tags;
 }
 
+/// `logcat -b events -d`: the masks of the system's configuration changes
+/// (`ActivityInfo.CONFIG_*` bits), the newest [androidConfigLimit].
+List<int> configMasks(String events) {
+  final masks = [
+    for (final match in RegExp(
+      r'\sconfiguration_changed: (\d+)\s*$',
+      multiLine: true,
+    ).allMatches(events))
+      int.parse(match.group(1)!),
+  ].where((mask) => mask < 1 << 31).toList();
+  return masks.length > androidConfigLimit
+      ? masks.sublist(masks.length - androidConfigLimit)
+      : masks;
+}
+
+/// `date +%s` minus the host's seconds, or null.
+int? clockSkew(String date, int hostSeconds) {
+  final device = int.tryParse(date.trim());
+  return device == null ? null : device - hostSeconds;
+}
+
 /// The system reported low memory (`am_low_memory`) or lmkd killed something.
 bool lowMemory(String events, String lmk) =>
     RegExp(r'\sam_low_memory:').hasMatch(events) ||
@@ -217,7 +243,11 @@ Future<Map<String, Object?>> probeAndroid(
   required String name,
   required String package,
   required String ownedPid,
+  int? launchSkew,
+  int Function()? hostSeconds,
 }) async {
+  final host =
+      hostSeconds ?? () => DateTime.now().millisecondsSinceEpoch ~/ 1000;
   Future<String?> output(List<String> args) async {
     try {
       final result = await adb(args);
@@ -272,6 +302,8 @@ Future<Map<String, Object?>> probeAndroid(
     'system',
     'screen_off_timeout',
   ]);
+  final date = await output(['shell', 'date', '+%s']);
+  final skew = date == null ? null : clockSkew(date, host());
   final record = processes == null ? null : processRecord(processes);
   final exit = exits == null ? null : lastExit(exits, ownedPid);
   final mem = meminfo == null ? null : memory(meminfo);
@@ -288,10 +320,13 @@ Future<Map<String, Object?>> probeAndroid(
     'exit_importance': exit?.importance,
     'exit_owned': exit?.owned,
     'lifecycle': events == null ? null : lifecycle(events, package),
+    'config_masks': events == null ? null : configMasks(events),
     'low_memory': events == null || lmk == null ? null : lowMemory(events, lmk),
     'lmk_killed_app': lmk == null ? null : lmkKilledApp(lmk, package),
     'mem_total_mib': mem?.total,
     'mem_available_mib': mem?.available,
     'screen_off_timeout_ms': timeout == null ? null : setting(timeout),
+    'clock_skew_s': skew,
+    'launch_clock_skew_s': launchSkew,
   };
 }

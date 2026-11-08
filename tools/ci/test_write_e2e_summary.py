@@ -8,7 +8,7 @@ import unittest
 SCRIPT = pathlib.Path(__file__).with_name('write_e2e_summary.py')
 DETAILS = json.loads((SCRIPT.parents[1] / 'e2e' / 'diagnostic_details.json').read_text(encoding='utf-8'))['details']
 SCENARIO_KEYS = {'detail': None, 'scenario': 'm2', 'android_crash': None,
-                 'last_view': None, 'participant': None, 'android': None}
+                 'last_view': None, 'participant': None, 'rpc_op': None, 'android': None}
 
 
 class SummaryTests(unittest.TestCase):
@@ -26,11 +26,11 @@ class SummaryTests(unittest.TestCase):
                                '--exit-code', '17', '--memory-file', str(source))
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(json.loads((root / 'summary.json').read_text()), {
-                'schema_version': 5, 'profile': 'android', 'stage': 'scenario', 'outcome': 'failure',
+                'schema_version': 6, 'profile': 'android', 'stage': 'scenario', 'outcome': 'failure',
                 'exitCode': 17, 'peak_rss_kib': 1234,
                 'phase': None, 'failure_kind': None, 'command_exit_code': None,
                 'detail': None, 'scenario': None, 'android_crash': None,
-                'last_view': None, 'participant': None, 'android': None})
+                'last_view': None, 'participant': None, 'rpc_op': None, 'android': None})
 
     def test_safe_diagnostic_and_missing_file(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -47,7 +47,7 @@ class SummaryTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             summary = json.loads((root / 'summary.json').read_text())
             self.assertEqual({key: summary[key] for key in value}, value)
-            self.assertEqual(len(summary), 15)
+            self.assertEqual(len(summary), 16)
 
     def test_invalid_projection_fails_without_echoing_private_values(self):
         valid = {'phase': 'build_android', 'failure_kind': 'command_exit', 'command_exit_code': 17,
@@ -95,8 +95,8 @@ class SummaryTests(unittest.TestCase):
                 if accepted:
                     self.assertEqual(result.returncode, 0, result.stderr)
                     summary = json.loads((root / 'summary.json').read_text())
-                    self.assertEqual(len(summary), 15)
-                    self.assertEqual(summary['schema_version'], 5)
+                    self.assertEqual(len(summary), 16)
+                    self.assertEqual(summary['schema_version'], 6)
                     self.assertEqual(summary['outcome'], 'failure')
                     self.assertEqual(summary['exitCode'], 1)
                     self.assertEqual({key: summary[key] for key in value}, value)
@@ -133,7 +133,7 @@ class SummaryTests(unittest.TestCase):
                     summary = json.loads((root / 'summary.json').read_text())
                     self.assertEqual(set(summary), {'schema_version', 'profile', 'stage', 'outcome',
                                                     'exitCode', 'peak_rss_kib', *value})
-                    self.assertEqual(summary['schema_version'], 5)
+                    self.assertEqual(summary['schema_version'], 6)
                     self.assertEqual({key: summary[key] for key in value}, value)
                 else:
                     self.assertNotEqual(result.returncode, 0)
@@ -143,11 +143,11 @@ class SummaryTests(unittest.TestCase):
 
     def test_scenario_detail_and_crash_presence(self):
         base = {'phase': 'scenario', 'failure_kind': 'timeout', 'command_exit_code': None,
-                'last_view': None, 'participant': None, 'android': None}
+                'last_view': None, 'participant': None, 'rpc_op': None, 'android': None}
         cases = [('android', {'scenario': s, 'detail': None, 'android_crash': None}, True)
                  for s in ('m2', 'm3', 'm3-auth', 'm4', 'm6')]
         cases += [('android', {'scenario': 'm4', 'detail': d, 'android_crash': None}, True)
-                  for d in ('Message scenario deadline: message_state', 'Android owned activity exited',
+                  for d in ('Message scenario deadline: contact_blocked', 'Android owned activity exited',
                             'participant disconnected', 'Account scenario: SAS mismatch',
                             'RPC failed: ContactRequired', 'Future not completed')]
         cases += [('android', {'scenario': 'm3', 'detail': None, 'android_crash': c}, True)
@@ -177,19 +177,29 @@ class SummaryTests(unittest.TestCase):
                  'proc_state': 19, 'oom_adj': 900, 'frozen': True, 'exit_reason': 'FREEZER',
                  'exit_subreason': 0, 'exit_importance': 400, 'exit_owned': False,
                  'lifecycle': ['am_proc_start', 'wm_on_resume_called', 'screen_off', 'wm_on_stop_called'],
+                 'config_masks': [536870912, 3], 'clock_skew_s': -3600, 'launch_clock_skew_s': 2,
                  'low_memory': False, 'lmk_killed_app': False, 'mem_total_mib': 1967,
                  'mem_available_mib': 300, 'screen_off_timeout_ms': 60000}
         unknown = {**{key: None for key in probe}, 'name': 'android-1', 'screen': 'unknown',
                    'top': 'unknown', 'process': 'unknown'}
         base = {'phase': 'scenario', 'failure_kind': 'timeout', 'command_exit_code': None,
                 'detail': 'Account state deadline', 'scenario': 'm3', 'android_crash': False,
-                'last_view': None, 'participant': None, 'android': None}
+                'last_view': None, 'participant': None, 'rpc_op': None, 'android': None}
         cases = [('android', {'last_view': v, 'participant': 'android-2'}, True)
-                 for v in ('Unconfigured', 'Active', 'Locked', 'NotAvailable', 'other')]
+                 for v in ('Unconfigured', 'Active', 'Locked', 'NotAvailable', 'other',
+                           'Queued', 'Blocked', 'absent')]
+        cases += [('android', {'rpc_op': op, 'participant': 'android-1'}, True)
+                  for op in ('account_local_pair_scan', 'message_local_send_text',
+                             'mailbox_local_sync_now')]
         cases += [('android', {'android': a}, True) for a in ([], [probe], [unknown, probe])]
         cases += [('windows', {'last_view': 'Active', 'participant': 'windows-1'}, True),
                   ('windows', {'android': [probe]}, False)]
         bad = [{'last_view': 'PRIVATE_TOKEN'}, {'last_view': 1}, {'participant': 'PRIVATE_TOKEN'},
+               {'rpc_op': 'PRIVATE_TOKEN'}, {'rpc_op': 'account_local_PRIVATE_TOKEN'},
+               {'rpc_op': 'network_info'}, {'rpc_op': 1},
+               {'android': [{**probe, 'config_masks': [-1]}]},
+               {'android': [{**probe, 'config_masks': [1] * 9}]},
+               {'android': [{**probe, 'clock_skew_s': 1.5}]},
                {'android': {}}, {'android': [probe, probe, probe]}, {'android': ['PRIVATE_TOKEN']},
                {'android': [{**probe, 'extra': 1}]}, {'android': [{k: v for k, v in probe.items() if k != 'top'}]}]
         bad += [{'android': [{**probe, key: 'PRIVATE_TOKEN'}]} for key in probe]

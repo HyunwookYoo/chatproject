@@ -44,6 +44,11 @@ def _one_of(values, nullable=False):
     return lambda v: (nullable and v is None) or (isinstance(v, str) and v in values)
 
 
+def _masks(v):
+    return v is None or (isinstance(v, list) and len(v) <= ANDROID['config_limit']
+                         and all(type(m) is int and 0 <= m < 1 << 31 for m in v))
+
+
 def _lifecycle(v):
     return v is None or (isinstance(v, list) and len(v) <= ANDROID['lifecycle_limit']
                          and all(isinstance(t, str) and t in ANDROID['lifecycle'] for t in v))
@@ -62,12 +67,17 @@ PROBE = {
     'exit_importance': _int(0, 1000),
     'exit_owned': _bool,
     'lifecycle': _lifecycle,
+    'config_masks': _masks,
     'low_memory': _bool,
     'lmk_killed_app': _bool,
     'mem_total_mib': _int(0, 1 << 20),
     'mem_available_mib': _int(0, 1 << 20),
     'screen_off_timeout_ms': _int(0, (1 << 31) - 1),
+    'clock_skew_s': _int(-(1 << 31), (1 << 31) - 1),
+    'launch_clock_skew_s': _int(-(1 << 31), (1 << 31) - 1),
 }
+# The command an RPC failed on: a fixed scenario op name, never its arguments.
+RPC_OP = re.compile(r'(?:account|message|mailbox)_local_[a-z_]{1,48}')
 
 
 def _android(value, profile):
@@ -102,13 +112,13 @@ def main():
                 peak = int(match[1])
     safe = {'phase': None, 'failure_kind': None, 'command_exit_code': None,
             'detail': None, 'scenario': None, 'android_crash': None,
-            'last_view': None, 'participant': None, 'android': None}
+            'last_view': None, 'participant': None, 'rpc_op': None, 'android': None}
     if args.diagnostic_file and args.diagnostic_file.is_file():
         try:
             diagnostic = json.loads(args.diagnostic_file.read_text(encoding='utf-8'))
             if not isinstance(diagnostic, dict) or set(diagnostic) != set(safe):
                 raise ValueError()
-            phase, kind, code, detail, scenario, crash, view, participant, android = (
+            phase, kind, code, detail, scenario, crash, view, participant, op, android = (
                 diagnostic[key] for key in safe)
             if not isinstance(phase, str) or phase not in PHASES:
                 raise ValueError()
@@ -131,15 +141,18 @@ def main():
             if participant is not None and (not isinstance(participant, str)
                                             or participant not in PARTICIPANTS):
                 raise ValueError()
+            if op is not None and (not isinstance(op, str) or not RPC_OP.fullmatch(op)):
+                raise ValueError()
             if not _android(android, args.profile):
                 raise ValueError()
             safe = {'phase': phase, 'failure_kind': kind, 'command_exit_code': code,
                     'detail': detail, 'scenario': scenario, 'android_crash': crash,
-                    'last_view': view, 'participant': participant, 'android': android}
+                    'last_view': view, 'participant': participant, 'rpc_op': op,
+                    'android': android}
         except (OSError, ValueError):
             parser.error('Invalid safe diagnostic')
     # Reconstruct only fixed keys and validated values; never copy log/error text.
-    value = {'schema_version': 5, 'profile': args.profile, 'stage': args.stage,
+    value = {'schema_version': 6, 'profile': args.profile, 'stage': args.stage,
              'outcome': args.outcome, 'exitCode': args.exit_code, 'peak_rss_kib': peak,
              **safe}
     args.output.write_text(json.dumps(value, indent=2) + '\n', encoding='utf-8')

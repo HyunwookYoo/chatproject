@@ -38,10 +38,10 @@ void main() {
     );
     expect(
       safeDetail(
-        TimeoutException('Message scenario deadline: message_state'),
+        TimeoutException('Message scenario deadline: contact_blocked'),
         allowed,
       ),
-      'Message scenario deadline: message_state',
+      'Message scenario deadline: contact_blocked',
     );
     expect(
       safeDetail(const RpcError('ContactRequired', '[redacted]'), allowed),
@@ -117,7 +117,7 @@ void main() {
         if (literal != null) need('$code$literal');
       }
       if (deadline == null) continue;
-      for (final name in ['until', 'view']) {
+      for (final name in ['until', 'view', 'state']) {
         for (final arguments in _calls(source, name)) {
           final literal = _lastLiteral(arguments);
           if (literal != null) need('$deadline$literal');

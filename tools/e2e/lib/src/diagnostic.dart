@@ -51,6 +51,24 @@ const _phases = {
   'Locked',
 };
 
+const _states = {
+  'Queued',
+  'SentDirect',
+  'Delivered',
+  'Read',
+  'Blocked',
+  'Failed',
+  'Cancelled',
+};
+
+/// A message's delivery state as a fixed value: `absent` when the page does
+/// not hold it, `other` for anything unknown.
+String observedState(Object? item) {
+  if (item == null) return 'absent';
+  final state = item is Map ? item['state'] : null;
+  return _states.contains(state) ? state as String : 'other';
+}
+
 /// The fixed category of one read in a scenario wait: an account snapshot's
 /// phase, `NotAvailable` for that RPC error, otherwise `other`.
 String observedView(Object? read) {
