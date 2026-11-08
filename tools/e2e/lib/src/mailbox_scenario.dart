@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'controller.dart';
+import 'diagnostic.dart';
 import 'protocol.dart';
 
 /// Takes one device off the network (`true`) or puts it back (`false`), the
@@ -38,11 +39,17 @@ Future<void> runMailboxScenario(
     if (!ok) throw StateError('Mailbox scenario: $code');
   }
 
+  // The participant of the latest call, named by a deadline.
+  String? who;
   Future<Object?> call(
     Participant p,
     String op, [
     Map<String, Object?> args = const {},
-  ]) => p.call(op, args, timeout: timeout);
+  ]) {
+    who = p.name;
+    return p.call(op, args, timeout: timeout);
+  }
+
   Future<Map<String, Object?>> snapshot(Participant p) async =>
       object(await call(p, 'account_local_snapshot'));
   Future<T> until<T>(
@@ -51,16 +58,23 @@ Future<void> runMailboxScenario(
     String phase,
   ) async {
     final deadline = DateTime.now().add(timeout);
+    String? last;
     while (DateTime.now().isBefore(deadline)) {
       try {
         final value = await read();
+        last = observedView(value);
         if (matches(value)) return value;
       } on RpcError catch (error) {
         if (error.code != 'NotAvailable') rethrow;
+        last = observedView(error);
       }
       await Future<void>.delayed(const Duration(milliseconds: 100));
     }
-    throw TimeoutException('Mailbox scenario deadline: $phase');
+    throw ScenarioDeadline(
+      'Mailbox scenario deadline: $phase',
+      lastView: last,
+      participant: who,
+    );
   }
 
   Future<Map<String, Object?>> view(

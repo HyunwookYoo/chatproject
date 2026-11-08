@@ -4,6 +4,7 @@ import 'dart:io';
 import 'dart:mirrors';
 
 import 'package:test/test.dart';
+import 'package:chat_e2e/src/diagnostic.dart';
 import 'package:chat_e2e/src/emulators.dart';
 import 'package:chat_e2e/src/process_runner.dart';
 
@@ -656,5 +657,37 @@ void main() { Timer.periodic(const Duration(seconds: 1), (_) {}); }
       'command_exit_code': null,
       'detail': 'Android owned activity exited',
     });
+  });
+  test('a scenario deadline keeps its last view and participant if listed', () {
+    phase('scenario');
+    run.invoke(const Symbol('recordFailure'), [
+      ScenarioDeadline(
+        'Message scenario deadline: initial_account',
+        lastView: 'NotAvailable',
+        participant: 'android-2',
+      ),
+    ]);
+    run.invoke(const Symbol('recordFailure'), [
+      ScenarioDeadline('Account state deadline', lastView: 'Active'),
+    ]);
+    expect(
+      projection()['detail'],
+      'Message scenario deadline: initial_account',
+    );
+    expect(run.getField(const Symbol('lastView')).reflectee, 'NotAvailable');
+    expect(
+      run.getField(const Symbol('lastParticipant')).reflectee,
+      'android-2',
+    );
+    run = type('_Run').newInstance(const Symbol(''), [logs]);
+    run.invoke(const Symbol('recordFailure'), [
+      ScenarioDeadline(
+        'Account state deadline',
+        lastView: 'PRIVATE_TOKEN',
+        participant: 'PRIVATE_TOKEN',
+      ),
+    ]);
+    expect(run.getField(const Symbol('lastView')).reflectee, isNull);
+    expect(run.getField(const Symbol('lastParticipant')).reflectee, isNull);
   });
 }

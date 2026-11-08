@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:chat_e2e/src/diagnostic.dart';
@@ -63,6 +64,40 @@ void main() {
     }
   });
 
+  test('a deadline names the last read only as a fixed category', () {
+    expect(
+      observedView({'phase': 'Locked', 'peer': 'PRIVATE_TOKEN'}),
+      'Locked',
+    );
+    expect(observedView({'phase': 'PRIVATE_TOKEN'}), 'other');
+    expect(observedView({'items': []}), 'other');
+    expect(
+      observedView(const RpcError('NotAvailable', 'PRIVATE_TOKEN')),
+      'NotAvailable',
+    );
+    expect(observedView(const RpcError('PRIVATE_TOKEN', 'x')), 'other');
+    final views =
+        (jsonDecode(File('diagnostic_details.json').readAsStringSync())
+                as Map<String, dynamic>)['last_view']
+            as List;
+    for (final phase in [
+      'Unconfigured',
+      'Active',
+      'Locked',
+      'NotAvailable',
+      'other',
+    ]) {
+      expect(views, contains(phase));
+    }
+    expect(
+      safeDetail(
+        ScenarioDeadline('Account state deadline', lastView: 'Active'),
+        allowed,
+      ),
+      'Account state deadline',
+    );
+  });
+
   test('every fixed scenario code, deadline and failure text is listed', () {
     final missing = <String>{};
     void need(String text) {
@@ -96,7 +131,7 @@ void main() {
     for (final file in sources) {
       final source = file.readAsStringSync();
       for (final match in RegExp(
-        r"\b(?:StateError|TimeoutException)\(\s*'([^'$]*)',?\s*\)",
+        r"\b(?:StateError|TimeoutException|ScenarioDeadline)\(\s*'([^'$]*)'(?:,?\s*\)|,\s*\w+:)",
       ).allMatches(source)) {
         need(match.group(1)!);
       }

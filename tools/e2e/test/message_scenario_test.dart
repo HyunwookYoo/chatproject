@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:chat_e2e/src/controller.dart';
+import 'package:chat_e2e/src/diagnostic.dart';
 import 'package:chat_e2e/src/message_scenario.dart';
 import 'package:chat_e2e/src/protocol.dart';
 import 'package:test/test.dart';
@@ -113,7 +114,22 @@ void main() {
             evidence: (stage, data) => fixture.stages.add(stage),
             timeout: const Duration(milliseconds: 350),
           );
-          if (loseStore || reuseFreshStore) {
+          if (reuseFreshStore) {
+            // The deadline names what the last read showed, as fixed values.
+            await expectLater(
+              scenario,
+              throwsA(
+                isA<ScenarioDeadline>()
+                    .having(
+                      (e) => e.message,
+                      'text',
+                      'Message scenario deadline: fresh_initial_account',
+                    )
+                    .having((e) => e.lastView, 'last view', 'Active')
+                    .having((e) => e.participant, 'participant', 'a'),
+              ),
+            );
+          } else if (loseStore) {
             await expectLater(scenario, throwsA(isA<TimeoutException>()));
           } else {
             await scenario;

@@ -4,6 +4,7 @@ import 'package:crypto/crypto.dart';
 
 import 'account_scenario.dart' show AccountRestart;
 import 'controller.dart';
+import 'diagnostic.dart';
 import 'protocol.dart';
 
 /// Native participants own their existing protected account and message store.
@@ -26,11 +27,17 @@ Future<void> runMessageScenario(
     if (!ok) throw StateError('Message scenario: $code');
   }
 
+  // The participant of the latest call, named by a deadline.
+  String? who;
   Future<Object?> call(
     Participant p,
     String op, [
     Map<String, Object?> args = const {},
-  ]) => p.call(op, args, timeout: timeout);
+  ]) {
+    who = p.name;
+    return p.call(op, args, timeout: timeout);
+  }
+
   Future<Map<String, Object?>> snapshot(Participant p) async =>
       object(await call(p, 'account_local_snapshot'));
   Future<Map<String, Object?>> until(
@@ -39,16 +46,23 @@ Future<void> runMessageScenario(
     String phase,
   ) async {
     final deadline = DateTime.now().add(timeout);
+    String? last;
     while (DateTime.now().isBefore(deadline)) {
       try {
         final view = await read();
+        last = observedView(view);
         if (matches(view)) return view;
       } on RpcError catch (error) {
         if (error.code != 'NotAvailable') rethrow;
+        last = observedView(error);
       }
       await Future<void>.delayed(const Duration(milliseconds: 100));
     }
-    throw TimeoutException('Message scenario deadline: $phase');
+    throw ScenarioDeadline(
+      'Message scenario deadline: $phase',
+      lastView: last,
+      participant: who,
+    );
   }
 
   // `phase` names which create a deadline was (the first or the fresh-store one).

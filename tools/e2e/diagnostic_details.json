@@ -172,5 +172,92 @@
     "protocol hello timeout",
     "protocol repeated hello",
     "protocol unmatched result id"
-  ]
+  ],
+  "last_view": [
+    "Unconfigured",
+    "Candidate",
+    "PendingImport",
+    "LocalReady",
+    "PublishPending",
+    "Active",
+    "Conflict",
+    "Locked",
+    "NotAvailable",
+    "other"
+  ],
+  "participants": [
+    "android-1",
+    "android-2",
+    "windows-1",
+    "windows-2",
+    "node"
+  ],
+  "android": {
+    "screen": [
+      "awake",
+      "asleep",
+      "dozing",
+      "dreaming",
+      "unknown"
+    ],
+    "top": [
+      "app",
+      "permission_controller",
+      "settings",
+      "launcher",
+      "systemui",
+      "other",
+      "none",
+      "unknown"
+    ],
+    "process": [
+      "alive_same",
+      "alive_other",
+      "none",
+      "unknown"
+    ],
+    "exit_reason": [
+      "UNKNOWN",
+      "EXIT_SELF",
+      "SIGNALED",
+      "LOW_MEMORY",
+      "CRASH",
+      "CRASH_NATIVE",
+      "ANR",
+      "INITIALIZATION_FAILURE",
+      "PERMISSION_CHANGE",
+      "EXCESSIVE_RESOURCE_USAGE",
+      "USER_REQUESTED",
+      "USER_STOPPED",
+      "DEPENDENCY_DIED",
+      "OTHER",
+      "FREEZER",
+      "PACKAGE_STATE_CHANGE",
+      "PACKAGE_UPDATED"
+    ],
+    "lifecycle": [
+      "am_proc_start",
+      "am_proc_bound",
+      "am_proc_died",
+      "am_kill",
+      "am_anr",
+      "am_crash",
+      "am_freeze",
+      "am_unfreeze",
+      "wm_on_create_called",
+      "wm_on_start_called",
+      "wm_on_restart_called",
+      "wm_on_resume_called",
+      "wm_on_top_resumed_gained_called",
+      "wm_on_top_resumed_lost_called",
+      "wm_on_paused_called",
+      "wm_on_stop_called",
+      "wm_on_destroy_called",
+      "wm_finish_activity",
+      "wm_destroy_activity",
+      "screen_off",
+      "screen_on"
+    ],
+    "lifecycle_limit": 32
+  }
 }

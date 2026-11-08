@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:args/args.dart';
+import 'package:chat_e2e/src/android_probe.dart';
 import 'package:chat_e2e/src/android_sdk.dart';
 import 'package:chat_e2e/src/controller.dart';
 import 'package:chat_e2e/src/account_scenario.dart';
@@ -120,6 +121,8 @@ Future<void> main(List<String> arguments) async {
   Controller? controller;
   // Presence of Android crash-buffer entries only; the entries stay private.
   Future<bool?> Function()? androidCrashed;
+  // Fixed public state of each owned emulator and its app (account scenarios).
+  final androidProbes = <Future<Map<String, Object?>> Function()>[];
   StreamSubscription<ProcessSignal>? signal;
   Future<void>? interrupted;
   var finished = false;
@@ -358,8 +361,16 @@ Future<void> main(List<String> arguments) async {
         final adb = ['-s', spec.serial];
         run.phase = _Phase.androidInstall;
         if (accountScenario) {
-          // A restored snapshot may carry an older crash buffer.
-          await run.command(sdk.adb, [...adb, 'logcat', '-b', 'crash', '-c']);
+          // A restored snapshot may carry older crash and lmkd entries.
+          await run.command(sdk.adb, [
+            ...adb,
+            'logcat',
+            '-b',
+            'crash',
+            '-b',
+            'main',
+            '-c',
+          ]);
         }
         await run.command(
           sdk.adb,
@@ -425,6 +436,16 @@ Future<void> main(List<String> arguments) async {
             }
             if (freshStore) store++;
             run.phase = _Phase.androidLaunch;
+            if (accountScenario) {
+              // The probe's lifecycle covers the process launched next.
+              await run.command(sdk.adb, [
+                ...adb,
+                'logcat',
+                '-b',
+                'events',
+                '-c',
+              ]);
+            }
             final launched = await run.command(sdk.adb, [
               ...adb,
               'shell',
@@ -483,6 +504,19 @@ Future<void> main(List<String> arguments) async {
         }
 
         final first = await launch(null);
+        androidProbes.add(
+          () => probeAndroid(
+            (args) => run.command(
+              sdk.adb,
+              [...adb, ...args],
+              requireSuccess: false,
+              cleanup: true,
+            ),
+            name: name,
+            package: package,
+            ownedPid: appPid,
+          ),
+        );
         appRestarts[name] = (old, {bool freshStore = false}) =>
             launch(old, freshStore: freshStore);
         appAirplane[name] = (on) async {
@@ -714,10 +748,15 @@ Future<void> main(List<String> arguments) async {
       timeout: Duration(minutes: accountScenario ? 8 : 4),
       failurePhase: 'scenario',
     );
+    if (accountScenario) run.android = await _probeAll(androidProbes);
   } catch (error, stack) {
     run.recordFailure(error);
     code = userInterrupted ? 130 : 1;
     run.token.cancel();
+    // Before the controller closes: the apps still run as the failure left them.
+    if (accountScenario && run.android == null) {
+      run.android = await _probeAll(androidProbes);
+    }
     await run.interrupt(controller);
     if (accountScenario && androidCrashed != null) {
       try {
@@ -806,6 +845,9 @@ Future<void> main(List<String> arguments) async {
                 },
             'scenario': scenarioName,
             'android_crash': run.androidCrash,
+            'last_view': run.lastView,
+            'participant': run.lastParticipant,
+            'android': run.android,
           }),
           flush: true,
         );
@@ -923,13 +965,24 @@ class _Run extends IoProcessRunner {
   _Phase phase = _Phase.preflight;
   Map<String, Object?>? safeFailure;
   bool? androidCrash;
+  String? lastView;
+  String? lastParticipant;
+  List<Map<String, Object?>>? android;
   final safeDetails = loadSafeDetails();
+  final safeViews = loadSafeValues('last_view');
+  final safeParticipants = loadSafeValues('participants');
 
   void recordFailure(
     Object? error, {
     String? failurePhase,
     String? timeoutKind,
   }) {
+    if (safeFailure == null && error is ScenarioDeadline) {
+      lastView = safeViews.contains(error.lastView) ? error.lastView : null;
+      lastParticipant = safeParticipants.contains(error.participant)
+          ? error.participant
+          : null;
+    }
     safeFailure ??= {
       'phase': failurePhase ?? phase.value,
       'failure_kind': switch (error) {
@@ -1350,6 +1403,21 @@ class _Managed implements OwnedProcess {
   Future<int> get exitCode => process.exitCode;
   @override
   Future<void> stop() => _stopping ??= run.stop(process);
+}
+
+/// Probes every owned emulator; one that cannot be read is left out.
+Future<List<Map<String, Object?>>> _probeAll(
+  List<Future<Map<String, Object?>> Function()> probes,
+) async {
+  final states = <Map<String, Object?>>[];
+  for (final probe in probes) {
+    try {
+      states.add(await probe());
+    } catch (_) {
+      /* The summary keeps the emulators that could be read. */
+    }
+  }
+  return states;
 }
 
 /// `-g` grants the runtime permissions: the notification prompt an active

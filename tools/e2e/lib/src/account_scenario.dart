@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'controller.dart';
+import 'diagnostic.dart';
 import 'protocol.dart';
 
 typedef AccountRestart =
@@ -41,16 +42,23 @@ Future<void> runAccountScenario(
     bool Function(Map<String, Object?>) predicate,
   ) async {
     final deadline = DateTime.now().add(timeout);
+    String? last;
     while (DateTime.now().isBefore(deadline)) {
       try {
         final view = await snapshot(p);
+        last = observedView(view);
         if (predicate(view)) return view;
       } on RpcError catch (e) {
         if (e.code != 'NotAvailable') rethrow;
+        last = observedView(e);
       }
       await Future<void>.delayed(const Duration(milliseconds: 100));
     }
-    throw TimeoutException('Account state deadline');
+    throw ScenarioDeadline(
+      'Account state deadline',
+      lastView: last,
+      participant: p.name,
+    );
   }
 
   Future<Map<String, Object?>> active(Participant p) =>

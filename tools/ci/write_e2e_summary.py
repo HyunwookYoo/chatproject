@@ -22,9 +22,61 @@ FAILURE_KINDS = set('cleanup command_exit timeout cancelled socket filesystem pr
                     'timeout_network_stop timeout_state_event timeout_probe_event timeout_offline_event'.split())
 SCENARIOS = {'m2', 'm3', 'm3-auth', 'm4', 'm6'}
 # Fixed public failure texts, shared with tools/e2e/lib/src/diagnostic.dart.
-DETAILS = frozenset(json.loads(
+SHARED = json.loads(
     (pathlib.Path(__file__).resolve().parents[1] / 'e2e' / 'diagnostic_details.json')
-    .read_text(encoding='utf-8'))['details'])
+    .read_text(encoding='utf-8'))
+DETAILS = frozenset(SHARED['details'])
+LAST_VIEWS = frozenset(SHARED['last_view'])
+PARTICIPANTS = frozenset(SHARED['participants'])
+# One owned emulator's state (tools/e2e/lib/src/android_probe.dart): key -> check.
+ANDROID = SHARED['android']
+
+
+def _int(low, high):
+    return lambda v: v is None or (type(v) is int and low <= v <= high)
+
+
+def _bool(v):
+    return v is None or type(v) is bool
+
+
+def _one_of(values, nullable=False):
+    return lambda v: (nullable and v is None) or (isinstance(v, str) and v in values)
+
+
+def _lifecycle(v):
+    return v is None or (isinstance(v, list) and len(v) <= ANDROID['lifecycle_limit']
+                         and all(isinstance(t, str) and t in ANDROID['lifecycle'] for t in v))
+
+
+PROBE = {
+    'name': _one_of({'android-1', 'android-2'}),
+    'screen': _one_of(ANDROID['screen']),
+    'top': _one_of(ANDROID['top']),
+    'process': _one_of(ANDROID['process']),
+    'proc_state': _int(0, 30),
+    'oom_adj': _int(-1000, 1001),
+    'frozen': _bool,
+    'exit_reason': _one_of(ANDROID['exit_reason'], nullable=True),
+    'exit_subreason': _int(0, 1000),
+    'exit_importance': _int(0, 1000),
+    'exit_owned': _bool,
+    'lifecycle': _lifecycle,
+    'low_memory': _bool,
+    'lmk_killed_app': _bool,
+    'mem_total_mib': _int(0, 1 << 20),
+    'mem_available_mib': _int(0, 1 << 20),
+    'screen_off_timeout_ms': _int(0, (1 << 31) - 1),
+}
+
+
+def _android(value, profile):
+    if value is None:
+        return True
+    return (profile == 'android' and isinstance(value, list) and len(value) <= 2
+            and all(isinstance(probe, dict) and set(probe) == set(PROBE)
+                    and all(check(probe[key]) for key, check in PROBE.items())
+                    for probe in value))
 EXIT_KINDS = set('command_exit avd_list_exit avd_create_exit avd_devices_exit avd_console_exit '
                  'avd_snapshot_exit owned_relay_exit owned_emulator_exit owned_chat_node_exit '
                  'owned_windows_exit owned_child_exit'.split())
@@ -49,13 +101,15 @@ def main():
             if match:
                 peak = int(match[1])
     safe = {'phase': None, 'failure_kind': None, 'command_exit_code': None,
-            'detail': None, 'scenario': None, 'android_crash': None}
+            'detail': None, 'scenario': None, 'android_crash': None,
+            'last_view': None, 'participant': None, 'android': None}
     if args.diagnostic_file and args.diagnostic_file.is_file():
         try:
             diagnostic = json.loads(args.diagnostic_file.read_text(encoding='utf-8'))
             if not isinstance(diagnostic, dict) or set(diagnostic) != set(safe):
                 raise ValueError()
-            phase, kind, code, detail, scenario, crash = (diagnostic[key] for key in safe)
+            phase, kind, code, detail, scenario, crash, view, participant, android = (
+                diagnostic[key] for key in safe)
             if not isinstance(phase, str) or phase not in PHASES:
                 raise ValueError()
             if kind is not None and (not isinstance(kind, str) or kind not in FAILURE_KINDS):
@@ -71,12 +125,21 @@ def main():
             # Presence of Android crash-buffer entries only, never their text.
             if crash is not None and (type(crash) is not bool or args.profile != 'android'):
                 raise ValueError()
+            # A scenario deadline's last read and participant, as fixed values.
+            if view is not None and (not isinstance(view, str) or view not in LAST_VIEWS):
+                raise ValueError()
+            if participant is not None and (not isinstance(participant, str)
+                                            or participant not in PARTICIPANTS):
+                raise ValueError()
+            if not _android(android, args.profile):
+                raise ValueError()
             safe = {'phase': phase, 'failure_kind': kind, 'command_exit_code': code,
-                    'detail': detail, 'scenario': scenario, 'android_crash': crash}
+                    'detail': detail, 'scenario': scenario, 'android_crash': crash,
+                    'last_view': view, 'participant': participant, 'android': android}
         except (OSError, ValueError):
             parser.error('Invalid safe diagnostic')
     # Reconstruct only fixed keys and validated values; never copy log/error text.
-    value = {'schema_version': 4, 'profile': args.profile, 'stage': args.stage,
+    value = {'schema_version': 5, 'profile': args.profile, 'stage': args.stage,
              'outcome': args.outcome, 'exitCode': args.exit_code, 'peak_rss_kib': peak,
              **safe}
     args.output.write_text(json.dumps(value, indent=2) + '\n', encoding='utf-8')
