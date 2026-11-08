@@ -316,13 +316,18 @@ Future<void> runMessageScenario(
   );
   await call(b, 'clock_advance', {'seconds': 1});
   final checkpoints = object(await call(b, 'message_local_test_ack_loss_wait'));
+  // Between two M5 cores the text came over MLS: the held `Ack` is B's only
+  // acknowledgement (no Delivered receipt job to hold), and B's response
+  // writes since the baseline include its answers to A's group setup, so the
+  // held Ack shows as A not having it (the state check below).
+  final receiptJob = checkpoints['receipt_job'] != false;
   require(
     checkpoints['response_checkpoint'] == true &&
-        checkpoints['receipt_checkpoint'] == true,
+        (checkpoints['receipt_checkpoint'] == true || !receiptJob),
     'ack_checkpoints',
   );
   final ackHeld = object(await call(b, 'message_local_test_write_counts'));
-  require(same(ackHeld, ackBaseline), 'ack_written_before_kill');
+  require(!receiptJob || same(ackHeld, ackBaseline), 'ack_written_before_kill');
   await state(a, key, {'Queued', 'SentDirect'});
   final firstWrites = object(await call(a, 'message_local_test_write_counts'));
   require(firstWrites['payload_writes'] == 1, 'first_actual_payload');

@@ -65,12 +65,17 @@ void main() {
       }
     });
   }
-  for (final mode in [(false, false), (true, false), (false, true)]) {
-    final (loseStore, reuseFreshStore) = mode;
+  for (final mode in [
+    (false, false, false),
+    (true, false, false),
+    (false, true, false),
+    (false, false, true),
+  ]) {
+    final (loseStore, reuseFreshStore, mls) = mode;
     test(
-      'restart scenario validates persistence loseStore=$loseStore reuseFreshStore=$reuseFreshStore',
+      'restart scenario validates persistence loseStore=$loseStore reuseFreshStore=$reuseFreshStore mls=$mls',
       () async {
-        final fixture = MessageFixture(loseStore: loseStore);
+        final fixture = MessageFixture(loseStore: loseStore, mls: mls);
         await fixture.start();
         try {
           var recoveryAudits = 0;
@@ -276,8 +281,12 @@ void main() {
 
 // Orchestration fixture only: no native SQL, cryptography or network-ACK claim.
 class MessageFixture {
-  MessageFixture({this.loseStore = false});
+  MessageFixture({this.loseStore = false, this.mls = false});
   final bool loseStore;
+
+  /// MLS cores: the held `Ack` is the only acknowledgement (no receipt job),
+  /// and the receiver answers the sender's group setup meanwhile.
+  final bool mls;
   late Directory logs;
   late Controller controller;
   final sockets = <WebSocket>[];
@@ -296,6 +305,7 @@ class MessageFixture {
   final generations = {'a': 0, 'b': 0};
   var held = false;
   var consumed = false;
+  var groupAnswers = 0;
   final payloadWrites = {'a': 0, 'b': 0};
   final received = <String>{};
   List<int> peer(String name) =>
@@ -378,13 +388,17 @@ class MessageFixture {
           held = true;
         case 'message_local_test_ack_loss_wait':
           expect(consumed, isTrue);
-          result = {'response_checkpoint': true, 'receipt_checkpoint': true};
+          result = {
+            'response_checkpoint': true,
+            'receipt_checkpoint': !mls,
+            'receipt_job': !mls,
+          };
         case 'message_local_test_ack_loss_release':
           held = false;
         case 'message_local_test_write_counts':
           result = {
             'payload_writes': payloadWrites[name],
-            'response_writes': 0,
+            'response_writes': mls && held && name == 'b' ? ++groupAnswers : 0,
           };
         case 'message_local_open_dm':
           result = {'unread': rows.length, 'id': List.filled(32, 5)};
