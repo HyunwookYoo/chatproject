@@ -690,4 +690,23 @@ void main() { Timer.periodic(const Duration(seconds: 1), (_) {}); }
     expect(run.getField(const Symbol('lastView')).reflectee, isNull);
     expect(run.getField(const Symbol('lastParticipant')).reflectee, isNull);
   });
+  test('a run without owned emulators keeps no Android state', () async {
+    Future<Object?> probeAll(
+      List<Future<Map<String, Object?>> Function()> probes,
+    ) =>
+        library.invoke(MirrorSystem.getSymbol('_probeAll', library), [
+              probes,
+            ]).reflectee
+            as Future<Object?>;
+    expect(await probeAll([]), isNull);
+    expect(
+      await probeAll([
+        () async => {'name': 'android-1'},
+        () async => throw StateError('unreadable'),
+      ]),
+      [
+        {'name': 'android-1'},
+      ],
+    );
+  });
 }

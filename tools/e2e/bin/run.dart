@@ -1405,10 +1405,12 @@ class _Managed implements OwnedProcess {
   Future<void> stop() => _stopping ??= run.stop(process);
 }
 
-/// Probes every owned emulator; one that cannot be read is left out.
-Future<List<Map<String, Object?>>> _probeAll(
+/// Probes every owned emulator; one that cannot be read is left out. A run
+/// without emulators (Windows) has no Android state.
+Future<List<Map<String, Object?>>?> _probeAll(
   List<Future<Map<String, Object?>> Function()> probes,
 ) async {
+  if (probes.isEmpty) return null;
   final states = <Map<String, Object?>>[];
   for (final probe in probes) {
     try {
