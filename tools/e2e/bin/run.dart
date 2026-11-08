@@ -411,6 +411,27 @@ Future<void> main(List<String> arguments) async {
         var appPid = '';
         var restarting = false;
         var store = 0;
+        // The slowest launch so far: `am start` until the app's control hello.
+        int? launchMsMax;
+        int? launchSkew;
+        // Registered before the first launch, so a first launch that fails is
+        // probed too.
+        androidProbes.add(
+          () => probeAndroid(
+            (args) => run.command(
+              sdk.adb,
+              [...adb, ...args],
+              requireSuccess: false,
+              cleanup: true,
+            ),
+            name: name,
+            package: package,
+            ownedPid: appPid,
+            launchSkew: launchSkew,
+            launchMsMax: launchMsMax,
+            hostLoad: _hostLoad(),
+          ),
+        );
         Future<Participant> launch(
           Participant? old, {
           bool freshStore = false,
@@ -447,6 +468,7 @@ Future<void> main(List<String> arguments) async {
                 '-c',
               ]);
             }
+            final launchClock = Stopwatch()..start();
             final launched = await run.command(sdk.adb, [
               ...adb,
               'shell',
@@ -497,6 +519,8 @@ Future<void> main(List<String> arguments) async {
               next = await control.waitParticipant(name);
               return old == null || next!.instance != old.instance;
             }, const Duration(seconds: 30));
+            final took = launchClock.elapsedMilliseconds;
+            if (launchMsMax == null || took > launchMsMax!) launchMsMax = took;
             return next!;
           } finally {
             restarting = false;
@@ -505,7 +529,6 @@ Future<void> main(List<String> arguments) async {
         }
 
         final first = await launch(null);
-        int? launchSkew;
         try {
           final date = await run.command(sdk.adb, [
             ...adb,
@@ -522,20 +545,6 @@ Future<void> main(List<String> arguments) async {
         } on StateError {
           /* An unread launch clock stays null. */
         }
-        androidProbes.add(
-          () => probeAndroid(
-            (args) => run.command(
-              sdk.adb,
-              [...adb, ...args],
-              requireSuccess: false,
-              cleanup: true,
-            ),
-            name: name,
-            package: package,
-            ownedPid: appPid,
-            launchSkew: launchSkew,
-          ),
-        );
         appRestarts[name] = (old, {bool freshStore = false}) =>
             launch(old, freshStore: freshStore);
         appAirplane[name] = (on) async {
@@ -1438,6 +1447,15 @@ class _Managed implements OwnedProcess {
 
 /// A fixed scenario op name (tools/ci/write_e2e_summary.py `RPC_OP`).
 final _rpcOp = RegExp(r'^(?:account|message|mailbox)_local_[a-z_]{1,48}$');
+
+/// The host's 1-minute load average times 100 (Linux), or null.
+int? _hostLoad() {
+  try {
+    return loadX100(File('/proc/loadavg').readAsStringSync());
+  } on FileSystemException {
+    return null;
+  }
+}
 
 /// Probes every owned emulator; one that cannot be read is left out. A run
 /// without emulators (Windows) has no Android state.

@@ -77,6 +77,11 @@ PROBE = {
     'screen_off_timeout_ms': _int(0, (1 << 31) - 1),
     'clock_skew_s': _int(-(1 << 31), (1 << 31) - 1),
     'launch_clock_skew_s': _int(-(1 << 31), (1 << 31) - 1),
+    'launch_ms_max': _int(0, 10_000_000),
+    'load_x100': _int(0, 1_000_000),
+    'host_load_x100': _int(0, 1_000_000),
+    'app_cpu_pct': _int(0, 10_000),
+    'frames': _int(0, (1 << 31) - 1),
 }
 # The command an RPC failed on: a fixed scenario op name, never its arguments.
 RPC_OP = re.compile(r'(?:account|message|mailbox)_local_[a-z_]{1,48}')
@@ -163,7 +168,7 @@ def main():
         except (OSError, ValueError):
             parser.error('Invalid safe diagnostic')
     # Reconstruct only fixed keys and validated values; never copy log/error text.
-    value = {'schema_version': 7, 'profile': args.profile, 'stage': args.stage,
+    value = {'schema_version': 8, 'profile': args.profile, 'stage': args.stage,
              'outcome': args.outcome, 'exitCode': args.exit_code, 'peak_rss_kib': peak,
              **safe}
     args.output.write_text(json.dumps(value, indent=2) + '\n', encoding='utf-8')

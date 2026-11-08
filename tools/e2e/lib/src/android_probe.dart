@@ -200,6 +200,42 @@ List<int> configMasks(String events) {
       : masks;
 }
 
+/// `/proc/loadavg`: the 1-minute load average times 100, or null.
+int? loadX100(String loadavg) {
+  final value = double.tryParse(loadavg.trim().split(RegExp(r'\s+')).first);
+  return value == null || value < 0 || value > 10000
+      ? null
+      : (value * 100).round();
+}
+
+/// The app's average CPU use since it started, in percent of one core, from
+/// `/proc/<pid>/stat` and `/proc/uptime` (clock ticks of 100 Hz).
+int? appCpuPercent(String stat, String uptime) {
+  // Fields after the parenthesised name: state is field 3, utime 14, stime 15,
+  // starttime 22.
+  final close = stat.lastIndexOf(')');
+  final up = double.tryParse(uptime.trim().split(RegExp(r'\s+')).first);
+  if (close < 0 || up == null) return null;
+  final fields = stat.substring(close + 1).trim().split(RegExp(r'\s+'));
+  if (fields.length < 20) return null;
+  final utime = int.tryParse(fields[11]);
+  final stime = int.tryParse(fields[12]);
+  final start = int.tryParse(fields[19]);
+  if (utime == null || stime == null || start == null) return null;
+  final age = up * 100 - start;
+  if (age <= 0) return null;
+  final percent = ((utime + stime) * 100 / age).round();
+  return percent > 10000 ? null : percent;
+}
+
+/// `dumpsys gfxinfo <package>`: frames the app rendered, or null.
+int? framesRendered(String gfxinfo) {
+  final value = RegExp(
+    r'Total frames rendered:\s*(\d+)',
+  ).firstMatch(gfxinfo)?.group(1);
+  return value == null ? null : int.tryParse(value);
+}
+
 /// `date +%s` minus the host's seconds, or null.
 int? clockSkew(String date, int hostSeconds) {
   final device = int.tryParse(date.trim());
@@ -244,6 +280,8 @@ Future<Map<String, Object?>> probeAndroid(
   required String package,
   required String ownedPid,
   int? launchSkew,
+  int? launchMsMax,
+  int? hostLoad,
   int Function()? hostSeconds,
 }) async {
   final host =
@@ -303,6 +341,15 @@ Future<Map<String, Object?>> probeAndroid(
     'screen_off_timeout',
   ]);
   final date = await output(['shell', 'date', '+%s']);
+  final loadavg = await output(['shell', 'cat', '/proc/loadavg']);
+  final pidNumber = RegExp(r'^\d+$').hasMatch(ownedPid);
+  final stat = pidNumber
+      ? await output(['shell', 'cat', '/proc/$ownedPid/stat'])
+      : null;
+  final uptime = stat == null
+      ? null
+      : await output(['shell', 'cat', '/proc/uptime']);
+  final gfx = await output(['shell', 'dumpsys', 'gfxinfo', package]);
   final skew = date == null ? null : clockSkew(date, host());
   final record = processes == null ? null : processRecord(processes);
   final exit = exits == null ? null : lastExit(exits, ownedPid);
@@ -328,5 +375,12 @@ Future<Map<String, Object?>> probeAndroid(
     'screen_off_timeout_ms': timeout == null ? null : setting(timeout),
     'clock_skew_s': skew,
     'launch_clock_skew_s': launchSkew,
+    'launch_ms_max': launchMsMax,
+    'load_x100': loadavg == null ? null : loadX100(loadavg),
+    'host_load_x100': hostLoad,
+    'app_cpu_pct': stat == null || uptime == null
+        ? null
+        : appCpuPercent(stat, uptime),
+    'frames': gfx == null ? null : framesRendered(gfx),
   };
 }

@@ -26,7 +26,7 @@ class SummaryTests(unittest.TestCase):
                                '--exit-code', '17', '--memory-file', str(source))
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(json.loads((root / 'summary.json').read_text()), {
-                'schema_version': 7, 'profile': 'android', 'stage': 'scenario', 'outcome': 'failure',
+                'schema_version': 8, 'profile': 'android', 'stage': 'scenario', 'outcome': 'failure',
                 'exitCode': 17, 'peak_rss_kib': 1234,
                 'phase': None, 'failure_kind': None, 'command_exit_code': None,
                 'detail': None, 'scenario': None, 'android_crash': None,
@@ -96,7 +96,7 @@ class SummaryTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 0, result.stderr)
                     summary = json.loads((root / 'summary.json').read_text())
                     self.assertEqual(len(summary), 17)
-                    self.assertEqual(summary['schema_version'], 7)
+                    self.assertEqual(summary['schema_version'], 8)
                     self.assertEqual(summary['outcome'], 'failure')
                     self.assertEqual(summary['exitCode'], 1)
                     self.assertEqual({key: summary[key] for key in value}, value)
@@ -133,7 +133,7 @@ class SummaryTests(unittest.TestCase):
                     summary = json.loads((root / 'summary.json').read_text())
                     self.assertEqual(set(summary), {'schema_version', 'profile', 'stage', 'outcome',
                                                     'exitCode', 'peak_rss_kib', *value})
-                    self.assertEqual(summary['schema_version'], 7)
+                    self.assertEqual(summary['schema_version'], 8)
                     self.assertEqual({key: summary[key] for key in value}, value)
                 else:
                     self.assertNotEqual(result.returncode, 0)
@@ -178,6 +178,8 @@ class SummaryTests(unittest.TestCase):
                  'exit_subreason': 0, 'exit_importance': 400, 'exit_owned': False,
                  'lifecycle': ['am_proc_start', 'wm_on_resume_called', 'screen_off', 'wm_on_stop_called'],
                  'config_masks': [536870912, 3], 'clock_skew_s': -3600, 'launch_clock_skew_s': 2,
+                 'launch_ms_max': 31000, 'load_x100': 812, 'host_load_x100': 650,
+                 'app_cpu_pct': 140, 'frames': 9000,
                  'low_memory': False, 'lmk_killed_app': False, 'mem_total_mib': 1967,
                  'mem_available_mib': 300, 'screen_off_timeout_ms': 60000}
         unknown = {**{key: None for key in probe}, 'name': 'android-1', 'screen': 'unknown',
@@ -205,6 +207,8 @@ class SummaryTests(unittest.TestCase):
                {'android': [{**probe, 'config_masks': [-1]}]},
                {'android': [{**probe, 'config_masks': [1] * 9}]},
                {'android': [{**probe, 'clock_skew_s': 1.5}]},
+               {'android': [{**probe, 'app_cpu_pct': -1}]},
+               {'android': [{**probe, 'launch_ms_max': True}]},
                {'android': {}}, {'android': [probe, probe, probe]}, {'android': ['PRIVATE_TOKEN']},
                {'android': [{**probe, 'extra': 1}]}, {'android': [{k: v for k, v in probe.items() if k != 'top'}]}]
         bad += [{'android': [{**probe, key: 'PRIVATE_TOKEN'}]} for key in probe]

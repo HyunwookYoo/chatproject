@@ -159,6 +159,19 @@ void main() {
     expect(clockSkew('PRIVATE', 1), isNull);
   });
 
+  test('load, app CPU and rendered frames', () {
+    expect(loadX100('3.52 2.10 1.00 4/900 1234\n'), 352);
+    expect(loadX100('PRIVATE'), isNull);
+    // utime 300 + stime 200 ticks over (2000 - 1000) ticks of age: 50 %.
+    const stat =
+        '4321 (a b) S 1 2 3 4 5 6 7 8 9 10 300 200 0 0 20 0 30 0 1000 0 0';
+    expect(appCpuPercent(stat, '20.00 10.00'), 50);
+    expect(appCpuPercent('PRIVATE', '20'), isNull);
+    expect(appCpuPercent(stat, 'PRIVATE'), isNull);
+    expect(framesRendered('  Total frames rendered: 1234\n'), 1234);
+    expect(framesRendered('none'), isNull);
+  });
+
   test('lmkd kills and memory', () {
     const lmk =
         "11-08 08:31:12.000  300  300 I lowmemorykiller: Kill '$package' (4321), uid 10190, oom_score_adj 900 to free 100000kB\n";
@@ -197,6 +210,25 @@ void main() {
       'logcat -b main -d -s lowmemorykiller lmkd': ProcessResult(1, 0, '', ''),
       'shell cat /proc/meminfo': ProcessResult(1, 0, 'MemTotal: 2048 kB\n', ''),
       'shell date +%s': ProcessResult(1, 0, '1000\n', ''),
+      'shell cat /proc/loadavg': ProcessResult(
+        1,
+        0,
+        '3.52 2.10 1.00 4/900 1234\n',
+        '',
+      ),
+      'shell cat /proc/4321/stat': ProcessResult(
+        1,
+        0,
+        '4321 (PRIVATE app) S 1 2 3 4 5 6 7 8 9 10 300 200 0 0 20 0 30 0 1000 0 0\n',
+        '',
+      ),
+      'shell cat /proc/uptime': ProcessResult(1, 0, '20.00 10.00\n', ''),
+      'shell dumpsys gfxinfo $package': ProcessResult(
+        1,
+        0,
+        'Total frames rendered: 77\n',
+        '',
+      ),
       'shell settings get system screen_off_timeout': ProcessResult(
         1,
         1,
@@ -210,6 +242,8 @@ void main() {
       package: package,
       ownedPid: '4321',
       launchSkew: -3,
+      launchMsMax: 12000,
+      hostLoad: 410,
       hostSeconds: () => 1090,
     );
     expect(probe, {
@@ -233,6 +267,11 @@ void main() {
       'screen_off_timeout_ms': null,
       'clock_skew_s': -90,
       'launch_clock_skew_s': -3,
+      'launch_ms_max': 12000,
+      'load_x100': 352,
+      'host_load_x100': 410,
+      'app_cpu_pct': 50,
+      'frames': 77,
     });
     expect(jsonEncode(probe), isNot(contains('PRIVATE')));
   });
