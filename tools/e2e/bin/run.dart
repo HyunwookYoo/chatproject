@@ -328,9 +328,11 @@ Future<void> main(List<String> arguments) async {
       await emulators.preflight(specs);
       run.phase = _Phase.avdCreate;
       for (final spec in specs) {
+        // A missing snapshot: first boot (bootTimeout 3 min), settle (at most
+        // 10 min), save and stop.
         await run.wait(
           emulators.ensure(spec),
-          timeout: const Duration(minutes: 5),
+          timeout: const Duration(minutes: 20),
         );
       }
       run.phase = _Phase.avdBoot;
@@ -515,10 +517,16 @@ Future<void> main(List<String> arguments) async {
             run.save();
             Participant? next;
             run.phase = _Phase.androidParticipant;
+            // `am start` to the control hello took up to 17.4 s in a passing run
+            // on the GitHub emulators. waitParticipant's default 10 s, counted
+            // from here, was the tighter limit, not the outer 30 s.
             await run.until(() async {
-              next = await control.waitParticipant(name);
+              next = await control.waitParticipant(
+                name,
+                timeout: const Duration(seconds: 60),
+              );
               return old == null || next!.instance != old.instance;
-            }, const Duration(seconds: 30));
+            }, const Duration(seconds: 60));
             final took = launchClock.elapsedMilliseconds;
             if (launchMsMax == null || took > launchMsMax!) launchMsMax = took;
             return next!;

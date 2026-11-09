@@ -76,7 +76,8 @@ jobs:
             ~/.android/avd/chat_e2e_1.ini
             ~/.android/avd/chat_e2e_2.avd
             ~/.android/avd/chat_e2e_2.ini
-          key: nightly-avd-${{ runner.os }}-${{ hashFiles('tools/e2e/avd_config.json') }}
+          # The clean snapshot depends on how emulators.dart prepares it (settle).
+          key: nightly-avd-${{ runner.os }}-${{ hashFiles('tools/e2e/avd_config.json', 'tools/e2e/lib/src/emulators.dart') }}
       - name: Dart dependencies
         run: |
           (cd app && flutter pub get)
