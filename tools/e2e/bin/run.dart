@@ -784,15 +784,14 @@ Future<void> main(List<String> arguments) async {
       timeout: Duration(minutes: accountScenario ? 8 : 4),
       failurePhase: 'scenario',
     );
-    if (accountScenario) run.android = await _probeAll(androidProbes);
+    // Every Android run, m2 too (no Android owned: null).
+    run.android = await _probeAll(androidProbes);
   } catch (error, stack) {
     run.recordFailure(error);
     code = userInterrupted ? 130 : 1;
     run.token.cancel();
     // Before the controller closes: the apps still run as the failure left them.
-    if (accountScenario && run.android == null) {
-      run.android = await _probeAll(androidProbes);
-    }
+    run.android ??= await _probeAll(androidProbes);
     await run.interrupt(controller);
     if (accountScenario && androidCrashed != null) {
       try {

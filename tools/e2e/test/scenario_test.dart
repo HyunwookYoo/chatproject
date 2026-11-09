@@ -174,6 +174,10 @@ class FakeCore {
           error = 'Busy';
           break;
         }
+        if (fixture.fault == 'connect timeout' && name == 'android' && remote.name == 'node') {
+          error = 'NetworkTimeout';
+          break;
+        }
         connected.add(remote.endpoint);
         remote.connected.add(endpoint);
         value = {
@@ -714,6 +718,29 @@ Future<void> main(List<String> args) async {
       }
     },
   );
+
+  test('a failed connect names the dialing pair', () async {
+    final fixture = Fixture()..fault = 'connect timeout';
+    final participants = await fixture.start();
+    final failures = <(Object, String?, String?)>[];
+    try {
+      await expectLater(
+        runScenario(
+          fixture.controller,
+          participants,
+          restart: fixture.restart,
+          timeout: const Duration(milliseconds: 40),
+          onFailure: (error, phase, kind) => failures.add((error, phase, kind)),
+        ),
+        throwsA(isA<RpcError>().having((e) => e.code, 'code', 'NetworkTimeout')),
+      );
+      expect(failures, hasLength(1));
+      expect(failures.single.$2, 'scenario_app2_to_node');
+      expect(failures.single.$3, isNull);
+    } finally {
+      await fixture.close();
+    }
+  });
 
   for (final fault in [
     'wrong body',

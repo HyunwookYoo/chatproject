@@ -95,9 +95,15 @@ Future<void> runScenario(
   }
 
   Future<void> connect(Participant left, Participant right) async {
-    await call(left, 'connect_peer', {
-      'target': addresses[right.name]!['ticket'],
-    });
+    try {
+      await call(left, 'connect_peer', {
+        'target': addresses[right.name]!['ticket'],
+      });
+    } on RpcError catch (error) {
+      // A core's own connect deadline (NetworkTimeout) names the dialing pair.
+      report(error, pair(left, right));
+      rethrow;
+    }
   }
 
   Future<void> exchange(

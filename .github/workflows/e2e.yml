@@ -150,7 +150,9 @@ jobs:
           retention-days: 14
       - name: M3 account/auth and M4 message regressions
         id: account_scenario
-        if: steps.scenario.outcome == 'success'
+        # Also after the m2 run failed (it wrote an exit code): each scenario
+        # boots its own emulators, and the job still fails on m2.
+        if: ${{ !cancelled() && steps.scenario.outputs.exit_code != '' }}
         working-directory: tools/e2e
         run: |
           set +e
