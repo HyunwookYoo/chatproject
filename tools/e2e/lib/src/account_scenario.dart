@@ -41,19 +41,26 @@ Future<void> runAccountScenario(
     Participant p,
     bool Function(Map<String, Object?>) predicate,
   ) async {
+    // Named as the deadline below, so the literal-sync test sees the text.
+    const name = 'Account state deadline';
+    final took = Stopwatch()..start();
     final deadline = DateTime.now().add(timeout);
     String? last;
     while (DateTime.now().isBefore(deadline)) {
       try {
         final view = await snapshot(p);
         last = observedView(view);
-        if (predicate(view)) return view;
+        if (predicate(view)) {
+          noteWait(name, took.elapsedMilliseconds);
+          return view;
+        }
       } on RpcError catch (e) {
         if (e.code != 'NotAvailable') rethrow;
         last = observedView(e);
       }
       await Future<void>.delayed(const Duration(milliseconds: 100));
     }
+    noteWait(name, took.elapsedMilliseconds);
     throw ScenarioDeadline(
       'Account state deadline',
       lastView: last,

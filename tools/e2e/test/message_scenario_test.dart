@@ -133,6 +133,7 @@ void main() {
             await expectLater(scenario, throwsA(isA<TimeoutException>()));
           } else {
             await scenario;
+            expect(waitMs.keys, contains('Message scenario deadline: read'));
             expect(recoveryAudits, 4);
             expect(fixture.freshRestarts, 2);
             expect(fixture.restarts, 2);

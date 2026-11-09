@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'controller.dart';
+import 'diagnostic.dart';
 import 'protocol.dart';
 
 /// Exercises one foreground session; process ownership stays with the caller.
@@ -34,11 +35,14 @@ Future<void> runScenario(
     (2, 1): 'scenario_node_to_app2',
   }[(current.indexOf(subject), current.indexOf(observer))]!;
   Future<T> positive<T>(Future<T> work, String phase, String kind) async {
+    final took = Stopwatch()..start();
     try {
       return await work;
     } on TimeoutException catch (error) {
       report(error, phase, kind);
       rethrow;
+    } finally {
+      noteWait(kind, took.elapsedMilliseconds);
     }
   }
 

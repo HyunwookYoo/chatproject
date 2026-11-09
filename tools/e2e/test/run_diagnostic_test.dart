@@ -723,6 +723,21 @@ void main() { Timer.periodic(const Duration(seconds: 1), (_) {}); }
     expect(run.getField(const Symbol('lastParticipant')).reflectee, isNull);
   });
 
+  test('the slowest waits keep listed names only', () {
+    waitMs
+      ..clear()
+      ..['account_local_pair_scan'] = 9800
+      ..['timeout_probe_event'] = 15000
+      ..['Mailbox scenario deadline: first_text'] = 41250
+      ..['PRIVATE_TOKEN'] = 60000;
+    expect(run.invoke(const Symbol('waits'), []).reflectee, [
+      {'name': 'Mailbox scenario deadline: first_text', 'ms': 41250},
+      {'name': 'timeout_probe_event', 'ms': 15000},
+      {'name': 'account_local_pair_scan', 'ms': 9800},
+    ]);
+    waitMs.clear();
+  });
+
   test('a run without owned emulators keeps no Android state', () async {
     Future<Object?> probeAll(
       List<Future<Map<String, Object?>> Function()> probes,

@@ -146,6 +146,43 @@ void main() {
     failureFacts.clear();
   });
 
+  test('the slowest waits keep listed names only, slowest first', () {
+    waitMs.clear();
+    noteWait('account_local_pair_scan', 9800);
+    noteWait('account_local_pair_scan', 1200);
+    noteWait('Mailbox scenario deadline: first_text', 41250);
+    noteWait('timeout_probe_event', 15000);
+    noteWait('network_info', 30000);
+    noteWait('account_local_PRIVATE_TOKEN', 50000);
+    noteWait('Mailbox scenario deadline: PRIVATE_TOKEN', 50000);
+    expect(waitMs['account_local_pair_scan'], 9800);
+    final kinds = loadSafeValues('wait_kinds');
+    expect(safeWaits(waitMs, allowed, kinds), [
+      {'name': 'Mailbox scenario deadline: first_text', 'ms': 41250},
+      {'name': 'timeout_probe_event', 'ms': 15000},
+      {'name': 'account_local_pair_scan', 'ms': 9800},
+    ]);
+    waitMs.clear();
+    for (var i = 0; i < 10; i++) {
+      noteWait('account_local_op_${String.fromCharCode(97 + i)}', i);
+    }
+    final kept = safeWaits(waitMs, allowed, kinds)!;
+    expect(kept, hasLength(waitsLimit));
+    expect(kept.first, {'name': 'account_local_op_j', 'ms': 9});
+    waitMs.clear();
+    expect(safeWaits(waitMs, allowed, kinds), isNull);
+  });
+
+  test('every m2 timeout kind is a listed wait name', () {
+    final source = File('lib/src/scenario.dart').readAsStringSync();
+    final kinds = {
+      for (final match in RegExp(r"'(timeout_[a-z_]+)'").allMatches(source))
+        match.group(1)!,
+    };
+    expect(kinds, isNotEmpty);
+    expect(kinds.difference(loadSafeValues('wait_kinds')), isEmpty);
+  });
+
   test('every fixed scenario code, deadline and failure text is listed', () {
     final missing = <String>{};
     void need(String text) {

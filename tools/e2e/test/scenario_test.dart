@@ -6,6 +6,7 @@ import 'dart:mirrors';
 import '../bin/run.dart' as harness;
 
 import 'package:chat_e2e/src/controller.dart';
+import 'package:chat_e2e/src/diagnostic.dart';
 import 'package:chat_e2e/src/owned_resources.dart';
 import 'package:chat_e2e/src/protocol.dart';
 import 'package:chat_e2e/src/scenario.dart';
@@ -600,6 +601,7 @@ Future<void> main(List<String> args) async {
     () async {
       final fixture = Fixture()..fault = 'recovery ordering';
       final participants = await fixture.start();
+      waitMs.clear();
       try {
         await runScenario(
           fixture.controller,
@@ -607,6 +609,11 @@ Future<void> main(List<String> args) async {
           restart: fixture.restart,
           timeout: short,
         );
+        expect(
+          waitMs.keys,
+          containsAll(['timeout_probe_event', 'timeout_send_probe_text']),
+        );
+        waitMs.clear();
       } finally {
         await fixture.close();
       }

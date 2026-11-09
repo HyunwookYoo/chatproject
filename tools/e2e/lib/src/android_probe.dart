@@ -236,6 +236,12 @@ int? framesRendered(String gfxinfo) {
   return value == null ? null : int.tryParse(value);
 }
 
+/// `nproc`: the guest's online CPUs, or null.
+int? cpuCount(String nproc) {
+  final value = int.tryParse(nproc.trim());
+  return value == null || value < 1 || value > 1024 ? null : value;
+}
+
 /// `date +%s` minus the host's seconds, or null.
 int? clockSkew(String date, int hostSeconds) {
   final device = int.tryParse(date.trim());
@@ -350,6 +356,7 @@ Future<Map<String, Object?>> probeAndroid(
       ? null
       : await output(['shell', 'cat', '/proc/uptime']);
   final gfx = await output(['shell', 'dumpsys', 'gfxinfo', package]);
+  final nproc = await output(['shell', 'nproc']);
   final skew = date == null ? null : clockSkew(date, host());
   final record = processes == null ? null : processRecord(processes);
   final exit = exits == null ? null : lastExit(exits, ownedPid);
@@ -382,5 +389,6 @@ Future<Map<String, Object?>> probeAndroid(
         ? null
         : appCpuPercent(stat, uptime),
     'frames': gfx == null ? null : framesRendered(gfx),
+    'cpus': nproc == null ? null : cpuCount(nproc),
   };
 }

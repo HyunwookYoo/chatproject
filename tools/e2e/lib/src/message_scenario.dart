@@ -46,21 +46,27 @@ Future<void> runMessageScenario(
     String phase, {
     String Function(Map<String, Object?>) observe = observedView,
   }) async {
+    final name = 'Message scenario deadline: $phase';
+    final took = Stopwatch()..start();
     final deadline = DateTime.now().add(timeout);
     String? last;
     while (DateTime.now().isBefore(deadline)) {
       try {
         final view = await read();
         last = observe(view);
-        if (matches(view)) return view;
+        if (matches(view)) {
+          noteWait(name, took.elapsedMilliseconds);
+          return view;
+        }
       } on RpcError catch (error) {
         if (error.code != 'NotAvailable') rethrow;
         last = observedView(error);
       }
       await Future<void>.delayed(const Duration(milliseconds: 100));
     }
+    noteWait(name, took.elapsedMilliseconds);
     throw ScenarioDeadline(
-      'Message scenario deadline: $phase',
+      name,
       lastView: last,
       participant: who,
     );

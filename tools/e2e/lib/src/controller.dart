@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'diagnostic.dart';
 import 'protocol.dart';
 
 /// Owns only its loopback listener, sockets and diagnostic log.
@@ -599,6 +600,7 @@ class Participant {
     _operations[id] = op;
     // Attach the timeout/error handler before any write can fail the scenario.
     final result = completer.future.timeout(timeout);
+    final took = Stopwatch()..start();
     try {
       try {
         _controller._send(_connection, {
@@ -617,6 +619,7 @@ class Participant {
     } finally {
       _pending.remove(id);
       _operations.remove(id);
+      noteWait(op, took.elapsedMilliseconds);
     }
   }
 

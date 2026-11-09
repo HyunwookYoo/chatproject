@@ -82,9 +82,25 @@ PROBE = {
     'host_load_x100': _int(0, 1_000_000),
     'app_cpu_pct': _int(0, 10_000),
     'frames': _int(0, (1 << 31) - 1),
+    'cpus': _int(1, 1024),
 }
 # The command an RPC failed on: a fixed scenario op name, never its arguments.
 RPC_OP = re.compile(r'(?:account|message|mailbox)_local_[a-z_]{1,48}')
+
+
+# m2's own waits, named by their timeout kind.
+WAIT_KINDS = frozenset(SHARED['wait_kinds'])
+WAITS_LIMIT = 8
+
+
+def _waits(value):
+    """The slowest waits: listed names (a deadline text, a scenario op, an m2 timeout kind), once each."""
+    return value is None or (
+        isinstance(value, list) and len(value) <= WAITS_LIMIT
+        and all(isinstance(w, dict) and set(w) == {'name', 'ms'} and isinstance(w['name'], str)
+                and (w['name'] in DETAILS or w['name'] in WAIT_KINDS or RPC_OP.fullmatch(w['name']))
+                and type(w['ms']) is int and 0 <= w['ms'] <= 10_000_000 for w in value)
+        and len({w['name'] for w in value}) == len(value))
 
 
 def _facts(value):
@@ -126,14 +142,14 @@ def main():
     safe = {'phase': None, 'failure_kind': None, 'command_exit_code': None,
             'detail': None, 'scenario': None, 'android_crash': None,
             'last_view': None, 'participant': None, 'rpc_op': None, 'facts': None,
-            'android': None}
+            'android': None, 'waits': None}
     if args.diagnostic_file and args.diagnostic_file.is_file():
         try:
             diagnostic = json.loads(args.diagnostic_file.read_text(encoding='utf-8'))
             if not isinstance(diagnostic, dict) or set(diagnostic) != set(safe):
                 raise ValueError()
             (phase, kind, code, detail, scenario, crash, view, participant, op, facts,
-             android) = (diagnostic[key] for key in safe)
+             android, waits) = (diagnostic[key] for key in safe)
             if not isinstance(phase, str) or phase not in PHASES:
                 raise ValueError()
             if kind is not None and (not isinstance(kind, str) or kind not in FAILURE_KINDS):
@@ -161,14 +177,16 @@ def main():
                 raise ValueError()
             if not _android(android, args.profile):
                 raise ValueError()
+            if not _waits(waits):
+                raise ValueError()
             safe = {'phase': phase, 'failure_kind': kind, 'command_exit_code': code,
                     'detail': detail, 'scenario': scenario, 'android_crash': crash,
                     'last_view': view, 'participant': participant, 'rpc_op': op,
-                    'facts': facts, 'android': android}
+                    'facts': facts, 'android': android, 'waits': waits}
         except (OSError, ValueError):
             parser.error('Invalid safe diagnostic')
     # Reconstruct only fixed keys and validated values; never copy log/error text.
-    value = {'schema_version': 8, 'profile': args.profile, 'stage': args.stage,
+    value = {'schema_version': 9, 'profile': args.profile, 'stage': args.stage,
              'outcome': args.outcome, 'exitCode': args.exit_code, 'peak_rss_kib': peak,
              **safe}
     args.output.write_text(json.dumps(value, indent=2) + '\n', encoding='utf-8')

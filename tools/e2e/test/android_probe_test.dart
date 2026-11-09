@@ -170,6 +170,9 @@ void main() {
     expect(appCpuPercent(stat, 'PRIVATE'), isNull);
     expect(framesRendered('  Total frames rendered: 1234\n'), 1234);
     expect(framesRendered('none'), isNull);
+    expect(cpuCount('4\n'), 4);
+    expect(cpuCount('0\n'), isNull);
+    expect(cpuCount('PRIVATE'), isNull);
   });
 
   test('lmkd kills and memory', () {
@@ -223,6 +226,7 @@ void main() {
         '',
       ),
       'shell cat /proc/uptime': ProcessResult(1, 0, '20.00 10.00\n', ''),
+      'shell nproc': ProcessResult(1, 0, '2\n', ''),
       'shell dumpsys gfxinfo $package': ProcessResult(
         1,
         0,
@@ -272,6 +276,7 @@ void main() {
       'host_load_x100': 410,
       'app_cpu_pct': 50,
       'frames': 77,
+      'cpus': 2,
     });
     expect(jsonEncode(probe), isNot(contains('PRIVATE')));
   });

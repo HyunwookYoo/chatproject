@@ -355,5 +355,17 @@
       "Failed",
       "unknown"
     ]
-  }
+  },
+  "wait_kinds": [
+    "timeout_connect_peer",
+    "timeout_disconnect_peer",
+    "timeout_network_info",
+    "timeout_network_start",
+    "timeout_network_stop",
+    "timeout_offline_event",
+    "timeout_probe_event",
+    "timeout_send_probe_text",
+    "timeout_set_offline",
+    "timeout_state_event"
+  ]
 }

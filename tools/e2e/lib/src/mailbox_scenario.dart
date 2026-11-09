@@ -57,21 +57,27 @@ Future<void> runMailboxScenario(
     bool Function(T) matches,
     String phase,
   ) async {
+    final name = 'Mailbox scenario deadline: $phase';
+    final took = Stopwatch()..start();
     final deadline = DateTime.now().add(timeout);
     String? last;
     while (DateTime.now().isBefore(deadline)) {
       try {
         final value = await read();
         last = observedView(value);
-        if (matches(value)) return value;
+        if (matches(value)) {
+          noteWait(name, took.elapsedMilliseconds);
+          return value;
+        }
       } on RpcError catch (error) {
         if (error.code != 'NotAvailable') rethrow;
         last = observedView(error);
       }
       await Future<void>.delayed(const Duration(milliseconds: 100));
     }
+    noteWait(name, took.elapsedMilliseconds);
     throw ScenarioDeadline(
-      'Mailbox scenario deadline: $phase',
+      name,
       lastView: last,
       participant: who,
     );

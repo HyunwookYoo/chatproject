@@ -886,6 +886,7 @@ Future<void> main(List<String> arguments) async {
             'rpc_op': run.rpcOp,
             'facts': run.facts(),
             'android': run.android,
+            'waits': run.waits(),
           }),
           flush: true,
         );
@@ -1012,6 +1013,9 @@ class _Run extends IoProcessRunner {
   final safeParticipants = loadSafeValues('participants');
   final safeFactValues = loadSafeFacts();
   Map<String, String>? facts() => safeFacts(failureFacts, safeFactValues);
+  final safeWaitKinds = loadSafeValues('wait_kinds');
+  List<Map<String, Object>>? waits() =>
+      safeWaits(waitMs, safeDetails, safeWaitKinds);
 
   void recordFailure(
     Object? error, {

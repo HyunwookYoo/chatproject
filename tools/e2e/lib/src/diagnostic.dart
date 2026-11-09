@@ -122,6 +122,38 @@ Future<void> notePairSide(
       : 'unknown';
 }
 
+/// The slowest time in ms of each named wait, pass or fail: a scenario
+/// deadline's text, an RPC op or an m2 timeout kind (`waits`).
+final waitMs = <String, int>{};
+
+/// The most waits a summary keeps.
+const waitsLimit = 8;
+
+/// Keeps [ms] if it is the slowest [name] so far.
+void noteWait(String name, int ms) {
+  if (ms > (waitMs[name] ?? -1)) waitMs[name] = ms;
+}
+
+final _scenarioOp = RegExp(r'^(?:account|message|mailbox)_local_[a-z_]{1,48}$');
+
+/// The [waitsLimit] slowest waits whose name is a listed failure text, a listed
+/// m2 kind or a scenario op, slowest first; null when none is left.
+List<Map<String, Object>>? safeWaits(
+  Map<String, int> waits,
+  Set<String> details,
+  Set<String> kinds,
+) {
+  final kept =
+      [
+        for (final MapEntry(:key, :value) in waits.entries)
+          if (details.contains(key) ||
+              kinds.contains(key) ||
+              _scenarioOp.hasMatch(key))
+            {'name': key, 'ms': value},
+      ]..sort((a, b) => (b['ms'] as int).compareTo(a['ms'] as int));
+  return kept.isEmpty ? null : kept.take(waitsLimit).toList();
+}
+
 /// A scenario wait that ran out. Besides its fixed text it names, as fixed
 /// values, what the last read showed (an account phase, `NotAvailable` or
 /// `other`) and which participant it read.

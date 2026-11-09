@@ -138,6 +138,7 @@ void main() {
   test('scenario passes when the phone gets the kept texts once', () async {
     final fixture = MailboxFixture();
     await fixture.start();
+    waitMs.clear();
     try {
       final stages = <String>[];
       await runMailboxScenario(
@@ -157,6 +158,15 @@ void main() {
       ]);
       expect(fixture.actions, ['airplane on', 'airplane off', 'foreground']);
       expect(fixture.texts['phone']!.length, 4);
+      // Pass or fail, each deadline wait notes how long it took.
+      expect(
+        waitMs.keys,
+        containsAll([
+          'Mailbox scenario deadline: first_text',
+          'account_local_pair_scan',
+        ]),
+      );
+      waitMs.clear();
     } finally {
       await fixture.close();
     }

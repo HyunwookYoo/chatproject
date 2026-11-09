@@ -3,6 +3,7 @@ import 'dart:io';
 import 'dart:convert';
 import 'package:chat_e2e/src/controller.dart';
 import 'package:chat_e2e/src/account_scenario.dart';
+import 'package:chat_e2e/src/diagnostic.dart';
 import 'package:chat_e2e/src/protocol.dart';
 import 'package:test/test.dart';
 import 'controller_test.dart' show MockParticipant;
@@ -74,7 +75,10 @@ void main() {
       final fixture = AccountFixture();
       await fixture.start();
       try {
+        waitMs.clear();
         await fixture.run(authOnly: true);
+        expect(waitMs.keys, contains('Account state deadline'));
+        waitMs.clear();
         expect(
           fixture.stages,
           containsAll([
