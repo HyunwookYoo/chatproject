@@ -181,6 +181,19 @@ Future<void> runScenario(
         // Which path each pair used (`m2_path_<a>_<b>`), pass or fail.
         failureFacts['m2_path_${short(peer)}_${short(remote)}'] =
             entry['path'] as String;
+        // How long the session took to connect (`m2_connect_<a>_<b>`).
+        final ms = entry['connect_ms'];
+        failureFacts['m2_connect_${short(peer)}_${short(remote)}'] = ms is! int
+            ? 'none'
+            : ms < 1000
+            ? 'lt1s'
+            : ms < 3000
+            ? '1to3s'
+            : ms < 6000
+            ? '3to6s'
+            : ms < 10000
+            ? '6to10s'
+            : 'ge10s';
         return;
       }
       final revision = info['revision'] as int;

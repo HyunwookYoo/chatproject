@@ -474,6 +474,54 @@
       "Disconnected_Direct",
       "absent",
       "unknown"
+    ],
+    "m2_connect_app1_app2": [
+      "lt1s",
+      "1to3s",
+      "3to6s",
+      "6to10s",
+      "ge10s",
+      "none"
+    ],
+    "m2_connect_app1_node": [
+      "lt1s",
+      "1to3s",
+      "3to6s",
+      "6to10s",
+      "ge10s",
+      "none"
+    ],
+    "m2_connect_app2_app1": [
+      "lt1s",
+      "1to3s",
+      "3to6s",
+      "6to10s",
+      "ge10s",
+      "none"
+    ],
+    "m2_connect_app2_node": [
+      "lt1s",
+      "1to3s",
+      "3to6s",
+      "6to10s",
+      "ge10s",
+      "none"
+    ],
+    "m2_connect_node_app1": [
+      "lt1s",
+      "1to3s",
+      "3to6s",
+      "6to10s",
+      "ge10s",
+      "none"
+    ],
+    "m2_connect_node_app2": [
+      "lt1s",
+      "1to3s",
+      "3to6s",
+      "6to10s",
+      "ge10s",
+      "none"
     ]
   },
   "wait_kinds": [
