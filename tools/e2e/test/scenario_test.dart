@@ -723,6 +723,7 @@ Future<void> main(List<String> args) async {
     final fixture = Fixture()..fault = 'connect timeout';
     final participants = await fixture.start();
     final failures = <(Object, String?, String?)>[];
+    failureFacts.clear();
     try {
       await expectLater(
         runScenario(
@@ -737,6 +738,21 @@ Future<void> main(List<String> args) async {
       expect(failures, hasLength(1));
       expect(failures.single.$2, 'scenario_app2_to_node');
       expect(failures.single.$3, isNull);
+      // Each side's view of the others, and the paths known before, as fixed values.
+      expect(failureFacts, {
+        'm2_path_app1_app2': 'Direct',
+        'm2_path_app2_app1': 'Direct',
+        'm2_path_app1_node': 'Direct',
+        'm2_path_node_app1': 'Direct',
+        'm2_seen_app1_app2': 'Connected_Direct',
+        'm2_seen_app1_node': 'Connected_Direct',
+        'm2_seen_app2_app1': 'Connected_Direct',
+        'm2_seen_app2_node': 'absent',
+        'm2_seen_node_app1': 'Connected_Direct',
+        'm2_seen_node_app2': 'absent',
+      });
+      expect(safeFacts(failureFacts, loadSafeFacts()), failureFacts);
+      failureFacts.clear();
     } finally {
       await fixture.close();
     }

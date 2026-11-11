@@ -94,6 +94,35 @@ Future<void> runScenario(
     return info;
   }
 
+  // `app1`, `app2` or `node`: a fact key part, never a private name.
+  String short(Participant peer) => slot(peer).substring('scenario_'.length);
+  // Notes how each participant sees each other one (`m2_seen_<a>_<b>`):
+  // `<phase>_<path>` of its peer entry, `absent`, or `unknown`.
+  Future<void> noteSeen() async {
+    for (final observer in current) {
+      Map<String, Object?>? info;
+      try {
+        info = object(await call(observer, 'network_info'));
+      } catch (_) {
+        info = null;
+      }
+      for (final peer in current.where((p) => p != observer)) {
+        final id = addresses[peer.name]?['endpoint_id'];
+        final entry = info == null
+            ? null
+            : (info['peers'] as List)
+                  .map(object)
+                  .where((v) => v['peer_id'] == id)
+                  .firstOrNull;
+        failureFacts['m2_seen_${short(observer)}_${short(peer)}'] = info == null
+            ? 'unknown'
+            : entry == null
+            ? 'absent'
+            : '${entry['phase']}_${entry['path']}';
+      }
+    }
+  }
+
   Future<void> connect(Participant left, Participant right) async {
     try {
       await call(left, 'connect_peer', {
@@ -102,6 +131,7 @@ Future<void> runScenario(
     } on RpcError catch (error) {
       // A core's own connect deadline (NetworkTimeout) names the dialing pair.
       report(error, pair(left, right));
+      await noteSeen();
       rethrow;
     }
   }
@@ -116,17 +146,22 @@ Future<void> runScenario(
       'peer_id': addresses[receiver.name]!['endpoint_id'],
       'text': body,
     });
-    await positive(
-      receiver.expectEvent(
-        (e) =>
-            e['kind'] == 'probe_text_received' &&
-            e['peer_id'] == addresses[sender.name]!['endpoint_id'] &&
-            e['text'] == body,
-        timeout: timeout,
-      ),
-      pair(sender, receiver),
-      'timeout_probe_event',
-    );
+    try {
+      await positive(
+        receiver.expectEvent(
+          (e) =>
+              e['kind'] == 'probe_text_received' &&
+              e['peer_id'] == addresses[sender.name]!['endpoint_id'] &&
+              e['text'] == body,
+          timeout: timeout,
+        ),
+        pair(sender, receiver),
+        'timeout_probe_event',
+      );
+    } on TimeoutException {
+      await noteSeen();
+      rethrow;
+    }
   }
 
   Future<void> knownPath(Participant peer, Participant remote) async {
@@ -138,7 +173,16 @@ Future<void> runScenario(
     final deadline = DateTime.now().add(timeout);
     while (true) {
       final info = object(await call(peer, 'network_info'));
-      if ((info['peers'] as List).any((v) => known(object(v)))) return;
+      final entry = (info['peers'] as List)
+          .map(object)
+          .where(known)
+          .firstOrNull;
+      if (entry != null) {
+        // Which path each pair used (`m2_path_<a>_<b>`), pass or fail.
+        failureFacts['m2_path_${short(peer)}_${short(remote)}'] =
+            entry['path'] as String;
+        return;
+      }
       final revision = info['revision'] as int;
       await positive(
         peer.expectEvent(

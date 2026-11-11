@@ -354,6 +354,126 @@
       "Online",
       "Failed",
       "unknown"
+    ],
+    "m2_path_app1_app2": [
+      "Direct",
+      "Relay"
+    ],
+    "m2_seen_app1_app2": [
+      "Connecting_Unknown",
+      "Connecting_Relay",
+      "Connecting_Direct",
+      "Connected_Unknown",
+      "Connected_Relay",
+      "Connected_Direct",
+      "Reconnecting_Unknown",
+      "Reconnecting_Relay",
+      "Reconnecting_Direct",
+      "Disconnected_Unknown",
+      "Disconnected_Relay",
+      "Disconnected_Direct",
+      "absent",
+      "unknown"
+    ],
+    "m2_path_app1_node": [
+      "Direct",
+      "Relay"
+    ],
+    "m2_seen_app1_node": [
+      "Connecting_Unknown",
+      "Connecting_Relay",
+      "Connecting_Direct",
+      "Connected_Unknown",
+      "Connected_Relay",
+      "Connected_Direct",
+      "Reconnecting_Unknown",
+      "Reconnecting_Relay",
+      "Reconnecting_Direct",
+      "Disconnected_Unknown",
+      "Disconnected_Relay",
+      "Disconnected_Direct",
+      "absent",
+      "unknown"
+    ],
+    "m2_path_app2_app1": [
+      "Direct",
+      "Relay"
+    ],
+    "m2_seen_app2_app1": [
+      "Connecting_Unknown",
+      "Connecting_Relay",
+      "Connecting_Direct",
+      "Connected_Unknown",
+      "Connected_Relay",
+      "Connected_Direct",
+      "Reconnecting_Unknown",
+      "Reconnecting_Relay",
+      "Reconnecting_Direct",
+      "Disconnected_Unknown",
+      "Disconnected_Relay",
+      "Disconnected_Direct",
+      "absent",
+      "unknown"
+    ],
+    "m2_path_app2_node": [
+      "Direct",
+      "Relay"
+    ],
+    "m2_seen_app2_node": [
+      "Connecting_Unknown",
+      "Connecting_Relay",
+      "Connecting_Direct",
+      "Connected_Unknown",
+      "Connected_Relay",
+      "Connected_Direct",
+      "Reconnecting_Unknown",
+      "Reconnecting_Relay",
+      "Reconnecting_Direct",
+      "Disconnected_Unknown",
+      "Disconnected_Relay",
+      "Disconnected_Direct",
+      "absent",
+      "unknown"
+    ],
+    "m2_path_node_app1": [
+      "Direct",
+      "Relay"
+    ],
+    "m2_seen_node_app1": [
+      "Connecting_Unknown",
+      "Connecting_Relay",
+      "Connecting_Direct",
+      "Connected_Unknown",
+      "Connected_Relay",
+      "Connected_Direct",
+      "Reconnecting_Unknown",
+      "Reconnecting_Relay",
+      "Reconnecting_Direct",
+      "Disconnected_Unknown",
+      "Disconnected_Relay",
+      "Disconnected_Direct",
+      "absent",
+      "unknown"
+    ],
+    "m2_path_node_app2": [
+      "Direct",
+      "Relay"
+    ],
+    "m2_seen_node_app2": [
+      "Connecting_Unknown",
+      "Connecting_Relay",
+      "Connecting_Direct",
+      "Connected_Unknown",
+      "Connected_Relay",
+      "Connected_Direct",
+      "Reconnecting_Unknown",
+      "Reconnecting_Relay",
+      "Reconnecting_Direct",
+      "Disconnected_Unknown",
+      "Disconnected_Relay",
+      "Disconnected_Direct",
+      "absent",
+      "unknown"
     ]
   },
   "wait_kinds": [
