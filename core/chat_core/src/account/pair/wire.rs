@@ -145,9 +145,13 @@ impl Qr {
             expires,
             psk,
         };
+        // A QR lives 5 minutes on its owner's clock. The scanner's clock may
+        // be behind the owner's (seconds between real devices), so the upper
+        // bound tolerates the same 5 minutes of skew as record issue times.
+        // The scanner's own session still ends within 5 minutes (Session::new).
         if (qr.owner() == Role::Existing) != qr.existing.is_some()
             || expires <= now
-            || expires > now.saturating_add(300)
+            || expires > now.saturating_add(300 + 300)
         {
             return Err(invalid());
         }
