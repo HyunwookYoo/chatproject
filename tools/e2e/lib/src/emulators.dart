@@ -281,7 +281,8 @@ class Emulators {
 
   /// Before the clean snapshot is saved: animations off, and the first boot's
   /// post-boot work (BOOT_COMPLETED receivers, first-run jobs) done, i.e. the
-  /// 1-minute load at most one per CPU. Otherwise every test boot restores that
+  /// 1- and the 5-minute load at most one per CPU (one snapshot settled on the
+  /// 1-minute load alone restored at load 12-29). Otherwise every test boot restores that
   /// work and replays it. Gives up after [settleTimeout] or on an unreadable load;
   /// the snapshot is saved either way.
   Future<void> settle(EmulatorSpec spec) async {
@@ -294,8 +295,12 @@ class Emulators {
     final deadline = _now().add(settleTimeout);
     while (true) {
       final read = await _run(sdk.adb, [...shell, 'cat', '/proc/loadavg']);
-      final load = read.exitCode == 0 ? loadX100(read.stdout as String) : null;
-      if (load == null || load <= 100 * cpus || !_now().isBefore(deadline)) return;
+      final text = read.exitCode == 0 ? read.stdout as String : '';
+      final load = loadX100(text);
+      final fields = text.trim().split(RegExp(r'\s+'));
+      final load5 = fields.length > 1 ? loadX100(fields[1]) : null;
+      if (load == null || load5 == null) return;
+      if ((load <= 100 * cpus && load5 <= 100 * cpus) || !_now().isBefore(deadline)) return;
       await _sleep(settlePoll);
     }
   }

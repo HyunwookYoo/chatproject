@@ -511,7 +511,7 @@ void main() {
     final avdHome = await Directory.systemTemp.createTemp('avd_home_');
     addTearDown(() => avdHome.delete(recursive: true));
     var clock = DateTime(2026);
-    final loads = ['18.40 9.10 3.20 5/900 4000', '3.10 6.00 3.00 2/900 4000', '1.90 5.00 3.00 1/900 4000'];
+    final loads = ['18.40 9.10 3.20 5/900 4000', '1.90 5.00 3.00 1/900 4000', '1.60 2.10 2.00 1/900 4000', '1.50 1.90 2.00 1/900 4000'];
     var reads = 0;
     final runner = FakeRunner((exe, args) {
       if (args.first == 'devices') return ok('List of devices attached\n');
@@ -529,8 +529,9 @@ void main() {
     for (final scale in ['window_animation_scale', 'transition_animation_scale', 'animator_duration_scale']) {
       expect(runner.calls.any((c) => c.endsWith('-s emulator-5554 shell settings put global $scale 0')), isTrue);
     }
-    // 18.40 and 3.10 are above one per CPU (2); 1.90 is not.
-    expect(reads, 3);
+    // Both the 1- and the 5-minute load must be at most one per CPU (2): a
+    // dip of the 1-minute load (1.90 with 5.00) is not the end of the work.
+    expect(reads, 4);
     final saved = runner.calls.indexWhere((c) => c.endsWith('emu avd snapshot save clean'));
     expect(saved, greaterThan(runner.calls.lastIndexWhere((c) => c.contains('/proc/loadavg'))));
     expect(saved, greaterThan(runner.calls.lastIndexWhere((c) => c.contains('animator_duration_scale'))));
