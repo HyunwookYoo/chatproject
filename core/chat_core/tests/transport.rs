@@ -876,6 +876,10 @@ async fn transport_trace_times_each_attempt_without_addresses_or_ids() {
     // Nothing was open to b before, and the handshake did not stall.
     assert_eq!((dial["prior_ip"].clone(), dial["prior_relay"].clone()), (0.into(), 0.into()));
     assert!(dial["stall_ip"].is_null() && dial["stall_relay"].is_null());
+    // Its handshake went over IP only, and the endpoint counted the bytes.
+    assert_eq!((dial["from"].clone(), dial["stall_from"].clone()), ("none".into(), "none".into()));
+    assert!(dial["ip_out"].as_u64().unwrap() >= 1200 && dial["ip_in"].as_u64().unwrap() > 0);
+    assert_eq!((dial["relay_out"].clone(), dial["relay_in"].clone()), (0.into(), 0.into()));
     for key in ["at_ms", "resolve_ms", "handshake_ms", "total_ms", "rtt_ms", "tx", "rx", "lost"] {
         assert!(dial[key].is_u64(), "{key}");
     }
@@ -888,6 +892,8 @@ async fn transport_trace_times_each_attempt_without_addresses_or_ids() {
     assert_eq!(accepted["alpn"], "session");
     assert_eq!(accepted["outcome"], "ok");
     assert!(accepted["handshake_ms"].is_u64());
+    assert_eq!((accepted["from"].clone(), accepted["stall_from"].clone()), ("ip".into(), "none".into()));
+    assert!(accepted["ip_in"].as_u64().unwrap() >= 1200);
     for text in [out.to_string(), into.to_string()] {
         for private in [ticket.as_str(), &peer.peer_id, ai.endpoint_id.as_deref().unwrap(), "127.0.0.1", "::1"] {
             assert!(!text.contains(private));
@@ -915,5 +921,8 @@ async fn transport_trace_keeps_a_stalled_dial_cut_off_by_its_deadline() {
     assert!(dial["handshake_ms"].is_null());
     assert_eq!((dial["stall_ip"].clone(), dial["stall_relay"].clone()), (0.into(), 0.into()));
     assert!(dial["total_ms"].as_u64().unwrap() >= 9_900);
+    // Every Initial went to the one unreachable address; nothing came back.
+    assert!(dial["ip_out"].as_u64().unwrap() >= 2 * 1200);
+    assert_eq!(dial["ip_in"], 0);
     a.execute(NetworkOp::Stop).await.unwrap();
 }

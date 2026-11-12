@@ -292,12 +292,14 @@ class SummaryTests(unittest.TestCase):
         dial = {'at_ms': 41000, 'alpn': 'auth', 'incoming': False, 'outcome': 'dropped',
                 'relay_up': True, 'target_relays': 1, 'target_ips': 3, 'target_own_ips': 0,
                 'prior_ip': 1, 'prior_relay': 0, 'stall_ip': 1, 'stall_relay': 0,
+                'from': 'none', 'stall_from': 'none', 'ip_out': 3600, 'relay_out': 0, 'ip_in': 0,
+                'relay_in': 0,
                 'resolve_ms': 0, 'handshake_ms': None, 'total_ms': 8001, 'path': 'none',
                 'paths_ip': 0, 'paths_relay': 0, 'rtt_ms': None, 'tx': None, 'rx': None, 'lost': None}
         accepted = {**dial, 'alpn': 'session', 'incoming': True, 'outcome': 'ok', 'target_relays': None,
                     'target_ips': None, 'target_own_ips': None, 'resolve_ms': None, 'handshake_ms': 35,
                     'total_ms': 35, 'path': 'relay', 'paths_relay': 1, 'rtt_ms': 12, 'tx': 9, 'rx': 8,
-                    'lost': 0}
+                    'lost': 0, 'from': 'relay'}
         endpoint = {'binds': 2, 'bind_ms_max': 40, 'online_ms_max': 900, 'relay_drops': 0}
         one = {'name': 'android-1', 'endpoint': endpoint, 'dials': [dial, accepted]}
         good = [[], [one], [one, {'name': 'node', 'endpoint': endpoint, 'dials': []}],
@@ -314,6 +316,9 @@ class SummaryTests(unittest.TestCase):
                [{**one, 'dials': [{**dial, 'alpn': 'PRIVATE_TOKEN'}]}],
                [{**one, 'dials': [{**dial, 'outcome': 'PRIVATE_TOKEN'}]}],
                [{**one, 'dials': [{**dial, 'path': 'PRIVATE_TOKEN'}]}],
+               [{**one, 'dials': [{**dial, 'from': 'PRIVATE_TOKEN'}]}],
+               [{**one, 'dials': [{**dial, 'stall_from': None}]}],
+               [{**one, 'dials': [{**dial, 'ip_in': 'PRIVATE_TOKEN'}]}],
                [{**one, 'dials': [{**dial, 'incoming': 'PRIVATE_TOKEN'}]}],
                [{**one, 'dials': [{**dial, 'incoming': 1}]}],
                [{**one, 'dials': [{**dial, 'total_ms': True}]}],

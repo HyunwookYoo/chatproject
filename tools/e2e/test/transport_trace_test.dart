@@ -19,6 +19,12 @@ Map<String, Object?> _dial([Map<String, Object?> patch = const {}]) => {
   'prior_relay': 0,
   'stall_ip': 1,
   'stall_relay': 0,
+  'from': 'none',
+  'stall_from': 'none',
+  'ip_out': 3600,
+  'relay_out': 0,
+  'ip_in': 0,
+  'relay_in': 0,
   'resolve_ms': 0,
   'handshake_ms': null,
   'total_ms': 8001,
@@ -64,6 +70,21 @@ void main() {
       _trace(
         dials: [
           _dial({'path': 'PRIVATE_TOKEN'}),
+        ],
+      ),
+      _trace(
+        dials: [
+          _dial({'from': 'PRIVATE_TOKEN'}),
+        ],
+      ),
+      _trace(
+        dials: [
+          _dial({'stall_from': null}),
+        ],
+      ),
+      _trace(
+        dials: [
+          _dial({'ip_in': 'PRIVATE_TOKEN'}),
         ],
       ),
       _trace(

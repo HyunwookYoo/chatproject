@@ -553,6 +553,10 @@
       "prior_relay",
       "stall_ip",
       "stall_relay",
+      "ip_out",
+      "relay_out",
+      "ip_in",
+      "relay_in",
       "resolve_ms",
       "handshake_ms",
       "total_ms",
@@ -572,7 +576,9 @@
       "total_ms",
       "path",
       "paths_ip",
-      "paths_relay"
+      "paths_relay",
+      "from",
+      "stall_from"
     ],
     "dial_flags": [
       "incoming",
@@ -591,6 +597,16 @@
         "dropped"
       ],
       "path": [
+        "ip",
+        "relay",
+        "none"
+      ],
+      "from": [
+        "ip",
+        "relay",
+        "none"
+      ],
+      "stall_from": [
         "ip",
         "relay",
         "none"

@@ -50,6 +50,25 @@ fn alpn_kind(alpn: &[u8]) -> &'static str {
 fn relay_up(endpoint: &Endpoint) -> bool {
     endpoint.home_relay_status().get().iter().any(|status| status.is_connected())
 }
+/// The endpoint's bytes so far: sent over IP, sent over the relay, received over IP, received
+/// over the relay (all connections of the endpoint).
+fn bytes(endpoint: &Endpoint) -> [u64; 4] {
+    let m = &endpoint.metrics().socket;
+    [
+        m.send_ipv4.get() + m.send_ipv6.get(),
+        m.send_relay.get(),
+        m.recv_data_ipv4.get() + m.recv_data_ipv6.get(),
+        m.recv_data_relay.get(),
+    ]
+}
+const BYTES: [&str; 4] = ["ip_out", "relay_out", "ip_in", "relay_in"];
+fn from_kind(addr: &iroh::endpoint::IncomingAddr) -> &'static str {
+    match addr {
+        iroh::endpoint::IncomingAddr::Ip(_) => "ip",
+        iroh::endpoint::IncomingAddr::Relay { .. } => "relay",
+        _ => "none",
+    }
+}
 /// How many of the remote's IP and relay addresses an open path of some connection uses now.
 async fn active(endpoint: &Endpoint, id: iroh::EndpointId) -> (usize, usize) {
     let Some(info) = endpoint.remote_info(id).await else { return (0, 0) };
@@ -98,6 +117,8 @@ impl Trace {
         Attempt {
             trace: self,
             started: Instant::now(),
+            endpoint: endpoint.clone(),
+            bytes: bytes(endpoint),
             record: json!({
                 "at_ms": ms(self.created.elapsed()),
                 "alpn": "other",
@@ -111,6 +132,12 @@ impl Trace {
                 "prior_relay": null,
                 "stall_ip": null,
                 "stall_relay": null,
+                "from": "none",
+                "stall_from": "none",
+                "ip_out": null,
+                "relay_out": null,
+                "ip_in": null,
+                "relay_in": null,
                 "resolve_ms": null,
                 "handshake_ms": null,
                 "total_ms": 0,
@@ -172,7 +199,8 @@ impl Trace {
         }
         result
     }
-    /// An incoming attempt, timed from `accept` until the handshake completed.
+    /// An incoming attempt, timed from `accept` until the handshake completed, with the path
+    /// kind its first packet came over and, if still running at 7 s, the path kind then.
     pub(crate) async fn accept(
         &self,
         endpoint: &Endpoint,
@@ -180,7 +208,25 @@ impl Trace {
     ) -> Result<Connection, ()> {
         let mut attempt = self.attempt(endpoint, true);
         let started = attempt.started;
-        let result = incoming.await.map_err(|_| ());
+        attempt.record["from"] = from_kind(&incoming.remote_addr()).into();
+        let result = match incoming.accept() {
+            Ok(accepting) => {
+                tokio::pin!(accepting);
+                let stall = tokio::time::sleep_until((started + STALL).into());
+                tokio::pin!(stall);
+                let mut stalled = false;
+                loop {
+                    tokio::select! {
+                        result = &mut accepting => break result.map_err(|_| ()),
+                        _ = &mut stall, if !stalled => {
+                            stalled = true;
+                            attempt.record["stall_from"] = from_kind(&accepting.remote_addr()).into();
+                        }
+                    }
+                }
+            }
+            Err(_) => Err(()),
+        };
         match &result {
             Ok(connection) => {
                 attempt.record["alpn"] = alpn_kind(connection.alpn()).into();
@@ -194,6 +240,8 @@ impl Trace {
 struct Attempt<'a> {
     trace: &'a Trace,
     started: Instant,
+    endpoint: Endpoint,
+    bytes: [u64; 4],
     record: Value,
 }
 impl Attempt<'_> {
@@ -221,6 +269,10 @@ impl Attempt<'_> {
 impl Drop for Attempt<'_> {
     fn drop(&mut self) {
         self.record["total_ms"] = ms(self.started.elapsed()).into();
+        let now = bytes(&self.endpoint);
+        for ((key, then), now) in BYTES.iter().zip(self.bytes).zip(now) {
+            self.record[*key] = now.saturating_sub(then).into();
+        }
         let mut inner = self.trace.inner.lock().unwrap();
         if inner.dials.len() == LIMIT {
             inner.dials.pop_front();
