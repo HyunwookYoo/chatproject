@@ -695,97 +695,100 @@ Future<void> main(List<String> arguments) async {
     Participant named(String name) =>
         participants.singleWhere((participant) => participant.name == name);
     await run.wait(
-      mailboxScenario
-          ? runMailboxScenario(
-              control,
-              [
-                named('android-1'),
-                named(profile == 'mixed' ? 'windows-1' : 'android-2'),
-                named('node'),
-              ],
-              airplane: (participant, on) {
-                final action = appAirplane[participant.name];
-                if (action == null) {
-                  throw StateError('Airplane participant is not owned');
-                }
-                return action(on);
-              },
-              foreground: (participant) {
-                final action = appForeground[participant.name];
-                if (action == null) {
-                  throw StateError('Foreground participant is not owned');
-                }
-                return action();
-              },
-              evidence: (stage, data) =>
-                  File(
-                    p.join(logs.path, 'mailbox-public-evidence.jsonl'),
-                  ).writeAsStringSync(
-                    '${jsonEncode({'stage': stage, ...data})}\n',
-                    mode: FileMode.append,
-                    flush: true,
-                  ),
-            )
-          : messageScenario
-          ? runMessageScenario(
-              control,
-              participants,
-              auditRecovery: (patterns) => _auditRecoveryLogs(logs, patterns),
-              restart: (old, {bool freshStore = false}) {
-                final action = appRestarts[old.name];
-                if (action == null) {
-                  throw StateError('Restart participant is not owned');
-                }
-                return action(old, freshStore: freshStore);
-              },
-              evidence: (stage, data) =>
-                  File(
-                    p.join(logs.path, 'message-public-evidence.jsonl'),
-                  ).writeAsStringSync(
-                    '${jsonEncode({'stage': stage, ...data})}\n',
-                    mode: FileMode.append,
-                    flush: true,
-                  ),
-            )
-          : accountScenario
-          ? runAccountScenario(
-              control,
-              participants,
-              authOnly: authOnly,
-              wallClock: (participant) async =>
-                  appClocks[participant.name] == null
-                  ? DateTime.now().millisecondsSinceEpoch ~/ 1000
-                  : await appClocks[participant.name]!(),
-              restart: (old, {bool freshStore = false}) {
-                final action = appRestarts[old.name];
-                if (action == null) {
-                  throw StateError('Restart participant is not owned');
-                }
-                return action(old, freshStore: freshStore);
-              },
-              evidence: (stage, data) =>
-                  File(
-                    p.join(logs.path, 'account-public-evidence.jsonl'),
-                  ).writeAsStringSync(
-                    '${jsonEncode({'stage': stage, ...data})}\n',
-                    mode: FileMode.append,
-                    flush: true,
-                  ),
-            )
-          : runScenario(
-              control,
-              participants,
-              restart: launchNode,
-              onFailure: (error, phase, kind) => run.recordFailure(
-                error,
-                failurePhase: phase,
-                timeoutKind: kind,
+      _traceOnFailure(
+        mailboxScenario
+            ? runMailboxScenario(
+                control,
+                [
+                  named('android-1'),
+                  named(profile == 'mixed' ? 'windows-1' : 'android-2'),
+                  named('node'),
+                ],
+                airplane: (participant, on) {
+                  final action = appAirplane[participant.name];
+                  if (action == null) {
+                    throw StateError('Airplane participant is not owned');
+                  }
+                  return action(on);
+                },
+                foreground: (participant) {
+                  final action = appForeground[participant.name];
+                  if (action == null) {
+                    throw StateError('Foreground participant is not owned');
+                  }
+                  return action();
+                },
+                evidence: (stage, data) =>
+                    File(
+                      p.join(logs.path, 'mailbox-public-evidence.jsonl'),
+                    ).writeAsStringSync(
+                      '${jsonEncode({'stage': stage, ...data})}\n',
+                      mode: FileMode.append,
+                      flush: true,
+                    ),
+              )
+            : messageScenario
+            ? runMessageScenario(
+                control,
+                participants,
+                auditRecovery: (patterns) => _auditRecoveryLogs(logs, patterns),
+                restart: (old, {bool freshStore = false}) {
+                  final action = appRestarts[old.name];
+                  if (action == null) {
+                    throw StateError('Restart participant is not owned');
+                  }
+                  return action(old, freshStore: freshStore);
+                },
+                evidence: (stage, data) =>
+                    File(
+                      p.join(logs.path, 'message-public-evidence.jsonl'),
+                    ).writeAsStringSync(
+                      '${jsonEncode({'stage': stage, ...data})}\n',
+                      mode: FileMode.append,
+                      flush: true,
+                    ),
+              )
+            : accountScenario
+            ? runAccountScenario(
+                control,
+                participants,
+                authOnly: authOnly,
+                wallClock: (participant) async =>
+                    appClocks[participant.name] == null
+                    ? DateTime.now().millisecondsSinceEpoch ~/ 1000
+                    : await appClocks[participant.name]!(),
+                restart: (old, {bool freshStore = false}) {
+                  final action = appRestarts[old.name];
+                  if (action == null) {
+                    throw StateError('Restart participant is not owned');
+                  }
+                  return action(old, freshStore: freshStore);
+                },
+                evidence: (stage, data) =>
+                    File(
+                      p.join(logs.path, 'account-public-evidence.jsonl'),
+                    ).writeAsStringSync(
+                      '${jsonEncode({'stage': stage, ...data})}\n',
+                      mode: FileMode.append,
+                      flush: true,
+                    ),
+              )
+            : runScenario(
+                control,
+                participants,
+                restart: launchNode,
+                onFailure: (error, phase, kind) => run.recordFailure(
+                  error,
+                  failurePhase: phase,
+                  timeoutKind: kind,
+                ),
               ),
-            ),
+        () async =>
+            run.transport ??= await collectTransport(control.participants),
+      ),
       timeout: Duration(minutes: accountScenario ? 8 : 4),
       failurePhase: 'scenario',
     );
-    // First: unread events keep arriving and may overflow a buffer meanwhile.
     run.transport = await collectTransport(control.participants);
     // Every Android run, m2 too (no Android owned: null).
     run.android = await _probeAll(androidProbes);
@@ -794,10 +797,6 @@ Future<void> main(List<String> arguments) async {
     code = userInterrupted ? 130 : 1;
     run.token.cancel();
     // Before the controller closes: the apps still run as the failure left them.
-    final traced = controller;
-    if (traced != null) {
-      run.transport ??= await collectTransport(traced.participants);
-    }
     run.android ??= await _probeAll(androidProbes);
     await run.interrupt(controller);
     if (accountScenario && androidCrashed != null) {
@@ -902,6 +901,20 @@ Future<void> main(List<String> arguments) async {
       }
     }
     exit(code);
+  }
+}
+
+/// [work]; when it fails, [trace] runs first: the run's cancellation that
+/// follows a failure closes the controller and with it every participant.
+Future<T> _traceOnFailure<T>(
+  Future<T> work,
+  Future<void> Function() trace,
+) async {
+  try {
+    return await work;
+  } catch (_) {
+    await trace();
+    rethrow;
   }
 }
 

@@ -33,6 +33,25 @@ void main() {
   ClassMirror type(String name) =>
       library.declarations[MirrorSystem.getSymbol(name, library)]
           as ClassMirror;
+  test('a failed scenario is traced before its failure propagates', () async {
+    final order = <String>[];
+    Future<void> trace() async => order.add('trace');
+    Future<Object?> run(Future<Object?> work) =>
+        library.invoke(MirrorSystem.getSymbol('_traceOnFailure', library), [
+              work,
+              trace,
+            ]).reflectee
+            as Future<Object?>;
+    await expectLater(
+      run(
+        Future.error(StateError('scenario')),
+      ).whenComplete(() => order.add('failed')),
+      throwsA(isA<StateError>()),
+    );
+    expect(order, ['trace', 'failed']);
+    expect(await run(Future.value(7)), 7);
+    expect(order, ['trace', 'failed']);
+  });
   test('partial Android launch records PID before failing status', () async {
     final activity = <String, Object?>{'serial': 'owned-test'};
     var saved = false;
