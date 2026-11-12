@@ -15,6 +15,7 @@ import 'package:chat_e2e/src/owned_resources.dart';
 import 'package:chat_e2e/src/process_runner.dart';
 import 'package:chat_e2e/src/protocol.dart';
 import 'package:chat_e2e/src/scenario.dart';
+import 'package:chat_e2e/src/transport_trace.dart';
 import 'package:path/path.dart' as p;
 
 Map<String, String>? _androidBuildEnvironment(Map<String, String> inputs) {
@@ -786,12 +787,17 @@ Future<void> main(List<String> arguments) async {
     );
     // Every Android run, m2 too (no Android owned: null).
     run.android = await _probeAll(androidProbes);
+    run.transport = await collectTransport(control.participants);
   } catch (error, stack) {
     run.recordFailure(error);
     code = userInterrupted ? 130 : 1;
     run.token.cancel();
     // Before the controller closes: the apps still run as the failure left them.
     run.android ??= await _probeAll(androidProbes);
+    final traced = controller;
+    if (traced != null) {
+      run.transport ??= await collectTransport(traced.participants);
+    }
     await run.interrupt(controller);
     if (accountScenario && androidCrashed != null) {
       try {
@@ -886,6 +892,7 @@ Future<void> main(List<String> arguments) async {
             'facts': run.facts(),
             'android': run.android,
             'waits': run.waits(),
+            'transport': run.transport,
           }),
           flush: true,
         );
@@ -1007,6 +1014,7 @@ class _Run extends IoProcessRunner {
   String? lastParticipant;
   String? rpcOp;
   List<Map<String, Object?>>? android;
+  List<Map<String, Object?>>? transport;
   final safeDetails = loadSafeDetails();
   final safeViews = loadSafeValues('last_view');
   final safeParticipants = loadSafeValues('participants');

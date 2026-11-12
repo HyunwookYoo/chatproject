@@ -535,5 +535,62 @@
     "timeout_send_probe_text",
     "timeout_set_offline",
     "timeout_state_event"
-  ]
+  ],
+  "transport": {
+    "dials_limit": 32,
+    "endpoint": [
+      "binds",
+      "bind_ms_max",
+      "online_ms_max",
+      "relay_drops"
+    ],
+    "dial_counts": [
+      "at_ms",
+      "target_relays",
+      "target_ips",
+      "target_own_ips",
+      "resolve_ms",
+      "handshake_ms",
+      "total_ms",
+      "paths_ip",
+      "paths_relay",
+      "rtt_ms",
+      "tx",
+      "rx",
+      "lost"
+    ],
+    "dial_required": [
+      "at_ms",
+      "alpn",
+      "incoming",
+      "outcome",
+      "relay_up",
+      "total_ms",
+      "path",
+      "paths_ip",
+      "paths_relay"
+    ],
+    "dial_flags": [
+      "incoming",
+      "relay_up"
+    ],
+    "dial_kinds": {
+      "alpn": [
+        "session",
+        "auth",
+        "pair",
+        "other"
+      ],
+      "outcome": [
+        "ok",
+        "failed",
+        "dropped"
+      ],
+      "path": [
+        "ip",
+        "relay",
+        "none"
+      ]
+    }
+  }
 }

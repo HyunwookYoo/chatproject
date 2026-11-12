@@ -116,6 +116,35 @@ def _android(value, profile):
             and all(isinstance(probe, dict) and set(probe) == set(PROBE)
                     and all(check(probe[key]) for key, check in PROBE.items())
                     for probe in value))
+# Each participant's transport trace (task 18; chat_core transport/trace.rs `network_trace`):
+# fixed kinds, counts and milliseconds only, never an address, id or key.
+TRACE = SHARED['transport']
+_COUNT = _int(0, (1 << 31) - 1)
+TRACE_ENDPOINT = {key: _COUNT for key in TRACE['endpoint']}
+TRACE_DIAL = {key: _COUNT for key in TRACE['dial_counts']}
+TRACE_DIAL.update({key: (lambda v: v is not None and _bool(v)) for key in TRACE['dial_flags']})
+TRACE_DIAL.update({key: _one_of(values) for key, values in TRACE['dial_kinds'].items()})
+TRACE_REQUIRED = frozenset(TRACE['dial_required'])
+
+
+def _fixed(value, checks, required=frozenset()):
+    return (isinstance(value, dict) and set(value) == set(checks)
+            and all(check(value[key]) for key, check in checks.items())
+            and all(value[key] is not None for key in required))
+
+
+def _transport(value):
+    return value is None or (
+        isinstance(value, list) and len(value) <= len(PARTICIPANTS)
+        and all(isinstance(t, dict) and set(t) == {'name', 'endpoint', 'dials'}
+                and isinstance(t['name'], str) and t['name'] in PARTICIPANTS
+                and _fixed(t['endpoint'], TRACE_ENDPOINT, frozenset(TRACE_ENDPOINT))
+                and isinstance(t['dials'], list) and len(t['dials']) <= TRACE['dials_limit']
+                and all(_fixed(d, TRACE_DIAL, TRACE_REQUIRED) for d in t['dials'])
+                for t in value)
+        and len({t['name'] for t in value}) == len(value))
+
+
 EXIT_KINDS = set('command_exit avd_list_exit avd_create_exit avd_devices_exit avd_console_exit '
                  'avd_snapshot_exit owned_relay_exit owned_emulator_exit owned_chat_node_exit '
                  'owned_windows_exit owned_child_exit'.split())
@@ -142,14 +171,14 @@ def main():
     safe = {'phase': None, 'failure_kind': None, 'command_exit_code': None,
             'detail': None, 'scenario': None, 'android_crash': None,
             'last_view': None, 'participant': None, 'rpc_op': None, 'facts': None,
-            'android': None, 'waits': None}
+            'android': None, 'waits': None, 'transport': None}
     if args.diagnostic_file and args.diagnostic_file.is_file():
         try:
             diagnostic = json.loads(args.diagnostic_file.read_text(encoding='utf-8'))
             if not isinstance(diagnostic, dict) or set(diagnostic) != set(safe):
                 raise ValueError()
             (phase, kind, code, detail, scenario, crash, view, participant, op, facts,
-             android, waits) = (diagnostic[key] for key in safe)
+             android, waits, transport) = (diagnostic[key] for key in safe)
             if not isinstance(phase, str) or phase not in PHASES:
                 raise ValueError()
             if kind is not None and (not isinstance(kind, str) or kind not in FAILURE_KINDS):
@@ -179,14 +208,17 @@ def main():
                 raise ValueError()
             if not _waits(waits):
                 raise ValueError()
+            if not _transport(transport):
+                raise ValueError()
             safe = {'phase': phase, 'failure_kind': kind, 'command_exit_code': code,
                     'detail': detail, 'scenario': scenario, 'android_crash': crash,
                     'last_view': view, 'participant': participant, 'rpc_op': op,
-                    'facts': facts, 'android': android, 'waits': waits}
+                    'facts': facts, 'android': android, 'waits': waits,
+                    'transport': transport}
         except (OSError, ValueError):
             parser.error('Invalid safe diagnostic')
     # Reconstruct only fixed keys and validated values; never copy log/error text.
-    value = {'schema_version': 9, 'profile': args.profile, 'stage': args.stage,
+    value = {'schema_version': 10, 'profile': args.profile, 'stage': args.stage,
              'outcome': args.outcome, 'exitCode': args.exit_code, 'peak_rss_kib': peak,
              **safe}
     args.output.write_text(json.dumps(value, indent=2) + '\n', encoding='utf-8')

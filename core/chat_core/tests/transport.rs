@@ -848,3 +848,48 @@ async fn disconnect_invalidates_delayed_inbound_but_allows_fresh_and_unrelated_p
     unrelated.execute(NetworkOp::Stop).await.unwrap();
     raw.close().await;
 }
+/// Task 18: each connection attempt is traced as fixed kinds, counts and milliseconds only.
+#[tokio::test]
+async fn transport_trace_times_each_attempt_without_addresses_or_ids() {
+    let (a, _, _) = network();
+    let (b, _, _) = network();
+    let ai = online(&a).await;
+    let bi = online(&b).await;
+    let ticket = bi.ticket.clone().unwrap();
+    let NetworkReply::Peer(peer) = a
+        .execute(NetworkOp::Connect { target: ticket.clone() })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    wait_connected(&b, &ai.endpoint_id.clone().unwrap()).await;
+    let out = a.transport_trace_for_test();
+    let dial = &out["dials"][0];
+    assert_eq!(dial["incoming"], false);
+    assert_eq!(dial["alpn"], "session");
+    assert_eq!(dial["outcome"], "ok");
+    assert_eq!(dial["path"], "ip");
+    assert_eq!(dial["target_relays"], 0);
+    assert!(dial["target_ips"].as_u64().unwrap() >= 1);
+    assert!(dial["paths_ip"].as_u64().unwrap() >= 1);
+    for key in ["at_ms", "resolve_ms", "handshake_ms", "total_ms", "rtt_ms", "tx", "rx", "lost"] {
+        assert!(dial[key].is_u64(), "{key}");
+    }
+    assert_eq!(out["endpoint"]["binds"], 1);
+    assert!(out["endpoint"]["online_ms_max"].is_u64());
+    assert_eq!(out["endpoint"]["relay_drops"], 0);
+    let into = b.transport_trace_for_test();
+    let accepted = &into["dials"][0];
+    assert_eq!(accepted["incoming"], true);
+    assert_eq!(accepted["alpn"], "session");
+    assert_eq!(accepted["outcome"], "ok");
+    assert!(accepted["handshake_ms"].is_u64());
+    for text in [out.to_string(), into.to_string()] {
+        for private in [ticket.as_str(), &peer.peer_id, ai.endpoint_id.as_deref().unwrap(), "127.0.0.1", "::1"] {
+            assert!(!text.contains(private));
+        }
+    }
+    a.execute(NetworkOp::Stop).await.unwrap();
+    b.execute(NetworkOp::Stop).await.unwrap();
+}

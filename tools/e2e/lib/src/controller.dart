@@ -74,6 +74,9 @@ class Controller {
 
   int get port => _server.port;
 
+  /// The participants connected now, the newest instance of each name.
+  Iterable<Participant> get participants => _participants.values;
+
   Future<Participant> waitParticipant(
     String name, {
     Duration timeout = const Duration(seconds: 10),
@@ -586,6 +589,7 @@ class Participant {
     String op,
     Map<String, Object?> args, {
     Duration timeout = const Duration(seconds: 15),
+    bool failOnTimeout = true,
   }) async {
     _check();
     if (_pending.length >= 64) {
@@ -614,7 +618,7 @@ class Participant {
       }
       return await result;
     } on TimeoutException catch (error) {
-      _controller._fail(error);
+      if (failOnTimeout) _controller._fail(error);
       rethrow;
     } finally {
       _pending.remove(id);

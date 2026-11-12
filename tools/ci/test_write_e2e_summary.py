@@ -9,7 +9,7 @@ SCRIPT = pathlib.Path(__file__).with_name('write_e2e_summary.py')
 DETAILS = json.loads((SCRIPT.parents[1] / 'e2e' / 'diagnostic_details.json').read_text(encoding='utf-8'))['details']
 SCENARIO_KEYS = {'detail': None, 'scenario': 'm2', 'android_crash': None,
                  'last_view': None, 'participant': None, 'rpc_op': None, 'facts': None, 'android': None,
-                 'waits': None}
+                 'waits': None, 'transport': None}
 
 
 class SummaryTests(unittest.TestCase):
@@ -27,12 +27,12 @@ class SummaryTests(unittest.TestCase):
                                '--exit-code', '17', '--memory-file', str(source))
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(json.loads((root / 'summary.json').read_text()), {
-                'schema_version': 9, 'profile': 'android', 'stage': 'scenario', 'outcome': 'failure',
+                'schema_version': 10, 'profile': 'android', 'stage': 'scenario', 'outcome': 'failure',
                 'exitCode': 17, 'peak_rss_kib': 1234,
                 'phase': None, 'failure_kind': None, 'command_exit_code': None,
                 'detail': None, 'scenario': None, 'android_crash': None,
                 'last_view': None, 'participant': None, 'rpc_op': None, 'facts': None, 'android': None,
-                'waits': None})
+                'waits': None, 'transport': None})
 
     def test_safe_diagnostic_and_missing_file(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -49,7 +49,7 @@ class SummaryTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             summary = json.loads((root / 'summary.json').read_text())
             self.assertEqual({key: summary[key] for key in value}, value)
-            self.assertEqual(len(summary), 18)
+            self.assertEqual(len(summary), 19)
 
     def test_invalid_projection_fails_without_echoing_private_values(self):
         valid = {'phase': 'build_android', 'failure_kind': 'command_exit', 'command_exit_code': 17,
@@ -97,8 +97,8 @@ class SummaryTests(unittest.TestCase):
                 if accepted:
                     self.assertEqual(result.returncode, 0, result.stderr)
                     summary = json.loads((root / 'summary.json').read_text())
-                    self.assertEqual(len(summary), 18)
-                    self.assertEqual(summary['schema_version'], 9)
+                    self.assertEqual(len(summary), 19)
+                    self.assertEqual(summary['schema_version'], 10)
                     self.assertEqual(summary['outcome'], 'failure')
                     self.assertEqual(summary['exitCode'], 1)
                     self.assertEqual({key: summary[key] for key in value}, value)
@@ -135,7 +135,7 @@ class SummaryTests(unittest.TestCase):
                     summary = json.loads((root / 'summary.json').read_text())
                     self.assertEqual(set(summary), {'schema_version', 'profile', 'stage', 'outcome',
                                                     'exitCode', 'peak_rss_kib', *value})
-                    self.assertEqual(summary['schema_version'], 9)
+                    self.assertEqual(summary['schema_version'], 10)
                     self.assertEqual({key: summary[key] for key in value}, value)
                 else:
                     self.assertNotEqual(result.returncode, 0)
@@ -146,7 +146,7 @@ class SummaryTests(unittest.TestCase):
     def test_scenario_detail_and_crash_presence(self):
         base = {'phase': 'scenario', 'failure_kind': 'timeout', 'command_exit_code': None,
                 'last_view': None, 'participant': None, 'rpc_op': None, 'facts': None, 'android': None,
-                'waits': None}
+                'waits': None, 'transport': None}
         cases = [('android', {'scenario': s, 'detail': None, 'android_crash': None}, True)
                  for s in ('m2', 'm3', 'm3-auth', 'm4', 'm6')]
         cases += [('android', {'scenario': 'm4', 'detail': d, 'android_crash': None}, True)
@@ -190,7 +190,7 @@ class SummaryTests(unittest.TestCase):
         base = {'phase': 'scenario', 'failure_kind': 'timeout', 'command_exit_code': None,
                 'detail': 'Account state deadline', 'scenario': 'm3', 'android_crash': False,
                 'last_view': None, 'participant': None, 'rpc_op': None, 'facts': None, 'android': None,
-                'waits': None}
+                'waits': None, 'transport': None}
         cases = [('android', {'last_view': v, 'participant': 'android-2'}, True)
                  for v in ('Unconfigured', 'Active', 'Locked', 'NotAvailable', 'other',
                            'Queued', 'Blocked', 'absent')]
@@ -281,6 +281,59 @@ class SummaryTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 0, result.stderr)
                     summary = json.loads((root / 'summary.json').read_text())
                     self.assertEqual(summary['waits'], waits)
+                else:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertNotIn('PRIVATE_TOKEN', result.stdout + result.stderr)
+                    self.assertFalse((root / 'summary.json').exists())
+
+    def test_transport_trace_is_fixed_kinds_and_bounded_numbers(self):
+        base = {'phase': 'complete', 'failure_kind': None, 'command_exit_code': None,
+                **SCENARIO_KEYS, 'scenario': 'm6'}
+        dial = {'at_ms': 41000, 'alpn': 'auth', 'incoming': False, 'outcome': 'dropped',
+                'relay_up': True, 'target_relays': 1, 'target_ips': 3, 'target_own_ips': 0,
+                'resolve_ms': 0, 'handshake_ms': None, 'total_ms': 8001, 'path': 'none',
+                'paths_ip': 0, 'paths_relay': 0, 'rtt_ms': None, 'tx': None, 'rx': None, 'lost': None}
+        accepted = {**dial, 'alpn': 'session', 'incoming': True, 'outcome': 'ok', 'target_relays': None,
+                    'target_ips': None, 'target_own_ips': None, 'resolve_ms': None, 'handshake_ms': 35,
+                    'total_ms': 35, 'path': 'relay', 'paths_relay': 1, 'rtt_ms': 12, 'tx': 9, 'rx': 8,
+                    'lost': 0}
+        endpoint = {'binds': 2, 'bind_ms_max': 40, 'online_ms_max': 900, 'relay_drops': 0}
+        one = {'name': 'android-1', 'endpoint': endpoint, 'dials': [dial, accepted]}
+        good = [[], [one], [one, {'name': 'node', 'endpoint': endpoint, 'dials': []}],
+                [{'name': 'windows-1', 'endpoint': endpoint, 'dials': [dial] * 32}]]
+        cases = [(t, True) for t in good]
+        bad = [{}, 'PRIVATE_TOKEN', ['PRIVATE_TOKEN'], [one] * 6,
+               [{**one, 'name': 'PRIVATE_TOKEN'}],
+               [{**one, 'extra': 'PRIVATE_TOKEN'}],
+               [{'name': 'node', 'endpoint': endpoint}],
+               [{**one, 'endpoint': {**endpoint, 'binds': 'PRIVATE_TOKEN'}}],
+               [{**one, 'endpoint': {**endpoint, 'relay_drops': -1}}],
+               [{**one, 'endpoint': {**endpoint, 'host': 'PRIVATE_TOKEN'}}],
+               [{**one, 'dials': [dial] * 33}],
+               [{**one, 'dials': [{**dial, 'alpn': 'PRIVATE_TOKEN'}]}],
+               [{**one, 'dials': [{**dial, 'outcome': 'PRIVATE_TOKEN'}]}],
+               [{**one, 'dials': [{**dial, 'path': 'PRIVATE_TOKEN'}]}],
+               [{**one, 'dials': [{**dial, 'incoming': 'PRIVATE_TOKEN'}]}],
+               [{**one, 'dials': [{**dial, 'incoming': 1}]}],
+               [{**one, 'dials': [{**dial, 'total_ms': True}]}],
+               [{**one, 'dials': [{**dial, 'total_ms': None}]}],
+               [{**one, 'dials': [{**dial, 'rtt_ms': 1.5}]}],
+               [{**one, 'dials': [{**dial, 'tx': 1 << 40}]}],
+               [{**one, 'dials': [{**dial, 'target': 'PRIVATE_TOKEN'}]}],
+               [{**one, 'dials': ['PRIVATE_TOKEN']}]]
+        cases += [(t, False) for t in bad]
+        for transport, ok in cases:
+            with self.subTest(transport=transport), tempfile.TemporaryDirectory() as directory:
+                root = pathlib.Path(directory)
+                diagnostic = root / 'diagnostic.json'
+                diagnostic.write_text(json.dumps({**base, 'transport': transport}))
+                result = self.call(root, '--profile', 'android', '--stage', 'scenario',
+                                   '--outcome', 'success', '--exit-code', '0',
+                                   '--diagnostic-file', str(diagnostic))
+                if ok:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    summary = json.loads((root / 'summary.json').read_text())
+                    self.assertEqual(summary['transport'], transport)
                 else:
                     self.assertNotEqual(result.returncode, 0)
                     self.assertNotIn('PRIVATE_TOKEN', result.stdout + result.stderr)
