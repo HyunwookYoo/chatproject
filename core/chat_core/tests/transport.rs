@@ -873,6 +873,9 @@ async fn transport_trace_times_each_attempt_without_addresses_or_ids() {
     assert_eq!(dial["target_relays"], 0);
     assert!(dial["target_ips"].as_u64().unwrap() >= 1);
     assert!(dial["paths_ip"].as_u64().unwrap() >= 1);
+    // Nothing was open to b before, and the handshake did not stall.
+    assert_eq!((dial["prior_ip"].clone(), dial["prior_relay"].clone()), (0.into(), 0.into()));
+    assert!(dial["stall_ip"].is_null() && dial["stall_relay"].is_null());
     for key in ["at_ms", "resolve_ms", "handshake_ms", "total_ms", "rtt_ms", "tx", "rx", "lost"] {
         assert!(dial[key].is_u64(), "{key}");
     }
@@ -892,4 +895,25 @@ async fn transport_trace_times_each_attempt_without_addresses_or_ids() {
     }
     a.execute(NetworkOp::Stop).await.unwrap();
     b.execute(NetworkOp::Stop).await.unwrap();
+}
+/// Task 18: a handshake that is still running at 7 s notes the remote's open paths then, and
+/// is kept as `dropped` when the dial deadline cuts it off.
+#[tokio::test]
+async fn transport_trace_keeps_a_stalled_dial_cut_off_by_its_deadline() {
+    let (a, _, _) = network();
+    online(&a).await;
+    let target = iroh_tickets::endpoint::EndpointTicket::new(iroh::EndpointAddr::from_parts(
+        iroh::SecretKey::generate().public(),
+        [iroh::TransportAddr::Ip("127.0.0.1:9".parse().unwrap())],
+    ))
+    .to_string();
+    let failed = a.execute(NetworkOp::Connect { target }).await.unwrap_err();
+    assert_eq!(failed.code, ErrorCode::NetworkTimeout);
+    let dial = &a.transport_trace_for_test()["dials"][0];
+    assert_eq!(dial["outcome"], "dropped");
+    assert_eq!(dial["path"], "none");
+    assert!(dial["handshake_ms"].is_null());
+    assert_eq!((dial["stall_ip"].clone(), dial["stall_relay"].clone()), (0.into(), 0.into()));
+    assert!(dial["total_ms"].as_u64().unwrap() >= 9_900);
+    a.execute(NetworkOp::Stop).await.unwrap();
 }

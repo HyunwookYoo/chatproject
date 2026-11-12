@@ -12,6 +12,9 @@ use std::{
 
 /// The newest attempts kept.
 const LIMIT: usize = 32;
+/// An outgoing handshake still running this long notes what the endpoint knows of the remote
+/// then (account dials end at 8 s, session dials at 10 s).
+const STALL: Duration = Duration::from_secs(7);
 
 pub(crate) struct Trace {
     created: Instant,
@@ -46,6 +49,16 @@ fn alpn_kind(alpn: &[u8]) -> &'static str {
 }
 fn relay_up(endpoint: &Endpoint) -> bool {
     endpoint.home_relay_status().get().iter().any(|status| status.is_connected())
+}
+/// How many of the remote's IP and relay addresses an open path of some connection uses now.
+async fn active(endpoint: &Endpoint, id: iroh::EndpointId) -> (usize, usize) {
+    let Some(info) = endpoint.remote_info(id).await else { return (0, 0) };
+    let open: Vec<_> = info
+        .addrs()
+        .filter(|a| matches!(a.usage(), iroh::endpoint::TransportAddrUsage::Active))
+        .map(|a| a.addr().is_ip())
+        .collect();
+    (open.iter().filter(|ip| **ip).count(), open.iter().filter(|ip| !**ip).count())
 }
 impl Trace {
     pub(crate) fn snapshot(&self) -> Value {
@@ -94,6 +107,10 @@ impl Trace {
                 "target_relays": null,
                 "target_ips": null,
                 "target_own_ips": null,
+                "prior_ip": null,
+                "prior_relay": null,
+                "stall_ip": null,
+                "stall_relay": null,
                 "resolve_ms": null,
                 "handshake_ms": null,
                 "total_ms": 0,
@@ -122,11 +139,31 @@ impl Trace {
         attempt.record["target_ips"] = target.ip_addrs().count().into();
         attempt.record["target_own_ips"] =
             target.ip_addrs().filter(|a| own.contains(&a.ip())).count().into();
+        let id = target.id;
+        let (ip, relay) = active(endpoint, id).await;
+        attempt.record["prior_ip"] = ip.into();
+        attempt.record["prior_relay"] = relay.into();
         let connecting = endpoint.connect_with_opts(target, alpn, Default::default()).await;
         attempt.record["resolve_ms"] = ms(attempt.started.elapsed()).into();
         let resolved = Instant::now();
         let result = match connecting {
-            Ok(connecting) => connecting.await.map_err(|_| ()),
+            Ok(connecting) => {
+                tokio::pin!(connecting);
+                let stall = tokio::time::sleep_until((attempt.started + STALL).into());
+                tokio::pin!(stall);
+                let mut stalled = false;
+                loop {
+                    tokio::select! {
+                        result = &mut connecting => break result.map_err(|_| ()),
+                        _ = &mut stall, if !stalled => {
+                            stalled = true;
+                            let (ip, relay) = active(endpoint, id).await;
+                            attempt.record["stall_ip"] = ip.into();
+                            attempt.record["stall_relay"] = relay.into();
+                        }
+                    }
+                }
+            }
             Err(_) => Err(()),
         };
         match &result {

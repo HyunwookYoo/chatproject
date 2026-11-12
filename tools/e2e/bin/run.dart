@@ -785,19 +785,20 @@ Future<void> main(List<String> arguments) async {
       timeout: Duration(minutes: accountScenario ? 8 : 4),
       failurePhase: 'scenario',
     );
+    // First: unread events keep arriving and may overflow a buffer meanwhile.
+    run.transport = await collectTransport(control.participants);
     // Every Android run, m2 too (no Android owned: null).
     run.android = await _probeAll(androidProbes);
-    run.transport = await collectTransport(control.participants);
   } catch (error, stack) {
     run.recordFailure(error);
     code = userInterrupted ? 130 : 1;
     run.token.cancel();
     // Before the controller closes: the apps still run as the failure left them.
-    run.android ??= await _probeAll(androidProbes);
     final traced = controller;
     if (traced != null) {
       run.transport ??= await collectTransport(traced.participants);
     }
+    run.android ??= await _probeAll(androidProbes);
     await run.interrupt(controller);
     if (accountScenario && androidCrashed != null) {
       try {

@@ -291,6 +291,7 @@ class SummaryTests(unittest.TestCase):
                 **SCENARIO_KEYS, 'scenario': 'm6'}
         dial = {'at_ms': 41000, 'alpn': 'auth', 'incoming': False, 'outcome': 'dropped',
                 'relay_up': True, 'target_relays': 1, 'target_ips': 3, 'target_own_ips': 0,
+                'prior_ip': 1, 'prior_relay': 0, 'stall_ip': 1, 'stall_relay': 0,
                 'resolve_ms': 0, 'handshake_ms': None, 'total_ms': 8001, 'path': 'none',
                 'paths_ip': 0, 'paths_relay': 0, 'rtt_ms': None, 'tx': None, 'rx': None, 'lost': None}
         accepted = {**dial, 'alpn': 'session', 'incoming': True, 'outcome': 'ok', 'target_relays': None,
