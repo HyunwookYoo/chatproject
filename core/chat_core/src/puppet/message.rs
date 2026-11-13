@@ -91,6 +91,11 @@ enum TestAction {
     AckLossWait {},
     AckLossRelease {},
     WriteCounts {},
+    /// A conversation's MLS group and one message's sends, as counts only (e2e diagnostics).
+    GroupFacts {
+        conversation: ConversationId,
+        key: Option<MessageKey>,
+    },
 }
 
 pub(super) async fn execute_test(
@@ -119,6 +124,24 @@ pub(super) async fn execute_test(
         TestAction::WriteCounts {} => {
             let (payload, response) = handle.message_test_write_starts().await?;
             Ok(json!({"payload_writes":payload,"response_writes":response}))
+        }
+        TestAction::GroupFacts { conversation, key } => {
+            let fixture = handle.storage_test_fixture();
+            let state = fixture.mls_state(conversation).await?;
+            let attempted = match key {
+                Some(key) => fixture.message_facts(key).await?.attempted_receivers.len(),
+                None => 0,
+            };
+            Ok(json!({
+                "group": state.group_epoch.is_some(),
+                "epoch": state.group_epoch,
+                "members": state.members.len(),
+                "processed_mls": state.processed_mls,
+                "deliveries": state.deliveries.len(),
+                "holds": state.holds,
+                "rejoins": state.rejoin_count,
+                "attempted": attempted,
+            }))
         }
     }
 }

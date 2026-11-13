@@ -146,6 +146,60 @@ void main() {
     failureFacts.clear();
   });
 
+  test('an m6 deadline notes every side group only as buckets', () async {
+    failureFacts.clear();
+    await noteGroup(
+      'node',
+      () async => {
+        'group': true,
+        'epoch': 1,
+        'members': 3,
+        'processed_mls': 0,
+        'deliveries': 1,
+        'holds': 0,
+        'rejoins': 0,
+        'attempted': 2,
+        'PRIVATE': 'PRIVATE_TOKEN',
+      },
+    );
+    await noteGroup(
+      'mailbox',
+      () async => {
+        'group': false,
+        'epoch': null,
+        'members': 0,
+        'processed_mls': 7,
+        'deliveries': 0,
+        'holds': 4,
+        'rejoins': null,
+        'attempted': 0,
+      },
+    );
+    await noteGroup('phone', () async => throw StateError('PRIVATE'));
+    expect(failureFacts, {
+      'm6_group_node': 'm3',
+      'm6_epoch_node': 'e1',
+      'm6_received_node': 'p0',
+      'm6_deliveries_node': 'd1',
+      'm6_holds_node': 'h0',
+      'm6_attempted_node': 'r2',
+      'm6_group_mailbox': 'none',
+      'm6_epoch_mailbox': 'none',
+      'm6_received_mailbox': 'p3plus',
+      'm6_deliveries_mailbox': 'd0',
+      'm6_holds_mailbox': 'h1plus',
+      'm6_attempted_mailbox': 'r0',
+      'm6_group_phone': 'unknown',
+      'm6_epoch_phone': 'unknown',
+      'm6_received_phone': 'unknown',
+      'm6_deliveries_phone': 'unknown',
+      'm6_holds_phone': 'unknown',
+      'm6_attempted_phone': 'unknown',
+    });
+    expect(safeFacts(failureFacts, loadSafeFacts()), failureFacts);
+    failureFacts.clear();
+  });
+
   test('the slowest waits keep listed names only, slowest first', () {
     waitMs.clear();
     noteWait('account_local_pair_scan', 9800);

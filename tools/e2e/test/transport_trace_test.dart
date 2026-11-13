@@ -7,6 +7,7 @@ import 'package:test/test.dart';
 import 'controller_test.dart' show MockParticipant;
 
 Map<String, Object?> _dial([Map<String, Object?> patch = const {}]) => {
+  'seq': 3,
   'at_ms': 41000,
   'alpn': 'auth',
   'incoming': false,
@@ -38,11 +39,29 @@ Map<String, Object?> _dial([Map<String, Object?> patch = const {}]) => {
   ...patch,
 };
 
-Map<String, Object?> _trace({List<Object?>? dials, Object? endpoint}) => {
+Map<String, Object?> _live([Map<String, Object?> patch = const {}]) => {
+  'seq': 3,
+  'age_ms': 52000,
+  'path': 'ip',
+  'paths_ip': 1,
+  'paths_relay': 1,
+  'rtt_ms': 14,
+  'tx': 90,
+  'rx': 80,
+  'lost': 2,
+  ...patch,
+};
+
+Map<String, Object?> _trace({
+  List<Object?>? dials,
+  Object? endpoint,
+  List<Object?>? live,
+}) => {
   'endpoint':
       endpoint ??
       {'binds': 2, 'bind_ms_max': 40, 'online_ms_max': 900, 'relay_drops': 1},
   'dials': dials ?? [_dial()],
+  'live': live ?? [_live()],
 };
 
 void main() {
@@ -113,6 +132,27 @@ void main() {
         ],
       ),
       _trace(dials: List.filled(33, _dial())),
+      _trace(live: List.filled(17, _live())),
+      _trace(
+        live: [
+          _live({'path': 'PRIVATE_TOKEN'}),
+        ],
+      ),
+      _trace(
+        live: [
+          _live({'age_ms': null}),
+        ],
+      ),
+      _trace(
+        live: [
+          _live({'peer': 'PRIVATE_TOKEN'}),
+        ],
+      ),
+      _trace(
+        dials: [
+          _dial({'seq': null}),
+        ],
+      ),
     ]) {
       expect(safeTransport('android-1', bad), isNull, reason: '$bad');
     }
@@ -129,8 +169,10 @@ void main() {
     expect(emitted, {
       ...transportEndpointKeys,
       ...transportDialKeys,
+      ...transportLiveKeys,
       'endpoint',
       'dials',
+      'live',
     });
   });
 

@@ -12,6 +12,8 @@ use std::{
 
 /// The newest attempts kept.
 const LIMIT: usize = 32;
+/// The newest connections followed while they stay open.
+const LIVE_LIMIT: usize = 16;
 /// An outgoing handshake still running this long notes what the endpoint knows of the remote
 /// then (account dials end at 8 s, session dials at 10 s).
 const STALL: Duration = Duration::from_secs(7);
@@ -27,6 +29,9 @@ struct Inner {
     bind_ms_max: u64,
     online_ms_max: u64,
     relay_drops: u64,
+    seq: u64,
+    /// Connections of successful attempts (their `seq`), while open: their path now.
+    live: VecDeque<(u64, Instant, iroh::endpoint::WeakConnectionHandle)>,
 }
 impl Default for Trace {
     fn default() -> Self {
@@ -79,10 +84,42 @@ async fn active(endpoint: &Endpoint, id: iroh::EndpointId) -> (usize, usize) {
         .collect();
     (open.iter().filter(|ip| **ip).count(), open.iter().filter(|ip| !**ip).count())
 }
+/// The selected path kind, path counts, RTT and datagram counts of `connection` now.
+fn paths(connection: &Connection, record: &mut Value) {
+    let paths = connection.paths();
+    let selected = paths.iter().find(|path| path.is_selected());
+    record["path"] = match &selected {
+        Some(path) if path.is_ip() => "ip",
+        Some(_) => "relay",
+        None => "none",
+    }
+    .into();
+    record["rtt_ms"] = selected.map(|path| ms(path.rtt())).into();
+    record["paths_ip"] = paths.iter().filter(|path| path.is_ip()).count().into();
+    record["paths_relay"] = paths.iter().filter(|path| path.is_relay()).count().into();
+    let stats = connection.stats();
+    record["tx"] = stats.udp_tx.datagrams.into();
+    record["rx"] = stats.udp_rx.datagrams.into();
+    record["lost"] = stats.lost_packets.into();
+}
 impl Trace {
     pub(crate) fn snapshot(&self) -> Value {
-        let inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
+        inner.live.retain(|(_, _, weak)| {
+            weak.upgrade().is_some_and(|c| c.close_reason().is_none())
+        });
+        let live: Vec<Value> = inner
+            .live
+            .iter()
+            .filter_map(|(seq, since, weak)| {
+                let connection = weak.upgrade()?;
+                let mut record = json!({"seq": seq, "age_ms": ms(since.elapsed())});
+                paths(&connection, &mut record);
+                Some(record)
+            })
+            .collect();
         json!({
+            "live": live,
             "endpoint": {
                 "binds": inner.binds,
                 "bind_ms_max": inner.bind_ms_max,
@@ -114,12 +151,19 @@ impl Trace {
         }
     }
     fn attempt(&self, endpoint: &Endpoint, incoming: bool) -> Attempt<'_> {
+        let seq = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.seq += 1;
+            inner.seq
+        };
         Attempt {
+            seq,
             trace: self,
             started: Instant::now(),
             endpoint: endpoint.clone(),
             bytes: bytes(endpoint),
             record: json!({
+                "seq": seq,
                 "at_ms": ms(self.created.elapsed()),
                 "alpn": "other",
                 "incoming": incoming,
@@ -238,6 +282,7 @@ impl Trace {
     }
 }
 struct Attempt<'a> {
+    seq: u64,
     trace: &'a Trace,
     started: Instant,
     endpoint: Endpoint,
@@ -246,24 +291,14 @@ struct Attempt<'a> {
 }
 impl Attempt<'_> {
     fn connected(&mut self, connection: &Connection, handshake: Instant) {
-        let record = &mut self.record;
-        record["outcome"] = "ok".into();
-        record["handshake_ms"] = ms(handshake.elapsed()).into();
-        let paths = connection.paths();
-        let selected = paths.iter().find(|path| path.is_selected());
-        record["path"] = match &selected {
-            Some(path) if path.is_ip() => "ip",
-            Some(_) => "relay",
-            None => "none",
+        self.record["outcome"] = "ok".into();
+        self.record["handshake_ms"] = ms(handshake.elapsed()).into();
+        paths(connection, &mut self.record);
+        let mut inner = self.trace.inner.lock().unwrap();
+        if inner.live.len() == LIVE_LIMIT {
+            inner.live.pop_front();
         }
-        .into();
-        record["rtt_ms"] = selected.map(|path| ms(path.rtt())).into();
-        record["paths_ip"] = paths.iter().filter(|path| path.is_ip()).count().into();
-        record["paths_relay"] = paths.iter().filter(|path| path.is_relay()).count().into();
-        let stats = connection.stats();
-        record["tx"] = stats.udp_tx.datagrams.into();
-        record["rx"] = stats.udp_rx.datagrams.into();
-        record["lost"] = stats.lost_packets.into();
+        inner.live.push_back((self.seq, Instant::now(), connection.weak_handle()));
     }
 }
 impl Drop for Attempt<'_> {

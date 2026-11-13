@@ -205,6 +205,52 @@ void main() {
       await fixture.close();
     }
   });
+  test('a delivery deadline notes every side group as fixed facts', () async {
+    final fixture = MailboxFixture()..fault = 'mailbox_missing';
+    await fixture.start();
+    failureFacts.clear();
+    try {
+      await expectLater(
+        runMailboxScenario(
+          fixture.controller,
+          fixture.ordered,
+          airplane: fixture.airplane,
+          foreground: fixture.foreground,
+          timeout: const Duration(seconds: 1),
+        ),
+        throwsA(
+          isA<ScenarioDeadline>().having(
+            (e) => e.message,
+            'text',
+            'Mailbox scenario deadline: first_text',
+          ),
+        ),
+      );
+      expect(failureFacts, {
+        'm6_group_node': 'm2',
+        'm6_epoch_node': 'e1',
+        'm6_received_node': 'p0',
+        'm6_deliveries_node': 'd1',
+        'm6_holds_node': 'h0',
+        'm6_attempted_node': 'r1',
+        'm6_group_phone': 'm2',
+        'm6_epoch_phone': 'e1',
+        'm6_received_phone': 'p1',
+        'm6_deliveries_phone': 'd0',
+        'm6_holds_phone': 'h0',
+        'm6_attempted_phone': 'r0',
+        'm6_group_mailbox': 'none',
+        'm6_epoch_mailbox': 'none',
+        'm6_received_mailbox': 'p0',
+        'm6_deliveries_mailbox': 'd0',
+        'm6_holds_mailbox': 'h0',
+        'm6_attempted_mailbox': 'r0',
+      });
+    } finally {
+      failureFacts.clear();
+      await fixture.close();
+    }
+  });
   for (final fault in ['duplicate', 'second_notification', 'not_isolated']) {
     test('scenario fails on $fault', () async {
       final fixture = MailboxFixture()..fault = fault;
@@ -397,9 +443,20 @@ class MailboxFixture {
           'state': 'Delivered',
         };
         texts['node']!.add(text);
-        store('mailbox', text);
+        if (fault != 'mailbox_missing') store('mailbox', text);
         if (!offline['phone']! || fault == 'not_isolated') store('phone', text);
         return text;
+      case 'message_local_test_group_facts':
+        return {
+          'group': name != 'mailbox',
+          'epoch': name == 'mailbox' ? null : 1,
+          'members': name == 'mailbox' ? 0 : 2,
+          'processed_mls': name == 'phone' ? 1 : 0,
+          'deliveries': name == 'node' ? 1 : 0,
+          'holds': 0,
+          'rejoins': 0,
+          'attempted': args['key'] == null ? 0 : 1,
+        };
       case 'message_local_load_messages':
         return {'revision': 1, 'items': texts[name], 'next': null};
       default:

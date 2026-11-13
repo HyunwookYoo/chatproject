@@ -522,6 +522,132 @@
       "6to10s",
       "ge10s",
       "none"
+    ],
+    "m6_group_phone": [
+      "none",
+      "m0",
+      "m1",
+      "m2",
+      "m3",
+      "m4plus",
+      "unknown"
+    ],
+    "m6_epoch_phone": [
+      "none",
+      "e0",
+      "e1",
+      "e2",
+      "e3plus",
+      "unknown"
+    ],
+    "m6_received_phone": [
+      "p0",
+      "p1",
+      "p2",
+      "p3plus",
+      "unknown"
+    ],
+    "m6_deliveries_phone": [
+      "d0",
+      "d1",
+      "d2plus",
+      "unknown"
+    ],
+    "m6_holds_phone": [
+      "h0",
+      "h1plus",
+      "unknown"
+    ],
+    "m6_attempted_phone": [
+      "r0",
+      "r1",
+      "r2",
+      "r3plus",
+      "unknown"
+    ],
+    "m6_group_mailbox": [
+      "none",
+      "m0",
+      "m1",
+      "m2",
+      "m3",
+      "m4plus",
+      "unknown"
+    ],
+    "m6_epoch_mailbox": [
+      "none",
+      "e0",
+      "e1",
+      "e2",
+      "e3plus",
+      "unknown"
+    ],
+    "m6_received_mailbox": [
+      "p0",
+      "p1",
+      "p2",
+      "p3plus",
+      "unknown"
+    ],
+    "m6_deliveries_mailbox": [
+      "d0",
+      "d1",
+      "d2plus",
+      "unknown"
+    ],
+    "m6_holds_mailbox": [
+      "h0",
+      "h1plus",
+      "unknown"
+    ],
+    "m6_attempted_mailbox": [
+      "r0",
+      "r1",
+      "r2",
+      "r3plus",
+      "unknown"
+    ],
+    "m6_group_node": [
+      "none",
+      "m0",
+      "m1",
+      "m2",
+      "m3",
+      "m4plus",
+      "unknown"
+    ],
+    "m6_epoch_node": [
+      "none",
+      "e0",
+      "e1",
+      "e2",
+      "e3plus",
+      "unknown"
+    ],
+    "m6_received_node": [
+      "p0",
+      "p1",
+      "p2",
+      "p3plus",
+      "unknown"
+    ],
+    "m6_deliveries_node": [
+      "d0",
+      "d1",
+      "d2plus",
+      "unknown"
+    ],
+    "m6_holds_node": [
+      "h0",
+      "h1plus",
+      "unknown"
+    ],
+    "m6_attempted_node": [
+      "r0",
+      "r1",
+      "r2",
+      "r3plus",
+      "unknown"
     ]
   },
   "wait_kinds": [
@@ -545,6 +671,7 @@
       "relay_drops"
     ],
     "dial_counts": [
+      "seq",
       "at_ms",
       "target_relays",
       "target_ips",
@@ -568,6 +695,7 @@
       "lost"
     ],
     "dial_required": [
+      "seq",
       "at_ms",
       "alpn",
       "incoming",
@@ -611,6 +739,24 @@
         "relay",
         "none"
       ]
-    }
+    },
+    "live_limit": 16,
+    "live_counts": [
+      "seq",
+      "age_ms",
+      "paths_ip",
+      "paths_relay",
+      "rtt_ms",
+      "tx",
+      "rx",
+      "lost"
+    ],
+    "live_required": [
+      "seq",
+      "age_ms",
+      "path",
+      "paths_ip",
+      "paths_relay"
+    ]
   }
 }

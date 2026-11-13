@@ -883,6 +883,14 @@ async fn transport_trace_times_each_attempt_without_addresses_or_ids() {
     for key in ["at_ms", "resolve_ms", "handshake_ms", "total_ms", "rtt_ms", "tx", "rx", "lost"] {
         assert!(dial[key].is_u64(), "{key}");
     }
+    // The connection is still open: it is listed as live, linked to its attempt.
+    let live = &out["live"][0];
+    assert_eq!(live["seq"], dial["seq"]);
+    assert_eq!(live["path"], "ip");
+    for key in ["age_ms", "paths_ip", "paths_relay", "rtt_ms", "tx", "rx", "lost"] {
+        assert!(live[key].is_u64(), "{key}");
+    }
+    assert_eq!(out["live"].as_array().unwrap().len(), 1);
     assert_eq!(out["endpoint"]["binds"], 1);
     assert!(out["endpoint"]["online_ms_max"].is_u64());
     assert_eq!(out["endpoint"]["relay_drops"], 0);

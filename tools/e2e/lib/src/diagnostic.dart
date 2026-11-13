@@ -122,6 +122,41 @@ Future<void> notePairSide(
       : 'unknown';
 }
 
+String _bucket(Object? value, String prefix, int top) => value is! int
+    ? 'unknown'
+    : value >= top
+    ? '$prefix${top}plus'
+    : '$prefix$value';
+
+/// Notes one m6 side's MLS group for the conversation as buckets
+/// (`message_local_test_group_facts`): `m6_group_<side>` (members or `none`),
+/// `m6_epoch_<side>`, `m6_received_<side>` (MLS ciphertexts processed),
+/// `m6_deliveries_<side>` (queued Commits/Welcomes), `m6_holds_<side>` and
+/// `m6_attempted_<side>` (receivers the sent text was tried to). `unknown`
+/// when it could not be read.
+Future<void> noteGroup(String side, Future<Object?> Function() facts) async {
+  Object? value;
+  try {
+    value = await facts();
+  } catch (_) {
+    value = null;
+  }
+  final map = value is Map ? value : const {};
+  final group = map['group'];
+  failureFacts['m6_group_$side'] = group == false
+      ? 'none'
+      : group == true
+      ? _bucket(map['members'], 'm', 4)
+      : 'unknown';
+  failureFacts['m6_epoch_$side'] = group == false
+      ? 'none'
+      : _bucket(map['epoch'], 'e', 3);
+  failureFacts['m6_received_$side'] = _bucket(map['processed_mls'], 'p', 3);
+  failureFacts['m6_deliveries_$side'] = _bucket(map['deliveries'], 'd', 2);
+  failureFacts['m6_holds_$side'] = _bucket(map['holds'], 'h', 1);
+  failureFacts['m6_attempted_$side'] = _bucket(map['attempted'], 'r', 3);
+}
+
 /// The slowest time in ms of each named wait, pass or fail: a scenario
 /// deadline's text, an RPC op or an m2 timeout kind (`waits`).
 final waitMs = <String, int>{};
@@ -143,14 +178,13 @@ List<Map<String, Object>>? safeWaits(
   Set<String> details,
   Set<String> kinds,
 ) {
-  final kept =
-      [
-        for (final MapEntry(:key, :value) in waits.entries)
-          if (details.contains(key) ||
-              kinds.contains(key) ||
-              _scenarioOp.hasMatch(key))
-            {'name': key, 'ms': value},
-      ]..sort((a, b) => (b['ms'] as int).compareTo(a['ms'] as int));
+  final kept = [
+    for (final MapEntry(:key, :value) in waits.entries)
+      if (details.contains(key) ||
+          kinds.contains(key) ||
+          _scenarioOp.hasMatch(key))
+        {'name': key, 'ms': value},
+  ]..sort((a, b) => (b['ms'] as int).compareTo(a['ms'] as int));
   return kept.isEmpty ? null : kept.take(waitsLimit).toList();
 }
 

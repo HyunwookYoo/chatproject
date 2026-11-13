@@ -76,11 +76,7 @@ Future<void> runMailboxScenario(
       await Future<void>.delayed(const Duration(milliseconds: 100));
     }
     noteWait(name, took.elapsedMilliseconds);
-    throw ScenarioDeadline(
-      name,
-      lastView: last,
-      participant: who,
-    );
+    throw ScenarioDeadline(name, lastView: last, participant: who);
   }
 
   Future<Map<String, Object?>> view(
@@ -279,6 +275,32 @@ Future<void> runMailboxScenario(
     require(same(own, conversation), 'one_conversation');
   }
 
+  // On a delivery deadline: each side's group for the conversation, as fixed
+  // buckets (the node's with its latest text's receivers).
+  Object? lastKey;
+  Future<T> grouped<T>(Future<T> Function() wait) async {
+    try {
+      return await wait();
+    } on ScenarioDeadline {
+      for (final (side, p) in [
+        ('node', node),
+        ('phone', phone),
+        ('mailbox', mailbox),
+      ]) {
+        await noteGroup(
+          side,
+          () => p.call(
+            'message_local_test_group_facts',
+            {'conversation': conversation, 'key': p == node ? lastKey : null},
+            timeout: const Duration(seconds: 5),
+            failOnTimeout: false,
+          ),
+        );
+      }
+      rethrow;
+    }
+  }
+
   Future<void> sendFromNode(int n) async {
     final sent = object(
       await call(node, 'message_local_send_text', {
@@ -288,24 +310,29 @@ Future<void> runMailboxScenario(
       }),
     );
     final key = sent['key'];
-    await until(
-      () => messages(node, conversation),
-      (items) => items.any(
-        (m) =>
-            same(m['key'], key) &&
-            const {'Delivered', 'Read'}.contains(m['state']),
+    lastKey = key;
+    await grouped(
+      () => until(
+        () => messages(node, conversation),
+        (items) => items.any(
+          (m) =>
+              same(m['key'], key) &&
+              const {'Delivered', 'Read'}.contains(m['state']),
+        ),
+        'node_delivered_$n',
       ),
-      'node_delivered_$n',
     );
   }
 
   // The first text makes the group with both of A's devices.
   await sendFromNode(1);
   for (final p in [phone, mailbox]) {
-    await until(
-      () => messages(p, conversation),
-      (items) => idsFrom(items, bPeer).length == 1,
-      'first_text',
+    await grouped(
+      () => until(
+        () => messages(p, conversation),
+        (items) => idsFrom(items, bPeer).length == 1,
+        'first_text',
+      ),
     );
   }
   await call(mailbox, 'mailbox_local_set', {'enabled': true});
@@ -320,10 +347,12 @@ Future<void> runMailboxScenario(
   for (var n = 2; n <= 4; n++) {
     await sendFromNode(n);
   }
-  final kept = await until(
-    () => messages(mailbox, conversation),
-    (items) => idsFrom(items, bPeer).length == 4,
-    'mailbox_received',
+  final kept = await grouped(
+    () => until(
+      () => messages(mailbox, conversation),
+      (items) => idsFrom(items, bPeer).length == 4,
+      'mailbox_received',
+    ),
   );
   require(
     idsFrom(await messages(phone, conversation), bPeer).length == 1,
@@ -339,10 +368,12 @@ Future<void> runMailboxScenario(
   await call(phone, 'account_local_route', {'ticket': await ticket(mailbox)});
   await foreground(phone);
   await call(phone, 'mailbox_local_sync_now');
-  final got = await until(
-    () => messages(phone, conversation),
-    (items) => idsFrom(items, bPeer).length >= 4,
-    'phone_received',
+  final got = await grouped(
+    () => until(
+      () => messages(phone, conversation),
+      (items) => idsFrom(items, bPeer).length >= 4,
+      'phone_received',
+    ),
   );
   final elapsed = DateTime.now().difference(returned);
   final expected = [for (var n = 1; n <= 4; n++) id(n)];

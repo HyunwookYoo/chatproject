@@ -125,6 +125,10 @@ TRACE_DIAL = {key: _COUNT for key in TRACE['dial_counts']}
 TRACE_DIAL.update({key: (lambda v: v is not None and _bool(v)) for key in TRACE['dial_flags']})
 TRACE_DIAL.update({key: _one_of(values) for key, values in TRACE['dial_kinds'].items()})
 TRACE_REQUIRED = frozenset(TRACE['dial_required'])
+# A connection still open when the trace was read: its path now, linked by `seq`.
+TRACE_LIVE = {key: _COUNT for key in TRACE['live_counts']}
+TRACE_LIVE['path'] = _one_of(TRACE['dial_kinds']['path'])
+TRACE_LIVE_REQUIRED = frozenset(TRACE['live_required'])
 
 
 def _fixed(value, checks, required=frozenset()):
@@ -136,11 +140,13 @@ def _fixed(value, checks, required=frozenset()):
 def _transport(value):
     return value is None or (
         isinstance(value, list) and len(value) <= len(PARTICIPANTS)
-        and all(isinstance(t, dict) and set(t) == {'name', 'endpoint', 'dials'}
+        and all(isinstance(t, dict) and set(t) == {'name', 'endpoint', 'dials', 'live'}
                 and isinstance(t['name'], str) and t['name'] in PARTICIPANTS
                 and _fixed(t['endpoint'], TRACE_ENDPOINT, frozenset(TRACE_ENDPOINT))
                 and isinstance(t['dials'], list) and len(t['dials']) <= TRACE['dials_limit']
                 and all(_fixed(d, TRACE_DIAL, TRACE_REQUIRED) for d in t['dials'])
+                and isinstance(t['live'], list) and len(t['live']) <= TRACE['live_limit']
+                and all(_fixed(c, TRACE_LIVE, TRACE_LIVE_REQUIRED) for c in t['live'])
                 for t in value)
         and len({t['name'] for t in value}) == len(value))
 

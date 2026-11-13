@@ -289,7 +289,7 @@ class SummaryTests(unittest.TestCase):
     def test_transport_trace_is_fixed_kinds_and_bounded_numbers(self):
         base = {'phase': 'complete', 'failure_kind': None, 'command_exit_code': None,
                 **SCENARIO_KEYS, 'scenario': 'm6'}
-        dial = {'at_ms': 41000, 'alpn': 'auth', 'incoming': False, 'outcome': 'dropped',
+        dial = {'seq': 3, 'at_ms': 41000, 'alpn': 'auth', 'incoming': False, 'outcome': 'dropped',
                 'relay_up': True, 'target_relays': 1, 'target_ips': 3, 'target_own_ips': 0,
                 'prior_ip': 1, 'prior_relay': 0, 'stall_ip': 1, 'stall_relay': 0,
                 'from': 'none', 'stall_from': 'none', 'ip_out': 3600, 'relay_out': 0, 'ip_in': 0,
@@ -301,14 +301,21 @@ class SummaryTests(unittest.TestCase):
                     'total_ms': 35, 'path': 'relay', 'paths_relay': 1, 'rtt_ms': 12, 'tx': 9, 'rx': 8,
                     'lost': 0, 'from': 'relay'}
         endpoint = {'binds': 2, 'bind_ms_max': 40, 'online_ms_max': 900, 'relay_drops': 0}
-        one = {'name': 'android-1', 'endpoint': endpoint, 'dials': [dial, accepted]}
-        good = [[], [one], [one, {'name': 'node', 'endpoint': endpoint, 'dials': []}],
-                [{'name': 'windows-1', 'endpoint': endpoint, 'dials': [dial] * 32}]]
+        live = {'seq': 3, 'age_ms': 52000, 'path': 'ip', 'paths_ip': 1, 'paths_relay': 1, 'rtt_ms': 14,
+                'tx': 90, 'rx': 80, 'lost': 2}
+        one = {'name': 'android-1', 'endpoint': endpoint, 'dials': [dial, accepted], 'live': [live]}
+        good = [[], [one], [one, {'name': 'node', 'endpoint': endpoint, 'dials': [], 'live': []}],
+                [{'name': 'windows-1', 'endpoint': endpoint, 'dials': [dial] * 32, 'live': [live] * 16}]]
         cases = [(t, True) for t in good]
         bad = [{}, 'PRIVATE_TOKEN', ['PRIVATE_TOKEN'], [one] * 6,
                [{**one, 'name': 'PRIVATE_TOKEN'}],
                [{**one, 'extra': 'PRIVATE_TOKEN'}],
-               [{'name': 'node', 'endpoint': endpoint}],
+               [{'name': 'node', 'endpoint': endpoint, 'dials': []}],
+               [{**one, 'live': [live] * 17}],
+               [{**one, 'live': [{**live, 'path': 'PRIVATE_TOKEN'}]}],
+               [{**one, 'live': [{**live, 'age_ms': None}]}],
+               [{**one, 'live': [{**live, 'peer': 'PRIVATE_TOKEN'}]}],
+               [{**one, 'dials': [{**dial, 'seq': None}]}],
                [{**one, 'endpoint': {**endpoint, 'binds': 'PRIVATE_TOKEN'}}],
                [{**one, 'endpoint': {**endpoint, 'relay_drops': -1}}],
                [{**one, 'endpoint': {**endpoint, 'host': 'PRIVATE_TOKEN'}}],
