@@ -2,7 +2,8 @@
 //! like the local e2e relay (no QUIC on the relay, as `chat_node relay` runs it).
 use chat_core::EventBus;
 use chat_core::transport::{
-    NetworkHandle, NetworkInfo, NetworkOp, NetworkProfile, NetworkReply, NetworkState, PeerPhase,
+    NetworkHandle, NetworkInfo, NetworkOp, NetworkProfile, NetworkReply, NetworkState, PeerPath,
+    PeerPhase,
 };
 use std::time::Duration;
 
@@ -25,7 +26,7 @@ async fn online(net: &NetworkHandle) -> NetworkInfo {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn relay_only_ticket_connects_within_a_second() {
+async fn relay_only_ticket_connects_within_a_second_then_goes_direct() {
     let mut config = iroh_relay::server::ServerConfig::default();
     config.relay = Some(iroh_relay::server::RelayConfig::new(
         "127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap(),
@@ -54,6 +55,20 @@ async fn relay_only_ticket_connects_within_a_second() {
         panic!()
     };
     assert_eq!(peer.phase, PeerPhase::Connected);
+    // The ticket named no direct address; the session still finds the direct path.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let NetworkReply::Info(info) = a.execute(NetworkOp::Info).await.unwrap() else {
+                panic!()
+            };
+            if info.peers.iter().any(|p| p.peer_id == peer.peer_id && p.path == PeerPath::Direct) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("no direct path within 10 s");
     a.execute(NetworkOp::Stop).await.unwrap();
     b.execute(NetworkOp::Stop).await.unwrap();
 }
