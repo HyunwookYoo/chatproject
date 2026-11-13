@@ -287,6 +287,34 @@ void main() {
     waitMs.clear();
   });
 
+  test('a late reply to an abandoned diagnostic call is dropped', () async {
+    final peer = await join();
+    final participant = await controller.waitParticipant('node');
+    await expectLater(
+      participant.call(
+        'network_trace',
+        {},
+        timeout: const Duration(milliseconds: 50),
+        failOnTimeout: false,
+      ),
+      throwsA(isA<TimeoutException>()),
+    );
+    final late = await peer.next();
+    peer.result(late['id'] as int, {'dials': <Object?>[]});
+    final next = participant.call('network_stop', {});
+    peer.result((await peer.next())['id'] as int, null);
+    expect(await next, isNull);
+    // Only once: a second reply to that id still fails the scenario.
+    final pending = expectLater(
+      participant.call('network_info', {}),
+      throwsA(scenarioFailure('protocol')),
+    );
+    await peer.next();
+    peer.result(late['id'] as int, null);
+    await pending;
+    await expectLater(controller.close(), throwsA(scenarioFailure('protocol')));
+  });
+
   test('direct-only config has mandatory null relay', () async {
     await controller.close();
     controller = await Controller.start(port: 0, logDir: logs, relay: null);

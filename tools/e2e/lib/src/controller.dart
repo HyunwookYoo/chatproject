@@ -438,6 +438,10 @@ class Controller {
       switch (record) {
         case ResultRecord():
           final pending = participant._pending[record.id];
+          // The late reply to a call its caller gave up on without failing.
+          if (pending == null && participant._abandoned.remove(record.id)) {
+            return;
+          }
           if (pending == null || pending.isCompleted) {
             throw StateError('protocol unmatched result id');
           }
@@ -575,6 +579,8 @@ class Participant {
   final String instance;
   final _pending = <int, Completer<Object?>>{};
   final _operations = <int, String>{};
+  // Ids of `failOnTimeout: false` calls that timed out; their reply is dropped.
+  final _abandoned = <int>{};
   final _events = <Map<String, Object?>>[];
   final _eventWaiters = <_EventWaiter>[];
   int _id = 0;
@@ -618,7 +624,11 @@ class Participant {
       }
       return await result;
     } on TimeoutException catch (error) {
-      if (failOnTimeout) _controller._fail(error);
+      if (failOnTimeout) {
+        _controller._fail(error);
+      } else {
+        _abandoned.add(id);
+      }
       rethrow;
     } finally {
       _pending.remove(id);
