@@ -62,6 +62,23 @@ void main() {
     );
   });
 
+  test(
+    'the pid monitor needs two misses in a row; an adb failure counts nothing',
+    () {
+      final same = ProcessResult(1, 0, '4321\n', '');
+      final gone = ProcessResult(1, 1, '', '');
+      final other = ProcessResult(1, 0, '9999\n', '');
+      final adbFailed = ProcessResult(1, 255, '', 'error: device offline');
+      expect(ownedMisses(gone, '4321', 0), 1);
+      expect(ownedMisses(other, '4321', 1), 2);
+      expect(ownedMisses(same, '4321', 1), 0);
+      // Says nothing about the app: the count stays.
+      expect(ownedMisses(adbFailed, '4321', 0), 0);
+      expect(ownedMisses(adbFailed, '4321', 1), 1);
+      expect(ownedExitedAfter, 2);
+    },
+  );
+
   test('process record numbers and freeze state', () {
     final record = processRecord(
       '  *APP* UID 10190 ProcessRecord{1 4321:$package/u0a190}\n'

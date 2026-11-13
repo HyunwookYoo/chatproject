@@ -602,6 +602,7 @@ Future<void> main(List<String> arguments) async {
         final watching = Completer<void>();
         run.monitorStops.add(watching);
         run.monitorTasks.add(() async {
+          var misses = 0;
           try {
             while (!watching.isCompleted && !run.token.isCancelled) {
               await Future.any([
@@ -610,7 +611,10 @@ Future<void> main(List<String> arguments) async {
                 run.token.cancelled,
               ]);
               if (watching.isCompleted || run.token.isCancelled) return;
-              if (restarting) continue;
+              if (restarting) {
+                misses = 0;
+                continue;
+              }
               final observedPid = appPid;
               final result = await run.command(
                 sdk.adb,
@@ -618,9 +622,12 @@ Future<void> main(List<String> arguments) async {
                 requireSuccess: false,
                 failurePhase: 'android_pid_monitor',
               );
-              if (!restarting &&
-                  appPid == observedPid &&
-                  (result.stdout as String).trim() != appPid) {
+              if (restarting || appPid != observedPid) {
+                misses = 0;
+                continue;
+              }
+              misses = ownedMisses(result, appPid, misses);
+              if (misses >= ownedExitedAfter) {
                 throw StateError('Android owned activity exited');
               }
             }

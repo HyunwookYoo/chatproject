@@ -112,6 +112,19 @@ String processState(ProcessResult pidof, String ownedPid) {
   return out == ownedPid ? 'alive_same' : 'alive_other';
 }
 
+/// The owned app counts as exited after this many `pidof` misses in a row.
+const ownedExitedAfter = 2;
+
+/// The pid monitor's misses in a row after one more `pidof`: no process or
+/// another pid is a miss, the owned pid clears them, and a failed adb says
+/// nothing about the app (a run's probe found the app alive after one).
+int ownedMisses(ProcessResult pidof, String ownedPid, int misses) =>
+    switch (processState(pidof, ownedPid)) {
+      'alive_same' => 0,
+      'unknown' => misses,
+      _ => misses + 1,
+    };
+
 /// `dumpsys activity processes <package>`: process state, oom adj and freeze.
 ({int? procState, int? oomAdj, bool? frozen}) processRecord(String dump) {
   int? number(RegExp pattern) {
