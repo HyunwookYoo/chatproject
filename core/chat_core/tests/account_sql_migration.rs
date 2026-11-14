@@ -550,7 +550,7 @@ async fn v1_db_upgrades_through_v2_to_v3() {
     assert_eq!(r.list_conversations(None, 50).await.unwrap().items.len(), 1);
     f.close().await;
     let after = Fixture::probe_database(dir.path(), p.clone()).unwrap();
-    assert_eq!((after.user_version, after.schema_version), (3, 3));
+    assert_eq!((after.user_version, after.schema_version), (4, 4));
     for table in [
         "mls_kv",
         "mls_conversation",
@@ -582,13 +582,13 @@ async fn v1_db_upgrades_through_v2_to_v3() {
     assert_eq!(after.outbox[0].attempts, u32::MAX as i64);
     assert_eq!(after.outbox[1].next_retry_at_ms, 123_456);
 
-    // A second open is a no-op on a v2 database.
+    // A second open is a no-op on the upgraded database.
     Fixture::open(dir.path(), p.clone()).await.unwrap().close().await;
     assert_eq!(Fixture::probe_database(dir.path(), p).unwrap(), after);
 }
 
 #[tokio::test]
-async fn upgraded_schema_matches_a_fresh_v3_schema() {
+async fn upgraded_schema_matches_a_fresh_v4_schema() {
     let upgraded = tempfile::tempdir().unwrap();
     let fresh = tempfile::tempdir().unwrap();
     let p: Arc<dyn KeyProtector> = protector();
@@ -629,7 +629,7 @@ async fn upgrade_interrupted_keeps_v1() {
     // The next open migrates again and succeeds.
     Fixture::open(dir.path(), p.clone()).await.unwrap().close().await;
     let after = Fixture::probe_database(dir.path(), p).unwrap();
-    assert_eq!((after.user_version, after.schema_version), (3, 3));
+    assert_eq!((after.user_version, after.schema_version), (4, 4));
     assert_eq!(after.message_rows, before.message_rows);
     assert!(after.outbox.iter().all(|o| o.codec == 3));
 }
@@ -652,17 +652,17 @@ async fn v2_db_upgrades_to_v3_preserving_everything() {
 
     Fixture::open(dir.path(), p.clone()).await.unwrap().close().await;
     let after = Fixture::probe_database(dir.path(), p.clone()).unwrap();
-    assert_eq!((after.user_version, after.schema_version), (3, 3));
+    assert_eq!((after.user_version, after.schema_version), (4, 4));
     // Every v2 table is byte-identical; storage_meta is compared without its schema_version,
     // which is the one value the upgrade rebuilds (asserted above).
     assert_eq!(after.v2_rows, before.v2_rows);
     assert_eq!(after.message_rows, before.message_rows);
-    assert_eq!(after.outbox, before.outbox);
+    assert_eq!(after.outbox, pushed_zero(&before.outbox));
     for table in MAILBOX_TABLES {
         assert!(after.tables.iter().any(|t| t == table), "{table}");
     }
     assert_eq!(after.mailbox_local, vec![(1, 0, 0)]);
-    // A second open is a no-op on a v3 database.
+    // A second open is a no-op on the upgraded database.
     Fixture::open(dir.path(), p.clone()).await.unwrap().close().await;
     assert_eq!(Fixture::probe_database(dir.path(), p).unwrap(), after);
 }
@@ -695,7 +695,7 @@ async fn upgrade_v2_interrupted_keeps_v2() {
     // The next open migrates again and succeeds.
     Fixture::open(dir.path(), p.clone()).await.unwrap().close().await;
     let after = Fixture::probe_database(dir.path(), p).unwrap();
-    assert_eq!((after.user_version, after.schema_version), (3, 3));
+    assert_eq!((after.user_version, after.schema_version), (4, 4));
     assert_eq!(after.v2_rows, before.v2_rows);
 }
 
@@ -705,4 +705,142 @@ async fn mailbox_seq_is_never_reused() {
     let p: Arc<dyn KeyProtector> = protector();
     Fixture::open(dir.path(), p.clone()).await.unwrap().close().await;
     assert_eq!(Fixture::mailbox_seq_after_clearing(dir.path(), p).unwrap(), 4);
+}
+
+// ---- schema v3 -> v4 (M7 push) -----------------------------------------------------------
+
+const PUSH_TABLES: [&str; 5] = ["push_local", "push_tag", "push_peer", "push_own", "push_delivery"];
+
+/// A real M6-shaped database: the v2 content (both outbox codecs, MLS rows) plus the mailbox
+/// tables, rewritten to the exact v3 shape by the narrow fixture.
+async fn v3_database(root: &Path, p: Arc<dyn KeyProtector>) {
+    populated_database(root, p.clone()).await;
+    Fixture::seed_v2_rows(root, p.clone()).unwrap();
+    Fixture::downgrade_to_v3(root, p).unwrap();
+}
+/// `outbox` as a v4 database holds it after the upgrade: every row gains `pushed = 0`.
+fn pushed_zero(rows: &[chat_core::storage_fixture::OutboxProbe]) -> Vec<chat_core::storage_fixture::OutboxProbe> {
+    rows.iter().cloned().map(|o| chat_core::storage_fixture::OutboxProbe { pushed: Some(0), ..o }).collect()
+}
+/// The one `push_local` row a v4 database starts with: push on, nothing registered yet.
+fn assert_push_seed(probe: &chat_core::storage_fixture::DbProbe) -> Vec<u8> {
+    for table in PUSH_TABLES {
+        assert!(probe.tables.iter().any(|t| t == table), "{table}");
+    }
+    assert_eq!(probe.push_local.len(), 1);
+    let seed = &probe.push_local[0];
+    assert_eq!((seed.id, seed.enabled, seed.platform), (1, 1, None));
+    assert_eq!((&seed.token, &seed.own_handle, seed.own_issued_at_ms), (&None, &None, None));
+    assert_eq!(seed.own_tag.len(), 16);
+    assert_ne!(seed.own_tag, vec![0; 16]);
+    seed.own_tag.clone()
+}
+
+#[tokio::test]
+async fn fresh_database_is_v4_with_push_local_seed() {
+    let dir = tempfile::tempdir().unwrap();
+    let p: Arc<dyn KeyProtector> = protector();
+    populated_database(dir.path(), p.clone()).await;
+    let probe = Fixture::probe_database(dir.path(), p.clone()).unwrap();
+    assert_eq!((probe.user_version, probe.schema_version), (4, 4));
+    let tag = assert_push_seed(&probe);
+    assert_eq!(probe.outbox.len(), 2);
+    assert!(probe.outbox.iter().all(|o| o.pushed == Some(0)));
+    // Reopening keeps the row (and its tag) as it is.
+    Fixture::open(dir.path(), p.clone()).await.unwrap().close().await;
+    assert_eq!(Fixture::probe_database(dir.path(), p.clone()).unwrap(), probe);
+    // Every database draws its own tag.
+    let other = tempfile::tempdir().unwrap();
+    Fixture::open(other.path(), p.clone()).await.unwrap().close().await;
+    assert_ne!(assert_push_seed(&Fixture::probe_database(other.path(), p).unwrap()), tag);
+}
+
+#[tokio::test]
+async fn v3_upgrades_to_v4_keeping_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let p: Arc<dyn KeyProtector> = protector();
+    v3_database(dir.path(), p.clone()).await;
+    let before = Fixture::probe_database(dir.path(), p.clone()).unwrap();
+    assert_eq!((before.user_version, before.schema_version), (3, 3));
+    assert!(!before.tables.iter().any(|t| t.starts_with("push_")));
+    assert!(before.push_local.is_empty());
+    assert_eq!(before.outbox.len(), 2);
+    assert!(before.outbox.iter().all(|o| o.pushed.is_none()));
+    let codecs: Vec<i64> = before.outbox.iter().map(|o| o.codec).collect();
+    assert!(codecs.contains(&2) && codecs.contains(&3));
+    assert_eq!(before.mailbox_local, vec![(1, 0, 0)]);
+
+    Fixture::open(dir.path(), p.clone()).await.unwrap().close().await;
+    let after = Fixture::probe_database(dir.path(), p.clone()).unwrap();
+    assert_eq!((after.user_version, after.schema_version), (4, 4));
+    // Every v3 row is byte-identical (storage_meta without schema_version, outbox without
+    // pushed); queued outbox rows stay queued with pushed = 0.
+    assert_eq!(after.v2_rows, before.v2_rows);
+    assert_eq!(after.message_rows, before.message_rows);
+    assert_eq!(after.outbox, pushed_zero(&before.outbox));
+    assert_eq!(after.mailbox_local, before.mailbox_local);
+    assert_push_seed(&after);
+    // A second open is a no-op on a v4 database.
+    Fixture::open(dir.path(), p.clone()).await.unwrap().close().await;
+    assert_eq!(Fixture::probe_database(dir.path(), p).unwrap(), after);
+}
+
+#[tokio::test]
+async fn v1_and_v2_chain_to_v4() {
+    let p: Arc<dyn KeyProtector> = protector();
+    for (version, dir) in [(1, tempfile::tempdir().unwrap()), (2, tempfile::tempdir().unwrap())] {
+        if version == 1 {
+            v1_database(dir.path(), p.clone()).await;
+        } else {
+            v2_database(dir.path(), p.clone()).await;
+        }
+        let before = Fixture::probe_database(dir.path(), p.clone()).unwrap();
+        assert_eq!((before.user_version, before.schema_version), (version, version));
+        Fixture::open(dir.path(), p.clone()).await.unwrap().close().await;
+        let after = Fixture::probe_database(dir.path(), p.clone()).unwrap();
+        assert_eq!((after.user_version, after.schema_version), (4, 4), "v{version}");
+        assert_push_seed(&after);
+        for table in MAILBOX_TABLES {
+            assert!(after.tables.iter().any(|t| t == table), "v{version} {table}");
+        }
+        assert_eq!(after.message_rows, before.message_rows, "v{version}");
+        assert_eq!(after.outbox.len(), before.outbox.len(), "v{version}");
+        assert!(after.outbox.iter().all(|o| o.pushed == Some(0)), "v{version}");
+    }
+}
+
+#[tokio::test]
+async fn upgrade_fault_leaves_v3_intact() {
+    let dir = tempfile::tempdir().unwrap();
+    let p: Arc<dyn KeyProtector> = protector();
+    v3_database(dir.path(), p.clone()).await;
+    let before = Fixture::probe_database(dir.path(), p.clone()).unwrap();
+    Fixture::fail_next_upgrade(dir.path());
+    assert!(Fixture::open(dir.path(), p.clone()).await.is_err());
+    // The push tables, the outbox column, the seed row and the storage_meta rebuild all rolled back.
+    let interrupted = Fixture::probe_database(dir.path(), p.clone()).unwrap();
+    assert_eq!(interrupted, before);
+    assert_eq!((interrupted.user_version, interrupted.schema_version), (3, 3));
+    assert!(!interrupted.tables.iter().any(|t| t.starts_with("push_")));
+    Fixture::v3_reader_check(dir.path(), p.clone()).unwrap();
+    // The next open upgrades again and succeeds.
+    Fixture::open(dir.path(), p.clone()).await.unwrap().close().await;
+    let after = Fixture::probe_database(dir.path(), p).unwrap();
+    assert_eq!((after.user_version, after.schema_version), (4, 4));
+    assert_eq!(after.v2_rows, before.v2_rows);
+    assert_eq!(after.outbox, pushed_zero(&before.outbox));
+    assert_push_seed(&after);
+}
+
+#[tokio::test]
+async fn v4_db_rejected_by_v3_reader() {
+    let dir = tempfile::tempdir().unwrap();
+    let p: Arc<dyn KeyProtector> = protector();
+    Fixture::open(dir.path(), p.clone()).await.unwrap().close().await;
+    let error = Fixture::v3_reader_check(dir.path(), p.clone()).unwrap_err();
+    assert_eq!(error.code, ErrorCode::StorageCorrupt);
+    // The replica is a real v3 reader: it accepts a genuine v3 database.
+    let v3 = tempfile::tempdir().unwrap();
+    v3_database(v3.path(), p.clone()).await;
+    Fixture::v3_reader_check(v3.path(), p).unwrap();
 }

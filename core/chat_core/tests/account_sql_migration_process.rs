@@ -262,3 +262,52 @@ async fn changed_legacy_source_is_preserved_and_rejected() {
         cleanup_fixture(dir, stage);
     }
 }
+
+/// A v3 (M6) store whose v3 -> v4 open is killed at each stage: before the upgrade commits
+/// the database is still an intact v3, after it the v4 seed is in place, and every later open
+/// keeps that one `push_local` row and its tag.
+#[tokio::test]
+async fn v3_to_v4_open_killed_at_every_stage_settles_on_v4() {
+    let _serial = ONE_AT_A_TIME.lock().await;
+    for (stage, upgraded) in [
+        ("Prepared", false),
+        ("KeysPrepared", false),
+        ("DatabaseStarted", false),
+        ("AfterImport", true),
+        ("Reopened", true),
+        ("CleanupComplete", true),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        Fixture::open(dir.path(), resources(dir.path()))
+            .await
+            .unwrap()
+            .close()
+            .await;
+        Fixture::downgrade_to_v3(dir.path(), resources(dir.path())).unwrap();
+        kill_at(dir.path(), stage);
+        let killed = Fixture::probe_database(dir.path(), resources(dir.path())).unwrap();
+        let mut tag = if upgraded {
+            assert_eq!((killed.user_version, killed.schema_version), (4, 4), "{stage}");
+            assert_eq!(killed.push_local.len(), 1, "{stage}");
+            Some(killed.push_local[0].own_tag.clone())
+        } else {
+            assert_eq!((killed.user_version, killed.schema_version), (3, 3), "{stage}");
+            assert!(!killed.tables.iter().any(|t| t.starts_with("push_")), "{stage}");
+            None
+        };
+        for _ in 0..2 {
+            Fixture::open(dir.path(), resources(dir.path()))
+                .await
+                .unwrap()
+                .close()
+                .await;
+            let probe = Fixture::probe_database(dir.path(), resources(dir.path())).unwrap();
+            assert_eq!((probe.user_version, probe.schema_version), (4, 4), "{stage}");
+            assert_eq!(probe.push_local.len(), 1, "{stage}");
+            let own_tag = &probe.push_local[0].own_tag;
+            assert_eq!(own_tag.len(), 16, "{stage}");
+            assert_eq!(tag.get_or_insert_with(|| own_tag.clone()), own_tag, "{stage}");
+        }
+        cleanup_fixture(dir, stage);
+    }
+}
