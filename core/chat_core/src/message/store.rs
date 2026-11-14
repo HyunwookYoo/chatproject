@@ -75,6 +75,10 @@ pub(crate) enum MessageDbOp {
     /// Test-hook builds: the M4-peer fixture's plaintext frame for a row awaiting encryption.
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     M4Encode(MessageKey),
+    /// Test-hook builds: seals a `PushHandle` (handle, issued at) in the conversation's group
+    /// as this device and returns the MLS ciphertext; only the ratchet changes.
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    SealPushHandle(ConversationId, Vec<u8>, u64),
     MlsGroupOp(ConversationId, super::mls_group::GroupOp),
     /// The device log: pages, cursors, retention (M6).
     Mailbox(super::mailbox_store::MailboxDbOp),
@@ -594,6 +598,8 @@ pub(crate) fn execute(
         MessageDbOp::ResealReceipt(key) => super::mls_store::reseal_receipt(c, key, mls_fault!(fault)),
         #[cfg(all(feature = "test-hooks", debug_assertions))]
         MessageDbOp::M4Encode(key) => super::mls_store::m4_encode(c, identity, key),
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        MessageDbOp::SealPushHandle(id, handle, issued_at_ms) => super::mls_store::fixture_seal_push_handle(c, identity, local, id, handle, issued_at_ms),
         MessageDbOp::MlsGroupOp(id, op) => super::mls_group::group_op(c, identity, local, id, op, mls_fault!(fault)),
         MessageDbOp::Mailbox(op) => super::mailbox_store::mailbox_op(c, identity, op, mls_fault!(fault)),
         MessageDbOp::NotifyItems(keys, read) => Ok(MessageDbReply::Notify(notify_items(c, &keys, &read)?)),
@@ -843,6 +849,8 @@ pub(crate) enum FixtureOp {
     /// Deletes one message row and the jobs that refer to it (as deleting its conversation
     /// would).
     DropMessage(MessageKey, tokio::sync::oneshot::Sender<R<()>>),
+    /// The `push_peer` rows and the number of `mailbox_notify` marks.
+    PushPeerState(tokio::sync::oneshot::Sender<R<super::push_store::PushPeerState>>),
 }
 #[cfg(all(feature = "test-hooks", debug_assertions))]
 pub(crate) fn fixture(c: &mut Connection, op: FixtureOp) {
@@ -993,6 +1001,9 @@ pub(crate) fn fixture(c: &mut Connection, op: FixtureOp) {
         FixtureOp::MailboxMark(installation, mailbox, at, reply) => {
             let _ = reply.send(super::mailbox_store::fixture_mark(c, installation, mailbox, at));
         }
+        FixtureOp::PushPeerState(reply) => {
+            let _ = reply.send(super::push_store::fixture_peer_state(c));
+        }
         FixtureOp::DropMessage(k, reply) => {
             let result = ["receipt_job", "mls_receipt", "outbox", "message"].iter().try_for_each(|table| {
                 c.execute(&format!("DELETE FROM {table} WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4"), params![k.conversation.0.as_slice(), k.sender.0.as_slice(), k.installation.0.as_slice(), k.id.0.as_slice()]).map(|_| ()).map_err(sql_error)
@@ -1129,6 +1140,13 @@ pub(crate) enum MessageDbReply {
     /// The reply for my `Read` receipt from another of my devices that made messages of the
     /// conversation read here just now (M6, spec 6.4).
     OpenedRead(crate::mls::wire::MlsReply, ConversationId),
+    /// The reply for a `PushHandle` of the other account's device `installation` (its MLS
+    /// leaf) that just changed what `push_peer` holds for it in `conversation` (M7 spec 5.2).
+    OpenedPushHandle {
+        reply: crate::mls::wire::MlsReply,
+        conversation: ConversationId,
+        installation: InstallationId,
+    },
     /// The account a receipt goes to, and whether the message came over MLS (its receipt may
     /// then go to any device of that account in the group).
     ReceiptPeer(PeerId, bool),
@@ -1145,6 +1163,9 @@ pub(crate) enum MessageDbReply {
     Message(MessageView),
     Messages(MessagePage),
     Conversations(ConversationPage),
+    /// Test-hook builds: an MLS ciphertext a fixture sealed.
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    Ciphertext(Vec<u8>),
 }
 impl MessageRepo {
     pub(crate) fn new(storage: StorageHandle, local: &LocalAccount) -> Self {
@@ -1240,7 +1261,7 @@ impl MessageDbOp {
             // The M4-peer fixture's frame is what its enqueue would have stored: not a step
             // of the attempt that fault tests interrupt.
             #[cfg(all(feature = "test-hooks", debug_assertions))]
-            Self::M4Encode(_) => false,
+            Self::M4Encode(_) | Self::SealPushHandle(..) => false,
             Self::MlsGroupOp(_, op) => op.writes(),
             Self::Mailbox(op) => op.writes(),
             _ => self.key(identity)?.is_some(),

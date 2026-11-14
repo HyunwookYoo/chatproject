@@ -14,6 +14,7 @@ use super::MlsProvider;
 use super::group::{self, CLASS_NO_GROUP, MAX_MLS_MESSAGE_BYTES, OpenFailure, Opened};
 use super::kv::{KvStore, storage_error};
 use super::payload::Content;
+use super::push_ct::{self, PushCtError};
 use crate::message::types::ConversationId;
 use crate::{CoreError, ErrorCode};
 
@@ -89,8 +90,20 @@ pub fn export_snapshot(c: &Connection, conversation: ConversationId) -> Result<V
 /// returns what a notification may show. Nothing is written anywhere: the rows are copied into
 /// an in-memory store that is dropped on return, so the same ciphertext opens again and the
 /// snapshot (which is only read) stays valid for the next one.
+///
+/// A push carries the ciphertext with its group id taken out (M7 spec 5.3,
+/// `push_ct::strip_group_id`); such a ciphertext gets the snapshot's group id back first.
 pub fn decrypt_readonly(snapshot: &[u8], ciphertext: &[u8]) -> Result<NsePreview, NseError> {
     let snapshot = state::decode(snapshot).map_err(|e| NseError::BadState(e.0))?;
+    if ciphertext.len() > MAX_MLS_MESSAGE_BYTES {
+        return Err(NseError::BadCiphertext);
+    }
+    let restored = match push_ct::restore_group_id(ciphertext, snapshot.group_id) {
+        Ok(restored) => Some(restored),
+        Err(PushCtError::NotStripped | PushCtError::NotPrivate) => None,
+        Err(PushCtError::Malformed) => return Err(NseError::BadCiphertext),
+    };
+    let ciphertext = restored.as_deref().unwrap_or(ciphertext);
     let well_formed = ciphertext.len() <= MAX_MLS_MESSAGE_BYTES
         && MlsMessageIn::tls_deserialize_exact(ciphertext)
             .ok()
@@ -223,6 +236,45 @@ mod tests {
                     .starts_with(&format!("M1b probe message {seq} "))
             );
         }
+    }
+
+    /// M7 spec 5.3: a push carries the ciphertext without its group id; the extension puts the
+    /// snapshot's back and decrypts the same text as from the complete ciphertext.
+    #[test]
+    fn nse_decrypts_stripped_ciphertext() {
+        let built = built();
+        let snapshot = snapshot_of(&built);
+        for ciphertext in &built.ciphertexts {
+            let stripped = push_ct::strip_group_id(ciphertext).unwrap();
+            assert!(
+                !stripped
+                    .windows(CONVERSATION.0.len())
+                    .any(|w| w == CONVERSATION.0)
+            );
+            assert_eq!(
+                decrypt_readonly(&snapshot, &stripped),
+                decrypt_readonly(&snapshot, ciphertext)
+            );
+            assert!(decrypt_readonly(&snapshot, &stripped).is_ok());
+        }
+        // A stripped ciphertext of another epoch fails as the complete one does, and a
+        // truncated stripped one is a bad ciphertext.
+        let next = push_ct::strip_group_id(&built.next).unwrap();
+        assert_eq!(
+            decrypt_readonly(&snapshot, &next),
+            Err(NseError::Decrypt(CLASS_FUTURE_EPOCH))
+        );
+        let stripped = push_ct::strip_group_id(&built.ciphertexts[0]).unwrap();
+        assert_eq!(
+            decrypt_readonly(&snapshot, &stripped[..4]),
+            Err(NseError::BadCiphertext)
+        );
+        // Restored with another group's id it does not open.
+        let other = rewrite(&snapshot, |group_id, _| group_id.push(0));
+        assert_eq!(
+            decrypt_readonly(&other, &stripped),
+            Err(NseError::GroupNotFound)
+        );
     }
 
     #[test]

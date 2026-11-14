@@ -11,6 +11,7 @@ pub(crate) mod membership;
 #[cfg(feature = "nse")]
 pub mod nse;
 pub(crate) mod payload;
+pub(crate) mod push_ct;
 pub(crate) mod wire;
 
 use openmls_rust_crypto::RustCrypto;

@@ -254,12 +254,28 @@ impl Messages {
         ciphertext: Vec<u8>,
         now: u64,
     ) -> Result<crate::mls::wire::MlsReply, CoreError> {
-        let from = crate::message::store::OpenFrom { peer: sender, transport, allowed, pull: None };
+        self.mls_open_app_via(sender, transport, allowed, None, conversation, ciphertext, now)
+            .await
+    }
+    /// `mls_open_app_from`, brought by a pull from mailbox `pull` when that is given.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn mls_open_app_via(
+        &self,
+        sender: crate::account::PeerId,
+        transport: crate::account::InstallationId,
+        allowed: Vec<crate::account::InstallationId>,
+        pull: Option<crate::account::InstallationId>,
+        conversation: ConversationId,
+        ciphertext: Vec<u8>,
+        now: u64,
+    ) -> Result<crate::mls::wire::MlsReply, CoreError> {
+        let from = crate::message::store::OpenFrom { peer: sender, transport, allowed, pull };
         let op = MessageDbOp::OpenApp(from, conversation, ciphertext, now);
         match self.mls(op).await? {
             MessageDbReply::Opened(reply)
             | MessageDbReply::OpenedText(reply, ..)
-            | MessageDbReply::OpenedRead(reply, _) => Ok(reply),
+            | MessageDbReply::OpenedRead(reply, _)
+            | MessageDbReply::OpenedPushHandle { reply, .. } => Ok(reply),
             // Without the actor no new epoch is made: the sender is told it is out of order.
             MessageDbReply::FarAhead { epoch } => Ok(crate::mls::wire::MlsReply::DecryptFailed {
                 class: crate::mls::group::CLASS_OUT_OF_ORDER,
@@ -269,6 +285,19 @@ impl Messages {
             MessageDbReply::Rejected => Err(CoreError::new(ErrorCode::InvalidMessage, "mls_text_rejected")),
             // Refused for its leaf, as the actor does on a direct session.
             MessageDbReply::NotCurrent => Err(CoreError::new(ErrorCode::InvalidMessage, "mls_leaf_not_current")),
+            _ => unreachable!(),
+        }
+    }
+    /// The MLS ciphertext of a `PushHandle` this device seals in the conversation's group for
+    /// `handle` issued at `issued_at_ms` (nothing is queued or logged).
+    pub async fn mls_seal_push_handle(
+        &self,
+        conversation: ConversationId,
+        handle: Vec<u8>,
+        issued_at_ms: u64,
+    ) -> Result<Vec<u8>, CoreError> {
+        match self.mls(MessageDbOp::SealPushHandle(conversation, handle, issued_at_ms)).await? {
+            MessageDbReply::Ciphertext(ciphertext) => Ok(ciphertext),
             _ => unreachable!(),
         }
     }
@@ -979,6 +1008,12 @@ impl Fixture {
         self.handle.0.test(TestOp::Message(FixtureOp::MlsPlantRow(conversation, key, value, tx))).await;
         rx.await.unwrap()
     }
+    /// The `push_peer` rows and the `mailbox_notify` count.
+    pub async fn push_peer_state(&self) -> Result<PushPeerState, CoreError> {
+        let (tx, rx) = oneshot::channel();
+        self.handle.0.test(TestOp::Message(FixtureOp::PushPeerState(tx))).await;
+        rx.await.unwrap()
+    }
     /// The device log, cursors and pulls, and counts of the other per-device tables.
     pub async fn mailbox_state(&self) -> Result<MailboxState, CoreError> {
         let (tx, rx) = oneshot::channel();
@@ -1348,6 +1383,8 @@ impl Fixture {
 pub use crate::message::wire::{decode as decode_message, Frame as MessageFrame};
 pub use crate::account::MessageMutation;
 pub use crate::mls::wire::{MlsFrame, MlsReply};
+pub use crate::mls::push_ct::{PushCtError, restore_group_id, strip_group_id};
+pub use crate::message::push_store::{PushPeerRow, PushPeerState};
 pub use crate::mailbox::wire::{
     EntryBody, HandoffEntry, LogEntry, MailboxFrame, MailboxReply, PlainRecord,
 };

@@ -842,6 +842,9 @@ fn decrypt_failed(class: u8, epoch: u64) -> MessageDbReply {
 /// * a `Read` receipt another device of this account sent means the user read those messages
 ///   there (spec 6.4): they are read here too, and no receipt goes from here. Its `Delivered`
 ///   receipt says nothing to this device and is dropped.
+/// * a `PushHandle` (M7 spec 5.2) is no message: from the other account it becomes (or, empty,
+///   removes) the `push_peer` row of the leaf that sealed it; another device of this account's
+///   is only taken. Neither is stored, counted unread or notified.
 pub(super) fn open_app(
     c: &mut Connection,
     identity: Identity,
@@ -946,6 +949,7 @@ pub(super) fn open_app(
     let mut stored = Stored::Yes;
     let mut text = None;
     let mut read = false;
+    let mut peer_handle = false;
     if let Some(message) = message {
         if matches!(message.content, Content::Text { .. }) {
             text = Some(MessageKey {
@@ -979,6 +983,18 @@ pub(super) fn open_app(
             Content::Receipt { .. } if own => Stored::Yes,
             Content::Receipt { kind, targets } => {
                 apply_receipt(&tx, identity, conversation, *kind, targets, now)?;
+                Stored::Yes
+            }
+            Content::PushHandle { handle } => {
+                if !own {
+                    peer_handle = super::push_store::store_peer_handle(
+                        &tx,
+                        conversation,
+                        sender_install,
+                        handle,
+                        now,
+                    )?;
+                }
                 Stored::Yes
             }
             // Content this version does not know is dropped (spec 5.1 `Custom` fallback).
@@ -1035,6 +1051,11 @@ pub(super) fn open_app(
         (Stored::Yes | Stored::New, None) if read => {
             MessageDbReply::OpenedRead(MlsReply::Ack { ct_hash }, conversation)
         }
+        (Stored::Yes | Stored::New, None) if peer_handle => MessageDbReply::OpenedPushHandle {
+            reply: MlsReply::Ack { ct_hash },
+            conversation,
+            installation: sender_install,
+        },
         (Stored::Yes | Stored::New, None) => ack,
     })
 }
@@ -1648,6 +1669,29 @@ pub(super) fn fixture_state(c: &Connection, conversation: ConversationId) -> R<M
     })
 }
 
+/// Test-only: seals a `PushHandle` of this device in the conversation's group and returns the
+/// MLS ciphertext. Only the ratchet changes (no frame is queued or logged).
+#[cfg(all(feature = "test-hooks", debug_assertions))]
+pub(super) fn fixture_seal_push_handle(
+    c: &mut Connection,
+    identity: Identity,
+    local: &LocalAccount,
+    conversation: ConversationId,
+    handle: Vec<u8>,
+    issued_at_ms: u64,
+) -> R<MessageDbReply> {
+    let tx = c.transaction().map_err(sql)?;
+    let group = group_row(&tx, conversation)?.ok_or_else(missing)?;
+    let provider = MlsProvider::new(KvStore::load_scope(&tx, conversation.0)?);
+    let (signer, _) = signer_of(local);
+    let message =
+        crate::mls::payload::push_handle_message(identity.installation, issued_at_ms, handle);
+    let ciphertext = group::seal(&provider, &signer, &group.group_id, &message)?;
+    provider.storage().flush(&tx, conversation.0)?;
+    finish(tx, NO_FAULT)?;
+    Ok(MessageDbReply::Ciphertext(ciphertext))
+}
+
 /// Test-only: lets the next own Commit be made although the last one is unacknowledged.
 #[cfg(all(feature = "test-hooks", debug_assertions))]
 pub(super) fn fixture_clear_commit_flag(c: &Connection, conversation: ConversationId) -> R<()> {
@@ -1684,6 +1728,137 @@ mod tests {
     }
     fn count(c: &Connection, sql: &str) -> i64 {
         c.query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    /// M7 spec 5.2: a `PushHandle` sealed by another device of this account is taken like any
+    /// frame (processed, in the device log, acknowledged) but is no peer handle; one from the
+    /// other account goes into `push_peer` under the leaf that sealed it.
+    #[test]
+    fn own_push_handle_is_not_stored_as_peer() {
+        let device = |seed: u8| derive_device(Secret32::from([seed; 32])).unwrap();
+        let (a1, b1, b2) = (device(1), device(2), device(3));
+        let (a_peer, b_peer) = (PeerId([1; 32]), PeerId([2; 32]));
+        let conversation = conversation_id(b_peer, a_peer).unwrap();
+        let party = |peer: PeerId, device: &crate::account::DeviceKeys, c: &Connection| {
+            (
+                MlsProvider::new(KvStore::load(c, conversation.0).unwrap()),
+                mls_signer(device),
+                MlsCredential::issue(peer, device),
+            )
+        };
+        let any = |_: &[u8], _: &[u8]| -> R<()> { Ok(()) };
+        let (a_connection, mut b1_connection, b2_connection) = (database(), database(), database());
+        let a = party(a_peer, &a1, &a_connection);
+        let b = party(b_peer, &b1, &b1_connection);
+        let b_other = party(b_peer, &b2, &b2_connection);
+        let key_packages = [&b, &b_other]
+            .map(|(p, signer, credential)| group::new_key_package(p, signer, credential).unwrap());
+        let created =
+            group::create_group(&a.0, &a.1, &a.2, conversation, &key_packages, &any).unwrap();
+        let joined = group::join(&b.0, &created.welcome, &any).unwrap();
+        group::join(&b_other.0, &created.welcome, &any).unwrap();
+        {
+            let tx = b1_connection.transaction().unwrap();
+            tx.execute(
+                "INSERT INTO conversation VALUES(?1,?2,0,?3,0,0)",
+                params![
+                    conversation.0.as_slice(),
+                    a_peer.0.as_slice(),
+                    [0u8; 32].as_slice()
+                ],
+            )
+            .unwrap();
+            b.0.storage().flush(&tx, conversation.0).unwrap();
+            tx.execute(
+                "INSERT INTO mls_conversation(conversation,group_id,first_commit_hash,epoch,own_commit_unacked,rejoin_count,rejoin_after_ms,peer_mls) VALUES(?1,?2,?3,?4,0,0,0,1)",
+                params![
+                    conversation.0.as_slice(),
+                    joined.group_id,
+                    created.first_commit_hash.as_slice(),
+                    joined.epoch as i64
+                ],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        let identity = Identity {
+            peer: b_peer,
+            installation: b1.installation_id(),
+        };
+        let open = |c: &mut Connection, from: OpenFrom, ciphertext: Vec<u8>| {
+            open_app(c, identity, &from, conversation, ciphertext, 7, NO_FAULT).unwrap()
+        };
+        let handle = vec![0x42; 100];
+
+        // From B2, a device of this account.
+        let message =
+            crate::mls::payload::push_handle_message(b2.installation_id(), 1, handle.clone());
+        let ciphertext = group::seal(&b_other.0, &b_other.1, &created.group_id, &message).unwrap();
+        let hash: [u8; 32] = Sha256::digest(&ciphertext).into();
+        let own = OpenFrom {
+            peer: b_peer,
+            transport: b2.installation_id(),
+            allowed: vec![b1.installation_id(), b2.installation_id()],
+            pull: None,
+        };
+        let reply = open(&mut b1_connection, own, ciphertext);
+        assert!(matches!(
+            reply,
+            MessageDbReply::Opened(MlsReply::Ack { ct_hash }) if ct_hash == hash
+        ));
+        assert_eq!(count(&b1_connection, "SELECT count(*) FROM push_peer"), 0);
+        assert_eq!(count(&b1_connection, "SELECT count(*) FROM message"), 0);
+        assert_eq!(
+            count(
+                &b1_connection,
+                "SELECT count(*) FROM processed_ct WHERE codec=2"
+            ),
+            1
+        );
+        assert_eq!(
+            count(&b1_connection, "SELECT count(*) FROM mailbox_store"),
+            1
+        );
+
+        // From A1, the other account: kept for A1's leaf.
+        let message =
+            crate::mls::payload::push_handle_message(a1.installation_id(), 1, handle.clone());
+        let ciphertext = group::seal(&a.0, &a.1, &created.group_id, &message).unwrap();
+        let hash: [u8; 32] = Sha256::digest(&ciphertext).into();
+        let peer = OpenFrom {
+            peer: a_peer,
+            transport: a1.installation_id(),
+            allowed: vec![a1.installation_id()],
+            pull: None,
+        };
+        let reply = open(&mut b1_connection, peer, ciphertext);
+        assert!(matches!(
+            reply,
+            MessageDbReply::OpenedPushHandle {
+                reply: MlsReply::Ack { ct_hash },
+                conversation: c,
+                installation,
+            } if ct_hash == hash && c == conversation && installation == a1.installation_id()
+        ));
+        let stored: (Vec<u8>, Vec<u8>, Vec<u8>, i64) = b1_connection
+            .query_row("SELECT * FROM push_peer", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })
+            .unwrap();
+        assert_eq!(
+            stored,
+            (
+                conversation.0.to_vec(),
+                a1.installation_id().0.to_vec(),
+                handle,
+                7
+            )
+        );
+        assert_eq!(count(&b1_connection, "SELECT count(*) FROM message"), 0);
+        assert_eq!(
+            count(&b1_connection, "SELECT count(*) FROM mailbox_store"),
+            2
+        );
     }
 
     /// An authenticated application message whose plaintext is not a `ChatMessage` (Ruling 8):

@@ -2663,6 +2663,8 @@ impl Manager {
                 self.read_synced(conversation, via, request).await;
                 Ok(Some(reply))
             }
+            // A peer device's push handle went into `push_peer` (M7 spec 5.2): nothing to show.
+            Ok(MessageDbReply::OpenedPushHandle { reply, .. }) => Ok(Some(reply)),
             Ok(MessageDbReply::Rejected) => Ok(None),
             // Sealed by a device of the account that is not current here. Directly: refused,
             // whoever carries it. From another own device's log (final review I3): that device
