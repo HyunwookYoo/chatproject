@@ -1,6 +1,5 @@
 package dev.chatproject.chat_app
 
-import android.content.Context
 import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.os.Bundle
@@ -23,10 +22,11 @@ internal fun ownedTestDataDir(filesDir: java.io.File, requestedPath: String): St
     return canonical.path
 }
 
+// The native library, its JNI context and the account key protector are ready before this
+// starts (ChatApplication).
 class MainActivity : FlutterActivity() {
-    private external fun initializeNetworkContext(context: Context): Boolean
-    private external fun initializeAccountKeyStore(store: AccountKeyStore): Boolean
     private lateinit var accountKeys: AccountKeyStore
+    private val notifications by lazy { Notifications(this) }
     private var accountChannel: MethodChannel? = null
     private var pendingInvite: String? = null
     private var mailbox: MailboxChannel? = null
@@ -45,7 +45,7 @@ class MainActivity : FlutterActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         receiveInvite(intent)
-        MailboxChannel.conversationOf(intent)?.let { mailbox?.openConversation(it) }
+        Notifications.conversationOf(intent)?.let { mailbox?.openConversation(it) }
     }
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
@@ -54,14 +54,23 @@ class MainActivity : FlutterActivity() {
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
-        System.loadLibrary("chat_ffi")
-        check(initializeNetworkContext(applicationContext)) { "Network context initialization failed" }
         accountKeys = AccountKeyStore(applicationContext)
-        check(initializeAccountKeyStore(accountKeys)) { "Account key protection initialization failed" }
         receiveInvite(intent)
         // A recreated activity keeps its launch intent; that tap was handled.
-        if (savedInstanceState == null) launchConversation = MailboxChannel.conversationOf(intent)
+        if (savedInstanceState == null) launchConversation = Notifications.conversationOf(intent)
         super.onCreate(savedInstanceState)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // The app on screen fetches what a push could not show (Notifications.showGeneric).
+        notifications.cancelGeneric()
+        mailbox?.setResumed(true)
+    }
+
+    override fun onPause() {
+        mailbox?.setResumed(false)
+        super.onPause()
     }
 
     override fun getDartEntrypointArgs(): List<String>? {

@@ -1,23 +1,31 @@
 #!/usr/bin/env python3
-"""Reject controller code in every native member of a Release artifact."""
+"""Reject controller code in every native member of a Release artifact, and the debug-only test
+push receiver in a Release APK's code and manifest."""
 import pathlib
 import sys
 import zipfile
 
 MARKER = b"chat-test-hooks:v1"
 MARKERS = (MARKER, b"account_local_", b"message_local_", b"Local record fixture unavailable")
+# The debug source set's push receiver (src/debug): dex names are UTF-8, the binary manifest's
+# string pool may be UTF-16.
+APP_MARKERS = tuple(
+    text.encode(encoding)
+    for text in ("TestPushReceiver", "dev.chatproject.chat_app.TEST_PUSH")
+    for encoding in ("utf-8", "utf-16-le")
+)
 MACHO = {bytes.fromhex(value) for value in (
     "feedface", "cefaedfe", "feedfacf", "cffaedfe", "cafebabe", "bebafeca", "cafebabf", "bfbafeca"
 )}
 
 
-def scan(stream):
+def scan(stream, markers=MARKERS, problem="native artifact contains test controller marker"):
     tail = b""
     while block := stream.read(1024 * 1024):
         data = tail + block
-        if any(marker in data for marker in MARKERS):
-            raise ValueError("native artifact contains test controller marker")
-        tail = data[-max(map(len, MARKERS)):]
+        if any(marker in data for marker in markers):
+            raise ValueError(problem)
+        tail = data[-max(map(len, markers)):]
 
 
 def check(artifact):
@@ -33,6 +41,9 @@ def check(artifact):
                     with archive.open(member) as stream:
                         scan(stream)
                     count += 1
+                elif member.filename.lower().endswith(".dex") or member.filename == "AndroidManifest.xml":
+                    with archive.open(member) as stream:
+                        scan(stream, APP_MARKERS, "release APK contains the debug test push receiver")
     elif artifact.is_dir():
         apple = artifact.suffix.lower() == ".app"
         files = sorted(artifact.rglob("*"))

@@ -83,17 +83,34 @@ def check(path, doc):
     return problems
 
 
-def check_android_instrumentation(output, phase):
-    expected = {'restartPersistence'} if phase in ('write', 'read') else {
+# Each phase: (test class, methods that must pass, the one method that must be skipped or None).
+# `full`/`write`/`read`: the native worker and its restart persistence (AccountKeyStoreTest).
+# `push`/`cold`: the push receiver, then its cold-process notification (PushReceiverTest).
+_ACCOUNT_TEST = 'dev.chatproject.chat_app.AccountKeyStoreTest'
+_PUSH_TEST = 'dev.chatproject.chat_app.PushReceiverTest'
+INSTRUMENTATION_PHASES = {
+    'full': (_ACCOUNT_TEST, {
         'ownedTestPathAcceptsOnlyAbsoluteChildren', 'ownedTestPathRejectsChildSymlinkEscape',
         'ownedTestPathRejectsRootSymlinkEscape', 'nativeWorkerUsesCachedHelperAndThreadLocalEnvironment',
         'roundTripScopeTamperAndDelete', 'noBackupRootPreservesLegacyIncompleteState',
         'invalidInputsAndCapacityDoNotCreateKeys',
-    }
+    }, 'restartPersistence'),
+    'write': (_ACCOUNT_TEST, {'restartPersistence'}, None),
+    'read': (_ACCOUNT_TEST, {'restartPersistence'}, None),
+    'push': (_PUSH_TEST, {
+        'unknownTagPostsNothing', 'storageRootSameFromNativeAndFlutter', 'brokenBindingFailsEnsureInitialized',
+        'notifierPostsUpdatesAndCancels', 'pushTheCoreCannotTakeStillNotifies',
+    }, 'coldPushShowedNotification'),
+    'cold': (_PUSH_TEST, {'coldPushShowedNotification'}, None),
+}
+
+
+def check_android_instrumentation(output, phase):
     failure = ['Android native worker/restart instrumentation did not complete selected tests']
-    if phase not in ('full', 'write', 'read') or re.search(
+    if phase not in INSTRUMENTATION_PHASES or re.search(
             r'FAILURES!!!|INSTRUMENTATION_FAILED|Process crashed', output):
         return failure
+    test_class, expected, assumption = INSTRUMENTATION_PHASES[phase]
     if not re.search(r'OK \([1-9][0-9]* tests?\)', output) or re.findall(
             r'^INSTRUMENTATION_CODE: (-?\d+)\s*$', output, re.M) != ['-1']:
         return failure
@@ -106,18 +123,18 @@ def check_android_instrumentation(output, phase):
         elif line.startswith('INSTRUMENTATION_STATUS_CODE: '):
             code = line[len('INSTRUMENTATION_STATUS_CODE: '):].strip()
             method = status.get('test')
-            if status.get('class') != 'dev.chatproject.chat_app.AccountKeyStoreTest':
+            if status.get('class') != test_class:
                 return failure
             if code == '1' and method not in started:
                 started.add(method)
             elif code == '0' and method in started and method not in completed:
                 completed.add(method)
-            elif code == '-4' and phase == 'full' and method == 'restartPersistence' and method in started:
+            elif code == '-4' and method == assumption and method in started:
                 skipped.add(method)
             else:
                 return failure
             status = {}
-    allowed_skip = {'restartPersistence'} if phase == 'full' else set()
+    allowed_skip = {assumption} if assumption else set()
     return [] if completed == expected and skipped == allowed_skip and started == expected | allowed_skip else failure
 
 
@@ -134,6 +151,8 @@ def check_ci(name, doc):
         if not all(token in script for token in (':app:assembleDebugAndroidTest', 'AccountKeyStoreTest',
                 'for phase in write read', 'accountPhase', '--android-instrumentation', 'adb -s emulator-5554')):
             problems.append(f"{name}: Android native worker and separate restart instrumentation gates are required")
+        if not all(token in script for token in ('PushReceiverTest', 'pushPhase', 'TestPushReceiver')):
+            problems.append(f"{name}: Android push receiver and cold-process notification instrumentation gates are required")
     bindings = (doc.get("jobs") or {}).get("bindings")
     if bindings is not None:
         generated = "\n".join(step.get("run", "") for step in bindings.get("steps") or [])

@@ -73,6 +73,29 @@ class CheckTest(unittest.TestCase):
         self.assertTrue(check_workflows.check_android_instrumentation(output.replace('nativeWorkerUsesCachedHelperAndThreadLocalEnvironment', 'notWorker'), 'full'))
         self.assertTrue(check_workflows.check_android_instrumentation(output.replace('CODE: 0', 'CODE: -4'), 'full'))
 
+    def push_output(self, methods, skipped=()):
+        return ''.join(f'INSTRUMENTATION_STATUS: class=dev.chatproject.chat_app.PushReceiverTest\nINSTRUMENTATION_STATUS: test={method}\nINSTRUMENTATION_STATUS_CODE: {code}\n'
+                       for method in methods for code in (1, -4 if method in skipped else 0)) + f'OK ({len(methods)} tests)\nINSTRUMENTATION_CODE: -1\n'
+
+    def test_push_instrumentation_requires_its_class_and_only_the_cold_assumption(self):
+        methods = ('unknownTagPostsNothing', 'storageRootSameFromNativeAndFlutter', 'brokenBindingFailsEnsureInitialized',
+                   'notifierPostsUpdatesAndCancels', 'pushTheCoreCannotTakeStillNotifies', 'coldPushShowedNotification')
+        output = self.push_output(methods, skipped=('coldPushShowedNotification',))
+        self.assertEqual(check_workflows.check_android_instrumentation(output, 'push'), [])
+        self.assertTrue(check_workflows.check_android_instrumentation(output.replace('unknownTagPostsNothing', 'other'), 'push'))
+        self.assertTrue(check_workflows.check_android_instrumentation(output.replace('PushReceiverTest', 'AccountKeyStoreTest'), 'push'))
+        self.assertTrue(check_workflows.check_android_instrumentation(output, 'full'))
+        cold = self.push_output(('coldPushShowedNotification',))
+        self.assertEqual(check_workflows.check_android_instrumentation(cold, 'cold'), [])
+        self.assertTrue(check_workflows.check_android_instrumentation(self.push_output(('coldPushShowedNotification',), skipped=('coldPushShowedNotification',)), 'cold'))
+
+    def test_android_cannot_omit_push_instrumentation(self):
+        doc = ci()
+        doc['jobs']['android'] = {'steps': [{'run': ':app:assembleDebugAndroidTest AccountKeyStoreTest for phase in write read accountPhase --android-instrumentation adb -s emulator-5554'}]}
+        self.assertTrue(any('push receiver' in p for p in check(pathlib.Path('ci.yml'), doc)))
+        doc['jobs']['android']['steps'][0]['run'] += ' PushReceiverTest pushPhase TestPushReceiver'
+        self.assertFalse(any('push receiver' in p for p in check(pathlib.Path('ci.yml'), doc)))
+
     def test_a_good_testflight_workflow_passes(self):
         self.assertEqual(check(self.path, testflight()), [])
 

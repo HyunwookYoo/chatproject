@@ -14,7 +14,7 @@
         android:fullBackupContent="@xml/account_backup_rules"
         android:dataExtractionRules="@xml/account_data_extraction_rules"
         android:label="ChatProject"
-        android:name="${applicationName}"
+        android:name=".ChatApplication"
         android:icon="@mipmap/ic_launcher">
         <activity
             android:name=".MainActivity"
@@ -49,6 +49,18 @@
             android:name=".MailboxService"
             android:foregroundServiceType="remoteMessaging"
             android:exported="false"/>
+        <!-- Pushes (M7 spec 5.4): FCM data messages, handled without Flutter. Not a
+             foreground service: a push shows only message notifications. -->
+        <service
+            android:name=".PushService"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.google.firebase.MESSAGING_EVENT"/>
+            </intent-filter>
+        </service>
+        <meta-data
+            android:name="com.google.firebase.messaging.default_notification_channel_id"
+            android:value="messages" />
         <!-- Don't delete the meta-data below.
              This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->
         <meta-data

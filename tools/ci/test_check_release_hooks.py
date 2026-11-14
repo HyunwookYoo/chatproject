@@ -48,6 +48,19 @@ class ReleaseHooksTests(unittest.TestCase):
         (app / "chat_ffi").write_bytes(MACHO + marker)
         self.check(app, False)
 
+    def test_release_apk_rejects_the_debug_test_push_receiver(self):
+        clean = {"lib/x86_64/libchat_ffi.so": b"ELF clean", "classes.dex": b"dex\nLdev/chatproject/chat_app/PushService;",
+                 "AndroidManifest.xml": ".PushService".encode("utf-16-le")}
+        self.check(self.apk(clean), True)
+        for name, data in (
+            ("classes2.dex", b"dex\nLdev/chatproject/chat_app/TestPushReceiver;"),
+            ("classes.dex", b"dex\ndev.chatproject.chat_app.TEST_PUSH"),
+            ("AndroidManifest.xml", ".TestPushReceiver".encode("utf-16-le")),
+            ("AndroidManifest.xml", b"dev.chatproject.chat_app.TEST_PUSH"),
+        ):
+            with self.subTest(name=name, data=data):
+                self.check(self.apk({**clean, name: data}), False)
+
     def test_no_native_apk_fails(self):
         self.check(self.apk({"assets/readme": b"clean"}), False)
 

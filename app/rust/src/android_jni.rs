@@ -9,7 +9,8 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
-// These handles must stay alive until process exit, including Activity recreation.
+// These handles must stay alive until process exit (`NativeInit` runs once per process, from
+// `ChatApplication`, before any activity, push receiver or worker).
 #[allow(dead_code)]
 struct ContextState {
     vm: JavaVM,
@@ -28,7 +29,7 @@ pub(crate) fn account_context() -> Option<(&'static JavaVM, &'static GlobalRef)>
 // Called from managed initialization after the existing network VM/context setup.
 // Cache the application object here: native worker threads cannot FindClass it reliably.
 #[no_mangle]
-pub extern "system" fn Java_dev_chatproject_chat_1app_MainActivity_initializeAccountKeyStore(
+pub extern "system" fn Java_dev_chatproject_chat_1app_NativeInit_initializeAccountKeyStore(
     env: JNIEnv,
     _this: JObject,
     store: JObject,
@@ -71,7 +72,7 @@ fn initialization_failed() -> jboolean {
 }
 
 #[no_mangle]
-pub extern "system" fn Java_dev_chatproject_chat_1app_MainActivity_initializeNetworkContext(
+pub extern "system" fn Java_dev_chatproject_chat_1app_NativeInit_initializeNetworkContext(
     env: JNIEnv,
     _this: JObject,
     context: JObject,
