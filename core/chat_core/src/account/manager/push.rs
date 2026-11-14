@@ -30,19 +30,39 @@
 //!   spawned task, bounded by `PUSH_TIMEOUT`; only its `gone` results come back, withdrawing
 //!   those handles. Read clearing (spec 7): reads here push one `read`, `READ_CLEAR_MS` after the
 //!   first of them, to my devices with an own-device handle and no session.
+//! * Receiving (spec 5.3, 5.4, 7): a push's tag names the conversation of one of this device's
+//!   current handles; an unknown one shows nothing. A `cipher` gets its group id back and is
+//!   opened like a received frame (`Via::Push`: no answer is sent), so a copy that also comes
+//!   directly is the same ciphertext and is taken once. A text stored just now alerts, one stored
+//!   already and unread updates its notification silently, one read already shows nothing; what
+//!   cannot be opened alerts as "새 메시지". A `wake` alerts as "새 메시지" first, then dials the
+//!   sender's devices and syncs with my devices until the caller's deadline: the first
+//!   notification of that conversation the fetch brings takes the generic one's place without
+//!   alerting again. A read clear syncs with my devices until the deadline. Both start the
+//!   network only if it was off, and stop only what they started; the waits happen in the
+//!   caller's task, never in an actor turn.
 use super::*;
+use super::mls::{Received, Via};
 use crate::account::connection::{Input, Session};
 use crate::message::{
     mls_group::Delivery,
-    push_store::{FirstAttempt, Issued, PushBatch, PushDbOp, PushDbReply, PushDue, RenewPlan},
+    push_store::{
+        FirstAttempt, Issued, PushBatch, PushDbOp, PushDbReply, PushDue, RenewPlan, Tagged,
+    },
     store::{MessageDbOp, MessageDbReply},
     types::{ConversationId, MessageId, MessageKey},
 };
+use crate::mls::{
+    group::MAX_MLS_MESSAGE_BYTES,
+    push_ct::{PushCtError, restore_group_id},
+    wire::MlsReply,
+};
 use crate::push::{
-    HandleRequest, Platform, PushConfig, PushError, PushProxy, PushResult, PushStatus,
-    RenewSummary, Tag,
+    FETCH_MAX_MS, HandleRequest, Platform, PushConfig, PushError, PushOutcome, PushProxy,
+    PushResult, PushStatus, ReceivedPush, RenewSummary, Tag,
 };
 use crate::mailbox::wire::HandoffEntry;
+use crate::{NetworkOp, NetworkReply, NetworkState};
 use push_wire::BASE64URL_NOPAD;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -59,6 +79,30 @@ const DIAL_CHECK_MS: u64 = 1_000;
 const PUSH_TIMEOUT: Duration = Duration::from_secs(20);
 /// Reads within this long of the first one clear notifications with one push (spec 7).
 const READ_CLEAR_MS: u64 = 1_000;
+/// While a fetch for a received push waits for the network to come up, it looks this often.
+const NETWORK_LOOK: Duration = Duration::from_millis(50);
+/// A fetch that got what it waited for keeps the network this much longer: the answer to the
+/// frame that brought it (the sender's `Ack`, so it shows delivered) is still on its way.
+const FETCH_LINGER: Duration = Duration::from_millis(1_000);
+/// While `push_messages_deleted` waits for the network to start, it looks this often.
+const FULL_SYNC_LOOK_MS: u64 = 1_000;
+
+/// What `AccountHandle` shares with the actor for push.
+#[derive(Default)]
+pub(super) struct Shared {
+    /// The latest `push_configure`.
+    config: ConfigSlot,
+    /// The network as received pushes use it.
+    network: tokio::sync::Mutex<NetworkLease>,
+}
+
+/// Received pushes fetching now, and whether they started the network (they stop it once the
+/// last of them ends).
+#[derive(Default)]
+struct NetworkLease {
+    users: u32,
+    started: bool,
+}
 
 /// The latest `push_configure` and its version, for the actor to take.
 #[derive(Default)]
@@ -122,6 +166,17 @@ pub(crate) struct Runtime {
     fingerprint: Option<[u8; 32]>,
     /// Scheduler time the pending read clear is sent at.
     read_clear_at: Option<u64>,
+    /// Wake pushes fetching now, per conversation: told when a notification of the conversation
+    /// takes the generic one's place. One whose caller stopped waiting (closed) is over.
+    waking: BTreeMap<ConversationId, oneshot::Sender<()>>,
+    /// Read clear pushes waiting for a sync with one of my devices to end.
+    syncs: Vec<oneshot::Sender<()>>,
+    /// `push_messages_deleted`: once the network is up, my devices are synced with and every
+    /// contact's devices dialed.
+    full_sync: bool,
+    /// The network is being looked at for `full_sync`, and when it is looked at next.
+    probing: bool,
+    probe_at: u64,
 }
 
 /// A spawned push request came back.
@@ -144,6 +199,81 @@ pub(crate) enum PushEvent {
         conversation: Option<ConversationId>,
         gone: Vec<(InstallationId, Vec<u8>)>,
     },
+    /// Whether the network is up, looked at for `push_messages_deleted`.
+    Network { ticket: u64, online: bool },
+}
+
+/// A wake push's conversation peer, and what tells its fetch is done.
+type Waking = (PeerId, oneshot::Receiver<()>);
+
+/// What a received push asks of the actor (`AccountHandle::push_received` and the rest).
+pub(super) enum PushCommand {
+    Cipher {
+        tag: Tag,
+        ciphertext: Vec<u8>,
+        reply: oneshot::Sender<Result<PushOutcome, CoreError>>,
+    },
+    /// Shows the generic notification of a wake push's conversation; replies its peer and what
+    /// tells the fetch is done (`None`: the tag is unknown).
+    Wake {
+        tag: Tag,
+        reply: oneshot::Sender<Result<Option<Waking>, CoreError>>,
+    },
+    /// Replies what tells a sync with one of my devices ended (a read clear push).
+    ReadClear {
+        reply: oneshot::Sender<Result<oneshot::Receiver<()>, CoreError>>,
+    },
+    /// Dials the devices of `peer` without a session, and syncs with my devices.
+    Fetch {
+        peer: Option<PeerId>,
+        reply: oneshot::Sender<Result<(), CoreError>>,
+    },
+    Ingest {
+        entries: Vec<(Tag, Vec<u8>)>,
+        reply: oneshot::Sender<Result<u32, CoreError>>,
+    },
+    MessagesDeleted {
+        reply: oneshot::Sender<Result<(), CoreError>>,
+    },
+    ConversationOf {
+        tag: Tag,
+        reply: oneshot::Sender<Result<Option<ConversationId>, CoreError>>,
+    },
+}
+
+impl PushCommand {
+    pub(super) fn reject(self, error: CoreError) {
+        match self {
+            Self::Cipher { reply, .. } => {
+                let _ = reply.send(Err(error));
+            }
+            Self::Wake { reply, .. } => {
+                let _ = reply.send(Err(error));
+            }
+            Self::ReadClear { reply } => {
+                let _ = reply.send(Err(error));
+            }
+            Self::Fetch { reply, .. } | Self::MessagesDeleted { reply } => {
+                let _ = reply.send(Err(error));
+            }
+            Self::Ingest { reply, .. } => {
+                let _ = reply.send(Err(error));
+            }
+            Self::ConversationOf { reply, .. } => {
+                let _ = reply.send(Err(error));
+            }
+        }
+    }
+}
+
+/// How a received ciphertext opened.
+enum PushOpened {
+    /// A text, stored just now or not.
+    Text(MessageKey, bool),
+    /// Something that is not a text (nothing to show).
+    Other,
+    /// It could not be opened or taken.
+    Failed,
 }
 
 impl AccountHandle {
@@ -154,8 +284,95 @@ impl AccountHandle {
         if let Some(url) = &config.proxy_url {
             crate::push::check_proxy_url(url)?;
         }
-        self.shared.push.set(config);
+        self.shared.push.config.set(config);
         Ok(())
+    }
+    /// A push this device received (spec 5.3, 5.4, 7), processed within `deadline` (at most
+    /// `FETCH_MAX_MS`). Shown through `CoreEvent::Notify`; an `Err` (the account cannot be used
+    /// now) shows nothing, and the platform shows its own "새 메시지".
+    pub async fn push_received(
+        &self,
+        push: ReceivedPush,
+        deadline: Duration,
+    ) -> Result<PushOutcome, CoreError> {
+        let until = tokio::time::Instant::now()
+            + deadline.min(Duration::from_millis(FETCH_MAX_MS));
+        match push {
+            ReceivedPush::Cipher { tag, ciphertext } => {
+                self.send(|reply| {
+                    Command::Push(PushCommand::Cipher {
+                        tag,
+                        ciphertext,
+                        reply,
+                    })
+                })
+                .await
+            }
+            ReceivedPush::Wake { tag } => {
+                // The generic notification first: the fetch may not end in time.
+                let Some((peer, fetched)) = self
+                    .send(|reply| Command::Push(PushCommand::Wake { tag, reply }))
+                    .await?
+                else {
+                    return Ok(PushOutcome::UnknownTag);
+                };
+                self.push_fetch(Some(peer), fetched, until).await;
+                Ok(PushOutcome::Notified)
+            }
+            ReceivedPush::ReadClear => {
+                let synced = self
+                    .send(|reply| Command::Push(PushCommand::ReadClear { reply }))
+                    .await?;
+                Ok(if self.push_fetch(None, synced, until).await {
+                    PushOutcome::Updated
+                } else {
+                    PushOutcome::Nothing
+                })
+            }
+        }
+    }
+    /// FCM dropped pushes for this device (`onDeletedMessages`): once the network is up, this
+    /// device syncs with my devices and dials every contact's devices.
+    pub async fn push_messages_deleted(&self) -> Result<(), CoreError> {
+        self.send(|reply| Command::Push(PushCommand::MessagesDeleted { reply }))
+            .await
+    }
+    /// The ciphertexts the iOS notification extension kept (spec 5.6), in order: each is taken
+    /// like a `cipher` push, without a notification (the extension showed one). Returns how
+    /// many texts were stored; ones stored already, and unknown tags, are skipped.
+    pub async fn push_ingest_inbox(&self, entries: Vec<(Tag, Vec<u8>)>) -> Result<u32, CoreError> {
+        self.send(|reply| Command::Push(PushCommand::Ingest { entries, reply }))
+            .await
+    }
+    /// The conversation `tag` names, if it is one of this device's current handles.
+    pub async fn push_conversation_of(&self, tag: Tag) -> Result<Option<ConversationId>, CoreError> {
+        self.send(|reply| Command::Push(PushCommand::ConversationOf { tag, reply }))
+            .await
+    }
+
+    /// Fetches for a received push until `done` is told or `until`: starts the network if it is
+    /// off, dials `peer`'s devices and syncs with my devices, and stops the network again if it
+    /// started it (and no other push still fetches). True when `done` was told in time; the
+    /// network then stays up `FETCH_LINGER` longer (within `until`) for the answers on their way.
+    async fn push_fetch(
+        &self,
+        peer: Option<PeerId>,
+        done: oneshot::Receiver<()>,
+        until: tokio::time::Instant,
+    ) -> bool {
+        let lease = NetworkUse::acquire(self.shared.clone()).await;
+        if lease.online(until).await {
+            let _ = self
+                .send(|reply| Command::Push(PushCommand::Fetch { peer, reply }))
+                .await;
+        }
+        let fetched = matches!(tokio::time::timeout_at(until, done).await, Ok(Ok(())));
+        if fetched {
+            let linger = tokio::time::Instant::now() + FETCH_LINGER;
+            tokio::time::sleep_until(linger.min(until)).await;
+        }
+        lease.release().await;
+        fetched
     }
     /// A new FCM/APNs token: taken while push is on, and every handle is issued again under it.
     pub async fn push_set_token(&self, platform: Platform, token: String) -> Result<(), CoreError> {
@@ -265,6 +482,7 @@ impl Manager {
         if self.messages.push.read_clear_at.is_some_and(|at| now >= at) {
             self.push_read_clears(request).await;
         }
+        self.push_probe(now, request);
         self.push_deliver(now, request).await;
     }
 
@@ -436,7 +654,7 @@ impl Manager {
     /// Takes a newer `push_configure`: the proxy for its address, and its platform into
     /// `push_local` (a change drops the token and every handle). The handles are checked next.
     async fn push_take_config(&mut self, request: Request) -> Result<(), CoreError> {
-        let Some((version, config)) = self.shared.push.newer(self.messages.push.config_seen)
+        let Some((version, config)) = self.shared.push.config.newer(self.messages.push.config_seen)
         else {
             return Ok(());
         };
@@ -689,6 +907,16 @@ impl Manager {
                     .push_db(PushDbOp::Gone { conversation, gone }, request)
                     .await;
             }
+            PushEvent::Network { ticket, online } => {
+                self.messages.push.probing = false;
+                let Some(request) = self.ready().ok().filter(|r| r.ticket == ticket) else {
+                    return;
+                };
+                if online && self.messages.push.full_sync {
+                    self.messages.push.full_sync = false;
+                    self.push_full_sync(request).await;
+                }
+            }
         }
     }
 
@@ -887,6 +1115,406 @@ impl Manager {
                 return;
             }
         }
+    }
+}
+
+/// Receiving pushes (spec 5.3, 5.4, 5.6, 7).
+impl Manager {
+    pub(super) async fn push_command(&mut self, command: PushCommand) {
+        match command {
+            PushCommand::Cipher {
+                tag,
+                ciphertext,
+                reply,
+            } => {
+                let result = self.push_cipher(tag, ciphertext).await;
+                let _ = reply.send(result);
+            }
+            PushCommand::Wake { tag, reply } => {
+                let result = self.push_wake(tag).await;
+                let _ = reply.send(result);
+            }
+            PushCommand::ReadClear { reply } => {
+                let result = self.ready().map(|_| {
+                    let (tell, told) = oneshot::channel();
+                    let syncs = &mut self.messages.push.syncs;
+                    syncs.retain(|sync| !sync.is_closed());
+                    syncs.push(tell);
+                    told
+                });
+                let _ = reply.send(result);
+            }
+            PushCommand::Fetch { peer, reply } => {
+                let result = self.push_fetch_now(peer).await;
+                let _ = reply.send(result);
+            }
+            PushCommand::Ingest { entries, reply } => {
+                let result = self.push_ingest(entries).await;
+                let _ = reply.send(result);
+            }
+            PushCommand::MessagesDeleted { reply } => {
+                let result = self.ready().map(|_| {
+                    self.messages.push.full_sync = true;
+                });
+                let _ = reply.send(result);
+            }
+            PushCommand::ConversationOf { tag, reply } => {
+                let result = match self.ready() {
+                    Ok(request) => self
+                        .push_tagged(tag, request)
+                        .await
+                        .map(|tagged| tagged.map(|t| t.conversation)),
+                    Err(error) => Err(error),
+                };
+                let _ = reply.send(result);
+            }
+        }
+    }
+
+    /// The conversation of a received push's tag: one of this device's current handles, in a
+    /// conversation with a contact.
+    async fn push_tagged(&mut self, tag: Tag, request: Request) -> Result<Option<Tagged>, CoreError> {
+        let PushDbReply::Tagged(tagged) = self.push_db(PushDbOp::Tagged(tag), request).await?
+        else {
+            return Err(unavailable(ErrorCode::InvalidMessage));
+        };
+        Ok(tagged.filter(|t| self.conversation_peer(t.conversation, t.peer).is_some()))
+    }
+
+    /// Opens a pushed ciphertext of `tagged`'s conversation like a received frame (`Via::Push`),
+    /// its group id given back first so a copy that came directly is the same ciphertext.
+    async fn push_open(
+        &mut self,
+        tagged: &Tagged,
+        ciphertext: Vec<u8>,
+        request: Request,
+    ) -> Result<PushOpened, CoreError> {
+        if ciphertext.len() > MAX_MLS_MESSAGE_BYTES {
+            return Ok(PushOpened::Failed);
+        }
+        let ciphertext = match restore_group_id(&ciphertext, &tagged.group_id) {
+            Ok(restored) => restored,
+            // Sent with its group id: opened as it is.
+            Err(PushCtError::NotStripped) => ciphertext,
+            Err(PushCtError::NotPrivate | PushCtError::Malformed) => {
+                return Ok(PushOpened::Failed);
+            }
+        };
+        let opened = self
+            .open_received(
+                tagged.peer,
+                None,
+                tagged.conversation,
+                ciphertext,
+                &Via::Push,
+                request,
+            )
+            .await;
+        match opened {
+            Ok(Received {
+                text: Some((key, new)),
+                ..
+            }) => Ok(PushOpened::Text(key, new)),
+            Ok(Received {
+                reply: Some(MlsReply::Ack { .. }),
+                ..
+            }) => Ok(PushOpened::Other),
+            Ok(_) => Ok(PushOpened::Failed),
+            Err(error)
+                if matches!(
+                    error.code,
+                    ErrorCode::AccountRestricted | ErrorCode::StorageLocked
+                ) =>
+            {
+                Err(error)
+            }
+            Err(_) => Ok(PushOpened::Failed),
+        }
+    }
+
+    /// A `cipher` push: a text stored just now alerts, one stored already and unread updates the
+    /// notification silently, one read already (or anything not a text) shows nothing, and
+    /// what cannot be opened alerts as "새 메시지".
+    async fn push_cipher(&mut self, tag: Tag, ciphertext: Vec<u8>) -> Result<PushOutcome, CoreError> {
+        let request = self.ready()?;
+        let Some(tagged) = self.push_tagged(tag, request).await? else {
+            return Ok(PushOutcome::UnknownTag);
+        };
+        let shown = match self.push_open(&tagged, ciphertext, request).await {
+            Ok(PushOpened::Text(key, new)) => {
+                self.push_text_shown(tagged.conversation, key, new, request)
+                    .await
+            }
+            Ok(PushOpened::Other) => Some(PushOutcome::Nothing),
+            Ok(PushOpened::Failed) | Err(_) => None,
+        };
+        if let Some(outcome) = shown {
+            return Ok(outcome);
+        }
+        self.push_generic(tagged.conversation, tagged.peer, request)
+            .await;
+        Ok(PushOutcome::Notified)
+    }
+
+    /// Shows a pushed text (spec 5.3): `None` when its notification could not be made.
+    async fn push_text_shown(
+        &mut self,
+        conversation: ConversationId,
+        key: MessageKey,
+        new: bool,
+        request: Request,
+    ) -> Option<PushOutcome> {
+        let seen = match self.push_db(PushDbOp::Seen(key), request).await {
+            Ok(PushDbReply::Seen(seen)) => seen,
+            _ => None,
+        };
+        match (seen, new) {
+            // Read on another device already: no notification (M6 user decision, spec 5.3).
+            (Some(true), _) => Some(PushOutcome::Nothing),
+            (Some(false), true) => self
+                .push_notify(vec![key], Vec::new(), request)
+                .await
+                .then_some(PushOutcome::Notified),
+            // It alerted when it came first: never a second time.
+            (_, false) => Some(
+                if self.push_notify(Vec::new(), vec![conversation], request).await {
+                    PushOutcome::Updated
+                } else {
+                    PushOutcome::Nothing
+                },
+            ),
+            (None, true) => None,
+        }
+    }
+
+    /// Notifies the texts `keys` and the conversations `read`; false when nothing was shown.
+    async fn push_notify(
+        &mut self,
+        keys: Vec<MessageKey>,
+        read: Vec<ConversationId>,
+        request: Request,
+    ) -> bool {
+        match self
+            .message_db(MessageDbOp::NotifyItems(keys, read), request)
+            .await
+        {
+            Ok(MessageDbReply::Notify(items)) if !items.is_empty() => {
+                self.publish_notify(items);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The "새 메시지" notification of a push whose text cannot be shown: one new message more
+    /// than the conversation's unread ones, without a preview.
+    async fn push_generic(&mut self, conversation: ConversationId, peer: PeerId, request: Request) {
+        let op = MessageDbOp::NotifyItems(Vec::new(), vec![conversation]);
+        let unread = match self.message_db(op, request).await {
+            Ok(MessageDbReply::Notify(items)) => items.first().map_or(0, |item| item.unread),
+            _ => 0,
+        };
+        self.publish_notify(vec![crate::event::NotifyItem {
+            conversation,
+            peer,
+            new_messages: 1,
+            unread: unread.saturating_add(1),
+            title: String::new(),
+            preview: None,
+        }]);
+    }
+
+    /// A `wake` push: its conversation's generic notification now; the fetch that follows
+    /// (`push_fetch`) is told once a notification of the conversation takes its place.
+    async fn push_wake(
+        &mut self,
+        tag: Tag,
+    ) -> Result<Option<Waking>, CoreError> {
+        let request = self.ready()?;
+        let Some(Tagged {
+            conversation, peer, ..
+        }) = self.push_tagged(tag, request).await?
+        else {
+            return Ok(None);
+        };
+        self.push_generic(conversation, peer, request).await;
+        let (tell, told) = oneshot::channel();
+        self.messages.push.waking.insert(conversation, tell);
+        Ok(Some((peer, told)))
+    }
+
+    /// Dials `peer`'s devices without a session and syncs with my devices; the dials run in
+    /// spawned tasks.
+    async fn push_fetch_now(&mut self, peer: Option<PeerId>) -> Result<(), CoreError> {
+        let request = self.ready()?;
+        if let Some(peer) = peer {
+            self.push_dial_devices(peer, request);
+        }
+        self.mailbox_sync_now().await
+    }
+
+    fn push_dial_devices(&mut self, peer: PeerId, request: Request) {
+        for installation in self.current_installations(peer) {
+            if !self.ready_session(peer, installation) {
+                self.start_dial(peer, installation, request);
+            }
+        }
+    }
+
+    /// The network is up after `push_messages_deleted`: syncs with my devices and dials every
+    /// contact's devices (spec 5.4, design 8.3).
+    async fn push_full_sync(&mut self, request: Request) {
+        let Ok(local) = self.local() else {
+            return;
+        };
+        let peers: Vec<PeerId> = local.contacts.iter().map(|c| c.peer).collect();
+        for peer in peers {
+            self.push_dial_devices(peer, request);
+        }
+        let _ = self.mailbox_sync_now().await;
+    }
+
+    /// While `push_messages_deleted` waits, looks whether the network is up, in a spawned task.
+    fn push_probe(&mut self, now: u64, request: Request) {
+        let push = &mut self.messages.push;
+        if !push.full_sync || push.probing || now < push.probe_at {
+            return;
+        }
+        push.probing = true;
+        push.probe_at = now.saturating_add(FULL_SYNC_LOOK_MS);
+        let network = self.shared.network.clone();
+        let mailbox = self.auth.send.clone();
+        let ticket = request.ticket;
+        tokio::spawn(async move {
+            let online = matches!(
+                network.execute(NetworkOp::Info).await,
+                Ok(NetworkReply::Info(info)) if info.state == NetworkState::Online
+            );
+            let _ = mailbox
+                .send(Input::Push(PushEvent::Network { ticket, online }))
+                .await;
+        });
+    }
+
+    /// The iOS extension's ciphertexts, taken without a notification; how many were stored.
+    async fn push_ingest(&mut self, entries: Vec<(Tag, Vec<u8>)>) -> Result<u32, CoreError> {
+        let request = self.ready()?;
+        let mut stored = 0u32;
+        for (tag, ciphertext) in entries {
+            let Some(tagged) = self.push_tagged(tag, request).await? else {
+                continue;
+            };
+            if let PushOpened::Text(_, true) = self.push_open(&tagged, ciphertext, request).await? {
+                stored = stored.saturating_add(1);
+            }
+        }
+        Ok(stored)
+    }
+
+    /// Fills in each item's title (the contact's alias), and lets the first notification of a
+    /// conversation a wake push fetches for take the generic one's place without alerting again.
+    pub(super) fn push_notify_items(&mut self, items: &mut [crate::event::NotifyItem]) {
+        if let Ok(local) = self.local() {
+            for item in items.iter_mut() {
+                item.title = local
+                    .contacts
+                    .iter()
+                    .find(|c| c.peer == item.peer)
+                    .map(|c| c.alias.clone())
+                    .unwrap_or_default();
+            }
+        }
+        let waking = &mut self.messages.push.waking;
+        waking.retain(|_, fetched| !fetched.is_closed());
+        for item in items.iter_mut() {
+            if (item.new_messages > 0 || item.unread == 0)
+                && let Some(fetched) = waking.remove(&item.conversation)
+            {
+                // The generic notification alerted for it already.
+                item.new_messages = 0;
+                let _ = fetched.send(());
+            }
+        }
+    }
+
+    /// A sync with one of my devices ended: the read clear pushes waiting are told.
+    pub(super) fn push_pull_done(&mut self) {
+        for sync in std::mem::take(&mut self.messages.push.syncs) {
+            let _ = sync.send(());
+        }
+    }
+}
+
+/// One received push's use of the network: it starts the network if it is off and nobody else
+/// uses it, and the last use to end stops what a push started. A use dropped before it ended
+/// (its task cancelled) ends in a task of its own.
+struct NetworkUse {
+    shared: Option<Arc<super::Shared>>,
+}
+
+impl NetworkUse {
+    async fn acquire(shared: Arc<super::Shared>) -> Self {
+        {
+            let mut lease = shared.push.network.lock().await;
+            if lease.users == 0 {
+                let off = matches!(
+                    shared.network.execute(NetworkOp::Info).await,
+                    Ok(NetworkReply::Info(info))
+                        if matches!(info.state, NetworkState::Stopped | NetworkState::Failed)
+                );
+                lease.started = off && shared.network.execute(NetworkOp::Start).await.is_ok();
+            }
+            lease.users = lease.users.saturating_add(1);
+        }
+        Self {
+            shared: Some(shared),
+        }
+    }
+
+    /// Whether the network is up by `until` (looked at every `NETWORK_LOOK`).
+    async fn online(&self, until: tokio::time::Instant) -> bool {
+        let Some(shared) = &self.shared else {
+            return false;
+        };
+        loop {
+            match shared.network.execute(NetworkOp::Info).await {
+                Ok(NetworkReply::Info(info)) => match info.state {
+                    NetworkState::Online => return true,
+                    NetworkState::Starting => {}
+                    NetworkState::Stopped | NetworkState::Failed => return false,
+                },
+                _ => return false,
+            }
+            if tokio::time::Instant::now() + NETWORK_LOOK > until {
+                return false;
+            }
+            tokio::time::sleep(NETWORK_LOOK).await;
+        }
+    }
+
+    async fn release(mut self) {
+        if let Some(shared) = self.shared.take() {
+            end_network_use(&shared).await;
+        }
+    }
+}
+
+impl Drop for NetworkUse {
+    fn drop(&mut self) {
+        if let Some(shared) = self.shared.take()
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            runtime.spawn(async move { end_network_use(&shared).await });
+        }
+    }
+}
+
+async fn end_network_use(shared: &super::Shared) {
+    let mut lease = shared.push.network.lock().await;
+    lease.users = lease.users.saturating_sub(1);
+    if lease.users == 0 && lease.started {
+        lease.started = false;
+        let _ = shared.network.execute(NetworkOp::Stop).await;
     }
 }
 

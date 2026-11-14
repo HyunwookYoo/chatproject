@@ -97,6 +97,8 @@ enum Command {
     PushSetEnabled(bool,oneshot::Sender<Result<(),CoreError>>),
     PushStatus(oneshot::Sender<Result<crate::push::PushStatus,CoreError>>),
     PushRenewDue(u64,oneshot::Sender<Result<crate::push::RenewSummary,CoreError>>),
+    /// A received push, and what processing one asks of the actor (M7).
+    Push(push::PushCommand),
     Retry(oneshot::Sender<Result<u64, CoreError>>),
     #[cfg(all(feature="test-hooks",debug_assertions))]
     PairTestStop(super::PairTestStop,oneshot::Sender<Result<(),CoreError>>),
@@ -176,6 +178,7 @@ impl Command {
             Self::PushSetToken(_,_,reply)|Self::PushSetEnabled(_,reply)=>{let _=reply.send(Err(error));}
             Self::PushStatus(reply)=>{let _=reply.send(Err(error));}
             Self::PushRenewDue(_,reply)=>{let _=reply.send(Err(error));}
+            Self::Push(command)=>command.reject(error),
             Self::Retry(reply) => { let _ = reply.send(Err(error)); }
             #[cfg(all(feature="test-hooks",debug_assertions))]
             Self::PairTestStop(_,reply)=>{let _=reply.send(Err(error));}
@@ -237,8 +240,9 @@ struct Shared {
     // ticket << 2 | 0 pending / 1 complete / 2 failed. Monotonic revisions
     // prevent an obsolete completion from reporting success for a newer request.
     status: AtomicU64,
-    /// The latest `push_configure`, taken by the actor at its next poll (M7).
-    push: push::ConfigSlot,
+    /// The latest `push_configure`, taken by the actor at its next poll, and the network a
+    /// received push started (M7).
+    push: push::Shared,
 }
 #[derive(Clone)]
 pub struct AccountHandle {
@@ -1278,6 +1282,7 @@ impl Manager {
                         Command::PushSetEnabled(enabled,reply)=>{let result=self.push_set_enabled(enabled).await;let _=reply.send(result);}
                         Command::PushStatus(reply)=>{let result=self.push_status().await;let _=reply.send(result);}
                         Command::PushRenewDue(now,reply)=>{self.push_renew_due(now,reply).await;}
+                        Command::Push(command)=>{self.push_command(command).await;}
                         Command::Retry(reply) => { let result = self.retry_open(); let _ = reply.send(result); }
                         #[cfg(all(feature="test-hooks",debug_assertions))]
                         Command::PairTestStop(stop,reply)=>{self.pair.stop=Some(stop);self.pair.reached=None;let _=reply.send(Ok(()));}

@@ -862,7 +862,7 @@ pub(super) fn open_app(
 ) -> R<MessageDbReply> {
     let ct_hash: [u8; 32] = Sha256::digest(&ciphertext).into();
     let ack = MessageDbReply::Opened(MlsReply::Ack { ct_hash });
-    if from.transport == identity.installation {
+    if from.transport == Some(identity.installation) {
         return Ok(ack);
     }
     let sender_peer = from.peer;
@@ -1811,7 +1811,7 @@ mod tests {
         let hash: [u8; 32] = Sha256::digest(&ciphertext).into();
         let own = OpenFrom {
             peer: b_peer,
-            transport: b2.installation_id(),
+            transport: Some(b2.installation_id()),
             allowed: vec![b1.installation_id(), b2.installation_id()],
             pull: None,
         };
@@ -1841,7 +1841,7 @@ mod tests {
         let hash: [u8; 32] = Sha256::digest(&ciphertext).into();
         let peer = OpenFrom {
             peer: a_peer,
-            transport: a1.installation_id(),
+            transport: Some(a1.installation_id()),
             allowed: vec![a1.installation_id()],
             pull: None,
         };
@@ -1958,7 +1958,7 @@ mod tests {
                 identity,
                 &OpenFrom {
                     peer: a_peer,
-                    transport: a_device.installation_id(),
+                    transport: Some(a_device.installation_id()),
                     allowed: vec![a_device.installation_id()],
                     pull: None,
                 },

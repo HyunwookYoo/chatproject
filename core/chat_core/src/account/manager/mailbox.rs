@@ -1743,10 +1743,12 @@ impl Manager {
 
     /// A text from the other account was stored just now: notified at once when it came
     /// directly, with the rest of its pull when it came from another own device's log (the
-    /// storing transaction marked it for that, Ruling 35).
+    /// storing transaction marked it for that, Ruling 35), and by the push's own processing
+    /// when a push brought it (`push_received`, which knows whether it was read already).
     pub(super) async fn text_stored(&mut self, key: MessageKey, via: &Via, request: Request) {
         match via {
             Via::Direct(_) => self.notify(vec![key], Vec::new(), request).await,
+            Via::Push => {}
             Via::Mailbox { .. } => {
                 #[cfg(all(feature = "test-hooks", debug_assertions))]
                 {
@@ -1769,7 +1771,7 @@ impl Manager {
         request: Request,
     ) {
         match via {
-            Via::Direct(_) => self.notify(Vec::new(), vec![conversation], request).await,
+            Via::Direct(_) | Via::Push => self.notify(Vec::new(), vec![conversation], request).await,
             Via::Mailbox { holder, .. } => {
                 if let Some(pull) = self.messages.mailbox.pulls.get_mut(holder) {
                     pull.read.insert(conversation);
@@ -1789,6 +1791,7 @@ impl Manager {
         };
         let now = self.schedule_now();
         let mailbox = &mut self.messages.mailbox;
+        let done = matches!(ended, Ended::Done);
         match ended {
             Ended::Done => {
                 mailbox.retry.remove(&holder);
@@ -1808,6 +1811,10 @@ impl Manager {
         if let Ok(MailboxDbReply::Notify(items)) = self.mailbox_db(op, request).await {
             self.publish_notify(items);
         }
+        if done {
+            // A read clear push (M7 spec 7) waits for a sync to end.
+            self.push_pull_done();
+        }
     }
 
     async fn notify(&mut self, keys: Vec<MessageKey>, read: Vec<ConversationId>, request: Request) {
@@ -1819,10 +1826,12 @@ impl Manager {
         }
     }
 
-    fn publish_notify(&mut self, items: Vec<crate::event::NotifyItem>) {
+    pub(super) fn publish_notify(&mut self, mut items: Vec<crate::event::NotifyItem>) {
         if items.is_empty() {
             return;
         }
+        // The alias, and a fetch for a wake push taking over its generic notification (M7).
+        self.push_notify_items(&mut items);
         #[cfg(all(feature = "test-hooks", debug_assertions))]
         {
             let new: u64 = items.iter().map(|i| u64::from(i.new_messages)).sum();

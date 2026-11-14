@@ -25,7 +25,8 @@ pub(crate) struct MessageRepo {
 /// sealed it; the MLS leaf that did is its sender.
 pub(crate) struct OpenFrom {
     pub peer: PeerId,
-    pub transport: InstallationId,
+    /// `None` for a push (M7): no device carried it.
+    pub transport: Option<InstallationId>,
     pub allowed: Vec<InstallationId>,
     /// The own device whose log it came from (a pull), if it did: a text from the other account
     /// stored just now is marked for that pull's notification (Ruling 35).
@@ -1363,9 +1364,50 @@ pub(super) fn notify_items(
                 peer: PeerId(peer),
                 new_messages,
                 unread,
+                // The alias is the actor's (`publish_notify`); the store has no contacts.
+                title: String::new(),
+                preview: last_unread_preview(c, conversation, unread)?,
             })
         })
         .collect()
+}
+/// Longest start of a text a notification shows, in bytes (M7; the iOS extension's too).
+pub(crate) const PREVIEW_BYTES: usize = 48;
+/// The start of `body` a notification shows: at most `PREVIEW_BYTES` bytes, cut at a character
+/// boundary.
+pub(crate) fn preview_prefix(body: &str) -> &str {
+    let mut end = body.len().min(PREVIEW_BYTES);
+    while !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    &body[..end]
+}
+/// A notification's body (M7): the start of the last unread text (`preview_prefix`), and
+/// `"<start> 외 N개"` when `more` (N) other messages are unread too.
+pub fn preview_text(body: &str, more: u32) -> String {
+    let prefix = preview_prefix(body);
+    if more == 0 {
+        prefix.to_owned()
+    } else {
+        format!("{prefix} 외 {more}개")
+    }
+}
+/// `preview_text` of the conversation's last unread text from the other account, the other
+/// unread ones counted; `None` with nothing unread.
+fn last_unread_preview(c: &Connection, conversation: ConversationId, unread: u64) -> R<Option<String>> {
+    if unread == 0 {
+        return Ok(None);
+    }
+    let body: Option<String> = c
+        .query_row(
+            "SELECT body FROM message WHERE conversation=?1 AND outgoing=0 AND seen_local=0 ORDER BY lamport DESC,sender_install DESC,msg_id DESC LIMIT 1",
+            params![conversation.0.as_slice()],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    let more = u32::try_from(unread - 1).unwrap_or(u32::MAX);
+    Ok(body.map(|body| preview_text(&body, more)))
 }
 impl MessageRepo {
     pub(crate) async fn operation(&self, op: MessageDbOp) -> R<MessageDbReply> {

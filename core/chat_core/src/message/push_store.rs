@@ -78,6 +78,14 @@ pub(crate) struct FirstAttempt {
     pub batch: Option<PushBatch>,
 }
 
+/// The conversation a received push's tag names (spec 5.3): one with a group, whose current
+/// handle carries that tag.
+pub(crate) struct Tagged {
+    pub conversation: ConversationId,
+    pub peer: PeerId,
+    pub group_id: Vec<u8>,
+}
+
 /// One `/push` request, and for each of its items (same order) whose handle it carries, so a
 /// `gone` result withdraws exactly that handle. `conversation`: the peers' handles of that
 /// conversation (`push_peer`); `None`: my own devices' handles (`push_own`).
@@ -242,6 +250,11 @@ pub(crate) enum PushDbOp {
     HandedOff {
         texts: Vec<(MessageKey, Vec<InstallationId>)>,
     },
+    /// The conversation of a received push's tag, if this device has a current handle with it
+    /// (a withdrawn one, or one of a conversation gone, names none). Replies `Tagged`.
+    Tagged(Tag),
+    /// Whether a received text is seen here already (`None`: not stored). Replies `Seen`.
+    Seen(MessageKey),
 }
 
 impl PushDbOp {
@@ -253,6 +266,8 @@ impl PushDbOp {
                 | Self::UnreachableDue { .. }
                 | Self::Status
                 | Self::ReadClear { .. }
+                | Self::Tagged(_)
+                | Self::Seen(_)
         )
     }
 }
@@ -285,6 +300,8 @@ pub(crate) enum PushDbReply {
     Batch(Option<PushBatch>),
     /// The pushes to send, one per message.
     Batches(Vec<PushBatch>),
+    Tagged(Option<Tagged>),
+    Seen(Option<bool>),
 }
 
 pub(super) fn push_op(
@@ -524,6 +541,35 @@ pub(super) fn push_op(
             finish(tx, fault)?;
             PushDbReply::Batches(batches)
         }
+        PushDbOp::Tagged(tag) => PushDbReply::Tagged(
+            c.query_row(
+                "SELECT p.conversation,v.peer,m.group_id FROM push_tag p JOIN conversation v ON v.id=p.conversation JOIN mls_conversation m ON m.conversation=p.conversation WHERE p.tag=?1 AND p.handle IS NOT NULL",
+                params![tag.as_slice()],
+                |r| {
+                    Ok(Tagged {
+                        conversation: ConversationId(bytes(r, 0)?),
+                        peer: PeerId(bytes(r, 1)?),
+                        group_id: r.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(sql)?,
+        ),
+        PushDbOp::Seen(key) => PushDbReply::Seen(
+            c.query_row(
+                "SELECT seen_local FROM message WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",
+                params![
+                    key.conversation.0.as_slice(),
+                    key.sender.0.as_slice(),
+                    key.installation.0.as_slice(),
+                    key.id.0.as_slice()
+                ],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(sql)?,
+        ),
     };
     Ok(MessageDbReply::Push(reply))
 }

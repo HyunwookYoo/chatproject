@@ -485,6 +485,8 @@ mod tests {
             peer: chat_core::account::PeerId([n + 1; 32]),
             new_messages,
             unread,
+            title: String::new(),
+            preview: None,
         };
         assert_eq!(
             ChatEvent::from(chat_core::CoreEvent::Notify { items: vec![item(1, 5, 7), item(3, 0, 0)] }),

@@ -46,7 +46,9 @@ async fn phone_gets_what_mailbox_kept_in_order_once() {
             conversation: conv,
             peer: b1.peer,
             new_messages: 5,
-            unread: 5
+            unread: 5,
+            title: "remote".into(),
+            preview: Some("text 5 외 4개".into()),
         }]
     );
 }
@@ -260,7 +262,9 @@ async fn sync_killed_after_a_page_notifies_its_texts_after_restart() {
             conversation: conv,
             peer: b1.peer,
             new_messages: 4,
-            unread: 4
+            unread: 4,
+            title: "remote".into(),
+            preview: Some("text 5 외 3개".into()),
         }]
     );
 }
@@ -282,7 +286,9 @@ async fn sync_killed_after_a_page_notifies_after_restart_without_its_holder() {
             conversation: conv,
             peer: b1.peer,
             new_messages: 3,
-            unread: 3
+            unread: 3,
+            title: "remote".into(),
+            preview: Some("text 3 외 2개".into()),
         }]
     );
     assert_eq!(texts_from(&a1, conv, b1.peer).await.len(), 3);

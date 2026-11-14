@@ -269,7 +269,7 @@ impl Messages {
         ciphertext: Vec<u8>,
         now: u64,
     ) -> Result<crate::mls::wire::MlsReply, CoreError> {
-        let from = crate::message::store::OpenFrom { peer: sender, transport, allowed, pull };
+        let from = crate::message::store::OpenFrom { peer: sender, transport: Some(transport), allowed, pull };
         let op = MessageDbOp::OpenApp(from, conversation, ciphertext, now);
         match self.mls(op).await? {
             MessageDbReply::Opened(reply)

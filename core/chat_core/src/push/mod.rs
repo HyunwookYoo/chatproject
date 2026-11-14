@@ -81,6 +81,36 @@ pub struct RenewSummary {
     pub withdrawn: u32,
 }
 
+/// Longest a received push may fetch for (spec 5.4: Android's wake budget); `push_received`
+/// takes a shorter deadline as it is.
+pub const FETCH_MAX_MS: u64 = 20_000;
+
+/// A push this device received (plan 2, spec 5.3), as the platform receiver parsed it: `t` and
+/// `e` (base64url-decoded), `t` with `w`, or `r`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReceivedPush {
+    /// A text's MLS ciphertext with its group id taken out (`strip_group_id`).
+    Cipher { tag: Tag, ciphertext: Vec<u8> },
+    /// A text too large to carry: fetched from the sender and my mailbox.
+    Wake { tag: Tag },
+    /// Messages were read on another of my devices (spec 7).
+    ReadClear,
+}
+
+/// What processing a received push showed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PushOutcome {
+    /// A notification that alerts (`NotifyItem::new_messages > 0`).
+    Notified,
+    /// The conversation's notification was updated or cleared without alerting.
+    Updated,
+    /// Nothing to show: a text read already, or a push about nothing new.
+    Nothing,
+    /// The tag is not one of this device's current handles (withdrawn, or the conversation is
+    /// gone): nothing is shown.
+    UnknownTag,
+}
+
 /// A proxy address this build may use: `https://`, or in debug builds also `http://` (Global
 /// Constraints). Anything else is `InvalidConfig`.
 pub fn check_proxy_url(url: &str) -> Result<(), CoreError> {

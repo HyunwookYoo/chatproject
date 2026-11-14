@@ -29,7 +29,7 @@ use crate::message::mls_group::{
     Committed, Delivery, DueDelivery, GroupOp, GroupReply, Outcome, OwnWelcome,
 };
 use crate::message::store::{MessageDbOp, MessageDbReply, OpenFrom, conversation_id};
-use crate::message::types::{BlockReason, ConversationId};
+use crate::message::types::{BlockReason, ConversationId, MessageKey};
 use crate::message::wire::{Frame, RejectReason};
 use crate::mls::{
     group::{CLASS_FUTURE_EPOCH, CLASS_OTHER, CLASS_OUT_OF_ORDER, inspect_key_package},
@@ -288,6 +288,17 @@ pub(super) enum Via {
         #[allow(dead_code)]
         seq: u64,
     },
+    /// A push (M7 spec 5.3): no device carried it, nobody waits for an answer, and nothing is
+    /// sent to the sender (it learns of the delivery from its next direct attempt).
+    Push,
+}
+
+/// What opening one received application ciphertext did.
+pub(super) struct Received {
+    /// The answer to its sender: `None` when it carried a text M4 would refuse.
+    pub reply: Option<MlsReply>,
+    /// The text it carried, and whether that was stored just now.
+    pub text: Option<(MessageKey, bool)>,
 }
 
 /// The answer to one kind 17 request, or one record lookup, this actor started.
@@ -2616,7 +2627,30 @@ impl Manager {
         via: &Via,
         request: Request,
     ) -> Result<Option<MlsReply>, CoreError> {
-        let sender = from.peer;
+        self.open_received(
+            from.peer,
+            Some(from.installation),
+            conversation,
+            ciphertext,
+            via,
+            request,
+        )
+        .await
+        .map(|received| received.reply)
+    }
+
+    /// `receive_app` of a ciphertext from `sender`'s account carried by its device `carrier`, or
+    /// by no device (`None`: a push, `Via::Push`); tells which text it carried too.
+    pub(super) async fn open_received(
+        &mut self,
+        sender: PeerId,
+        carrier: Option<InstallationId>,
+        conversation: ConversationId,
+        ciphertext: Vec<u8>,
+        via: &Via,
+        request: Request,
+    ) -> Result<Received, CoreError> {
+        let answer = |reply| Received { reply, text: None };
         // Application messages come from the conversation's peer account, or (spec 5.3) are a
         // copy of what another device of this account sent in a conversation with a contact.
         let own = sender == self.local()?.keys.peer_id();
@@ -2624,15 +2658,15 @@ impl Manager {
             .conversation_peer(conversation, sender)
             .filter(|peer| own || *peer == sender)
         else {
-            return Ok(Some(MlsReply::ContactRequired));
+            return Ok(answer(Some(MlsReply::ContactRequired)));
         };
         let open = OpenFrom {
             peer: sender,
-            transport: from.installation,
+            transport: carrier,
             allowed: self.current_installations(sender),
             pull: match via {
                 Via::Mailbox { holder, .. } => Some(*holder),
-                Via::Direct(_) => None,
+                Via::Direct(_) | Via::Push => None,
             },
         };
         let op = MessageDbOp::OpenApp(
@@ -2642,11 +2676,14 @@ impl Manager {
             self.services.clock.wall_ms(),
         );
         let result = self.message_db(op, request).await;
-        if result.is_ok() && !own {
-            self.speaks_mls(from.installation);
+        if result.is_ok()
+            && !own
+            && let Some(carrier) = carrier
+        {
+            self.speaks_mls(carrier);
         }
         match result {
-            Ok(MessageDbReply::Opened(reply)) => Ok(Some(reply)),
+            Ok(MessageDbReply::Opened(reply)) => Ok(answer(Some(reply))),
             Ok(MessageDbReply::OpenedText(reply, key, new)) => {
                 // The keyed response checkpoint of tests: the Ack that stores this text.
                 #[cfg(all(feature = "test-hooks", debug_assertions))]
@@ -2656,37 +2693,40 @@ impl Manager {
                 if new {
                     self.text_stored(key, via, request).await;
                 }
-                Ok(Some(reply))
+                Ok(Received {
+                    reply: Some(reply),
+                    text: Some((key, new)),
+                })
             }
             // My read on another own device: shown here as read, its notification cleared.
             Ok(MessageDbReply::OpenedRead(reply, conversation)) => {
                 self.read_synced(conversation, via, request).await;
-                Ok(Some(reply))
+                Ok(answer(Some(reply)))
             }
             // A peer device's push handle went into `push_peer` (M7 spec 5.2): nothing to show.
-            Ok(MessageDbReply::OpenedPushHandle { reply, .. }) => Ok(Some(reply)),
-            Ok(MessageDbReply::Rejected) => Ok(None),
-            // Sealed by a device of the account that is not current here. Directly: refused,
-            // whoever carries it. From another own device's log (final review I3): that device
-            // took it while the leaf was current (it was a member of the group the message
-            // opened in), so it is not taken from the ciphertext but goes to the plaintext
-            // hand-over (spec 6.3), not skipped.
+            Ok(MessageDbReply::OpenedPushHandle { reply, .. }) => Ok(answer(Some(reply))),
+            Ok(MessageDbReply::Rejected) => Ok(answer(None)),
+            // Sealed by a device of the account that is not current here. Directly or by push:
+            // refused, whoever carries it. From another own device's log (final review I3): that
+            // device took it while the leaf was current (it was a member of the group the
+            // message opened in), so it is not taken from the ciphertext but goes to the
+            // plaintext hand-over (spec 6.3), not skipped.
             Ok(MessageDbReply::NotCurrent) => match via {
-                Via::Direct(_) => Ok(None),
-                Via::Mailbox { .. } => Ok(Some(MlsReply::DecryptFailed {
+                Via::Direct(_) | Via::Push => Ok(answer(None)),
+                Via::Mailbox { .. } => Ok(answer(Some(MlsReply::DecryptFailed {
                     class: CLASS_OTHER,
                     epoch: 0,
-                })),
+                }))),
             },
             Ok(MessageDbReply::FarAhead { epoch }) => match via {
-                Via::Direct(_) => Ok(Some(
+                Via::Direct(_) => Ok(answer(Some(
                     self.move_epoch(conversation, peer, epoch, request).await?,
-                )),
+                ))),
                 // No sender waits to seal it again in a new epoch: it is not opened here.
-                Via::Mailbox { .. } => Ok(Some(MlsReply::DecryptFailed {
+                Via::Mailbox { .. } | Via::Push => Ok(answer(Some(MlsReply::DecryptFailed {
                     class: CLASS_OUT_OF_ORDER,
                     epoch,
-                })),
+                }))),
             },
             Ok(_) => Err(unavailable(ErrorCode::InvalidMessage)),
             // The MLS sender is not the authenticated device, or the message conflicts.
@@ -2696,7 +2736,7 @@ impl Manager {
                     ErrorCode::InvalidMessage | ErrorCode::MessageConflict
                 ) =>
             {
-                Ok(None)
+                Ok(answer(None))
             }
             Err(error) => Err(error),
         }

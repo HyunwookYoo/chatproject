@@ -22,8 +22,8 @@ use crate::{CoreError, ErrorCode};
 pub mod fixture;
 mod state;
 
-/// Longest preview, in bytes.
-const PREVIEW_BYTES: usize = 48;
+/// Longest preview, in bytes: the app's notification text cuts at the same place.
+const PREVIEW_BYTES: usize = crate::message::store::PREVIEW_BYTES;
 
 /// What the notification may show of a message.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,11 +134,7 @@ pub fn decrypt_readonly(snapshot: &[u8], ciphertext: &[u8]) -> Result<NsePreview
 }
 
 fn preview_of(body: &str) -> String {
-    let mut end = body.len().min(PREVIEW_BYTES);
-    while !body.is_char_boundary(end) {
-        end -= 1;
-    }
-    body[..end].to_owned()
+    crate::message::store::preview_prefix(body).to_owned()
 }
 
 #[cfg(test)]

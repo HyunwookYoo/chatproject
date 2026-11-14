@@ -10,4 +10,5 @@ pub(crate) mod wire;
 pub(crate) mod scheduler;
 pub(crate) mod service;
 pub use service::MessageHandle;
+pub use store::preview_text;
 pub use types::*;
