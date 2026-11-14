@@ -250,6 +250,11 @@ pub fn build_full(n: usize, k: usize, credential_bytes: usize) -> Fixture {
     }
 }
 
+/// A ciphertext as a push carries it: its group id taken out (M7 spec 5.3).
+pub fn stripped(ciphertext: &[u8]) -> Vec<u8> {
+    crate::mls::push_ct::strip_group_id(ciphertext).expect("a private message")
+}
+
 /// [`build_full`] without the ciphertexts that do not decrypt: `(snapshot, ciphertexts)`.
 pub fn build(n: usize, k: usize, credential_bytes: usize) -> (Vec<u8>, Vec<Vec<u8>>) {
     let fixture = build_full(n, k, credential_bytes);

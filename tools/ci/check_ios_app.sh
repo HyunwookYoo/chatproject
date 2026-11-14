@@ -45,8 +45,15 @@ got="$("$pb" -c 'Print :CFBundleIdentifier' "$appex/Info.plist")" \
   || fail "cannot read CFBundleIdentifier from the extension's Info.plist"
 [ "$got" = "$NSE_ID" ] || fail "the embedded extension is '$got', expected '$NSE_ID'"
 echo "extension: $got"
-[ -f "$appex/nse_state.bin" ] \
-  || fail "nse_state.bin is not in the extension (the NotificationService target carries the 200-leaf fixture as a resource)"
+# M7 removed the M1b probe: its fixture and its channel must not ship (Task 11).
+[ ! -e "$appex/nse_state.bin" ] \
+  || fail "nse_state.bin is in the extension: the M1b probe fixture must not ship (add_notification_service.rb adds no resource to the extension)"
+probe="$(grep -rlF ios_probe "$app" 2> /dev/null || true)"
+[ -z "$probe" ] \
+  || fail "the app bundle still holds the M1b probe channel 'ios_probe' in: $(printf '%s' "$probe" | sed "s|$app/||" | tr '\n' ' ')"
+# A push the extension does not change shows aps.alert.loc-key NEW_MSG from the app's strings.
+[ -f "$app/Localizable.strings" ] \
+  || fail "Runner.app has no Localizable.strings, so a push the extension did not change would show NEW_MSG (add_notification_service.rb adds it to Runner's resources)"
 
 # App Store Connect rejects an extension whose version differs from the app's, but only after the whole
 # signed build. Both must come from FLUTTER_BUILD_NAME/NUMBER (Ruling R14).

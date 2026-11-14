@@ -35,17 +35,21 @@ elif tool == "otool":
 @unittest.skipUnless(BASH and pathlib.Path(BASH).is_file(), "requires native bash")
 class IosSymbolsTest(unittest.TestCase):
     # SQLCipher 4.14's CommonCrypto provider imports CCHmacInit/Update/Final, never CCHmac itself.
-    def run_check(self, imports="_getaddrinfo\n_nw_path_get_status\n_CCHmacInit", network=None, fail_tool="", sqlite_link=""):
+    def run_check(self, imports="_getaddrinfo\n_nw_path_get_status\n_CCHmacInit", network=None, fail_tool="", sqlite_link="",
+                  files=None):
         with tempfile.TemporaryDirectory(prefix="ios symbols fixture ") as folder:
             root = pathlib.Path(folder)
             app = root / "Runner.app"
             appex = app / "PlugIns/NotificationService.appex"
             appex.mkdir(parents=True)
             (appex / "NotificationService").touch()
-            (appex / "nse_state.bin").touch()
             ffi = app / "Frameworks/chat_ffi.framework"
             ffi.mkdir(parents=True)
             (ffi / "chat_ffi").touch()
+            # Bundle files by their path in Runner.app, with their bytes; None leaves one out.
+            for path, data in {"Localizable.strings": b'"NEW_MSG" = "x";', **(files or {})}.items():
+                if data is not None:
+                    (app / path).write_bytes(data)
             fake_bin = root / "bin"
             fake_bin.mkdir()
             fake = root / "fake_tool.py"
@@ -68,6 +72,19 @@ class IosSymbolsTest(unittest.TestCase):
     def test_clean_public_imports_pass(self):
         result = self.run_check(imports="_getaddrinfo\n_nw_path_get_status\n_SCNetworkReachabilityCreateWithName\n_CCHmacInit")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_m1b_probe_leftovers_are_rejected(self):
+        for files, message in (({"PlugIns/NotificationService.appex/nse_state.bin": b""}, "nse_state.bin"),
+                               ({"Frameworks/chat_ffi.framework/chat_ffi": b"..chat_app/ios_probe.."}, "ios_probe")):
+            with self.subTest(message=message):
+                result = self.run_check(files=files)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stdout)
+
+    def test_missing_push_strings_are_rejected(self):
+        result = self.run_check(files={"Localizable.strings": None})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Localizable.strings", result.stdout)
 
     def test_missing_commoncrypto_provider_is_rejected(self):
         result = self.run_check(imports="_getaddrinfo\n_nw_path_get_status")

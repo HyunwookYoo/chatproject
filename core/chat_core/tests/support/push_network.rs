@@ -36,6 +36,8 @@ impl FakePushProxy {
             1,
             Arc::new(push_proxy::FakeUpstream::new()),
         );
+        // iOS devices (Task 11) get handles too.
+        state.apns = Some(Arc::new(push_proxy::FakeUpstream::new()));
         state.jitter = Arc::new(|| Duration::ZERO);
         state.log = Arc::new(|_: &str| {});
         Arc::new(Self {

@@ -1,13 +1,15 @@
 //! One bounded, typed writer. SQL and OS protection run only on blocking threads.
 use super::migration::{self, binding, load};
+use crate::message::push_store::IosStateSource;
 use crate::message::store::{self as messages, Identity, MessageDbOp, MessageDbReply};
+use crate::push::ios_state;
 use crate::{
     CoreError, ErrorCode,
     account::storage::{KeyProtector, StoredPlaintext, ownership::Ownership, schema::AccountState},
 };
 use rusqlite::{Connection, params};
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 use tokio::sync::{mpsc, oneshot};
@@ -57,6 +59,9 @@ struct Worker {
     state: State,
     pending_message: Option<messages::PendingMessage>,
     counts: Arc<Counts>,
+    /// `<snapshot_dir>/push` while the device receives APNs pushes (`push_configure`): the
+    /// notification extension's state files are kept there (`push::ios_state`).
+    push_dir: Option<Arc<Path>>,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     hook: Option<(usize, CommitAction)>,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
@@ -72,6 +77,20 @@ impl Worker {
         let pending = self.pending_message.is_some();
         self.operation(|c| messages::due_hint(c, now).map(|due| due || pending))
     }
+    fn push_dir(&mut self, dir: Option<PathBuf>) -> R<()> {
+        self.push_dir = dir.map(Arc::from);
+        let Some(dir) = self.push_dir.clone() else {
+            return Ok(());
+        };
+        let db_id = self.id;
+        self.operation(|c| {
+            // Without an active account there are no tags, and nothing to bring up to date.
+            if let Some((_, AccountState::Active(local))) = migration::load_validated(c, &db_id)? {
+                ios_state::sync_all(&IosStateSource { c, local: &local }, &dir);
+            }
+            Ok(())
+        })
+    }
     fn message(&mut self, identity: Identity, op: MessageDbOp) -> R<MessageDbReply> {
         let key = op.pending(identity)?;
         let db_id = self.id;
@@ -86,6 +105,7 @@ impl Worker {
         // A received MLS ciphertext learns its message only once opened; it moves the clock too.
         #[cfg(all(feature="test-hooks",debug_assertions))]
         let clock=if key.is_some() || op.opens_app() {self.message_clock.take()} else {None};
+        let push_dir = self.push_dir.clone();
         let result = self.operation(|c| {
             let (_, state) = migration::load_validated(c, &db_id)?.ok_or_else(|| {
                 CoreError::new(ErrorCode::AccountRestricted, "active_account_required")
@@ -104,19 +124,28 @@ impl Worker {
                     "message_identity_mismatch",
                 ));
             }
-            if let Some(key) = pending.clone() {
-                messages::reconcile(c, key)?;
+            let (result, changes) = ios_state::recording(|| {
+                if let Some(key) = pending.clone() {
+                    messages::reconcile(c, key)?;
+                }
+                reconciled = true;
+                messages::authorize(c,&local,&op)?;
+                messages::execute(
+                    c,
+                    identity,
+                    &local,
+                    op,
+                    #[cfg(all(feature = "test-hooks", debug_assertions))]
+                    fault,
+                )
+            });
+            // What committed is read back; an uncertain connection is not read.
+            if let Some(dir) = &push_dir
+                && !result.as_ref().is_err_and(|e| e.code == ErrorCode::StorageUncertain)
+            {
+                ios_state::refresh(&IosStateSource { c, local: &local }, dir, &changes);
             }
-            reconciled = true;
-            messages::authorize(c,&local,&op)?;
-            messages::execute(
-                c,
-                identity,
-                &local,
-                op,
-                #[cfg(all(feature = "test-hooks", debug_assertions))]
-                fault,
-            )
+            result
         });
         #[cfg(all(feature="test-hooks",debug_assertions))]
         if key.is_some() && let Some((entered,release))=self.message_reply_pause.take() {let _=entered.send(());let _=release.recv();}
@@ -339,6 +368,7 @@ struct Pending<T> {
 enum DbOp {
     DueHint(u64, oneshot::Sender<R<bool>>),
     Message(Identity, MessageDbOp, oneshot::Sender<R<MessageDbReply>>),
+    PushDir(Option<PathBuf>, oneshot::Sender<R<()>>),
     Load(oneshot::Sender<R<Option<StoredPlaintext>>>),
     Commit(StoredPlaintext, oneshot::Sender<R<()>>),
     DiscardPending(oneshot::Sender<R<()>>),
@@ -379,6 +409,12 @@ impl StorageHandle {
         self.receive(self.send(|reply| DbOp::Message(identity, op, reply), false)?)
             .await
     }
+    /// Where the iOS notification extension's state files go from now on (`None`: nowhere); a
+    /// folder is brought up to date at once (`push::ios_state::sync_all`).
+    pub(crate) async fn push_dir(&self, dir: Option<PathBuf>) -> R<()> {
+        self.receive(self.send(|reply| DbOp::PushDir(dir, reply), false)?)
+            .await
+    }
     /// Caller must use a blocking thread/pool; initialization does SQL, OS key work and fsync.
     pub(crate) fn open_blocking(
         root: PathBuf,
@@ -402,6 +438,7 @@ impl StorageHandle {
             state: conn.map(State::Open).unwrap_or(State::Closed),
             pending_message: None,
             counts: counts.clone(),
+            push_dir: None,
             #[cfg(all(feature = "test-hooks", debug_assertions))]
             hook: None,
             #[cfg(all(feature = "test-hooks", debug_assertions))]
@@ -526,6 +563,14 @@ fn run(mut w: Worker, mut rx: mpsc::Receiver<Request>, fence: Arc<Mutex<Fence>>)
             DbOp::Message(identity, op, reply) => {
                 let result = if valid() && fence.lock().is_ok_and(|f| !f.blocked) {
                     w.message(identity, op)
+                } else {
+                    Err(locked())
+                };
+                let _ = reply.send(if valid() { result } else { Err(locked()) });
+            }
+            DbOp::PushDir(dir, reply) => {
+                let result = if valid() && fence.lock().is_ok_and(|f| !f.blocked) {
+                    w.push_dir(dir)
                 } else {
                     Err(locked())
                 };

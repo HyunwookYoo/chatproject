@@ -17,7 +17,6 @@ import 'message/message_client.dart';
 import 'message/message_model.dart';
 import 'message/screens/conversation_screen.dart';
 import 'network/network_client.dart';
-import 'probe/probe_host.dart';
 import 'src/rust/frb_generated.dart';
 import 'theme/app_theme.dart';
 
@@ -39,7 +38,6 @@ class ChatApp extends StatefulWidget {
   const ChatApp({
     super.key,
     required this.core,
-    this.probe,
     this.network,
     this.account,
     this.messages,
@@ -52,7 +50,6 @@ class ChatApp extends StatefulWidget {
   final MessageClient? messages;
   final MailboxClient? mailbox;
   final MailboxPlatform mailboxPlatform;
-  final ProbeHost? probe;
   final NetworkClient? network;
 
   @override
@@ -135,7 +132,6 @@ class _ChatAppState extends State<ChatApp> {
         builder: (context) {
           final home = HomeScreen(
             core: widget.core,
-            probe: widget.probe,
             network: widget.network,
             account: widget.account,
             messages: widget.messages,

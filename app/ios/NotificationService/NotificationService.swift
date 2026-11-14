@@ -1,135 +1,62 @@
 import Foundation
 import UserNotifications
 
-/// M1b probe (design 12.3, roadmap M1b): decrypts the push's MLS ciphertext `e` against the
-/// bundled 200-leaf group state and appends its own memory use to the App Group file
-/// `nse_memory.jsonl`. M7 replaces it with the real extension.
+/// The notification service extension (M7 spec 5.6, design 12.3). A push carries `t` (the tag of
+/// one of this device's handles) and, for a text that fits, `e` (its MLS ciphertext without the
+/// group id). `chat_nse` decrypts `e` read-only against the app's state file of the tag; the
+/// extension never writes group state, it only appends `e` to the inbox the app takes later.
+///
+/// * No `t`: the push's own content ("새 메시지", the app's `NEW_MSG`).
+/// * No state file for `t` (a withdrawn tag, a conversation gone): an empty content, so
+///   nothing is shown (Review Focus 1).
+/// * Otherwise the alias and the start of the text, or "새 메시지" when it cannot be decrypted
+///   (no `e`, a state older than the text, before the first unlock), grouped by `t`.
+/// * Out of time: "새 메시지".
 final class NotificationService: UNNotificationServiceExtension {
-    private static let appGroup = "group.dev.chatproject.chatapp"
-    private static let logName = "nse_memory.jsonl"
+  private let lock = NSLock()
+  private var contentHandler: ((UNNotificationContent) -> Void)?
+  private var fallback: UNNotificationContent?
 
-    private let lock = NSLock()
-    private var contentHandler: ((UNNotificationContent) -> Void)?
-    private var original: UNNotificationContent?
-
-    override func didReceive(_ request: UNNotificationRequest,
-                             withContentHandler contentHandler: @escaping (UNNotificationContent) -> Void) {
-        lock.lock()
-        self.contentHandler = contentHandler
-        original = request.content
-        lock.unlock()
-
-        let info = request.content.userInfo
-        let seq = (info["seq"] as? NSNumber)?.intValue ?? -1
-        let pid = Int(getpid())
-        // Written before any work, so a record exists even if iOS kills the extension.
-        var logProblem = Self.append([
-            "phase": "start",
-            "seq": seq,
-            "sent_at": (info["sent_at"] as? NSNumber)?.int64Value ?? -1,
-            "received_at": Int64(Date().timeIntervalSince1970 * 1000),
-            "pid": pid,
-            "footprint": Memory.sample()?.footprint ?? 0,
-        ])
-
-        guard let content = request.content.mutableCopy() as? UNMutableNotificationContent else {
-            return deliver(request.content)
-        }
-        var end: [String: Any] = ["phase": "end", "seq": seq, "pid": pid]
-        do {
-            guard let e = info["e"] as? String, let ciphertext = Data(base64Encoded: e) else {
-                throw ProbeError.noCiphertext
-            }
-            guard let state = Bundle.main.path(forResource: "nse_state", ofType: "bin") else {
-                throw ProbeError.noState
-            }
-            let outcome = try probeDecrypt(statePath: state, ciphertext: ciphertext)
-            end["ok"] = true
-            end["plaintext_len"] = outcome.plaintextLen
-            end["load_us"] = outcome.loadMicros
-            end["decrypt_us"] = outcome.decryptMicros
-            content.body = "#\(seq) \(outcome.preview)"
-        } catch {
-            end["ok"] = false
-            end["error"] = "\(error)"
-        }
-        let sample = Memory.sample()
-        end["footprint"] = sample?.footprint ?? 0
-        end["peak"] = sample?.peak ?? -1
-        end["available"] = os_proc_available_memory() // 0 when iOS does not report it for extensions
-        let endProblem = Self.append(end)
-        logProblem = logProblem ?? endProblem
-        var title: String?
-        if let peak = sample?.peak {
-            title = String(format: "NSE 최대 %.1f MB", Double(peak) / 1_048_576)
-        }
-        // iOS gives the extension no console, so a log that could not be written must show on the notification.
-        if let logProblem {
-            title = (title ?? "NSE") + " · 기록 실패 (\(logProblem))"
-        }
-        if let title { content.title = title }
-        deliver(content)
+  override func didReceive(_ request: UNNotificationRequest,
+                           withContentHandler contentHandler: @escaping (UNNotificationContent) -> Void) {
+    let info = request.content.userInfo
+    let t = info["t"] as? String
+    var fallback = request.content
+    if let t, let grouped = request.content.mutableCopy() as? UNMutableNotificationContent {
+      grouped.threadIdentifier = t
+      fallback = grouped
     }
+    lock.lock()
+    self.contentHandler = contentHandler
+    self.fallback = fallback
+    lock.unlock()
 
-    override func serviceExtensionTimeWillExpire() {
-        lock.lock()
-        let content = original
-        lock.unlock()
-        if let content { deliver(content) }
+    guard let t, let directory = PushInbox.directory() else { return deliver(fallback) }
+    let e = info["e"] as? String ?? ""
+    let notice = nseOpen(pushDir: directory.path, tagB64: t, strippedB64: e)
+    if notice.body.isEmpty { return deliver(UNNotificationContent()) }
+    if !e.isEmpty { PushInbox.append(directory: directory, t: t, e: e) }
+    guard let content = fallback.mutableCopy() as? UNMutableNotificationContent else {
+      return deliver(fallback)
     }
+    content.title = notice.title
+    content.body = notice.body
+    deliver(content)
+  }
 
-    /// Calls the handler at most once, whichever path gets here first.
-    private func deliver(_ content: UNNotificationContent) {
-        lock.lock()
-        let handler = contentHandler
-        contentHandler = nil
-        lock.unlock()
-        handler?(content)
-    }
+  override func serviceExtensionTimeWillExpire() {
+    lock.lock()
+    let content = fallback
+    lock.unlock()
+    if let content { deliver(content) }
+  }
 
-    /// Appends one JSON line with O_APPEND, so lines from concurrent notifications do not interleave.
-    /// Returns nil on success, otherwise a short reason for the notification title: a missing App Group
-    /// (a wrong entitlement or profile) and a write before the first unlock look alike without it.
-    private static func append(_ record: [String: Any]) -> String? {
-        guard let dir = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroup) else {
-            return "그룹 없음"
-        }
-        guard var line = try? JSONSerialization.data(withJSONObject: record, options: [.sortedKeys]) else {
-            return "JSON"
-        }
-        line.append(0x0A)
-        let url = dir.appendingPathComponent(logName)
-        // The log holds measurements only. Creating it without data protection lets notifications that arrive
-        // before the first unlock after a reboot append too; the default class refuses until then.
-        // .withoutOverwriting keeps an existing log, and the error for "it exists" is expected.
-        try? Data().write(to: url, options: [.withoutOverwriting, .noFileProtection])
-        let fd = open(url.path, O_WRONLY | O_CREAT | O_APPEND, 0o644)
-        guard fd >= 0 else { return "열기 \(errno)" }
-        defer { close(fd) }
-        let written = line.withUnsafeBytes { write(fd, $0.baseAddress, $0.count) }
-        return written == line.count ? nil : "쓰기 \(errno)"
-    }
-}
-
-private enum ProbeError: Error { case noCiphertext, noState }
-
-private enum Memory {
-    struct Sample { let footprint: UInt64; let peak: Int64? }
-
-    /// TASK_VM_INFO: phys_footprint now, and the lifetime peak (rev 3, iOS 13+).
-    static func sample() -> Sample? {
-        var info = task_vm_info_data_t()
-        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size)
-        let kr = withUnsafeMutablePointer(to: &info) {
-            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
-                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
-            }
-        }
-        guard kr == KERN_SUCCESS else { return nil }
-        // The kernel reports how many words it filled; the peak field needs revision 3.
-        let peakEnd = (MemoryLayout<task_vm_info_data_t>.offset(of: \task_vm_info_data_t.ledger_phys_footprint_peak)!
-                       + MemoryLayout<Int64>.size) / MemoryLayout<natural_t>.size
-        return Sample(footprint: info.phys_footprint,
-                      peak: Int(count) >= peakEnd ? info.ledger_phys_footprint_peak : nil)
-    }
+  /// Calls the handler at most once, whichever path gets here first.
+  private func deliver(_ content: UNNotificationContent) {
+    lock.lock()
+    let handler = contentHandler
+    contentHandler = nil
+    lock.unlock()
+    handler?(content)
+  }
 }

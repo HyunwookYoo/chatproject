@@ -1396,6 +1396,14 @@ pub use crate::message::push_store::{
 pub use crate::mailbox::wire::{
     EntryBody, HandoffEntry, LogEntry, MailboxFrame, MailboxReply, PlainRecord,
 };
+/// The notification extension's decrypt of one pushed ciphertext against an iOS state file
+/// (`push::ios_state`): the text's preview, or `None` for what the extension cannot show.
+pub fn nse_preview(state_file: &[u8], ciphertext: &[u8]) -> Option<String> {
+    let state = crate::push::ios_state::decode_state(state_file)?;
+    crate::mls::nse::decrypt_readonly(state.snapshot, ciphertext)
+        .ok()
+        .map(|preview| preview.preview)
+}
 pub const MAILBOX_MAX_ENTRY_BODY: usize = crate::mailbox::wire::MAX_ENTRY_BODY;
 pub fn mailbox_page(entries: impl Iterator<Item = LogEntry>) -> (Vec<LogEntry>, bool) {
     crate::mailbox::wire::page(entries)

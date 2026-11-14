@@ -1,6 +1,6 @@
 # frozen_string_literal: true
 
-# Adds the NotificationService app extension target to Runner.xcodeproj (M1b).
+# Adds the NotificationService app extension target to Runner.xcodeproj (M1b, M7).
 # There is no Mac, so this script is the source of truth: CI runs it before every iOS build.
 # Running it twice changes nothing ("already up to date").
 #
@@ -32,16 +32,14 @@ runner = project.native_targets.find { |t| t.name == 'Runner' } or abort 'no Run
 
 # Files of app/ios/NotificationService.
 group = project.main_group[NSE] || project.main_group.new_group(NSE, NSE)
-sources = ["#{NSE}.swift", 'Generated/chat_nse.swift'].map { |p| file_ref.(group, p) }
+sources = ["#{NSE}.swift", 'PushInbox.swift', 'Generated/chat_nse.swift'].map { |p| file_ref.(group, p) }
 %W[Info.plist #{NSE}.entitlements #{NSE}-Bridging-Header.h Generated/chat_nseFFI.h].each { |p| file_ref.(group, p) }
-state = file_ref.(group, 'Fixture/nse_state.bin')
 
 # The extension target.
 nse = project.native_targets.find { |t| t.name == NSE } ||
       project.new_target(:app_extension, NSE, :ios, deployment_target, nil, :swift)
 CONFIGS.each { |name| nse.add_build_configuration(name, name == 'Debug' ? :debug : :release) }
 nse.add_file_references(sources)
-nse.add_resources([state])
 
 # Build settings. Flutter/Generated.xcconfig supplies FLUTTER_BUILD_NAME/NUMBER for Info.plist.
 # Runner's own Debug/Release.xcconfig is not used here: Flutter prepends the CocoaPods include to
@@ -85,8 +83,10 @@ run_script = phases.find { |p| p.is_a?(Xcodeproj::Project::Object::PBXShellScrip
   abort 'no Run Script phase'
 phases.move(embed, phases.index(run_script)) if phases.index(embed) > phases.index(run_script)
 
-# Runner: App Group + push entitlements.
+# Runner: App Group + push entitlements, and the NEW_MSG text of a push the extension did not
+# change (aps.alert.loc-key, M7).
 file_ref.(project.main_group['Runner'], 'Runner.entitlements')
+runner.add_resources([file_ref.(project.main_group['Runner'], 'Localizable.strings')])
 runner.build_configurations.each do |config|
   set.(config, 'PRODUCT_BUNDLE_IDENTIFIER', APP_ID)
   set.(config, 'CODE_SIGN_ENTITLEMENTS', 'Runner/Runner.entitlements')

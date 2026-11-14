@@ -19,7 +19,7 @@ use crate::mls::{
     MlsProvider, kv::KvStore, payload::push_handle_message, push_ct::strip_group_id,
     wire::MlsFrame,
 };
-use crate::push::PushStatus;
+use crate::push::{PushStatus, ios_state};
 use crate::{CoreError, ErrorCode};
 use openmls_traits::OpenMlsProvider as _;
 
@@ -329,6 +329,7 @@ pub(super) fn push_op(
             )
             .map_err(sql)?;
             tx.execute("UPDATE push_tag SET handle=NULL", []).map_err(sql)?;
+            ios_state::changed_all();
             finish(tx, fault)?;
             PushDbReply::Count(1)
         }
@@ -351,6 +352,7 @@ pub(super) fn push_op(
             .map_err(sql)?;
             // `issued_at_ms` stays: it is the floor of the next frame time (Ruling R11).
             tx.execute("UPDATE push_tag SET handle=NULL", []).map_err(sql)?;
+            ios_state::changed_all();
             finish(tx, fault)?;
             PushDbReply::Count(1)
         }
@@ -377,6 +379,7 @@ pub(super) fn push_op(
                         params![integer(now)?],
                     )
                     .map_err(sql)?;
+                ios_state::changed_all();
             }
             finish(tx, fault)?;
             PushDbReply::Count(withdrawn as u64)
@@ -695,12 +698,16 @@ fn store_issued(c: &mut Connection, issued: &Issued, fault: Fault) -> R<u64> {
         if !fits(handle) {
             continue;
         }
-        stored += tx
+        let updated = tx
             .execute(
                 "UPDATE push_tag SET handle=?3,issued_at_ms=max(?4,coalesce(issued_at_ms+1,0)),announced=0 WHERE conversation=?1 AND tag=?2",
                 params![conversation.0.as_slice(), tag.as_slice(), handle, now],
             )
             .map_err(sql)?;
+        if updated > 0 {
+            ios_state::changed(conversation.0);
+        }
+        stored += updated;
     }
     if let Some((tag, handle)) = &issued.own
         && fits(handle)
@@ -1005,6 +1012,59 @@ pub(super) fn read_up(tx: &Transaction<'_>, conversation: ConversationId) -> R<(
     )
     .map_err(sql)?;
     Ok(())
+}
+
+/// What the iOS state files (`push::ios_state`) read: a tag names a conversation exactly as
+/// `PushDbOp::Tagged` finds it (a current handle, a group, the conversation), and the file holds
+/// the contact's alias from `local` with the conversation's `export_snapshot`. A read that fails
+/// is `None`: no file is written or removed for it.
+pub(crate) struct IosStateSource<'a> {
+    pub c: &'a Connection,
+    pub local: &'a LocalAccount,
+}
+
+impl ios_state::StateSource for IosStateSource<'_> {
+    fn target(&self, conversation: [u8; 32]) -> Option<(Tag, bool)> {
+        self.c
+            .query_row(
+                "SELECT p.tag,p.handle IS NOT NULL AND EXISTS(SELECT 1 FROM mls_conversation m WHERE m.conversation=p.conversation) AND EXISTS(SELECT 1 FROM conversation v WHERE v.id=p.conversation) FROM push_tag p WHERE p.conversation=?1",
+                params![conversation.as_slice()],
+                |r| Ok((bytes::<16>(r, 0)?, r.get(1)?)),
+            )
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    fn live(&self) -> Option<Vec<([u8; 32], Tag)>> {
+        let mut q = self
+            .c
+            .prepare("SELECT p.conversation,p.tag FROM push_tag p JOIN conversation v ON v.id=p.conversation JOIN mls_conversation m ON m.conversation=p.conversation WHERE p.handle IS NOT NULL")
+            .ok()?;
+        q.query_map([], |r| Ok((bytes::<32>(r, 0)?, bytes::<16>(r, 1)?)))
+            .ok()?
+            .collect::<Result<_, _>>()
+            .ok()
+    }
+
+    fn contents(&self, conversation: [u8; 32]) -> Option<Vec<u8>> {
+        let peer: [u8; 32] = self
+            .c
+            .query_row(
+                "SELECT peer FROM conversation WHERE id=?1",
+                params![conversation.as_slice()],
+                |r| bytes::<32>(r, 0),
+            )
+            .ok()?;
+        let snapshot = crate::mls::nse::export_snapshot(self.c, ConversationId(conversation)).ok()?;
+        let alias = self
+            .local
+            .contacts
+            .iter()
+            .find(|contact| contact.peer.0 == peer)
+            .map_or("", |contact| contact.alias.as_str());
+        Some(ios_state::encode_state(alias, &snapshot))
+    }
 }
 
 /// Longest handle `push_peer`, `push_tag`, `push_own` and a kind 18 `Announce` take (their

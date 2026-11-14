@@ -464,6 +464,9 @@ jobs:
           for phase in write read locked missing read lifecycle; do
             flutter test integration_test/account_storage_test.dart -d "${{ steps.sim.outputs.udid }}" --no-uninstall --dart-define=ACCOUNT_STORAGE_PHASE="$phase" --dart-define=ACCOUNT_STORAGE_ROOT="$container/Library/Application Support/ci-account-storage"
           done
+      - name: Push folder and inbox on the simulator
+        working-directory: app
+        run: flutter test integration_test/push_ios_test.dart -d "${{ steps.sim.outputs.udid }}" --no-uninstall
       - name: Native message storage across simulator processes
         working-directory: app
         run: |

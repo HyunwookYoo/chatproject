@@ -397,6 +397,8 @@ fn forget(tx: &Transaction<'_>, conversation: ConversationId) -> R<()> {
         tx.execute(statement, params![conversation.0.as_slice()])
             .map_err(sql)?;
     }
+    // Its iOS notification extension state file goes with the group.
+    crate::push::ios_state::changed(conversation.0);
     Ok(())
 }
 

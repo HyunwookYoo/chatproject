@@ -13,6 +13,7 @@ use crate::{CoreError, ErrorCode};
 
 #[cfg(feature = "push-http")]
 mod client;
+pub mod ios_state;
 #[cfg(feature = "push-http")]
 pub use client::{HttpPushProxy, Url};
 

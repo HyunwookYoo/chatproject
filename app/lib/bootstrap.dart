@@ -12,7 +12,6 @@ import 'src/rust/api/account.dart' as account;
 import 'mailbox/mailbox_client.dart';
 import 'main.dart';
 import 'network/network_client.dart';
-import 'probe/probe_host.dart';
 import 'src/rust/api/chat.dart' as rust;
 import 'startup_error_app.dart';
 
@@ -50,7 +49,6 @@ Future<Widget> bootstrap(
       messages: core is FrbCoreClient ? core.messages : null,
       mailbox: core is FrbCoreClient ? const FrbMailboxClient() : null,
       network: core is NetworkClient ? core as NetworkClient : null,
-      probe: Platform.isIOS ? IosProbeHost() : null,
     );
     return accountModel == null
         ? app

@@ -757,8 +757,8 @@ name = "chat_nse"
 version = "0.1.0"
 dependencies = [
  "chat_core",
+ "push_wire",
  "tempfile",
- "thiserror 2.0.21",
  "uniffi",
 ]
 
@@ -3553,16 +3553,6 @@ dependencies = [
  "socket2",
  "tracing",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "nse_fixture"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "chat_core",
- "chat_nse",
- "tempfile",
 ]
 
 [[package]]

@@ -134,9 +134,6 @@ pub(crate) struct Runtime {
     config_seen: u64,
     /// The proxy of the configured address (`None`: no address, no request of any kind).
     proxy: Option<Arc<dyn PushProxy>>,
-    /// The iOS snapshot directory, for the notification extension's state file (Task 11).
-    #[allow(dead_code)]
-    snapshot_dir: Option<std::path::PathBuf>,
     /// Moves on when push goes off, the token or the platform changes: a renewal of an older
     /// generation stores nothing and sends no further request.
     generation: Arc<std::sync::atomic::AtomicU64>,
@@ -691,6 +688,13 @@ impl Manager {
         else {
             return Err(unavailable(ErrorCode::InvalidMessage));
         };
+        // The notification extension's state files (spec 5.6): an APNs device with a folder.
+        let push_dir = match (config.platform, &config.snapshot_dir) {
+            (Some(Platform::Apns), Some(dir)) => Some(dir.join(crate::push::ios_state::PUSH_DIR)),
+            _ => None,
+        };
+        self.ensure_ready(request)?;
+        self.store.push_dir(push_dir).await?;
         let proxy = config
             .proxy_url
             .as_deref()
@@ -698,7 +702,6 @@ impl Manager {
         let push = &mut self.messages.push;
         push.config_seen = version;
         push.proxy = proxy;
-        push.snapshot_dir = config.snapshot_dir;
         push.check_at = 0;
         if changed > 0 {
             push.generation.fetch_add(1, Ordering::SeqCst);

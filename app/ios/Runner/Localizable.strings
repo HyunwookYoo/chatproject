@@ -1,0 +1,2 @@
+/* The alert of a push (aps.alert.loc-key), shown when the notification extension cannot show the text. */
+"NEW_MSG" = "새 메시지";

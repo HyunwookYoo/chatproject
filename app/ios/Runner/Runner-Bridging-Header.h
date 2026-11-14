@@ -6,6 +6,11 @@
 int32_t cp_account_suspend(void);
 int32_t cp_account_resume(void);
 
+// Renews the push handles that are due (BGAppRefreshTask). Blocks for up to timeout_ms.
+// 0 done, -1 bad data_dir, -2 invalid configuration, -3 timed out, -4 the core could not do it,
+// -5 an internal failure.
+int32_t cp_push_renew(const char *data_dir, uint32_t timeout_ms);
+
 // Hands Runner's Keychain functions to Rust, which cannot link against Runner.
 // 0 registered, 1 already registered, 3 a null pointer.
 typedef int32_t (*cp_key_transform)(const uint8_t *id, const uint8_t *input, size_t len,
