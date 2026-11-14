@@ -4144,6 +4144,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "push_wire"
+version = "0.1.0"
+dependencies = [
+ "chacha20poly1305",
+ "data-encoding",
+ "getrandom 0.3.4",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "quick-xml"
 version = "0.42.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
