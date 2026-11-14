@@ -1152,6 +1152,7 @@ fn apply_own_read(
             ],
         )
         .map_err(sql)?;
+        super::push_store::read_up(tx, conversation)?;
     }
     Ok(read)
 }

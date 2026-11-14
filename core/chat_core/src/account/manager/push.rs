@@ -36,9 +36,11 @@
 //!   directly is the same ciphertext and is taken once. A text stored just now alerts, one stored
 //!   already and unread updates its notification silently, one read already shows nothing; what
 //!   cannot be opened alerts as "새 메시지". A `wake` alerts as "새 메시지" first, then dials the
-//!   sender's devices and syncs with my devices until the caller's deadline: the first
-//!   notification of that conversation the fetch brings takes the generic one's place without
-//!   alerting again. A read clear syncs with my devices until the deadline. Both start the
+//!   sender's devices and syncs with my devices until the caller's deadline, or until a
+//!   notification of the conversation shows a text in the generic one's place. Ruling R13: once
+//!   a generic notification alerted, the conversation's texts (by any path, also after a
+//!   restart: the mark is `push_tag.generic`) update it without alerting until it is read up.
+//!   A read clear syncs with my devices until the deadline. Both start the
 //!   network only if it was off, and stop only what they started; the waits happen in the
 //!   caller's task, never in an actor turn.
 use super::*;
@@ -166,9 +168,10 @@ pub(crate) struct Runtime {
     fingerprint: Option<[u8; 32]>,
     /// Scheduler time the pending read clear is sent at.
     read_clear_at: Option<u64>,
-    /// Wake pushes fetching now, per conversation: told when a notification of the conversation
-    /// takes the generic one's place. One whose caller stopped waiting (closed) is over.
-    waking: BTreeMap<ConversationId, oneshot::Sender<()>>,
+    /// Wake pushes fetching now, per conversation, with the unread count their generic
+    /// notification showed: told when a notification of the conversation shows a text in its
+    /// place. One whose caller stopped waiting (closed) is over.
+    waking: BTreeMap<ConversationId, (oneshot::Sender<()>, u64)>,
     /// Read clear pushes waiting for a sync with one of my devices to end.
     syncs: Vec<oneshot::Sender<()>>,
     /// `push_messages_deleted`: once the network is up, my devices are synced with and every
@@ -1251,9 +1254,14 @@ impl Manager {
         if let Some(outcome) = shown {
             return Ok(outcome);
         }
-        self.push_generic(tagged.conversation, tagged.peer, request)
+        let (_, alerted) = self
+            .push_generic(tagged.conversation, tagged.peer, request)
             .await;
-        Ok(PushOutcome::Notified)
+        Ok(if alerted {
+            PushOutcome::Notified
+        } else {
+            PushOutcome::Updated
+        })
     }
 
     /// Shows a pushed text (spec 5.3): `None` when its notification could not be made.
@@ -1271,57 +1279,77 @@ impl Manager {
         match (seen, new) {
             // Read on another device already: no notification (M6 user decision, spec 5.3).
             (Some(true), _) => Some(PushOutcome::Nothing),
+            // Silent when a generic notification of the conversation alerted already (R13).
             (Some(false), true) => self
                 .push_notify(vec![key], Vec::new(), request)
                 .await
-                .then_some(PushOutcome::Notified),
+                .map(|alerted| {
+                    if alerted {
+                        PushOutcome::Notified
+                    } else {
+                        PushOutcome::Updated
+                    }
+                }),
             // It alerted when it came first: never a second time.
             (_, false) => Some(
-                if self.push_notify(Vec::new(), vec![conversation], request).await {
-                    PushOutcome::Updated
-                } else {
-                    PushOutcome::Nothing
+                match self.push_notify(Vec::new(), vec![conversation], request).await {
+                    Some(_) => PushOutcome::Updated,
+                    None => PushOutcome::Nothing,
                 },
             ),
             (None, true) => None,
         }
     }
 
-    /// Notifies the texts `keys` and the conversations `read`; false when nothing was shown.
+    /// Notifies the texts `keys` and the conversations `read`: whether that alerted, `None`
+    /// when nothing was shown.
     async fn push_notify(
         &mut self,
         keys: Vec<MessageKey>,
         read: Vec<ConversationId>,
         request: Request,
-    ) -> bool {
+    ) -> Option<bool> {
         match self
             .message_db(MessageDbOp::NotifyItems(keys, read), request)
             .await
         {
             Ok(MessageDbReply::Notify(items)) if !items.is_empty() => {
+                let alerted = items.iter().any(|item| item.new_messages > 0);
                 self.publish_notify(items);
-                true
+                Some(alerted)
             }
-            _ => false,
+            _ => None,
         }
     }
 
     /// The "새 메시지" notification of a push whose text cannot be shown: one new message more
-    /// than the conversation's unread ones, without a preview.
-    async fn push_generic(&mut self, conversation: ConversationId, peer: PeerId, request: Request) {
-        let op = MessageDbOp::NotifyItems(Vec::new(), vec![conversation]);
-        let unread = match self.message_db(op, request).await {
-            Ok(MessageDbReply::Notify(items)) => items.first().map_or(0, |item| item.unread),
-            _ => 0,
+    /// than the conversation's unread ones, without a preview. It alerts unless one alerted for
+    /// the conversation already and was not read up since; until it is, the conversation's new
+    /// texts update it without alerting (Ruling R13, marked in `push_tag`). Returns the unread
+    /// count it shows and whether it alerted.
+    async fn push_generic(
+        &mut self,
+        conversation: ConversationId,
+        peer: PeerId,
+        request: Request,
+    ) -> (u64, bool) {
+        let (unread, pending) = match self
+            .push_db(PushDbOp::Generic(conversation), request)
+            .await
+        {
+            Ok(PushDbReply::Generic { unread, pending }) => (unread, pending),
+            _ => (0, false),
         };
+        let unread = unread.saturating_add(1);
         self.publish_notify(vec![crate::event::NotifyItem {
             conversation,
             peer,
-            new_messages: 1,
-            unread: unread.saturating_add(1),
+            new_messages: u32::from(!pending),
+            unread,
             title: String::new(),
             preview: None,
         }]);
+        (unread, !pending)
     }
 
     /// A `wake` push: its conversation's generic notification now; the fetch that follows
@@ -1337,9 +1365,9 @@ impl Manager {
         else {
             return Ok(None);
         };
-        self.push_generic(conversation, peer, request).await;
+        let (unread, _) = self.push_generic(conversation, peer, request).await;
         let (tell, told) = oneshot::channel();
-        self.messages.push.waking.insert(conversation, tell);
+        self.messages.push.waking.insert(conversation, (tell, unread));
         Ok(Some((peer, told)))
     }
 
@@ -1411,8 +1439,9 @@ impl Manager {
         Ok(stored)
     }
 
-    /// Fills in each item's title (the contact's alias), and lets the first notification of a
-    /// conversation a wake push fetches for take the generic one's place without alerting again.
+    /// Fills in each item's title (the contact's alias), and tells a wake push's fetch once a
+    /// notification of its conversation shows a text in the generic one's place (or clears it).
+    /// That notification does not alert again: `notify_items` keeps it silent (Ruling R13).
     pub(super) fn push_notify_items(&mut self, items: &mut [crate::event::NotifyItem]) {
         if let Ok(local) = self.local() {
             for item in items.iter_mut() {
@@ -1425,13 +1454,17 @@ impl Manager {
             }
         }
         let waking = &mut self.messages.push.waking;
-        waking.retain(|_, fetched| !fetched.is_closed());
-        for item in items.iter_mut() {
-            if (item.new_messages > 0 || item.unread == 0)
-                && let Some(fetched) = waking.remove(&item.conversation)
+        waking.retain(|_, (fetched, _)| !fetched.is_closed());
+        for item in items.iter() {
+            // An item of older messages read elsewhere (fewer unread) says nothing of the fetch.
+            let shown = |unread: u64| {
+                item.unread == 0 || (item.preview.is_some() && item.unread >= unread)
+            };
+            if waking
+                .get(&item.conversation)
+                .is_some_and(|(_, unread)| shown(*unread))
+                && let Some((fetched, _)) = waking.remove(&item.conversation)
             {
-                // The generic notification alerted for it already.
-                item.new_messages = 0;
                 let _ = fetched.send(());
             }
         }

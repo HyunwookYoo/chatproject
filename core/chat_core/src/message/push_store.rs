@@ -255,6 +255,9 @@ pub(crate) enum PushDbOp {
     Tagged(Tag),
     /// Whether a received text is seen here already (`None`: not stored). Replies `Seen`.
     Seen(MessageKey),
+    /// A "새 메시지" notification alerts for a push of the conversation (Ruling R13): marks it,
+    /// and replies `Generic` with its unread count and whether one alerted already.
+    Generic(ConversationId),
 }
 
 impl PushDbOp {
@@ -302,6 +305,7 @@ pub(crate) enum PushDbReply {
     Batches(Vec<PushBatch>),
     Tagged(Option<Tagged>),
     Seen(Option<bool>),
+    Generic { unread: u64, pending: bool },
 }
 
 pub(super) fn push_op(
@@ -570,6 +574,20 @@ pub(super) fn push_op(
             .optional()
             .map_err(sql)?,
         ),
+        PushDbOp::Generic(conversation) => {
+            let tx = c.transaction().map_err(sql)?;
+            let id = params![conversation.0.as_slice()];
+            let unread = tx
+                .query_row("SELECT unread FROM conversation WHERE id=?1", id, |r| uint(r, 0))
+                .optional()
+                .map_err(sql)?
+                .unwrap_or(0);
+            let pending = generic_pending(&tx, conversation)?;
+            tx.execute("UPDATE push_tag SET generic=1 WHERE conversation=?1", id)
+                .map_err(sql)?;
+            finish(tx, fault)?;
+            PushDbReply::Generic { unread, pending }
+        }
     };
     Ok(MessageDbReply::Push(reply))
 }
@@ -612,7 +630,7 @@ fn renew(c: &mut Connection, now: u64, own: bool, fault: Fault) -> R<Option<Rene
         let mut tag: Tag = [0; 16];
         getrandom::fill(&mut tag).map_err(|_| CoreError::new(ErrorCode::NotAvailable, "push_tag"))?;
         tx.execute(
-            "INSERT INTO push_tag VALUES(?1,?2,NULL,NULL,1)",
+            "INSERT INTO push_tag VALUES(?1,?2,NULL,NULL,1,0)",
             params![conversation.as_slice(), tag.as_slice()],
         )
         .map_err(sql)?;
@@ -958,6 +976,30 @@ pub(super) fn drop_delivered(
     tx.execute(
         "DELETE FROM push_delivery WHERE conversation=?1 AND msg_id=?2",
         params![conversation.0.as_slice(), msg_id.0.as_slice()],
+    )
+    .map_err(sql)?;
+    Ok(())
+}
+
+/// Ruling R13: a "새 메시지" notification alerted for a push of the conversation and it was not
+/// read up since; until it is, its new texts update that notification without alerting.
+pub(super) fn generic_pending(c: &Connection, conversation: ConversationId) -> R<bool> {
+    Ok(c.query_row(
+        "SELECT generic FROM push_tag WHERE conversation=?1",
+        params![conversation.0.as_slice()],
+        |r| r.get::<_, bool>(0),
+    )
+    .optional()
+    .map_err(sql)?
+    .unwrap_or(false))
+}
+
+/// In the transaction that read messages of the conversation: once nothing is unread, a
+/// generic push notification no longer keeps its new texts from alerting (Ruling R13).
+pub(super) fn read_up(tx: &Transaction<'_>, conversation: ConversationId) -> R<()> {
+    tx.execute(
+        "UPDATE push_tag SET generic=0 WHERE conversation=?1 AND generic=1 AND (SELECT unread FROM conversation WHERE id=?1)=0",
+        params![conversation.0.as_slice()],
     )
     .map_err(sql)?;
     Ok(())

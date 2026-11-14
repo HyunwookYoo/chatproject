@@ -260,7 +260,9 @@ CREATE TABLE push_tag (
     tag BLOB UNIQUE NOT NULL CHECK(length(tag)=16),
     handle BLOB CHECK(handle IS NULL OR length(handle) BETWEEN 1 AND 1024),
     issued_at_ms INTEGER CHECK(issued_at_ms IS NULL OR issued_at_ms>=0),
-    announced INTEGER NOT NULL CHECK(announced IN (0,1))   -- 현재 handle(또는 철회)을 봉인했나
+    announced INTEGER NOT NULL CHECK(announced IN (0,1)),  -- 현재 handle(또는 철회)을 봉인했나
+    -- 푸시로 "새 메시지"가 울린 뒤 아직 다 읽지 않았나: 그동안 이 대화의 새 글은 소리 없이 고친다 (Ruling R13)
+    generic INTEGER NOT NULL DEFAULT 0 CHECK(generic IN (0,1))
 ) STRICT;
 -- 상대 기기가 알린 handle: (대화, 상대 leaf installation)마다 최신 하나 (spec 5.2)
 -- handle NULL = 철회(묘비). sent_at_ms(그 frame의 ChatMessage.sent_at_ms)가 더 큰 것만 덮어쓴다 (Ruling R10)

@@ -377,7 +377,7 @@ async fn push_for_unknown_tag_shows_nothing() {
 
 #[tokio::test]
 async fn undecryptable_push_notifies_generic() {
-    let (a1, b1, conv, _net, proxy) = offline_receiver().await;
+    let (a1, b1, conv, net, proxy) = offline_receiver().await;
     let sent = pushed(&a1, b1.peer, &proxy, &["cannot open"]).await;
     let (key, tag, kind) = &sent[0];
     assert_eq!(
@@ -395,19 +395,92 @@ async fn undecryptable_push_notifies_generic() {
         title: "remote".into(),
         preview: None,
     };
-    for ciphertext in [broken, vec![0xff; 40], Vec::new()] {
+    // Ruling R13: the first alerts; until the conversation is read up, the next ones only
+    // update it.
+    for (n, ciphertext) in [broken, vec![0xff; 40], Vec::new()].into_iter().enumerate() {
         let before = notify_events(&b1).len();
         let push = ReceivedPush::Cipher {
             tag: *tag,
             ciphertext,
         };
+        let (outcome, new_messages) = if n == 0 {
+            (PushOutcome::Notified, 1)
+        } else {
+            (PushOutcome::Updated, 0)
+        };
+        assert_eq!(b1.account.push_received(push, WAIT).await.unwrap(), outcome);
         assert_eq!(
-            b1.account.push_received(push, WAIT).await.unwrap(),
-            PushOutcome::Notified
+            notified_since(&b1, before),
+            [NotifyItem {
+                new_messages,
+                ..generic.clone()
+            }]
         );
-        assert_eq!(notified_since(&b1, before), [generic.clone()]);
     }
     assert!(message(&b1, *key).await.is_none());
+
+    // B1's process ends and starts again; the text then comes directly: it updates the generic
+    // notification without alerting.
+    let b1 = start_as(B, stop(b1), net.clone()).await;
+    link(&b1, &a1).await;
+    settle!([&a1, &b1], message(&b1, *key).await.is_some());
+    quiet(&[&a1, &b1]).await;
+    assert_eq!(
+        notify_events(&b1),
+        [NotifyItem {
+            new_messages: 0,
+            preview: Some("cannot open".into()),
+            ..generic.clone()
+        }]
+    );
+    // Read up: the next text alerts again.
+    b1.account
+        .messages()
+        .mark_read(conv, vec![*key])
+        .await
+        .unwrap();
+    let next = send_to(&a1, b1.peer, 2, "after reading").await;
+    settle!([&a1, &b1], message(&b1, next).await.is_some());
+    quiet(&[&a1, &b1]).await;
+    assert_eq!(
+        notify_events(&b1).last(),
+        Some(&NotifyItem {
+            preview: Some("after reading".into()),
+            ..generic
+        })
+    );
+    assert_eq!(alerts(&b1, conv), 1);
+}
+
+/// Ruling R13: the wake's fetch reached nobody before its deadline; the text comes directly
+/// later and updates the generic notification without alerting a second time.
+#[tokio::test]
+async fn wake_then_late_direct_text_updates_without_second_alert() {
+    let (a1, b1, conv, _net, proxy) = offline_receiver().await;
+    let body = "늦게 온 ".repeat(1_200);
+    let sent = pushed(&a1, b1.peer, &proxy, &[body.as_str()]).await;
+    let (key, tag, kind) = &sent[0];
+    assert!(*kind == PushItemKind::Wake);
+    network(&a1, NetworkOp::Stop).await;
+    let push = ReceivedPush::Wake { tag: *tag };
+    assert_eq!(
+        b1.account
+            .push_received(push, Duration::from_secs(2))
+            .await
+            .unwrap(),
+        PushOutcome::Notified
+    );
+    assert!(message(&b1, *key).await.is_none());
+    assert_eq!(alerts(&b1, conv), 1);
+
+    online(&a1).await;
+    back_online(&b1, &[&a1]).await;
+    settle!([&a1, &b1], message(&b1, *key).await.is_some());
+    quiet(&[&a1, &b1]).await;
+    assert_eq!(alerts(&b1, conv), 1);
+    let last = notify_events(&b1).pop().unwrap();
+    assert_eq!((last.new_messages, last.unread), (0, 1));
+    assert_eq!(last.preview, Some(preview_text(&body, 0)));
 }
 
 /// A text too large to carry wakes B1: the generic notification first, then B1 starts its

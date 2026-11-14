@@ -1359,6 +1359,13 @@ pub(super) fn notify_items(
                     |r| Ok((bytes::<32>(r, 0)?, uint(r, 1)?)),
                 )
                 .map_err(sql_error)?;
+            // Ruling R13: after a generic push notification ("새 메시지") alerted, the
+            // conversation's new texts update it without alerting until it is read up.
+            let new_messages = if new_messages > 0 && super::push_store::generic_pending(c, conversation)? {
+                0
+            } else {
+                new_messages
+            };
             Ok(crate::event::NotifyItem {
                 conversation,
                 peer: PeerId(peer),
@@ -2474,6 +2481,7 @@ fn mark_read(
             params![id.0.as_slice(), changed as i64, integer(rev)?],
         )
         .map_err(sql_error)?;
+        super::push_store::read_up(&tx, id)?;
     }
     commit(
         tx,
