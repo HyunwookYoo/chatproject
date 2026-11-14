@@ -708,13 +708,15 @@ pub(super) fn reseal_receipt(
 
 /// The synchronous `Ack` of a sent `App` frame: the recipient stored the message (spec: the
 /// same meaning as an M4 `Receipt`), so it is `Delivered` and leaves the outbox. The recipient
-/// must be one this message was prepared for. Never undoes `Read`.
+/// must be one this message was prepared for. Never undoes `Read`. `first`: its first attempt,
+/// whose push is decided on in this transaction before the outbox row goes (M7 spec 6.1).
 pub(super) fn acked(
     c: &mut Connection,
     identity: Identity,
     key: MessageKey,
     recipient: InstallationId,
     now: u64,
+    first: Option<&mut super::push_store::FirstAttempt>,
     fault: Fault,
 ) -> R<MessageDbReply> {
     check_own(identity, key)?;
@@ -729,6 +731,9 @@ pub(super) fn acked(
         .map_err(sql)?;
     if !message.outgoing || !super::store::receivers(&raw)?.contains(&recipient) {
         return Err(invalid());
+    }
+    if let Some(first) = first {
+        first.decide(&tx, key)?;
     }
     let changed = tx
         .execute(
@@ -1497,6 +1502,9 @@ pub struct MlsOutbox {
     pub reencrypts: u64,
     pub waiting_peer_update: bool,
     pub dispatch_state: u64,
+    pub attempts: u64,
+    /// `outbox.pushed`: the push decision of its first attempt is made (M7).
+    pub pushed: bool,
 }
 /// MLS state of one conversation, for fixture assertions.
 #[cfg(all(feature = "test-hooks", debug_assertions))]
@@ -1548,7 +1556,7 @@ pub(super) fn fixture_promote(c: &Connection, key: MessageKey) -> R<()> {
 pub(super) fn fixture_outbox(c: &Connection, key: MessageKey) -> R<MlsOutbox> {
     let row = c
         .query_row(
-            "SELECT codec,wire,reencrypts,waiting_peer_update,dispatch_state FROM outbox WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",
+            "SELECT codec,wire,reencrypts,waiting_peer_update,dispatch_state,attempts,pushed FROM outbox WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",
             params![key.conversation.0.as_slice(), key.sender.0.as_slice(), key.installation.0.as_slice(), key.id.0.as_slice()],
             |r| Ok(MlsOutbox {
                 codec: Some(r.get(0)?),
@@ -1556,6 +1564,8 @@ pub(super) fn fixture_outbox(c: &Connection, key: MessageKey) -> R<MlsOutbox> {
                 reencrypts: uint(r, 2)?,
                 waiting_peer_update: r.get(3)?,
                 dispatch_state: uint(r, 4)?,
+                attempts: uint(r, 5)?,
+                pushed: r.get(6)?,
             }),
         )
         .optional()
@@ -1566,6 +1576,8 @@ pub(super) fn fixture_outbox(c: &Connection, key: MessageKey) -> R<MlsOutbox> {
         reencrypts: 0,
         waiting_peer_update: false,
         dispatch_state: 0,
+        attempts: 0,
+        pushed: false,
     }))
 }
 

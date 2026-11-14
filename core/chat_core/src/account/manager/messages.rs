@@ -50,6 +50,8 @@ pub(crate) struct AttemptResult {
     pub ahead: Vec<(DueDelivery, Delivery)>,
     /// The `(conversation, recipient)` this attempt reserved for those deliveries.
     pub reserved: Option<(ConversationId, InstallationId)>,
+    /// The devices sent a copy of the acknowledged `App` frame (spec 5.3).
+    pub copied: Vec<InstallationId>,
 }
 struct Pending {
     peer: PeerId,
@@ -369,6 +371,7 @@ impl NetworkAttempt {
         let mut ahead = Vec::new();
         let sent_hash = app_ciphertext_hash(&job.wire);
         let copy = (sent_hash.is_some() && !self.copies.is_empty()).then(|| job.wire.to_vec());
+        let mut copied = Vec::new();
         let work = async {
             if job.ticket != lease.ticket
                 || job.peer != lease.session.grant.peer
@@ -466,6 +469,7 @@ impl NetworkAttempt {
             for _ in &sessions {
                 self.frames.lock().unwrap().push(wire.clone());
             }
+            copied = sessions.iter().map(|s| s.grant.installation).collect();
             tokio::spawn(async move {
                 for session in sessions {
                     let _ = super::mls::exchange(&session, &wire).await;
@@ -478,6 +482,7 @@ impl NetworkAttempt {
             outcome,
             ahead,
             reserved: self.reserved,
+            copied,
         }
     }
 }
@@ -658,6 +663,13 @@ impl Manager {
             MessageDbReply::Messages(v) => A::Messages(v),
             MessageDbReply::Message(v) => A::Message(v),
             MessageDbReply::Done => A::Done,
+            // `MarkRead`: how many messages were read just now (M7 spec 7).
+            MessageDbReply::Count(read) => {
+                if read > 0 {
+                    self.push_read_clear();
+                }
+                A::Done
+            }
             _ => unreachable!(),
         })
     }
@@ -1218,6 +1230,23 @@ impl Manager {
             // connection): the message waits for the update. Otherwise it was written and the
             // answer lost.
             let recipient = result.lease.session.grant.installation;
+            // A text's attempt that went out (or tried to) decides its push with the outcome it
+            // records, once (M7 spec 6.1): the devices it reached get none.
+            let reached = match result.outcome {
+                AttemptOutcome::Acked => Some(
+                    std::iter::once(recipient)
+                        .chain(std::mem::take(&mut result.copied))
+                        .collect(),
+                ),
+                AttemptOutcome::Written
+                | AttemptOutcome::NoReply
+                | AttemptOutcome::PeerUpdateRequired
+                | AttemptOutcome::Transient(_) => Some(Vec::new()),
+                _ => None,
+            };
+            let mut first = reached
+                .filter(|_| pending.receipt.is_none())
+                .and_then(|reached| self.push_first(pending.peer, reached));
             match result.outcome {
                 AttemptOutcome::Acked | AttemptOutcome::DecryptFailed(..) => {
                     self.speaks_mls(recipient);
@@ -1247,14 +1276,16 @@ impl Manager {
                 // No receipt is accepted from a closed/restricted grant. The known
                 // completed attempt may still release its retained retry job.
                 if pending.receipt.is_none() {
-                    self.message_db(
+                    let block = if self.grant_authorized(&result.lease.session.grant) {
+                        None
+                    } else {
+                        first = None;
+                        Some(BlockReason::Account)
+                    };
+                    self.outcome_db(
                         MessageDbOp::AttemptOutcome(
                             result.key,
-                            if self.grant_authorized(&result.lease.session.grant) {
-                                None
-                            } else {
-                                Some(BlockReason::Account)
-                            },
+                            block,
                             None,
                             matches!(
                                 result.outcome,
@@ -1264,6 +1295,7 @@ impl Manager {
                                     | AttemptOutcome::Acked
                             ),
                         ),
+                        first,
                         request,
                     )
                     .await?;
@@ -1322,8 +1354,9 @@ impl Manager {
                             request,
                         )
                         .await?;
-                        self.message_db(
+                        self.outcome_db(
                             MessageDbOp::AttemptOutcome(result.key, None, None, false),
+                            first,
                             request,
                         )
                         .await?;
@@ -1356,8 +1389,9 @@ impl Manager {
                 }
                 AttemptOutcome::Transient(code) => {
                     if pending.receipt.is_none() {
-                        self.message_db(
+                        self.outcome_db(
                             MessageDbOp::AttemptOutcome(result.key, None, None, false),
+                            first,
                             request,
                         )
                         .await?;
@@ -1366,8 +1400,9 @@ impl Manager {
                 }
                 AttemptOutcome::Written => {
                     if pending.receipt.is_none() {
-                        self.message_db(
+                        self.outcome_db(
                             MessageDbOp::AttemptOutcome(result.key, None, None, true),
+                            first,
                             request,
                         )
                         .await?;
@@ -1375,7 +1410,8 @@ impl Manager {
                     return Err(unavailable(ErrorCode::NetworkTimeout));
                 }
             };
-            self.message_db(op, request).await?;
+            // `first` is only ever given for a text's `MlsAcked` here.
+            self.outcome_db(op, first, request).await?;
             self.message_session(&result.lease.session.conn, request)?;
             Ok(())
         }
@@ -1887,13 +1923,13 @@ impl Manager {
             let receipt = job.key.sender != self.local().unwrap().keys.peer_id();
             if let Err(error) = self.message_contact(job.peer) {
                 let _ = self
-                    .scheduling_failure(job.key, receipt, error.code, request)
+                    .scheduling_failure(job.key, job.peer, receipt, error.code, request)
                     .await;
                 continue;
             }
             if !self.local_authorized() {
                 let _ = self
-                    .scheduling_failure(job.key, receipt, ErrorCode::AccountRestricted, request)
+                    .scheduling_failure(job.key, job.peer, receipt, ErrorCode::AccountRestricted, request)
                     .await;
                 continue;
             }
@@ -1951,9 +1987,11 @@ impl Manager {
             }
         }
     }
+    /// The job could not start: no device of `peer` was reached, or it may not go to it.
     async fn scheduling_failure(
         &mut self,
         key: MessageKey,
+        peer: PeerId,
         receipt: bool,
         code: ErrorCode,
         request: Request,
@@ -1974,7 +2012,13 @@ impl Manager {
             .await?;
         } else {
             let now = self.messages.scheduler.as_ref().unwrap().now_ms();
-            self.message_db(MessageDbOp::Defer(key, receipt, now), request)
+            // A text no device of the peer was reached for decides its push now (M7 spec 6.1).
+            let first = if receipt {
+                None
+            } else {
+                self.push_first_unreached(key, peer, request).await
+            };
+            self.outcome_db(MessageDbOp::Defer(key, receipt, now), first, request)
                 .await?;
         }
         Ok(())
@@ -1989,7 +2033,9 @@ impl Manager {
         let backend = match self.services.backend() {
             Ok(b) => b,
             Err(e) => {
-                let _ = self.scheduling_failure(key, receipt, e.code, request).await;
+                let _ = self
+                    .scheduling_failure(key, peer, receipt, e.code, request)
+                    .await;
                 return;
             }
         };
@@ -2276,11 +2322,12 @@ impl Manager {
             return;
         };
         a.phase = AcquisitionPhase::Completed;
-        let (receipt, ticket) = (a.receipt, a.ticket);
+        let (peer, receipt, ticket) = (a.peer, a.receipt, a.ticket);
         if let Ok(request) = self.ready()
             && self
                 .scheduling_failure(
                     key,
+                    peer,
                     receipt,
                     if ticket != request.ticket {
                         ErrorCode::TransportFailed

@@ -3,7 +3,10 @@
 //! of sealed `PushHandle` frames (`push_delivery`, the `mls_delivery` way). The `pub(super)`
 //! helpers run inside the caller's transaction; each `PushDbOp` is its own transaction (one per
 //! conversation for `Seal`).
-use push_wire::{Platform, RENEW_AFTER_MS, Tag};
+use push_wire::{
+    BASE64URL_NOPAD, PUSH_CIPHER_MAX, Platform, PushItem, PushItemKind, PushRequest,
+    RENEW_AFTER_MS, Tag,
+};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use super::mls_group::{Delivery, group_row, signer_of, sql};
@@ -12,7 +15,10 @@ use super::store::{Identity, MessageDbReply, bytes, integer, uint};
 use super::types::{ConversationId, MessageId, MessageKey};
 use crate::account::{InstallationId, PeerId, storage::schema::LocalAccount};
 use crate::mailbox::wire::HandoffEntry;
-use crate::mls::{MlsProvider, kv::KvStore, payload::push_handle_message, wire::MlsFrame};
+use crate::mls::{
+    MlsProvider, kv::KvStore, payload::push_handle_message, push_ct::strip_group_id,
+    wire::MlsFrame,
+};
 use crate::push::PushStatus;
 use crate::{CoreError, ErrorCode};
 use openmls_traits::OpenMlsProvider as _;
@@ -60,6 +66,121 @@ pub(crate) struct PushDue {
     pub wire: Vec<u8>,
 }
 
+/// The push decision of a text's first attempt (spec 6.1), made inside the transaction that
+/// records the attempt's outcome: what the actor knows, and the `/push` decided on.
+pub(crate) struct FirstAttempt {
+    /// The peer account's current devices.
+    pub devices: Vec<InstallationId>,
+    /// The devices the attempt reached: the one that acknowledged the text, and those sent a
+    /// copy of it.
+    pub reached: Vec<InstallationId>,
+    /// Set by `decide`: the push to send, if any.
+    pub batch: Option<PushBatch>,
+}
+
+/// One `/push` request, and for each of its items (same order) whose handle it carries, so a
+/// `gone` result withdraws exactly that handle. `conversation`: the peers' handles of that
+/// conversation (`push_peer`); `None`: my own devices' handles (`push_own`).
+pub(crate) struct PushBatch {
+    pub conversation: Option<ConversationId>,
+    pub targets: Vec<(InstallationId, Vec<u8>)>,
+    pub request: PushRequest,
+}
+
+impl FirstAttempt {
+    /// Decides once per text, in the caller's transaction: nothing while push is off here or
+    /// before the text is sealed; otherwise `pushed = 1`, and each current device of the peer
+    /// with a handle that the attempt did not reach gets the text's ciphertext without its group
+    /// id (`cipher`, or `wake` when that is over `PUSH_CIPHER_MAX`). A ciphertext that cannot be
+    /// stripped is not pushed, then or later: a push is never tried again.
+    pub(super) fn decide(&mut self, tx: &Transaction<'_>, key: MessageKey) -> R<()> {
+        let id = params![
+            key.conversation.0.as_slice(),
+            key.sender.0.as_slice(),
+            key.installation.0.as_slice(),
+            key.id.0.as_slice()
+        ];
+        let row: Option<(bool, i64, Vec<u8>)> = tx
+            .query_row(
+                "SELECT pushed,codec,wire FROM outbox WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",
+                id,
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()
+            .map_err(sql)?;
+        let Some((false, 2, wire)) = row else {
+            return Ok(());
+        };
+        if !load_local(tx)?.enabled {
+            return Ok(());
+        }
+        tx.execute(
+            "UPDATE outbox SET pushed=1 WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",
+            id,
+        )
+        .map_err(sql)?;
+        let Some(stripped) = stripped_ciphertext(&wire) else {
+            return Ok(());
+        };
+        let targets: Vec<(InstallationId, Vec<u8>)> = {
+            let mut q = tx
+                .prepare("SELECT installation,handle FROM push_peer WHERE conversation=?1 AND handle IS NOT NULL ORDER BY installation")
+                .map_err(sql)?;
+            q.query_map(params![key.conversation.0.as_slice()], |r| {
+                Ok((InstallationId(bytes(r, 0)?), r.get(1)?))
+            })
+            .map_err(sql)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(sql)?
+        };
+        let targets: Vec<_> = targets
+            .into_iter()
+            .filter(|(i, _)| self.devices.contains(i) && !self.reached.contains(i))
+            .collect();
+        if targets.is_empty() {
+            return Ok(());
+        }
+        let kind = if stripped.len() <= PUSH_CIPHER_MAX {
+            PushItemKind::Cipher {
+                e: BASE64URL_NOPAD.encode(&stripped),
+            }
+        } else {
+            PushItemKind::Wake
+        };
+        self.batch = Some(batch(Some(key.conversation), targets, kind));
+        Ok(())
+    }
+}
+
+/// The MLS ciphertext of a stored kind 17 `App` frame, its group id stripped (spec 5.3).
+fn stripped_ciphertext(wire: &[u8]) -> Option<Vec<u8>> {
+    let inner = crate::account::auth::payload(wire, 17).ok()?;
+    let MlsFrame::App { ciphertext, .. } = MlsFrame::decode(&inner).ok()? else {
+        return None;
+    };
+    strip_group_id(&ciphertext).ok()
+}
+
+/// One request with an item of `kind` for each target's handle.
+fn batch(
+    conversation: Option<ConversationId>,
+    targets: Vec<(InstallationId, Vec<u8>)>,
+    kind: PushItemKind,
+) -> PushBatch {
+    let items = targets
+        .iter()
+        .map(|(_, handle)| PushItem {
+            handle: BASE64URL_NOPAD.encode(handle),
+            kind: kind.clone(),
+        })
+        .collect();
+    PushBatch {
+        conversation,
+        targets,
+        request: PushRequest { items },
+    }
+}
+
 pub(crate) enum PushDbOp {
     Local,
     /// The platform `push_configure` gave. A change drops the token and every handle.
@@ -104,13 +225,27 @@ pub(crate) enum PushDbOp {
         peers: Vec<(PeerId, Vec<InstallationId>)>,
     },
     Status,
+    /// The `read` push for those of my devices in `offline` (no session now) that announced an
+    /// own-device handle (spec 7); none while push is off here.
+    ReadClear { offline: Vec<InstallationId> },
+    /// The proxy answered `gone` for these handles: a peer's (of `conversation`) becomes a
+    /// withdrawal that keeps its send time (Ruling R10), my own device's goes. A handle replaced
+    /// meanwhile stays.
+    Gone {
+        conversation: Option<ConversationId>,
+        gone: Vec<(InstallationId, Vec<u8>)>,
+    },
 }
 
 impl PushDbOp {
     pub(crate) fn writes(&self) -> bool {
         !matches!(
             self,
-            Self::Local | Self::DueDeliveries { .. } | Self::UnreachableDue { .. } | Self::Status
+            Self::Local
+                | Self::DueDeliveries { .. }
+                | Self::UnreachableDue { .. }
+                | Self::Status
+                | Self::ReadClear { .. }
         )
     }
 }
@@ -139,6 +274,8 @@ pub(crate) enum PushDbReply {
         unsealed: bool,
     },
     Status(PushStatus),
+    /// The push to send, if any.
+    Batch(Option<PushBatch>),
 }
 
 pub(super) fn push_op(
@@ -323,6 +460,45 @@ pub(super) fn push_op(
                 handles: u32::try_from(handles).unwrap_or(u32::MAX),
                 oldest_issued_at_ms: oldest.and_then(|at| u64::try_from(at).ok()),
             })
+        }
+        PushDbOp::ReadClear { offline } => {
+            let targets: Vec<(InstallationId, Vec<u8>)> = if load_local(c)?.enabled {
+                let mut q = c
+                    .prepare("SELECT installation,handle FROM push_own ORDER BY installation")
+                    .map_err(sql)?;
+                q.query_map([], |r| Ok((InstallationId(bytes(r, 0)?), r.get(1)?)))
+                    .map_err(sql)?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(sql)?
+            } else {
+                Vec::new()
+            };
+            let targets: Vec<_> = targets
+                .into_iter()
+                .filter(|(i, _)| offline.contains(i))
+                .collect();
+            PushDbReply::Batch(
+                (!targets.is_empty()).then(|| batch(None, targets, PushItemKind::Read)),
+            )
+        }
+        PushDbOp::Gone { conversation, gone } => {
+            let tx = c.transaction().map_err(sql)?;
+            let mut changed = 0;
+            for (installation, handle) in &gone {
+                changed += match conversation {
+                    Some(conversation) => tx.execute(
+                        "UPDATE push_peer SET handle=NULL WHERE conversation=?1 AND installation=?2 AND handle=?3",
+                        params![conversation.0.as_slice(), installation.0.as_slice(), handle],
+                    ),
+                    None => tx.execute(
+                        "DELETE FROM push_own WHERE installation=?1 AND handle=?2",
+                        params![installation.0.as_slice(), handle],
+                    ),
+                }
+                .map_err(sql)?;
+            }
+            finish(tx, fault)?;
+            PushDbReply::Count(changed as u64)
         }
     };
     Ok(MessageDbReply::Push(reply))

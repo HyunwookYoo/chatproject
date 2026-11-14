@@ -23,16 +23,24 @@
 //!   token and handles are dropped, and no proxy request is made until push is on again.
 //! * What revoked or unlisted devices announced, and what is queued for them, goes when the
 //!   records change.
+//! * Sending (spec 6): a text's first attempt that has a result decides, in the transaction
+//!   recording that result, on one `/push` with an item for each current device of the peer
+//!   that announced a handle and was neither reached nor sent a copy (`push_store::FirstAttempt`);
+//!   retries, mailbox handoffs, receipts, Commits and PushHandles never push. A `/push` runs in a
+//!   spawned task, bounded by `PUSH_TIMEOUT`; only its `gone` results come back, withdrawing
+//!   those handles. Read clearing (spec 7): reads here push one `read`, `READ_CLEAR_MS` after the
+//!   first of them, to my devices with an own-device handle and no session.
 use super::*;
 use crate::account::connection::{Input, Session};
 use crate::message::{
     mls_group::Delivery,
-    push_store::{Issued, PushDbOp, PushDbReply, PushDue, RenewPlan},
+    push_store::{FirstAttempt, Issued, PushBatch, PushDbOp, PushDbReply, PushDue, RenewPlan},
     store::{MessageDbOp, MessageDbReply},
-    types::{ConversationId, MessageId},
+    types::{ConversationId, MessageId, MessageKey},
 };
 use crate::push::{
-    HandleRequest, Platform, PushConfig, PushError, PushProxy, PushStatus, RenewSummary, Tag,
+    HandleRequest, Platform, PushConfig, PushError, PushProxy, PushResult, PushStatus,
+    RenewSummary, Tag,
 };
 use push_wire::BASE64URL_NOPAD;
 use sha2::{Digest, Sha256};
@@ -46,6 +54,10 @@ const HANDLE_TIMEOUT: Duration = Duration::from_secs(20);
 const DIAL_RETRY_MS: u64 = 30_000;
 /// The queue is looked through for recipients to dial at most this often.
 const DIAL_CHECK_MS: u64 = 1_000;
+/// Outer bound of one `/push` request, whatever the proxy implementation bounds itself to.
+const PUSH_TIMEOUT: Duration = Duration::from_secs(20);
+/// Reads within this long of the first one clear notifications with one push (spec 7).
+const READ_CLEAR_MS: u64 = 1_000;
 
 /// The latest `push_configure` and its version, for the actor to take.
 #[derive(Default)]
@@ -107,6 +119,8 @@ pub(crate) struct Runtime {
     dial_check_at: u64,
     /// Hash of the device lists the stored handles were last pruned against.
     fingerprint: Option<[u8; 32]>,
+    /// Scheduler time the pending read clear is sent at.
+    read_clear_at: Option<u64>,
 }
 
 /// A spawned push request came back.
@@ -122,6 +136,12 @@ pub(crate) enum PushEvent {
         recipient: InstallationId,
         msg_id: MessageId,
         outcome: Delivery,
+    },
+    /// The proxy answered `gone` for these handles of a `/push` (see `PushBatch`).
+    Gone {
+        ticket: u64,
+        conversation: Option<ConversationId>,
+        gone: Vec<(InstallationId, Vec<u8>)>,
     },
 }
 
@@ -241,7 +261,137 @@ impl Manager {
         if self.messages.push.seal_due {
             self.push_seal(request).await;
         }
+        if self.messages.push.read_clear_at.is_some_and(|at| now >= at) {
+            self.push_read_clears(request).await;
+        }
         self.push_deliver(now, request).await;
+    }
+
+    /// What the push decision of a text's first attempt needs (spec 6.1), `reached` being the
+    /// devices the attempt reached; `None` without a proxy (no request of any kind then).
+    pub(super) fn push_first(
+        &self,
+        peer: PeerId,
+        reached: Vec<InstallationId>,
+    ) -> Option<Box<FirstAttempt>> {
+        self.messages.push.proxy.as_ref()?;
+        Some(Box::new(FirstAttempt {
+            devices: self.current_installations(peer),
+            reached,
+            batch: None,
+        }))
+    }
+
+    /// `push_first` for a text no device was reached for, sealed first: the push carries its
+    /// ciphertext. `None` while it cannot be sealed (no group yet); a later attempt decides.
+    pub(super) async fn push_first_unreached(
+        &mut self,
+        key: MessageKey,
+        peer: PeerId,
+        request: Request,
+    ) -> Option<Box<FirstAttempt>> {
+        let first = self.push_first(peer, Vec::new())?;
+        let seal = MessageDbOp::Seal(key, self.services.clock.wall_ms());
+        match self.message_db(seal, request).await {
+            Ok(MessageDbReply::Sealed { .. }) => Some(first),
+            _ => None,
+        }
+    }
+
+    /// Records a text attempt's outcome `op`, with its push decision in the same transaction
+    /// when `first` is given, and sends the push decided on.
+    pub(super) async fn outcome_db(
+        &mut self,
+        op: MessageDbOp,
+        first: Option<Box<FirstAttempt>>,
+        request: Request,
+    ) -> Result<MessageDbReply, CoreError> {
+        let Some(first) = first else {
+            return self.message_db(op, request).await;
+        };
+        let reply = self
+            .message_db(MessageDbOp::FirstAttempt(Box::new(op), first), request)
+            .await?;
+        if let MessageDbReply::Push(PushDbReply::Batch(Some(batch))) = reply {
+            self.push_send(batch, request.ticket);
+        }
+        Ok(MessageDbReply::Done)
+    }
+
+    /// Messages were read here just now (spec 7): the read clear goes `READ_CLEAR_MS` after the
+    /// first read, for every read until then. Nothing without a proxy.
+    pub(super) fn push_read_clear(&mut self) {
+        if self.messages.push.proxy.is_none() {
+            return;
+        }
+        let at = self.schedule_now().saturating_add(READ_CLEAR_MS);
+        self.messages.push.read_clear_at.get_or_insert(at);
+    }
+
+    /// One `read` for each of my other current devices without a session now that announced an
+    /// own-device handle (only Android devices do).
+    async fn push_read_clears(&mut self, request: Request) {
+        self.messages.push.read_clear_at = None;
+        let Ok(local) = self.local() else {
+            return;
+        };
+        let (me, own) = (local.device.installation_id(), local.keys.peer_id());
+        let connected: Vec<InstallationId> = self
+            .mls_sessions()
+            .into_iter()
+            .filter(|s| s.grant.peer == own)
+            .map(|s| s.grant.installation)
+            .collect();
+        let offline = self
+            .current_installations(own)
+            .into_iter()
+            .filter(|i| *i != me && !connected.contains(i))
+            .collect();
+        if let Ok(PushDbReply::Batch(Some(batch))) = self
+            .push_db(PushDbOp::ReadClear { offline }, request)
+            .await
+        {
+            self.push_send(batch, request.ticket);
+        }
+    }
+
+    /// Sends one `/push` in a spawned task, bounded by `PUSH_TIMEOUT`; nothing waits for it. A
+    /// failure or `limited` is dropped, never sent again (spec 6.2); `gone` results come back.
+    fn push_send(&self, batch: PushBatch, ticket: u64) {
+        let Some(proxy) = self.messages.push.proxy.clone() else {
+            return;
+        };
+        let mailbox = self.auth.send.clone();
+        tokio::spawn(async move {
+            let PushBatch {
+                conversation,
+                targets,
+                request,
+            } = batch;
+            let Ok(Ok(response)) = tokio::time::timeout(PUSH_TIMEOUT, proxy.push(request)).await
+            else {
+                return;
+            };
+            // An answer that does not match the items says nothing about any of them.
+            if response.results.len() != targets.len() {
+                return;
+            }
+            let gone: Vec<_> = targets
+                .into_iter()
+                .zip(response.results)
+                .filter(|(_, result)| *result == PushResult::Gone)
+                .map(|(target, _)| target)
+                .collect();
+            if !gone.is_empty() {
+                let _ = mailbox
+                    .send(Input::Push(PushEvent::Gone {
+                        ticket,
+                        conversation,
+                        gone,
+                    }))
+                    .await;
+            }
+        });
     }
 
     /// Takes a newer `push_configure`: the proxy for its address, and its platform into
@@ -487,6 +637,18 @@ impl Manager {
                     now: self.schedule_now(),
                 };
                 let _ = self.push_db(op, request).await;
+            }
+            PushEvent::Gone {
+                ticket,
+                conversation,
+                gone,
+            } => {
+                let Some(request) = self.ready().ok().filter(|r| r.ticket == ticket) else {
+                    return;
+                };
+                let _ = self
+                    .push_db(PushDbOp::Gone { conversation, gone }, request)
+                    .await;
             }
         }
     }

@@ -84,6 +84,10 @@ pub(crate) enum MessageDbOp {
     Mailbox(super::mailbox_store::MailboxDbOp),
     /// This device's push handles and their delivery (M7).
     Push(super::push_store::PushDbOp),
+    /// The outcome of a text's first attempt (`MlsAcked`, `AttemptOutcome`, or `Defer` of a
+    /// text no device was reached for) with its push decision in the same transaction (M7 spec
+    /// 6.1). Replies `Push(Batch)`.
+    FirstAttempt(Box<MessageDbOp>, Box<super::push_store::FirstAttempt>),
     /// Notification items (M6) for texts just stored: per conversation, those of the keys that
     /// came from the other account and are still not seen here; and an item (maybe with no new
     /// message) for each conversation whose messages were read on another own device.
@@ -400,12 +404,7 @@ pub(crate) fn execute(
             commit(tx,#[cfg(all(feature="test-hooks",debug_assertions))] fault)?;
             Ok(MessageDbReply::Done)
         }
-        MessageDbOp::Defer(k, receipt, now) => {
-            let tx = c.transaction().map_err(sql_error)?;
-            schedule_retry(&tx, k, receipt, now)?;
-            commit(tx,#[cfg(all(feature="test-hooks",debug_assertions))] fault)?;
-            Ok(MessageDbReply::Done)
-        }
+        MessageDbOp::Defer(k, receipt, now) => defer(c, k, receipt, now, None, #[cfg(all(feature = "test-hooks", debug_assertions))] fault),
         MessageDbOp::ResetUnlaunched(k, provenance) => {
             if k.sender != identity.peer || k.installation != identity.installation {
                 return Err(invalid());
@@ -480,6 +479,7 @@ pub(crate) fn execute(
             block,
             failure,
             written,
+            None,
             #[cfg(all(feature = "test-hooks", debug_assertions))]
             fault,
         ),
@@ -596,7 +596,17 @@ pub(crate) fn execute(
         MessageDbOp::Reencrypt(key, now, counted) => super::mls_store::reencrypt(c, identity, local, key, now, counted, mls_fault!(fault)),
         MessageDbOp::OpenApp(from, id, ciphertext, now) => super::mls_store::open_app(c, identity, &from, id, ciphertext, now, mls_fault!(fault)),
         MessageDbOp::MarkWaitingPeerUpdate(key, waiting) => super::mls_store::mark_waiting(c, identity, key, waiting, mls_fault!(fault)),
-        MessageDbOp::MlsAcked(key, recipient, now) => super::mls_store::acked(c, identity, key, recipient, now, mls_fault!(fault)),
+        MessageDbOp::MlsAcked(key, recipient, now) => super::mls_store::acked(c, identity, key, recipient, now, None, mls_fault!(fault)),
+        MessageDbOp::FirstAttempt(op, mut first) => {
+            let decide = Some(&mut *first);
+            match *op {
+                MessageDbOp::MlsAcked(key, recipient, now) => super::mls_store::acked(c, identity, key, recipient, now, decide, mls_fault!(fault))?,
+                MessageDbOp::AttemptOutcome(key, block, failure, written) => attempt_outcome(c, key, block, failure, written, decide, #[cfg(all(feature = "test-hooks", debug_assertions))] fault)?,
+                MessageDbOp::Defer(key, false, now) => defer(c, key, false, now, decide, #[cfg(all(feature = "test-hooks", debug_assertions))] fault)?,
+                _ => return Err(invalid()),
+            };
+            Ok(MessageDbReply::Push(super::push_store::PushDbReply::Batch(first.batch.take())))
+        }
         MessageDbOp::ResealReceipt(key) => super::mls_store::reseal_receipt(c, key, mls_fault!(fault)),
         #[cfg(all(feature = "test-hooks", debug_assertions))]
         MessageDbOp::M4Encode(key) => super::mls_store::m4_encode(c, identity, key),
@@ -1274,6 +1284,7 @@ impl MessageDbOp {
             Self::MlsGroupOp(_, op) => op.writes(),
             Self::Mailbox(op) => op.writes(),
             Self::Push(op) => op.writes(),
+            Self::FirstAttempt(op, _) => return op.faultable(identity),
             _ => self.key(identity)?.is_some(),
         })
     }
@@ -1288,7 +1299,7 @@ impl MessageDbOp {
     }
     pub(crate) fn key(&self, identity: Identity) -> R<Option<MessageKey>> {
         Ok(match self {
-            Self::Observed(op) => return op.key(identity),
+            Self::Observed(op) | Self::FirstAttempt(op, _) => return op.key(identity),
             Self::MarkRead(_, keys, ..) => keys.first().copied(),
             Self::Enqueue(peer, id, _, _) => Some(MessageKey {
                 conversation: conversation_id(identity.peer, *peer)?,
@@ -1683,12 +1694,15 @@ fn applied(
     )?;
     Ok(MessageDbReply::Done)
 }
+/// `first`: the text's first attempt, decided on in this transaction before the row can go (not
+/// for a message given up on).
 fn attempt_outcome(
     c: &mut Connection,
     k: MessageKey,
     block: Option<BlockReason>,
     failure: Option<ErrorCode>,
     written: bool,
+    first: Option<&mut super::push_store::FirstAttempt>,
     #[cfg(all(feature = "test-hooks", debug_assertions))] fault: Option<
         crate::storage::worker::CommitFault,
     >,
@@ -1698,6 +1712,9 @@ fn attempt_outcome(
     // until the user's Retry; a late attempt outcome must not revive it.
     let exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM outbox WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4 AND reencrypts<3)",params![k.conversation.0.as_slice(),k.sender.0.as_slice(),k.installation.0.as_slice(),k.id.0.as_slice()],|r|r.get(0)).map_err(sql_error)?;
     if exists {
+        if let Some(first) = first {
+            first.decide(&tx, k)?;
+        }
         let reason = block.map(|b| match b {
             BlockReason::Account => 1,
             BlockReason::ContactRequired => 2,
@@ -1871,6 +1888,25 @@ fn outbox_delay_cap(c: &Connection) -> R<u64> {
     } else {
         super::scheduler::MAX_DELAY_MS
     })
+}
+/// The job backs off; `first`: a text's first attempt reached no device, decided on here too.
+fn defer(
+    c: &mut Connection,
+    k: MessageKey,
+    receipt: bool,
+    now: u64,
+    first: Option<&mut super::push_store::FirstAttempt>,
+    #[cfg(all(feature = "test-hooks", debug_assertions))] fault: Option<
+        crate::storage::worker::CommitFault,
+    >,
+) -> R<MessageDbReply> {
+    let tx = c.transaction().map_err(sql_error)?;
+    if let Some(first) = first {
+        first.decide(&tx, k)?;
+    }
+    schedule_retry(&tx, k, receipt, now)?;
+    commit(tx,#[cfg(all(feature = "test-hooks", debug_assertions))] fault)?;
+    Ok(MessageDbReply::Done)
 }
 pub(super) fn schedule_retry(tx: &Transaction<'_>, k: MessageKey, receipt: bool, now: u64) -> R<()> {
     let table = if receipt { "receipt_job" } else { "outbox" };
@@ -2402,5 +2438,6 @@ fn mark_read(
         #[cfg(all(feature = "test-hooks", debug_assertions))]
         fault,
     )?;
-    Ok(MessageDbReply::Done)
+    // How many were read just now (M7: only those clear notifications on my other devices).
+    Ok(MessageDbReply::Count(changed as u64))
 }
