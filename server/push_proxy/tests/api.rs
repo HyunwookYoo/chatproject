@@ -9,17 +9,20 @@ use axum::Router;
 use axum::body::Body;
 use axum::extract::ConnectInfo;
 use axum::http::{Request, StatusCode, header};
+use futures_util::StreamExt;
 use http_body_util::BodyExt;
-use push_proxy::{AppState, Delivery, DeliveryKind, FakeUpstream, router};
+use push_proxy::{AppState, Delivery, DeliveryKind, FakeUpstream, Limits, router, serve};
 use push_wire::{
     BASE64URL_NOPAD, HANDLE_LIFETIME_MS, HandlePlain, HandleRequest, HandleResponse, MAX_BODY,
     MAX_ITEMS, MAX_TOKEN, PUSH_CIPHER_MAX, Platform, PushItem, PushItemKind, PushRequest,
     PushResponse, PushResult, Tag, seal_handle,
 };
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower::ServiceExt;
 
 const T0: u64 = 1_800_000_000_000;
 const PEER: [u8; 4] = [127, 0, 0, 1];
+const CRLF: &str = "\r\n";
 
 fn test_key() -> [u8; 32] {
     let mut k = [0u8; 32];
@@ -41,6 +44,7 @@ struct Setup {
     jitter: Duration,
     apns: bool,
     trust_proxy: bool,
+    limits: Limits,
 }
 
 impl Setup {
@@ -51,6 +55,7 @@ impl Setup {
             jitter: Duration::ZERO,
             apns: false,
             trust_proxy: false,
+            limits: Limits::default(),
         }
     }
 
@@ -68,6 +73,7 @@ impl Setup {
         let jitter = self.jitter;
         state.jitter = Arc::new(move || jitter);
         state.trust_proxy = self.trust_proxy;
+        state.limits = self.limits;
         let sink = log.clone();
         state.log = Arc::new(move |line: &str| sink.lock().unwrap().push(line.to_owned()));
         Proxy {
@@ -587,4 +593,120 @@ async fn logs_hold_no_tokens_tags_handles_or_ips() {
         let found = lines.iter().filter(|l| l.starts_with(&want)).count();
         assert_eq!(found, 1, "{want} in:\n{log}");
     }
+}
+
+#[tokio::test]
+async fn in_flight_sends_are_capped() {
+    let mut setup = Setup::new(test_key());
+    setup.limits.max_sends = 2;
+    setup.jitter = Duration::from_millis(300);
+    let p = setup.start();
+    let a = p.issue(Platform::Fcm, "tok-a", [16; 16]).await;
+    let b = p.issue(Platform::Fcm, "tok-b", [17; 16]).await;
+    let c = p.issue(Platform::Fcm, "tok-c", [18; 16]).await;
+
+    let start = Instant::now();
+    let (_, results) = p
+        .push(vec![
+            item(&a, PushItemKind::Wake),
+            item(&b, PushItemKind::Wake),
+            item(&c, PushItemKind::Wake),
+        ])
+        .await;
+    assert!(
+        start.elapsed() < Duration::from_millis(200),
+        "waited for a slot"
+    );
+    assert_eq!(
+        results,
+        vec![PushResult::Ok, PushResult::Ok, PushResult::Limited]
+    );
+
+    // Slots come back when the sends end.
+    assert_eq!(deliveries(&p.fcm, 2).await.len(), 2);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        p.push(vec![item(&c, PushItemKind::Wake)]).await.1,
+        vec![PushResult::Ok]
+    );
+    let got = deliveries(&p.fcm, 3).await;
+    assert_eq!(got.len(), 3);
+    assert_eq!(got[2].token, "tok-c");
+}
+
+#[tokio::test]
+async fn stalled_request_body_times_out() {
+    let mut setup = Setup::new(test_key());
+    setup.limits.request_timeout = Duration::from_millis(200);
+    let p = setup.start();
+    let first = futures_util::stream::once(async {
+        Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"{\"items\":"))
+    });
+    let body = Body::from_stream(first.chain(futures_util::stream::pending()));
+    let mut req = Request::post("/push").body(body).unwrap();
+    req.extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from((PEER, 40_000))));
+
+    let start = Instant::now();
+    let resp = tokio::time::timeout(Duration::from_secs(5), p.app.clone().oneshot(req))
+        .await
+        .expect("request not bounded")
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::REQUEST_TIMEOUT);
+    assert!(start.elapsed() >= Duration::from_millis(200));
+    assert!(
+        p.log_text().contains("path=/push status=408"),
+        "{}",
+        p.log_text()
+    );
+}
+
+#[tokio::test]
+async fn stalled_headers_close_the_connection() {
+    let p = Setup::new(test_key()).start();
+    let listener = tokio::net::TcpListener::bind(SocketAddr::from((PEER, 0)))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(serve(listener, p.app.clone(), Duration::from_millis(200)));
+
+    // A complete request is served.
+    let mut ok = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let body = br#"{"items":[]}"#;
+    let head = format!(
+        "POST /push HTTP/1.1{CRLF}Host: proxy{CRLF}Content-Length: {}{CRLF}Connection: close{CRLF}{CRLF}",
+        body.len()
+    );
+    ok.write_all(head.as_bytes()).await.unwrap();
+    ok.write_all(body).await.unwrap();
+    let mut answer = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), ok.read_to_end(&mut answer))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        answer.starts_with(b"HTTP/1.1 200"),
+        "{}",
+        String::from_utf8_lossy(&answer)
+    );
+
+    // A head that never ends is cut off.
+    let mut stalled = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let partial = format!("POST /push HTTP/1.1{CRLF}Host: proxy{CRLF}");
+    stalled.write_all(partial.as_bytes()).await.unwrap();
+    let start = Instant::now();
+    let mut rest = Vec::new();
+    let closed = tokio::time::timeout(Duration::from_secs(5), stalled.read_to_end(&mut rest)).await;
+    assert!(closed.is_ok(), "connection still open after 5 s");
+    assert!(
+        start.elapsed() >= Duration::from_millis(150),
+        "{:?}",
+        start.elapsed()
+    );
+
+    // So is a connection that never sends a byte.
+    let mut silent = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let mut rest = Vec::new();
+    let closed = tokio::time::timeout(Duration::from_secs(5), silent.read_to_end(&mut rest)).await;
+    assert!(closed.is_ok(), "silent connection still open after 5 s");
 }

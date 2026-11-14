@@ -1,12 +1,11 @@
 //! `push_proxy`: plain HTTP on `PUSH_LISTEN`; TLS is the reverse proxy's job
 //! (spec 9.1). Configuration: see `Config`.
 
-use std::net::SocketAddr;
 use std::process::ExitCode;
 use std::sync::Arc;
 
 use futures_core::future::BoxFuture;
-use push_proxy::{AppState, Config, Delivery, Upstream, UpstreamResult, router};
+use push_proxy::{AppState, Config, Delivery, Upstream, UpstreamResult, router, serve};
 
 /// Stands in until the FCM sender exists (plan Task 3): every send fails and
 /// is counted as `failed` in the log.
@@ -36,10 +35,7 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let app = router(state).into_make_service_with_connect_info::<SocketAddr>();
-    if let Err(e) = axum::serve(listener, app).await {
-        eprintln!("push_proxy: {e}");
-        return ExitCode::FAILURE;
-    }
+    let header_timeout = state.limits.header_timeout;
+    serve(listener, router(state), header_timeout).await;
     ExitCode::SUCCESS
 }

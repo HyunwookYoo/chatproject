@@ -4,11 +4,13 @@
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::net::IpAddr;
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use sha2::{Digest, Sha256};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-/// Rates per minute and burst sizes.
+/// Rates per minute and burst sizes, and the bounds on waiting and in-flight work.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Limits {
     /// `/push` items per handle.
@@ -17,6 +19,15 @@ pub struct Limits {
     /// `/handle` requests per client IP.
     pub ip_per_minute: u32,
     pub ip_burst: u32,
+    /// Upstream sends waiting out their jitter or in progress, all handles
+    /// together. Beyond it an item is `limited`.
+    pub max_sends: usize,
+    /// From the request head being read to the response: covers a body that
+    /// stalls. Over it: 408.
+    pub request_timeout: Duration,
+    /// For the request head (HTTP/1 header read), when served by
+    /// [`crate::serve`]. Over it the connection is closed.
+    pub header_timeout: Duration,
 }
 
 impl Default for Limits {
@@ -26,6 +37,10 @@ impl Default for Limits {
             handle_burst: 20,
             ip_per_minute: 30,
             ip_burst: 30,
+            // About 5 KB each at most (token + `e`): tens of MB in the worst case.
+            max_sends: 10_000,
+            request_timeout: Duration::from_secs(10),
+            header_timeout: Duration::from_secs(10),
         }
     }
 }
@@ -95,6 +110,7 @@ fn refilled(b: &Bucket, now_ms: u64, per_minute: u64, capacity: u64) -> u64 {
 pub(crate) struct Limiter {
     handles: Mutex<Buckets<[u8; 32]>>,
     ips: Mutex<Buckets<IpAddr>>,
+    sends: Arc<Semaphore>,
 }
 
 impl Limiter {
@@ -102,7 +118,13 @@ impl Limiter {
         Limiter {
             handles: Mutex::new(Buckets::new(limits.handle_per_minute, limits.handle_burst)),
             ips: Mutex::new(Buckets::new(limits.ip_per_minute, limits.ip_burst)),
+            sends: Arc::new(Semaphore::new(limits.max_sends.min(Semaphore::MAX_PERMITS))),
         }
+    }
+
+    /// A slot for one upstream send, held until the send ends. Never waits.
+    pub(crate) fn send_permit(&self) -> Option<OwnedSemaphorePermit> {
+        self.sends.clone().try_acquire_owned().ok()
     }
 
     /// Keyed by SHA-256 of the handle bytes, so the map holds no handle.

@@ -6,10 +6,12 @@ mod app;
 mod config;
 mod limit;
 mod log;
+mod serve;
 mod upstream;
 
 pub use app::{AppState, router};
 pub use config::{ApnsConfig, ApnsEnv, Config, ConfigError};
 pub use limit::Limits;
 pub use log::{LogSink, stderr_sink};
+pub use serve::serve;
 pub use upstream::{Delivery, DeliveryKind, FakeUpstream, Upstream, UpstreamResult};

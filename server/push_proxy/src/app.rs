@@ -6,8 +6,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
-use axum::extract::{ConnectInfo, DefaultBodyLimit, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Extension, Router, middleware};
@@ -16,6 +17,8 @@ use push_wire::{
     MAX_BODY, MAX_ITEMS, MAX_TOKEN, PUSH_CIPHER_MAX, Platform, PushItem, PushItemKind, PushRequest,
     PushResponse, PushResult, Tag, open_handle, seal_handle,
 };
+
+use tokio::sync::OwnedSemaphorePermit;
 
 use crate::limit::{Limiter, Limits};
 use crate::log::{LogSink, Logger, PushCounts};
@@ -96,15 +99,25 @@ pub fn router(state: AppState) -> Router {
         state,
         logger: logger.clone(),
     });
+    let request_timeout = shared.state.limits.request_timeout;
     Router::new()
         .route("/handle", post(handle))
         .route("/push", post(push))
         .with_state(shared)
         .layer(DefaultBodyLimit::max(MAX_BODY))
+        .layer(middleware::from_fn_with_state(request_timeout, time_limit))
         .layer(middleware::from_fn_with_state(
             logger,
             crate::log::log_request,
         ))
+}
+
+/// Bounds everything after the request head, body reading included
+/// (extractors run inside `next`).
+async fn time_limit(State(limit): State<Duration>, request: Request, next: Next) -> Response {
+    tokio::time::timeout(limit, next.run(request))
+        .await
+        .unwrap_or_else(|_| StatusCode::REQUEST_TIMEOUT.into_response())
 }
 
 async fn handle(
@@ -208,8 +221,8 @@ async fn push(State(shared): State<Arc<Shared>>, body: Result<Bytes, BytesReject
         }
     }
     // Answer now; each send waits out its own jitter in the background.
-    for (upstream, delivery) in sends {
-        spawn_send(&shared, upstream, delivery);
+    for send in sends {
+        spawn_send(&shared, send);
     }
     let counts = PushCounts::of(&results);
     let mut resp = json(serde_json::to_vec(&PushResponse { results }));
@@ -217,12 +230,15 @@ async fn push(State(shared): State<Arc<Shared>>, body: Result<Bytes, BytesReject
     resp
 }
 
+/// One accepted item: where it goes and the in-flight slot it holds.
+struct Outgoing {
+    upstream: Arc<dyn Upstream>,
+    delivery: Delivery,
+    permit: OwnedSemaphorePermit,
+}
+
 /// The result of one item: what to send where, or why not.
-fn decide(
-    shared: &Shared,
-    item: PushItem,
-    now: u64,
-) -> Result<(Arc<dyn Upstream>, Delivery), PushResult> {
+fn decide(shared: &Shared, item: PushItem, now: u64) -> Result<Outgoing, PushResult> {
     let state = &shared.state;
     let bytes = BASE64URL_NOPAD
         .decode(item.handle.as_bytes())
@@ -240,18 +256,21 @@ fn decide(
         PushItemKind::Read if plain.platform == Platform::Apns => return Err(PushResult::Bad),
         PushItemKind::Read => DeliveryKind::Read,
     };
+    // The slot first: a full proxy must not spend the handle's token.
+    let permit = shared.limiter.send_permit().ok_or(PushResult::Limited)?;
     if !shared.limiter.allow_handle(&bytes, now) {
         return Err(PushResult::Limited);
     }
-    Ok((
-        upstream.clone(),
-        Delivery {
+    Ok(Outgoing {
+        upstream: upstream.clone(),
+        delivery: Delivery {
             platform: plain.platform,
             token: plain.token,
             tag: plain.tag,
             kind,
         },
-    ))
+        permit,
+    })
 }
 
 /// `e` is base64url of 1..=PUSH_CIPHER_MAX bytes, which keeps every platform
@@ -263,15 +282,21 @@ fn cipher_fits(e: &str) -> bool {
             .is_ok_and(|bytes| !bytes.is_empty())
 }
 
-fn spawn_send(shared: &Shared, upstream: Arc<dyn Upstream>, delivery: Delivery) {
+fn spawn_send(shared: &Shared, send: Outgoing) {
     let wait = (shared.state.jitter)();
     let logger = shared.logger.clone();
     tokio::spawn(async move {
+        let Outgoing {
+            upstream,
+            delivery,
+            permit,
+        } = send;
         tokio::time::sleep(wait).await;
         let start = Instant::now();
         let result = tokio::time::timeout(UPSTREAM_TIMEOUT, upstream.send(delivery))
             .await
             .unwrap_or(UpstreamResult::Failed);
+        drop(permit);
         logger.sent(result, start.elapsed());
     });
 }
