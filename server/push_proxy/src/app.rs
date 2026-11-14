@@ -71,7 +71,7 @@ impl AppState {
     }
 }
 
-fn system_clock_ms() -> u64 {
+pub(crate) fn system_clock_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
@@ -273,8 +273,11 @@ fn decide(shared: &Shared, item: PushItem, now: u64) -> Result<Outgoing, PushRes
     })
 }
 
-/// `e` is base64url of 1..=PUSH_CIPHER_MAX bytes, which keeps every platform
-/// payload under MAX_PAYLOAD.
+/// `e` is base64url of 1..=PUSH_CIPHER_MAX bytes. A payload is `e` plus a
+/// fixed-size envelope, and at this bound the APNs body and the FCM data
+/// payload are each at most MAX_PAYLOAD (`payload_with_max_cipher_fits_4096`
+/// in tests/upstream.rs). The senders still measure what they build and fail
+/// a send over MAX_PAYLOAD rather than send it.
 fn cipher_fits(e: &str) -> bool {
     e.len() <= BASE64URL_NOPAD.encode_len(PUSH_CIPHER_MAX)
         && BASE64URL_NOPAD
