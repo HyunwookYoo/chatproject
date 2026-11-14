@@ -79,7 +79,10 @@ pub(crate) struct Runtime {
     generation: Arc<std::sync::atomic::AtomicU64>,
     /// A renewal's `/handle` requests are running.
     renewing: bool,
-    /// Another renewal is wanted once the running one ends, at this wall time at the latest.
+    /// The wall time the running renewal looks at.
+    running_wall: u64,
+    /// Another renewal is wanted once the running one ends (a later time was asked for, or the
+    /// running one was made stale), at this wall time at the latest.
     again: Option<u64>,
     /// `push_renew_due` callers waiting for the running (or next) renewal.
     waiters: Vec<oneshot::Sender<Result<RenewSummary, CoreError>>>,
@@ -276,6 +279,8 @@ impl Manager {
         token: String,
     ) -> Result<(), CoreError> {
         let request = self.ready()?;
+        // A `push_configure` made just before counts (the poll may not have taken it yet).
+        self.push_take_config(request).await?;
         let PushDbReply::Count(changed) = self
             .push_db(PushDbOp::SetToken { platform, token }, request)
             .await?
@@ -294,6 +299,7 @@ impl Manager {
 
     pub(super) async fn push_set_enabled(&mut self, enabled: bool) -> Result<(), CoreError> {
         let request = self.ready()?;
+        self.push_take_config(request).await?;
         let now = self.services.clock.wall_ms();
         self.push_db(PushDbOp::SetEnabled { enabled, now }, request)
             .await?;
@@ -321,8 +327,16 @@ impl Manager {
         now_ms: u64,
         reply: oneshot::Sender<Result<RenewSummary, CoreError>>,
     ) {
+        // A `push_configure` made just before counts: the background renewal of a cold start
+        // (spec 3) configures and asks at once, and must not get an empty answer.
         let request = match self.ready() {
-            Ok(request) => request,
+            Ok(request) => match self.push_take_config(request).await {
+                Ok(()) => request,
+                Err(error) => {
+                    let _ = reply.send(Err(error));
+                    return;
+                }
+            },
             Err(error) => {
                 let _ = reply.send(Err(error));
                 return;
@@ -342,7 +356,11 @@ impl Manager {
     async fn start_renewal(&mut self, wall: u64, request: Request) {
         let push = &mut self.messages.push;
         if push.renewing {
-            push.again = Some(push.again.map_or(wall, |at| at.max(wall)));
+            // The running renewal answers a request for the same time or an earlier one; a
+            // stale one (token change, push off) is done again when it ends (`push_issued`).
+            if wall > push.running_wall {
+                push.again = Some(push.again.map_or(wall, |at| at.max(wall)));
+            }
             return;
         }
         let next = self.schedule_now().saturating_add(RENEW_CHECK_MS);
@@ -376,6 +394,7 @@ impl Manager {
         };
         let push = &mut self.messages.push;
         push.renewing = true;
+        push.running_wall = wall;
         let current = push.generation.clone();
         let generation = current.load(Ordering::SeqCst);
         let mailbox = self.auth.send.clone();
@@ -480,6 +499,12 @@ impl Manager {
         };
         let mut summary = RenewSummary::default();
         let current = self.messages.push.generation.load(Ordering::SeqCst) == generation;
+        if !current {
+            // Asked under an old token, or push went off: done again under what holds now
+            // (with push off that asks the proxy nothing).
+            let push = &mut self.messages.push;
+            push.again = Some(push.again.map_or(issued.now, |at| at.max(issued.now)));
+        }
         if current && (!issued.handles.is_empty() || issued.own.is_some()) {
             match self.push_db(PushDbOp::StoreIssued(issued), request).await {
                 Ok(PushDbReply::Count(stored)) => {

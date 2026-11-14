@@ -381,6 +381,36 @@ async fn revoked_device_handles_are_dropped() {
     settle!([&a2], push_state(&a2).await.own.is_empty());
 }
 
+/// Spec 3: a background renewal starts the core, configures push and asks for what is due at
+/// once; the configuration counts although the actor has not polled since.
+#[tokio::test]
+async fn renew_due_right_after_configure_issues() {
+    let (a1, b1, net, conv) = setup(&[B1]).await;
+    grouped(&a1, &b1, conv).await;
+    let proxy = proxy(&net);
+    let a1_id = installation(&a1).await;
+    // Without an address the token is stored but nothing is asked.
+    a1.account
+        .push_set_token(Platform::Fcm, "token-a1".into())
+        .await
+        .unwrap();
+    a1.account.push_configure(config(Some(Platform::Fcm))).unwrap();
+    let summary = a1.account.push_renew_due(NOW * 1000).await.unwrap();
+    assert_eq!(
+        summary,
+        RenewSummary {
+            issued: 1,
+            announced: 1,
+            withdrawn: 0
+        }
+    );
+    assert_eq!(proxy.handle_requests().len(), 1);
+    settle!(
+        [&a1, &b1],
+        peer_handle(&b1, conv, a1_id).await.flatten().is_some()
+    );
+}
+
 #[tokio::test]
 async fn windows_and_disabled_devices_never_call_proxy() {
     let (a1, b1, net, conv) = setup(&[B1]).await;
