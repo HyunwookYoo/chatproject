@@ -312,8 +312,8 @@ const LIFECYCLE_WAIT: Duration = Duration::from_secs(2);
 /// How often a lifecycle request is asked again while it is pending.
 const LIFECYCLE_LOOK: Duration = Duration::from_millis(10);
 
-/// Asks `request` (`account_suspend` / `account_resume`) until it completed (0), failed (2) or
-/// `until`; true when it completed.
+/// Asks `request` (a lifecycle request: 0 completed, 1 pending, otherwise failed or no longer
+/// ours) until it completed or `until`; true when it completed.
 fn lifecycle_until(request: impl Fn() -> i32, until: Instant) -> bool {
     loop {
         match request() {
@@ -324,31 +324,45 @@ fn lifecycle_until(request: impl Fn() -> i32, until: Instant) -> bool {
     }
 }
 
+/// A lifecycle request of the renewal, made only while the scene made none since `seen` (its
+/// latest word wins); `3` (stop asking) once it did.
+fn own_lifecycle(slot: &CoreSlot, suspend: bool, seen: u64) -> i32 {
+    slot.account_lifecycle_since(suspend, seen).unwrap_or(3)
+}
+
 /// Suspends the account again when dropped, also after an error or a panic: iOS kills a
-/// suspended app that holds file locks (0xdead10cc).
-struct Resuspend<'a>(&'a CoreSlot);
+/// suspended app that holds file locks (0xdead10cc). Not if the scene made a lifecycle request
+/// meanwhile (it came to the foreground, or went back): that request stands. The wait for the
+/// suspension to complete is bounded (`LIFECYCLE_WAIT`), so it is best effort.
+struct Resuspend<'a> {
+    slot: &'a CoreSlot,
+    seen: u64,
+}
 
 impl Drop for Resuspend<'_> {
     fn drop(&mut self) {
-        let slot = self.0;
-        lifecycle_until(|| slot.account_suspend(), Instant::now() + LIFECYCLE_WAIT);
+        let (slot, seen) = (self.slot, self.seen);
+        lifecycle_until(|| own_lifecycle(slot, true, seen), Instant::now() + LIFECYCLE_WAIT);
     }
 }
 
 /// Runs `renew` with the budget left until `deadline`. An account the iOS scene suspended (the
-/// app is alive in the background) is resumed for it and suspended again before this returns;
-/// one that was not suspended is left as it was.
+/// app is alive in the background) is resumed for it and suspended again before this returns,
+/// unless the scene made a lifecycle request meanwhile; one that was not suspended is left as
+/// it was.
 fn resumed_for(
     slot: &CoreSlot,
     deadline: Instant,
     renew: impl FnOnce(Duration) -> Result<u32, NativeError>,
 ) -> Result<u32, NativeError> {
+    // Read before the check: a scene request after it makes every own request below a no-op.
+    let seen = slot.scene_requests();
     if !slot.account_suspended() {
         return renew(deadline.saturating_duration_since(Instant::now()));
     }
-    let _again = Resuspend(slot);
+    let _again = Resuspend { slot, seen };
     let until = deadline.checked_sub(LIFECYCLE_WAIT).unwrap_or(deadline);
-    if !lifecycle_until(|| slot.account_resume(), until) {
+    if !lifecycle_until(|| own_lifecycle(slot, false, seen), until) {
         return Err(if Instant::now() < until { NativeError::core(ErrorCode::StorageLocked) } else { NativeError::Timeout });
     }
     renew(until.saturating_duration_since(Instant::now()))
@@ -893,6 +907,36 @@ mod tests {
             resumed_for(&slot, deadline, |_| panic!("renewal failed"))
         }));
         assert!(panicked.is_err());
+        suspended_again(&slot);
+    }
+
+    /// Re-review finding: the scene comes to the foreground while the renewal runs. Its resume
+    /// is a no-op then (the renewal resumed already), and the renewal must not suspend the
+    /// account under the active app afterwards.
+    #[test]
+    fn a_scene_resume_during_the_renewal_keeps_the_account_resumed() {
+        let (_dir, slot, _bus) = suspended_account();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        resumed_for(&slot, deadline, |_| {
+            assert_eq!(slot.account_resume(), 0, "a no-op resume of the scene");
+            Ok(0)
+        })
+        .unwrap();
+        assert!(!slot.account_suspended());
+        assert_eq!(slot.account_resume(), 0);
+    }
+
+    /// The scene comes to the foreground and goes back during the renewal: its suspension (its
+    /// latest word) stands.
+    #[test]
+    fn a_later_scene_suspend_during_the_renewal_stands() {
+        let (_dir, slot, _bus) = suspended_account();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let _ = resumed_for(&slot, deadline, |_| {
+            slot.account_resume();
+            suspend(&slot);
+            Ok(0)
+        });
         suspended_again(&slot);
     }
 

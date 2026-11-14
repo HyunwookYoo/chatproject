@@ -34,6 +34,9 @@ pub struct CoreInfo {
 pub struct CoreSlot {
     gate: Arc<crate::transport::Gate>,
     running: Mutex<Option<Arc<RunningCore>>>,
+    /// Lifecycle requests of the scene (`account_suspend` / `account_resume`) so far, no-ops
+    /// included. A native task's own requests (`account_lifecycle_since`) do not count.
+    scene_requests: Mutex<u64>,
 }
 
 struct RunningCore {
@@ -156,10 +159,26 @@ impl CoreSlot {
         account.ok_or_else(|| CoreError::new(ErrorCode::NotAvailable, "account not opened"))
     }
     /// Native lifecycle callers do not wait for initialization or another slot caller.
-    pub fn account_suspend(&self) -> i32 { self.account_lifecycle(true) }
-    pub fn account_resume(&self) -> i32 { self.account_lifecycle(false) }
+    pub fn account_suspend(&self) -> i32 { self.scene_lifecycle(true) }
+    pub fn account_resume(&self) -> i32 { self.scene_lifecycle(false) }
     /// Whether the last lifecycle request was a suspension (iOS scene in the background).
     pub fn account_suspended(&self) -> bool { self.gate.desired_suspend() }
+    /// How many lifecycle requests the scene made so far (see `account_lifecycle_since`).
+    pub fn scene_requests(&self) -> u64 {
+        *self.scene_requests.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    /// A lifecycle request of a native task (the iOS background renewal resuming a suspended
+    /// account, then suspending it again), made only if the scene made no request since it
+    /// read `seen` (`scene_requests`): the scene's latest word wins. `None` when it did.
+    pub fn account_lifecycle_since(&self, suspend: bool, seen: u64) -> Option<i32> {
+        let requests = self.scene_requests.lock().unwrap_or_else(|e| e.into_inner());
+        (*requests == seen).then(|| self.account_lifecycle(suspend))
+    }
+    fn scene_lifecycle(&self, suspend: bool) -> i32 {
+        let mut requests = self.scene_requests.lock().unwrap_or_else(|e| e.into_inner());
+        *requests = requests.wrapping_add(1);
+        self.account_lifecycle(suspend)
+    }
     fn account_lifecycle(&self, suspend: bool) -> i32 {
         self.gate.lifecycle(suspend);
         let Ok(running) = self.running.try_lock() else { return 1; };
