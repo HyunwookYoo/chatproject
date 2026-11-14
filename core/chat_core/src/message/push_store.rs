@@ -758,9 +758,12 @@ fn due(c: &Connection, now: u64, recipients: &[InstallationId]) -> R<PushDbReply
     })
 }
 
+/// A queued frame as `hand_off` reads it: conversation, peer account, msg_id, frame.
+type QueuedFrame = ([u8; 32], [u8; 32], [u8; 16], Vec<u8>);
+
 fn hand_off(c: &mut Connection, fault: Fault) -> R<Vec<HandoffEntry>> {
     let tx = c.transaction().map_err(sql)?;
-    let rows: Vec<([u8; 32], [u8; 32], [u8; 16], Vec<u8>)> = {
+    let rows: Vec<QueuedFrame> = {
         let mut q = tx
             .prepare("SELECT d.conversation,v.peer,d.msg_id,min(d.wire) FROM push_delivery d JOIN conversation v ON v.id=d.conversation GROUP BY d.conversation,d.msg_id ORDER BY d.conversation,d.msg_id")
             .map_err(sql)?;
