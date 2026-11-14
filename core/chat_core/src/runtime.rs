@@ -188,6 +188,14 @@ impl CoreSlot {
             .map(|core| core.info.clone())
     }
 
+    /// The core's runtime, for native entry points (Kotlin, Swift) that wait on core calls
+    /// from their own threads. Never block on it from one of its own worker threads.
+    pub fn runtime(&self) -> Result<tokio::runtime::Handle, CoreError> {
+        self.running.lock().expect("core slot lock poisoned").as_ref()
+            .and_then(|core| core.runtime.as_ref().map(|runtime| runtime.handle().clone()))
+            .ok_or_else(|| CoreError::new(ErrorCode::CoreNotStarted, "core not started"))
+    }
+
     /// Clones the actor handle; callers await commands after the slot lock is released.
     pub fn network(&self) -> Result<NetworkHandle, CoreError> {
         self.running.lock().expect("core slot lock poisoned").as_ref()

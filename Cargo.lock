@@ -727,6 +727,8 @@ dependencies = [
  "iroh",
  "jni 0.21.1",
  "ndk-context",
+ "push_wire",
+ "serde_json",
  "tempfile",
  "tokio",
  "uniffi",

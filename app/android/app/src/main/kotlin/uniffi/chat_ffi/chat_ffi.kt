@@ -649,6 +649,28 @@ internal open class UniffiForeignFutureResultVoid(
 internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
     fun callback(`callbackData`: Long,`result`: UniffiForeignFutureResultVoid.UniffiByValue,)
 }
+internal interface UniffiCallbackInterfaceNativeNotifierMethod0 : com.sun.jna.Callback {
+    fun callback(`uniffiHandle`: Long,`items`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
+}
+@Structure.FieldOrder("uniffiFree", "uniffiClone", "notify")
+internal open class UniffiVTableCallbackInterfaceNativeNotifier(
+    @JvmField internal var `uniffiFree`: UniffiCallbackInterfaceFree? = null,
+    @JvmField internal var `uniffiClone`: UniffiCallbackInterfaceClone? = null,
+    @JvmField internal var `notify`: UniffiCallbackInterfaceNativeNotifierMethod0? = null,
+) : Structure() {
+    class UniffiByValue(
+        `uniffiFree`: UniffiCallbackInterfaceFree? = null,
+        `uniffiClone`: UniffiCallbackInterfaceClone? = null,
+        `notify`: UniffiCallbackInterfaceNativeNotifierMethod0? = null,
+    ): UniffiVTableCallbackInterfaceNativeNotifier(`uniffiFree`,`uniffiClone`,`notify`,), Structure.ByValue
+
+   internal fun uniffiSetValue(other: UniffiVTableCallbackInterfaceNativeNotifier) {
+        `uniffiFree` = other.`uniffiFree`
+        `uniffiClone` = other.`uniffiClone`
+        `notify` = other.`notify`
+    }
+
+}
 
 // A JNA Library to expose the extern-C FFI definitions.
 // This is an implementation detail which will be called internally by the public API.
@@ -678,6 +700,22 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_chat_ffi_checksum_func_native_instance_id(
     ): Int
+    external fun uniffi_chat_ffi_checksum_func_native_push_deleted(
+    ): Int
+    external fun uniffi_chat_ffi_checksum_func_native_push_received(
+    ): Int
+    external fun uniffi_chat_ffi_checksum_func_native_push_renew(
+    ): Int
+    external fun uniffi_chat_ffi_checksum_func_native_push_token(
+    ): Int
+    external fun uniffi_chat_ffi_checksum_func_native_set_notifier(
+    ): Int
+    external fun uniffi_chat_ffi_checksum_func_native_set_open_conversation(
+    ): Int
+    external fun uniffi_chat_ffi_checksum_func_native_start(
+    ): Int
+    external fun uniffi_chat_ffi_checksum_method_nativenotifier_notify(
+    ): Int
     external fun ffi_chat_ffi_uniffi_contract_version(
     ): Int
 
@@ -689,13 +727,30 @@ internal object UniffiLib {
 
     init {
         Native.register(UniffiLib::class.java, findLibraryName(componentName = "chat_ffi"))
+        uniffiCallbackInterfaceNativeNotifier.register(this)
         
     }
 
     internal fun ensureInitialized() = Unit
+    external fun uniffi_chat_ffi_fn_init_callback_vtable_nativenotifier(`vtable`: UniffiVTableCallbackInterfaceNativeNotifier,
+    ): Unit
     external fun uniffi_chat_ffi_fn_func_native_core_version(uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_chat_ffi_fn_func_native_instance_id(uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_chat_ffi_fn_func_native_push_deleted(uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    external fun uniffi_chat_ffi_fn_func_native_push_received(`data`: RustBuffer.ByValue,`deadlineMs`: Int,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_chat_ffi_fn_func_native_push_renew(uniffi_out_err: UniffiRustCallStatus, 
+    ): Int
+    external fun uniffi_chat_ffi_fn_func_native_push_token(`token`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    external fun uniffi_chat_ffi_fn_func_native_set_notifier(`notifier`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    external fun uniffi_chat_ffi_fn_func_native_set_open_conversation(`id`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    external fun uniffi_chat_ffi_fn_func_native_start(`storageRoot`: RustBuffer.ByValue,`pushUrl`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun ffi_chat_ffi_rustbuffer_alloc(`size`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
@@ -822,6 +877,30 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if ((lib.uniffi_chat_ffi_checksum_func_native_instance_id() and 0xFFFF) != 60513) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if ((lib.uniffi_chat_ffi_checksum_func_native_push_deleted() and 0xFFFF) != 21936) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_chat_ffi_checksum_func_native_push_received() and 0xFFFF) != 15990) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_chat_ffi_checksum_func_native_push_renew() and 0xFFFF) != 55729) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_chat_ffi_checksum_func_native_push_token() and 0xFFFF) != 10560) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_chat_ffi_checksum_func_native_set_notifier() and 0xFFFF) != 54708) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_chat_ffi_checksum_func_native_set_open_conversation() and 0xFFFF) != 53651) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_chat_ffi_checksum_func_native_start() and 0xFFFF) != 64723) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_chat_ffi_checksum_method_nativenotifier_notify() and 0xFFFF) != 52865) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
 }
 
 /**
@@ -913,7 +992,107 @@ object UniffiWithHandle
  *
  * @suppress
  * */
-object NoHandle
+object NoHandle// Magic number for the Rust proxy to call using the same mechanism as every other method,
+// to free the callback once it's dropped by Rust.
+internal const val IDX_CALLBACK_FREE = 0
+// Callback return codes
+internal const val UNIFFI_CALLBACK_SUCCESS = 0
+internal const val UNIFFI_CALLBACK_ERROR = 1
+internal const val UNIFFI_CALLBACK_UNEXPECTED_ERROR = 2
+
+/**
+ * @suppress
+ */
+public abstract class FfiConverterCallbackInterface<CallbackInterface: Any>: FfiConverter<CallbackInterface, Long> {
+    internal val handleMap = UniffiHandleMap<CallbackInterface>()
+
+    internal fun drop(handle: Long) {
+        handleMap.remove(handle)
+    }
+
+    override fun lift(value: Long): CallbackInterface {
+        return handleMap.get(value)
+    }
+
+    override fun read(buf: ByteBuffer) = lift(buf.getLong())
+
+    override fun lower(value: CallbackInterface) = handleMap.insert(value)
+
+    override fun allocationSize(value: CallbackInterface) = 8UL
+
+    override fun write(value: CallbackInterface, buf: ByteBuffer) {
+        buf.putLong(lower(value))
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterUInt: FfiConverter<UInt, Int> {
+    override fun lift(value: Int): UInt {
+        return value.toUInt()
+    }
+
+    override fun read(buf: ByteBuffer): UInt {
+        return lift(buf.getInt())
+    }
+
+    override fun lower(value: UInt): Int {
+        return value.toInt()
+    }
+
+    override fun allocationSize(value: UInt) = 4UL
+
+    override fun write(value: UInt, buf: ByteBuffer) {
+        buf.putInt(value.toInt())
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterInt: FfiConverter<Int, Int> {
+    override fun lift(value: Int): Int {
+        return value
+    }
+
+    override fun read(buf: ByteBuffer): Int {
+        return buf.getInt()
+    }
+
+    override fun lower(value: Int): Int {
+        return value
+    }
+
+    override fun allocationSize(value: Int) = 4UL
+
+    override fun write(value: Int, buf: ByteBuffer) {
+        buf.putInt(value)
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterBoolean: FfiConverter<Boolean, Byte> {
+    override fun lift(value: Byte): Boolean {
+        return value.toInt() != 0
+    }
+
+    override fun read(buf: ByteBuffer): Boolean {
+        return lift(buf.get())
+    }
+
+    override fun lower(value: Boolean): Byte {
+        return if (value) 1.toByte() else 0.toByte()
+    }
+
+    override fun allocationSize(value: Boolean) = 1UL
+
+    override fun write(value: Boolean, buf: ByteBuffer) {
+        buf.put(lower(value))
+    }
+}
 
 /**
  * @suppress
@@ -972,6 +1151,414 @@ public object FfiConverterString: FfiConverter<String, RustBuffer.ByValue> {
     }
 }
 
+/**
+ * @suppress
+ */
+public object FfiConverterByteArray: FfiConverterRustBuffer<ByteArray> {
+    override fun read(buf: ByteBuffer): ByteArray {
+        val len = buf.getInt()
+        val byteArr = ByteArray(len)
+        buf.get(byteArr)
+        return byteArr
+    }
+    override fun allocationSize(value: ByteArray): ULong {
+        return 4UL + value.size.toULong()
+    }
+    override fun write(value: ByteArray, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        buf.put(value)
+    }
+}
+
+
+
+/**
+ * The core this call reached.
+ */
+data class NativeInfo (
+    var `version`: kotlin.String
+    , 
+    /**
+     * Same as Dart's `CoreInfo.instance_id` when both reached one core.
+     */
+    var `instanceId`: kotlin.String
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeNativeInfo: FfiConverterRustBuffer<NativeInfo> {
+    override fun read(buf: ByteBuffer): NativeInfo {
+        return NativeInfo(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: NativeInfo) = (
+            FfiConverterString.allocationSize(value.`version`) +
+            FfiConverterString.allocationSize(value.`instanceId`)
+    )
+
+    override fun write(value: NativeInfo, buf: ByteBuffer) {
+            FfiConverterString.write(value.`version`, buf)
+            FfiConverterString.write(value.`instanceId`, buf)
+    }
+}
+
+
+
+/**
+ * One conversation's notification as Kotlin shows it (spec 5.5; M6 channel and id rules).
+ */
+data class NativeNotifyItem (
+    /**
+     * The conversation's first 4 bytes as a signed big-endian i32 (Dart `notificationId`).
+     */
+    var `id`: kotlin.Int
+    , 
+    /**
+     * The contact's alias, or "새 메시지".
+     */
+    var `title`: kotlin.String
+    , 
+    /**
+     * The start of the last unread text (with " 외 N개"), or "새 메시지 N개".
+     */
+    var `body`: kotlin.String
+    , 
+    /**
+     * Update the shown notification without alerting (no new message).
+     */
+    var `update`: kotlin.Boolean
+    , 
+    /**
+     * Remove the notification (nothing unread); `title` and `body` are empty.
+     */
+    var `cancel`: kotlin.Boolean
+    , 
+    var `conversation`: kotlin.ByteArray
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeNativeNotifyItem: FfiConverterRustBuffer<NativeNotifyItem> {
+    override fun read(buf: ByteBuffer): NativeNotifyItem {
+        return NativeNotifyItem(
+            FfiConverterInt.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterByteArray.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: NativeNotifyItem) = (
+            FfiConverterInt.allocationSize(value.`id`) +
+            FfiConverterString.allocationSize(value.`title`) +
+            FfiConverterString.allocationSize(value.`body`) +
+            FfiConverterBoolean.allocationSize(value.`update`) +
+            FfiConverterBoolean.allocationSize(value.`cancel`) +
+            FfiConverterByteArray.allocationSize(value.`conversation`)
+    )
+
+    override fun write(value: NativeNotifyItem, buf: ByteBuffer) {
+            FfiConverterInt.write(value.`id`, buf)
+            FfiConverterString.write(value.`title`, buf)
+            FfiConverterString.write(value.`body`, buf)
+            FfiConverterBoolean.write(value.`update`, buf)
+            FfiConverterBoolean.write(value.`cancel`, buf)
+            FfiConverterByteArray.write(value.`conversation`, buf)
+    }
+}
+
+
+
+
+
+/**
+ * Why a native call failed. Never carries a token, handle, tag or payload.
+ */
+sealed class NativeException: kotlin.Exception() {
+    
+    /**
+     * The push's data is not one the push proxy builds (plan 2 payload table).
+     */
+    class BadPayload(
+        ) : NativeException() {
+        override val message
+            get() = ""
+    }
+    
+    /**
+     * A setting the core refuses: a storage root that is not absolute, or a push proxy address
+     * this build may not use (release builds take `https://` only).
+     */
+    class InvalidConfig(
+        ) : NativeException() {
+        override val message
+            get() = ""
+    }
+    
+    /**
+     * The call did not end within its bound.
+     */
+    class Timeout(
+        ) : NativeException() {
+        override val message
+            get() = ""
+    }
+    
+    /**
+     * The core could not do it now; `code` names the core's `ErrorCode` (e.g. `CoreNotStarted`).
+     */
+    class Core(
+        
+        val `code`: kotlin.String
+        ) : NativeException() {
+        override val message
+            get() = "code=${ `code` }"
+    }
+    
+
+    
+
+
+    companion object ErrorHandler : UniffiRustCallStatusErrorHandler<NativeException> {
+        override fun lift(error_buf: RustBuffer.ByValue): NativeException = FfiConverterTypeNativeError.lift(error_buf)
+    }
+
+    
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeNativeError : FfiConverterRustBuffer<NativeException> {
+    override fun read(buf: ByteBuffer): NativeException {
+        
+
+        return when(buf.getInt()) {
+            1 -> NativeException.BadPayload()
+            2 -> NativeException.InvalidConfig()
+            3 -> NativeException.Timeout()
+            4 -> NativeException.Core(
+                FfiConverterString.read(buf),
+                )
+            else -> throw RuntimeException("invalid error enum value, something is very wrong!!")
+        }
+    }
+
+    override fun allocationSize(value: NativeException): ULong {
+        return when(value) {
+            is NativeException.BadPayload -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL
+            )
+            is NativeException.InvalidConfig -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL
+            )
+            is NativeException.Timeout -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL
+            )
+            is NativeException.Core -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL
+                + FfiConverterString.allocationSize(value.`code`)
+            )
+        }
+    }
+
+    override fun write(value: NativeException, buf: ByteBuffer) {
+        when(value) {
+            is NativeException.BadPayload -> {
+                buf.putInt(1)
+                Unit
+            }
+            is NativeException.InvalidConfig -> {
+                buf.putInt(2)
+                Unit
+            }
+            is NativeException.Timeout -> {
+                buf.putInt(3)
+                Unit
+            }
+            is NativeException.Core -> {
+                buf.putInt(4)
+                FfiConverterString.write(value.`code`, buf)
+                Unit
+            }
+        }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
+    }
+
+}
+
+
+
+/**
+ * What processing a received push showed (`chat_core::push::PushOutcome`).
+ */
+
+enum class NativePushOutcome {
+    
+    /**
+     * A notification that alerts went to the `NativeNotifier`.
+     */
+    NOTIFIED,
+    /**
+     * A notification was updated or cleared without alerting.
+     */
+    UPDATED,
+    /**
+     * Nothing to show.
+     */
+    NOTHING,
+    /**
+     * The push names no current handle of this device: show nothing.
+     */
+    UNKNOWN_TAG;
+
+    
+
+
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeNativePushOutcome: FfiConverterRustBuffer<NativePushOutcome> {
+    override fun read(buf: ByteBuffer) = try {
+        NativePushOutcome.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: NativePushOutcome) = 4UL
+
+    override fun write(value: NativePushOutcome, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+
+
+/**
+ * Shows notifications for Kotlin. Called on a thread of its own, one batch at a time.
+ */
+public interface NativeNotifier {
+    
+    fun `notify`(`items`: List<NativeNotifyItem>)
+    
+    companion object
+}
+
+
+
+// Put the implementation in an object so we don't pollute the top-level namespace
+internal object uniffiCallbackInterfaceNativeNotifier {
+    internal object `notify`: UniffiCallbackInterfaceNativeNotifierMethod0 {
+        override fun callback(`uniffiHandle`: Long,`items`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,) {
+            val uniffiObj = FfiConverterTypeNativeNotifier.handleMap.get(uniffiHandle)
+            val makeCall = { ->
+                uniffiObj.`notify`(
+                    FfiConverterSequenceTypeNativeNotifyItem.lift(`items`),
+                )
+            }
+            val writeReturn = { _: Unit -> Unit }
+            uniffiTraitInterfaceCall(uniffiCallStatus, makeCall, writeReturn)
+        }
+    }
+
+    internal object uniffiFree: UniffiCallbackInterfaceFree {
+        override fun callback(handle: Long) {
+            FfiConverterTypeNativeNotifier.handleMap.remove(handle)
+        }
+    }
+
+    internal object uniffiClone: UniffiCallbackInterfaceClone {
+        override fun callback(handle: Long): Long {
+            return FfiConverterTypeNativeNotifier.handleMap.clone(handle)
+        }
+    }
+
+    internal var vtable = UniffiVTableCallbackInterfaceNativeNotifier.UniffiByValue(
+        uniffiFree,
+        uniffiClone,
+        `notify`,
+    )
+
+    // Registers the foreign callback with the Rust side.
+    // This method is generated for each callback interface.
+    internal fun register(lib: UniffiLib) {
+        lib.uniffi_chat_ffi_fn_init_callback_vtable_nativenotifier(vtable)
+    }
+}
+
+/**
+ * The ffiConverter which transforms the Callbacks in to handles to pass to Rust.
+ *
+ * @suppress
+ */
+public object FfiConverterTypeNativeNotifier: FfiConverterCallbackInterface<NativeNotifier>()
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalInt: FfiConverterRustBuffer<kotlin.Int?> {
+    override fun read(buf: ByteBuffer): kotlin.Int? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterInt.read(buf)
+    }
+
+    override fun allocationSize(value: kotlin.Int?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterInt.allocationSize(value)
+        }
+    }
+
+    override fun write(value: kotlin.Int?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterInt.write(value, buf)
+        }
+    }
+}
+
 
 
 
@@ -1003,6 +1590,73 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
         }
     }
 }
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeNativeNotifyItem: FfiConverterRustBuffer<List<NativeNotifyItem>> {
+    override fun read(buf: ByteBuffer): List<NativeNotifyItem> {
+        val len = buf.getInt()
+        return List<NativeNotifyItem>(len) {
+            FfiConverterTypeNativeNotifyItem.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<NativeNotifyItem>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeNativeNotifyItem.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<NativeNotifyItem>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeNativeNotifyItem.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterMapStringString: FfiConverterRustBuffer<Map<kotlin.String, kotlin.String>> {
+    override fun read(buf: ByteBuffer): Map<kotlin.String, kotlin.String> {
+        val len = buf.getInt()
+        return buildMap<kotlin.String, kotlin.String>(len) {
+            repeat(len) {
+                val k = FfiConverterString.read(buf)
+                val v = FfiConverterString.read(buf)
+                this[k] = v
+            }
+        }
+    }
+
+    override fun allocationSize(value: Map<kotlin.String, kotlin.String>): ULong {
+        val spaceForMapSize = 4UL
+        val spaceForChildren = value.map { (k, v) ->
+            FfiConverterString.allocationSize(k) +
+            FfiConverterString.allocationSize(v)
+        }.sum()
+        return spaceForMapSize + spaceForChildren
+    }
+
+    override fun write(value: Map<kotlin.String, kotlin.String>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        // The parens on `(k, v)` here ensure we're calling the right method,
+        // which is important for compatibility with older android devices.
+        // Ref https://blog.danlew.net/2017/03/16/kotlin-puzzler-whose-line-is-it-anyways/
+        value.forEach { (k, v) ->
+            FfiConverterString.write(k, buf)
+            FfiConverterString.write(v, buf)
+        }
+    }
+}
         /**
          * Version of the core in this library.
          */ fun `nativeCoreVersion`(): kotlin.String {
@@ -1025,6 +1679,112 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
     UniffiLib.uniffi_chat_ffi_fn_func_native_instance_id(
     
         _status)
+}
+    )
+    }
+    
+
+        /**
+         * FCM dropped pushes for this device (`onDeletedMessages`): the core syncs with my devices and
+         * every contact once the network is up.
+         */
+    @Throws(NativeException::class) fun `nativePushDeleted`()
+        = 
+    uniffiRustCallWithError(NativeException) { _status ->
+    UniffiLib.uniffi_chat_ffi_fn_func_native_push_deleted(
+    
+        _status)
+}
+    
+    
+
+        /**
+         * A received FCM data message (`onMessageReceived`), processed within `deadline_ms` (at most
+         * 20,000 ms) plus a 2-second margin. Notifications go to the `NativeNotifier`. On `Err` the
+         * receiver shows its own "새 메시지", except for `BadPayload` (not a push of this app).
+         */
+    @Throws(NativeException::class) fun `nativePushReceived`(`data`: Map<kotlin.String, kotlin.String>, `deadlineMs`: kotlin.UInt): NativePushOutcome {
+            return FfiConverterTypeNativePushOutcome.lift(
+    uniffiRustCallWithError(NativeException) { _status ->
+    UniffiLib.uniffi_chat_ffi_fn_func_native_push_received(
+    
+        
+        FfiConverterMapStringString.lower(`data`),
+        FfiConverterUInt.lower(`deadlineMs`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * The Android renewal job (every 24 hours): issues the handles due now, gives the peers the
+         * new ones, and returns how many were issued. Call `native_start` first.
+         */
+    @Throws(NativeException::class) fun `nativePushRenew`(): kotlin.UInt {
+            return FfiConverterUInt.lift(
+    uniffiRustCallWithError(NativeException) { _status ->
+    UniffiLib.uniffi_chat_ffi_fn_func_native_push_renew(
+    
+        _status)
+}
+    )
+    }
+    
+
+        /**
+         * A new FCM token (`onNewToken`): every handle is issued again under it.
+         */
+    @Throws(NativeException::class) fun `nativePushToken`(`token`: kotlin.String)
+        = 
+    uniffiRustCallWithError(NativeException) { _status ->
+    UniffiLib.uniffi_chat_ffi_fn_func_native_push_token(
+    
+        
+        FfiConverterString.lower(`token`),_status)
+}
+    
+    
+
+        /**
+         * Sets where `Notify` events go (Android; replaces an earlier notifier).
+         */ fun `nativeSetNotifier`(`notifier`: NativeNotifier)
+        = 
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_chat_ffi_fn_func_native_set_notifier(
+    
+        
+        FfiConverterTypeNativeNotifier.lower(`notifier`),_status)
+}
+    
+    
+
+        /**
+         * The notification id of the conversation on screen while the app is in the foreground, or
+         * `None`: that conversation's notifications are not shown, only cleared.
+         */ fun `nativeSetOpenConversation`(`id`: kotlin.Int?)
+        = 
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_chat_ffi_fn_func_native_set_open_conversation(
+    
+        
+        FfiConverterOptionalInt.lower(`id`),_status)
+}
+    
+    
+
+        /**
+         * Starts the core for the Android push receiver, its renewal job or `Application`, or reaches
+         * the one Dart started: the same `instance_id` either way. `push_url` replaces the build's
+         * proxy address (debug builds); `None` keeps it.
+         */
+    @Throws(NativeException::class) fun `nativeStart`(`storageRoot`: kotlin.String, `pushUrl`: kotlin.String?): NativeInfo {
+            return FfiConverterTypeNativeInfo.lift(
+    uniffiRustCallWithError(NativeException) { _status ->
+    UniffiLib.uniffi_chat_ffi_fn_func_native_start(
+    
+        
+        FfiConverterString.lower(`storageRoot`),
+        FfiConverterOptionalString.lower(`pushUrl`),_status)
 }
     )
     }

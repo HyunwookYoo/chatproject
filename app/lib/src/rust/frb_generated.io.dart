@@ -7,6 +7,7 @@ import 'api/account.dart';
 import 'api/chat.dart';
 import 'api/mailbox.dart';
 import 'api/message.dart';
+import 'api/push.dart';
 import 'dart:async';
 import 'dart:convert';
 import 'dart:ffi' as ffi;
@@ -77,6 +78,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   PeerInfo dco_decode_box_autoadd_peer_info(dynamic raw);
+
+  @protected
+  PushPlatform dco_decode_box_autoadd_push_platform(dynamic raw);
 
   @protected
   RecordView dco_decode_box_autoadd_record_view(dynamic raw);
@@ -225,6 +229,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   PairView? dco_decode_opt_box_autoadd_pair_view(dynamic raw);
 
   @protected
+  PushPlatform? dco_decode_opt_box_autoadd_push_platform(dynamic raw);
+
+  @protected
   RecordView? dco_decode_opt_box_autoadd_record_view(dynamic raw);
 
   @protected
@@ -268,6 +275,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   PublishIntent dco_decode_publish_intent(dynamic raw);
+
+  @protected
+  PushPlatform dco_decode_push_platform(dynamic raw);
+
+  @protected
+  PushStatusView dco_decode_push_status_view(dynamic raw);
 
   @protected
   RecordView dco_decode_record_view(dynamic raw);
@@ -358,6 +371,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   PeerInfo sse_decode_box_autoadd_peer_info(SseDeserializer deserializer);
+
+  @protected
+  PushPlatform sse_decode_box_autoadd_push_platform(
+    SseDeserializer deserializer,
+  );
 
   @protected
   RecordView sse_decode_box_autoadd_record_view(SseDeserializer deserializer);
@@ -530,6 +548,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   PairView? sse_decode_opt_box_autoadd_pair_view(SseDeserializer deserializer);
 
   @protected
+  PushPlatform? sse_decode_opt_box_autoadd_push_platform(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   RecordView? sse_decode_opt_box_autoadd_record_view(
     SseDeserializer deserializer,
   );
@@ -575,6 +598,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   PublishIntent sse_decode_publish_intent(SseDeserializer deserializer);
+
+  @protected
+  PushPlatform sse_decode_push_platform(SseDeserializer deserializer);
+
+  @protected
+  PushStatusView sse_decode_push_status_view(SseDeserializer deserializer);
 
   @protected
   RecordView sse_decode_record_view(SseDeserializer deserializer);
@@ -693,6 +722,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   @protected
   void sse_encode_box_autoadd_peer_info(
     PeerInfo self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_box_autoadd_push_platform(
+    PushPlatform self,
     SseSerializer serializer,
   );
 
@@ -913,6 +948,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_opt_box_autoadd_push_platform(
+    PushPlatform? self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_opt_box_autoadd_record_view(
     RecordView? self,
     SseSerializer serializer,
@@ -971,6 +1012,15 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_publish_intent(PublishIntent self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_push_platform(PushPlatform self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_push_status_view(
+    PushStatusView self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_record_view(RecordView self, SseSerializer serializer);

@@ -122,6 +122,11 @@ pub struct NotifyItem {
     pub new_messages: u32,
     /// The conversation's unread count (0: clear its notification).
     pub unread: u64,
+    /// The contact's alias; empty without one (show "새 메시지").
+    pub title: String,
+    /// The notification body: the start of the last unread text, with " 외 N개" for the N
+    /// other unread ones. `None` when no text is known: show "새 메시지 N개" (N = `unread`).
+    pub preview: Option<String>,
 }
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChatEvent {

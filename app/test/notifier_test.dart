@@ -24,6 +24,7 @@ r.NotifyItem _item(int conversation, int newMessages, int unread) =>
       peer: _bytes(conversation + 100),
       newMessages: newMessages,
       unread: BigInt.from(unread),
+      title: '',
     );
 
 /// 0x01010101: the first 4 conversation bytes as a big-endian int32.
@@ -218,6 +219,7 @@ void main() {
       peer: _bytes(conversation + 1),
       newMessages: 1,
       unread: BigInt.from(unread),
+      title: '',
     );
 
     messages.controller.add(r.ChatEvent.notify(items: [item(1, 1)]));

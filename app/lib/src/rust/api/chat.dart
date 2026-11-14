@@ -260,11 +260,20 @@ class NotifyItem {
   /// The conversation's unread count (0: clear its notification).
   final BigInt unread;
 
+  /// The contact's alias; empty without one (show "새 메시지").
+  final String title;
+
+  /// The notification body: the start of the last unread text, with " 외 N개" for the N
+  /// other unread ones. `None` when no text is known: show "새 메시지 N개" (N = `unread`).
+  final String? preview;
+
   const NotifyItem({
     required this.conversation,
     required this.peer,
     required this.newMessages,
     required this.unread,
+    required this.title,
+    this.preview,
   });
 
   @override
@@ -272,7 +281,9 @@ class NotifyItem {
       conversation.hashCode ^
       peer.hashCode ^
       newMessages.hashCode ^
-      unread.hashCode;
+      unread.hashCode ^
+      title.hashCode ^
+      preview.hashCode;
 
   @override
   bool operator ==(Object other) =>
@@ -282,7 +293,9 @@ class NotifyItem {
           conversation == other.conversation &&
           peer == other.peer &&
           newMessages == other.newMessages &&
-          unread == other.unread;
+          unread == other.unread &&
+          title == other.title &&
+          preview == other.preview;
 }
 
 class PeerInfo {

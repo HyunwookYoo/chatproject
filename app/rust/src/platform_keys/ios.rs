@@ -114,6 +114,24 @@ pub extern "C" fn cp_account_resume() -> i32 {
     std::panic::catch_unwind(|| crate::global::CORE.account_resume()).unwrap_or(2)
 }
 
+/// BGAppRefresh push renewal (M7 spec 5.1, 5.6): starts the core for `data_dir` (or reaches
+/// the running one), opens the account, issues the handles due and gives the peers the new
+/// ones, within `timeout_ms`. Blocks; call it off the main thread. 0 done; -1 a null or
+/// non-UTF-8 `data_dir`, -2 invalid configuration, -3 timed out, -4 the core could not do it,
+/// -5 an internal failure.
+#[no_mangle]
+pub extern "C" fn cp_push_renew(data_dir: *const std::ffi::c_char, timeout_ms: u32) -> i32 {
+    if data_dir.is_null() {
+        return -1;
+    }
+    // SAFETY: the caller passes a NUL-terminated string that outlives this call.
+    let Ok(data_dir) = unsafe { std::ffi::CStr::from_ptr(data_dir) }.to_str() else {
+        return -1;
+    };
+    std::panic::catch_unwind(|| crate::native::background_renew(data_dir, timeout_ms, super::provider))
+        .unwrap_or(-5)
+}
+
 // Apple-target source coverage. Windows execution of core lifecycle tests is
 // deliberately not presented as execution of this ABI or UIKit callbacks.
 #[cfg(all(test, feature = "test-hooks", debug_assertions))]
