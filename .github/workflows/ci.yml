@@ -2,18 +2,18 @@ name: ci
 
 on:
   push:
-    branches: [main]
+    branches: [main, "HyunwookYoo/**"]
   pull_request:
 
 permissions:
   contents: read
 
-# A new push to a PR cancels that PR's older run. A push to main never cancels the run that is already
-# going, but only one more run of main may wait behind it: when several pushes arrive meanwhile, the
-# newest waits and the ones before it are cancelled.
+# A new push to a PR or to a personal branch (pushed only to run CI) cancels that ref's older run. A
+# push to main never cancels the run that is already going, but only one more run of main may wait
+# behind it: when several pushes arrive meanwhile, the newest waits and the ones before it are cancelled.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   FLUTTER_VERSION: 3.44.6

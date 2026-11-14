@@ -76,7 +76,8 @@ jobs:
             ~/.android/avd/chat_e2e_1.ini
             ~/.android/avd/chat_e2e_2.avd
             ~/.android/avd/chat_e2e_2.ini
-          key: nightly-avd-${{ runner.os }}-${{ hashFiles('tools/e2e/avd_config.json') }}
+          # The clean snapshot depends on how emulators.dart prepares it (settle).
+          key: nightly-avd-${{ runner.os }}-${{ hashFiles('tools/e2e/avd_config.json', 'tools/e2e/lib/src/emulators.dart') }}
       - name: Dart dependencies
         run: |
           (cd app && flutter pub get)
@@ -149,34 +150,53 @@ jobs:
           retention-days: 14
       - name: M3 account/auth and M4 message regressions
         id: account_scenario
-        if: steps.scenario.outcome == 'success'
+        # Also after the m2 run failed (it wrote an exit code): each scenario
+        # boots its own emulators, and the job still fails on m2.
+        if: ${{ !cancelled() && steps.scenario.outputs.exit_code != '' }}
         working-directory: tools/e2e
-        env:
-          E2E_DIAGNOSTIC_FILE: ${{ runner.temp }}/m3-diagnostic.json
         run: |
           set +e
           code=0
-          for scenario in m3 m3-auth m4; do
-            dart run bin/run.dart --profile android --scenario "$scenario" --repo-root "$GITHUB_WORKSPACE" > "$RUNNER_TEMP/$scenario-private.log" 2>&1
-            code=$?
-            if [ "$code" -ne 0 ]; then break; fi
+          failed=
+          # M6 (phone, mailbox, node) needs an Android phone: android job only.
+          # Each scenario boots its own emulators, so every one runs even after
+          # a failure; the step fails with the first failure's code.
+          for scenario in m3 m3-auth m4 m6; do
+            E2E_DIAGNOSTIC_FILE="$RUNNER_TEMP/$scenario-diagnostic.json" dart run bin/run.dart --profile android --scenario "$scenario" --repo-root "$GITHUB_WORKSPACE" > "$RUNNER_TEMP/$scenario-private.log" 2>&1
+            result=$?
+            echo "$result" > "$RUNNER_TEMP/$scenario-code.txt"
+            echo "scenario $scenario: exit $result"
+            if [ "$result" -ne 0 ] && [ -z "$failed" ]; then failed=$scenario; code=$result; echo "failed scenario: $scenario"; fi
           done
+          echo "account_scenario=${failed:-m6}" >> "$GITHUB_OUTPUT"
           echo "exit_code=$code" >> "$GITHUB_OUTPUT"
           exit "$code"
       - name: M3 sanitized account summary
         if: always() && steps.account_scenario.outcome != 'skipped'
         env:
           ACCOUNT_CODE: ${{ steps.account_scenario.outputs.exit_code }}
+          ACCOUNT_SCENARIO: ${{ steps.account_scenario.outputs.account_scenario }}
         run: |
           code="${ACCOUNT_CODE:-1}"
           outcome=failure; if [ "$code" = 0 ]; then outcome=success; fi
-          python3 tools/ci/write_e2e_summary.py --profile android --stage scenario --outcome "$outcome" --exit-code "$code" --diagnostic-file "$RUNNER_TEMP/m3-diagnostic.json" --output "$RUNNER_TEMP/m3-summary.json"
+          case "$ACCOUNT_SCENARIO" in m3|m3-auth|m4|m6) ;; *) ACCOUNT_SCENARIO=m3 ;; esac
+          mkdir -p "$RUNNER_TEMP/account-summaries"
+          python3 tools/ci/write_e2e_summary.py --profile android --stage scenario --outcome "$outcome" --exit-code "$code" --diagnostic-file "$RUNNER_TEMP/$ACCOUNT_SCENARIO-diagnostic.json" --output "$RUNNER_TEMP/account-summaries/m3-summary.json"
+          cat "$RUNNER_TEMP/account-summaries/m3-summary.json" >> "$GITHUB_STEP_SUMMARY"
+          # One summary per scenario that ran, with its own exit code.
+          for scenario in m3 m3-auth m4 m6; do
+            [ -f "$RUNNER_TEMP/$scenario-code.txt" ] || continue
+            each="$(cat "$RUNNER_TEMP/$scenario-code.txt")"
+            case "$each" in ''|*[!0-9]*) each=1 ;; esac
+            result=failure; if [ "$each" = 0 ]; then result=success; fi
+            python3 tools/ci/write_e2e_summary.py --profile android --stage scenario --outcome "$result" --exit-code "$each" --diagnostic-file "$RUNNER_TEMP/$scenario-diagnostic.json" --output "$RUNNER_TEMP/account-summaries/$scenario-summary.json"
+          done
       - name: Retain sanitized M3 summary only
         if: always() && steps.account_scenario.outcome != 'skipped'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: android-m3-account-summary
-          path: ${{ runner.temp }}/m3-summary.json
+          path: ${{ runner.temp }}/account-summaries/*-summary.json
           if-no-files-found: error
           retention-days: 14
 
@@ -242,14 +262,14 @@ jobs:
         id: account_scenario
         if: steps.scenario.outcome == 'success'
         working-directory: tools/e2e
-        env:
-          E2E_DIAGNOSTIC_FILE: ${{ runner.temp }}/m3-diagnostic.json
         run: |
           $code = 0
           foreach ($scenario in @('m3', 'm3-auth', 'm4')) {
+            "account_scenario=$scenario" >> $env:GITHUB_OUTPUT
+            $env:E2E_DIAGNOSTIC_FILE = "$env:RUNNER_TEMP/$scenario-diagnostic.json"
             dart run bin/run.dart --profile windows --scenario $scenario --repo-root "$env:GITHUB_WORKSPACE" *> "$env:RUNNER_TEMP/$scenario-private.log"
             $code = $LASTEXITCODE
-            if ($code -ne 0) { break }
+            if ($code -ne 0) { Write-Output "failed scenario: $scenario"; break }
           }
           "exit_code=$code" >> $env:GITHUB_OUTPUT
           exit $code
@@ -257,12 +277,16 @@ jobs:
         if: always() && steps.account_scenario.outcome != 'skipped'
         env:
           ACCOUNT_CODE: ${{ steps.account_scenario.outputs.exit_code }}
+          ACCOUNT_SCENARIO: ${{ steps.account_scenario.outputs.account_scenario }}
         run: |
           $code = 1; $outcome = 'failure'
           if ($env:ACCOUNT_CODE) { $code = [int]$env:ACCOUNT_CODE }
           if ($code -eq 0) { $outcome = 'success' }
-          python tools/ci/write_e2e_summary.py --profile windows --stage scenario --outcome $outcome --exit-code $code --diagnostic-file "$env:RUNNER_TEMP/m3-diagnostic.json" --output "$env:RUNNER_TEMP/m3-summary.json"
+          $scenario = 'm3'
+          if (@('m3', 'm3-auth', 'm4') -contains $env:ACCOUNT_SCENARIO) { $scenario = $env:ACCOUNT_SCENARIO }
+          python tools/ci/write_e2e_summary.py --profile windows --stage scenario --outcome $outcome --exit-code $code --diagnostic-file "$env:RUNNER_TEMP/$scenario-diagnostic.json" --output "$env:RUNNER_TEMP/m3-summary.json"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-Content "$env:RUNNER_TEMP/m3-summary.json" >> $env:GITHUB_STEP_SUMMARY
       - name: Retain sanitized M3 summary only
         if: always() && steps.account_scenario.outcome != 'skipped'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9

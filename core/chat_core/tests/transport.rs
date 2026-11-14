@@ -848,3 +848,89 @@ async fn disconnect_invalidates_delayed_inbound_but_allows_fresh_and_unrelated_p
     unrelated.execute(NetworkOp::Stop).await.unwrap();
     raw.close().await;
 }
+/// Task 18: each connection attempt is traced as fixed kinds, counts and milliseconds only.
+#[tokio::test]
+async fn transport_trace_times_each_attempt_without_addresses_or_ids() {
+    let (a, _, _) = network();
+    let (b, _, _) = network();
+    let ai = online(&a).await;
+    let bi = online(&b).await;
+    let ticket = bi.ticket.clone().unwrap();
+    let NetworkReply::Peer(peer) = a
+        .execute(NetworkOp::Connect { target: ticket.clone() })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    wait_connected(&b, &ai.endpoint_id.clone().unwrap()).await;
+    let out = a.transport_trace_for_test();
+    let dial = &out["dials"][0];
+    assert_eq!(dial["incoming"], false);
+    assert_eq!(dial["alpn"], "session");
+    assert_eq!(dial["outcome"], "ok");
+    assert_eq!(dial["path"], "ip");
+    assert_eq!(dial["target_relays"], 0);
+    assert!(dial["target_ips"].as_u64().unwrap() >= 1);
+    assert!(dial["paths_ip"].as_u64().unwrap() >= 1);
+    // Nothing was open to b before, and the handshake did not stall.
+    assert_eq!((dial["prior_ip"].clone(), dial["prior_relay"].clone()), (0.into(), 0.into()));
+    assert!(dial["stall_ip"].is_null() && dial["stall_relay"].is_null());
+    // Its handshake went over IP only, and the endpoint counted the bytes.
+    assert_eq!((dial["from"].clone(), dial["stall_from"].clone()), ("none".into(), "none".into()));
+    assert!(dial["ip_out"].as_u64().unwrap() >= 1200 && dial["ip_in"].as_u64().unwrap() > 0);
+    assert_eq!((dial["relay_out"].clone(), dial["relay_in"].clone()), (0.into(), 0.into()));
+    for key in ["at_ms", "resolve_ms", "handshake_ms", "total_ms", "rtt_ms", "tx", "rx", "lost"] {
+        assert!(dial[key].is_u64(), "{key}");
+    }
+    // The connection is still open: it is listed as live, linked to its attempt.
+    let live = &out["live"][0];
+    assert_eq!(live["seq"], dial["seq"]);
+    assert_eq!(live["path"], "ip");
+    for key in ["age_ms", "paths_ip", "paths_relay", "rtt_ms", "tx", "rx", "lost"] {
+        assert!(live[key].is_u64(), "{key}");
+    }
+    assert_eq!(out["live"].as_array().unwrap().len(), 1);
+    assert_eq!(out["endpoint"]["binds"], 1);
+    assert!(out["endpoint"]["online_ms_max"].is_u64());
+    assert_eq!(out["endpoint"]["relay_drops"], 0);
+    let into = b.transport_trace_for_test();
+    let accepted = &into["dials"][0];
+    assert_eq!(accepted["incoming"], true);
+    assert_eq!(accepted["alpn"], "session");
+    assert_eq!(accepted["outcome"], "ok");
+    assert!(accepted["handshake_ms"].is_u64());
+    assert_eq!((accepted["from"].clone(), accepted["stall_from"].clone()), ("ip".into(), "none".into()));
+    assert!(accepted["ip_in"].as_u64().unwrap() >= 1200);
+    for text in [out.to_string(), into.to_string()] {
+        for private in [ticket.as_str(), &peer.peer_id, ai.endpoint_id.as_deref().unwrap(), "127.0.0.1", "::1"] {
+            assert!(!text.contains(private));
+        }
+    }
+    a.execute(NetworkOp::Stop).await.unwrap();
+    b.execute(NetworkOp::Stop).await.unwrap();
+}
+/// Task 18: a handshake that is still running at 7 s notes the remote's open paths then, and
+/// is kept as `dropped` when the dial deadline cuts it off.
+#[tokio::test]
+async fn transport_trace_keeps_a_stalled_dial_cut_off_by_its_deadline() {
+    let (a, _, _) = network();
+    online(&a).await;
+    let target = iroh_tickets::endpoint::EndpointTicket::new(iroh::EndpointAddr::from_parts(
+        iroh::SecretKey::generate().public(),
+        [iroh::TransportAddr::Ip("127.0.0.1:9".parse().unwrap())],
+    ))
+    .to_string();
+    let failed = a.execute(NetworkOp::Connect { target }).await.unwrap_err();
+    assert_eq!(failed.code, ErrorCode::NetworkTimeout);
+    let dial = &a.transport_trace_for_test()["dials"][0];
+    assert_eq!(dial["outcome"], "dropped");
+    assert_eq!(dial["path"], "none");
+    assert!(dial["handshake_ms"].is_null());
+    assert_eq!((dial["stall_ip"].clone(), dial["stall_relay"].clone()), (0.into(), 0.into()));
+    assert!(dial["total_ms"].as_u64().unwrap() >= 9_900);
+    // Every Initial went to the one unreachable address; nothing came back.
+    assert!(dial["ip_out"].as_u64().unwrap() >= 2 * 1200);
+    assert_eq!(dial["ip_in"], 0);
+    a.execute(NetworkOp::Stop).await.unwrap();
+}

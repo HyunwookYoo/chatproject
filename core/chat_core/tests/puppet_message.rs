@@ -235,10 +235,24 @@ mod commands {
         let counts = call(&mut socket, 4, "message_local_test_write_counts", json!({})).await;
         assert_eq!(counts["value"]["payload_writes"], 0);
         assert_eq!(counts["value"]["response_writes"], 0);
+        // Task 18: a conversation's group and a message's sends as counts only (M4 here).
+        let facts = call(
+            &mut socket,
+            5,
+            "message_local_test_group_facts",
+            json!({"conversation": conversation, "key": lost_key}),
+        )
+        .await;
+        assert_eq!(
+            facts["value"],
+            json!({"group": false, "epoch": null, "members": 0, "processed_mls": 0,
+                   "deliveries": 0, "holds": 0, "rejoins": null, "attempted": 0}),
+            "{facts}"
+        );
         assert_eq!(
             call(
                 &mut socket,
-                5,
+                6,
                 "message_local_test_ack_loss_release",
                 json!({})
             )

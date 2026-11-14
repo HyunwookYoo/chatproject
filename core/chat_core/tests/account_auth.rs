@@ -385,6 +385,9 @@ async fn cached_unexpired_allows_new_proof_but_not_mutation() {
     let (a, b, backend) = pair().await;
     a.account.connect_account(b.peer).await.unwrap();
     backend.offline.store(true, Ordering::SeqCst);
+    // `connect_account` dials only devices without a ready session: close B's for a new proof.
+    let ib = b.view().await.installation.unwrap();
+    a.account.mls_test_close_session(ib).await.unwrap();
     a.account.connect_account(b.peer).await.unwrap();
     assert!(
         a.events
@@ -503,6 +506,8 @@ async fn real_revoke_closes_target_then_confirms_remaining_peer_before_public_mu
     let a = Fixture::new(3, 21, &signed, backend.clone()).await;
     let b = Fixture::new(3, 22, &signed, backend.clone()).await;
     let c = Fixture::new(3, 23, &signed, backend.clone()).await;
+    // The three are devices of one account: B's own-device sync (M6) would use its store too.
+    b.account.mailbox_test_hold(true).await.unwrap();
     b.route(&a).await;
     b.route(&c).await;
     c.route(&a).await;
@@ -516,6 +521,14 @@ async fn real_revoke_closes_target_then_confirms_remaining_peer_before_public_mu
     let target = c.view().await.installation.unwrap();
     *backend.capture.lock().unwrap() =
         Some((vec![a.account.storage_test_fixture().handle, b.account.storage_test_fixture().handle], target));
+    // The capacity check below must see B persisting the revoke, not B's own upkeep reading
+    // its store: hold B's message scheduler and Commit/Welcome deliveries, then let B run the
+    // upkeep tick its new sessions call for (a changed session set reads the group list) and
+    // wait for it to end (the wake runs before the next command). B is then idle.
+    b.account.message_test_hold_scheduler(true).await.unwrap();
+    b.account.mls_test_hold_delivery(true).await.unwrap();
+    b.clock.advance_monotonic_ms(0);
+    b.account.mls_test_sent_frames().await.unwrap();
     let sql = b.account.storage_test_fixture();
     let pause = sql.pause().await;
     pause.wait_entered().await;
@@ -746,6 +759,10 @@ async fn replay_other_connection_role_nonce_rejected() {
         });
         if mode == "replay" {
             a.account.connect_account(b_peer).await.unwrap();
+            // `connect_account` dials only devices without a ready session: close B's so the
+            // next one makes a second proof.
+            let ib = derive_device(Secret32::from([12; 32])).unwrap().installation_id();
+            a.account.mls_test_close_session(ib).await.unwrap();
         }
         assert!(
             a.account.connect_account(b_peer).await.is_err(),

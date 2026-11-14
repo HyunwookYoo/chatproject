@@ -4,8 +4,10 @@ import 'dart:io';
 import 'dart:mirrors';
 
 import 'package:test/test.dart';
+import 'package:chat_e2e/src/diagnostic.dart';
 import 'package:chat_e2e/src/emulators.dart';
 import 'package:chat_e2e/src/process_runner.dart';
+import 'package:chat_e2e/src/protocol.dart';
 
 import '../bin/run.dart' as cli;
 import 'emulators_test.dart' as fixtures;
@@ -31,6 +33,25 @@ void main() {
   ClassMirror type(String name) =>
       library.declarations[MirrorSystem.getSymbol(name, library)]
           as ClassMirror;
+  test('a failed scenario is traced before its failure propagates', () async {
+    final order = <String>[];
+    Future<void> trace() async => order.add('trace');
+    Future<Object?> run(Future<Object?> work) =>
+        library.invoke(MirrorSystem.getSymbol('_traceOnFailure', library), [
+              work,
+              trace,
+            ]).reflectee
+            as Future<Object?>;
+    await expectLater(
+      run(
+        Future.error(StateError('scenario')),
+      ).whenComplete(() => order.add('failed')),
+      throwsA(isA<StateError>()),
+    );
+    expect(order, ['trace', 'failed']);
+    expect(await run(Future.value(7)), 7);
+    expect(order, ['trace', 'failed']);
+  });
   test('partial Android launch records PID before failing status', () async {
     final activity = <String, Object?>{'serial': 'owned-test'};
     var saved = false;
@@ -51,6 +72,50 @@ void main() {
     await expectLater(result, throwsA(isA<StateError>()));
     expect(saved, isTrue);
   });
+  test('a launch that only brought an old task to the front fails', () async {
+    final activity = <String, Object?>{'serial': 'owned-test'};
+    final result =
+        library.invoke(
+              MirrorSystem.getSymbol('_captureAndroidLaunch', library),
+              [
+                ProcessResult(
+                  1,
+                  0,
+                  'Starting: Intent { cmp=x/.MainActivity }\n'
+                      'Warning: Activity not started, its current task has been '
+                      'brought to the front\n',
+                  '',
+                ),
+                () async => ProcessResult(2, 0, '', ''),
+                activity,
+                () {},
+              ],
+            ).reflectee
+            as Future;
+    await expectLater(
+      result,
+      throwsA(
+        isA<StateError>().having(
+          (e) => e.message,
+          'fixed detail',
+          'Android launch did not start the activity',
+        ),
+      ),
+    );
+    expect(activity.containsKey('pid'), isFalse);
+  });
+  test('Android installs grant the runtime permissions', () {
+    final args =
+        library.invoke(MirrorSystem.getSymbol('_androidInstall', library), [
+              ['-s', 'owned-test'],
+              'app.apk',
+            ]).reflectee
+            as List<String>;
+    // A notification prompt over the app would survive a force-stop and
+    // take the next launch (and m6 needs notifications allowed).
+    expect(args, ['-s', 'owned-test', 'install', '-r', '-g', 'app.apk']);
+  });
+
   late Directory logs;
   test(
     'Android build environment selection validates and composes only child overrides',
@@ -293,6 +358,7 @@ void main() {
             'phase': origin,
             'failure_kind': 'timeout',
             'command_exit_code': null,
+            'detail': 'Future not completed',
           });
         } finally {
           release.complete();
@@ -333,6 +399,7 @@ void main() {
         'phase': 'avd_create',
         'failure_kind': 'avd_list_exit',
         'command_exit_code': -9,
+        'detail': null,
       });
     },
   );
@@ -401,6 +468,7 @@ void main() {
           'phase': 'avd_create',
           'failure_kind': entry.$3,
           'command_exit_code': entry.$4,
+          'detail': null,
         });
         expect(projection().toString(), isNot(contains('PRIVATE_TOKEN')));
         await runner.stop(process);
@@ -441,6 +509,7 @@ void main() {
         'phase': 'scenario',
         'failure_kind': 'timeout',
         'command_exit_code': null,
+        'detail': null,
       });
     },
   );
@@ -481,6 +550,7 @@ void main() { Timer.periodic(const Duration(seconds: 1), (_) {}); }
         'phase': 'build_node',
         'failure_kind': 'timeout',
         'command_exit_code': null,
+        'detail': 'Future not completed',
       });
     },
   );
@@ -516,6 +586,7 @@ void main() { Timer.periodic(const Duration(seconds: 1), (_) {}); }
         'phase': 'build_android',
         'failure_kind': 'command_exit',
         'command_exit_code': 17,
+        'detail': null,
       });
     },
   );
@@ -544,6 +615,7 @@ void main() { Timer.periodic(const Duration(seconds: 1), (_) {}); }
       'phase': 'cleanup',
       'failure_kind': 'cleanup',
       'command_exit_code': null,
+      'detail': null,
     });
   });
 
@@ -568,6 +640,7 @@ void main() { Timer.periodic(const Duration(seconds: 1), (_) {}); }
         'phase': 'build_android',
         'failure_kind': 'command_exit',
         'command_exit_code': 17,
+        'detail': null,
       });
       expect(projection().toString(), isNot(contains('PRIVATE_TOKEN')));
     },
@@ -580,6 +653,7 @@ void main() { Timer.periodic(const Duration(seconds: 1), (_) {}); }
       'phase': 'cleanup',
       'failure_kind': 'cleanup',
       'command_exit_code': null,
+      'detail': null,
     });
     run = type('_Run').newInstance(const Symbol(''), [logs]);
     phase('android_participant');
@@ -588,6 +662,118 @@ void main() { Timer.periodic(const Duration(seconds: 1), (_) {}); }
       'phase': 'android_participant',
       'failure_kind': 'other',
       'command_exit_code': null,
+      'detail': null,
     });
+  });
+
+  test('a listed fixed failure text is kept as the detail', () {
+    phase('scenario');
+    run.invoke(const Symbol('recordFailure'), [
+      StateError('Android owned activity exited'),
+    ]);
+    expect(projection(), {
+      'phase': 'scenario',
+      'failure_kind': 'state',
+      'command_exit_code': null,
+      'detail': 'Android owned activity exited',
+    });
+  });
+  test('a scenario deadline keeps its last view and participant if listed', () {
+    phase('scenario');
+    run.invoke(const Symbol('recordFailure'), [
+      ScenarioDeadline(
+        'Message scenario deadline: initial_account',
+        lastView: 'NotAvailable',
+        participant: 'android-2',
+      ),
+    ]);
+    run.invoke(const Symbol('recordFailure'), [
+      ScenarioDeadline('Account state deadline', lastView: 'Active'),
+    ]);
+    expect(
+      projection()['detail'],
+      'Message scenario deadline: initial_account',
+    );
+    expect(run.getField(const Symbol('lastView')).reflectee, 'NotAvailable');
+    expect(
+      run.getField(const Symbol('lastParticipant')).reflectee,
+      'android-2',
+    );
+    run = type('_Run').newInstance(const Symbol(''), [logs]);
+    run.invoke(const Symbol('recordFailure'), [
+      ScenarioDeadline(
+        'Account state deadline',
+        lastView: 'PRIVATE_TOKEN',
+        participant: 'PRIVATE_TOKEN',
+      ),
+    ]);
+    expect(run.getField(const Symbol('lastView')).reflectee, isNull);
+    expect(run.getField(const Symbol('lastParticipant')).reflectee, isNull);
+  });
+  test('a failed RPC keeps its fixed op name and participant', () {
+    phase('scenario');
+    run.invoke(const Symbol('recordFailure'), [
+      const RpcError(
+        'AuthFailed',
+        '[redacted]',
+        op: 'account_local_pair_scan',
+        participant: 'android-2',
+      ),
+    ]);
+    expect(projection()['detail'], 'RPC failed: AuthFailed');
+    expect(
+      run.getField(const Symbol('rpcOp')).reflectee,
+      'account_local_pair_scan',
+    );
+    expect(
+      run.getField(const Symbol('lastParticipant')).reflectee,
+      'android-2',
+    );
+    run = type('_Run').newInstance(const Symbol(''), [logs]);
+    run.invoke(const Symbol('recordFailure'), [
+      const RpcError(
+        'AuthFailed',
+        'x',
+        op: 'account_local_PRIVATE',
+        participant: 'PRIVATE',
+      ),
+    ]);
+    expect(run.getField(const Symbol('rpcOp')).reflectee, isNull);
+    expect(run.getField(const Symbol('lastParticipant')).reflectee, isNull);
+  });
+
+  test('the slowest waits keep listed names only', () {
+    waitMs
+      ..clear()
+      ..['account_local_pair_scan'] = 9800
+      ..['timeout_probe_event'] = 15000
+      ..['Mailbox scenario deadline: first_text'] = 41250
+      ..['PRIVATE_TOKEN'] = 60000;
+    expect(run.invoke(const Symbol('waits'), []).reflectee, [
+      {'name': 'Mailbox scenario deadline: first_text', 'ms': 41250},
+      {'name': 'timeout_probe_event', 'ms': 15000},
+      {'name': 'account_local_pair_scan', 'ms': 9800},
+    ]);
+    waitMs.clear();
+  });
+
+  test('a run without owned emulators keeps no Android state', () async {
+    Future<Object?> probeAll(
+      List<Future<Map<String, Object?>> Function()> probes,
+    ) =>
+        library.invoke(MirrorSystem.getSymbol('_probeAll', library), [
+              probes,
+            ]).reflectee
+            as Future<Object?>;
+    expect(await probeAll([]), isNull);
+    expect(
+      await probeAll([
+        () async => {'name': 'android-1'},
+        () async => throw StateError('unreadable'),
+      ]),
+      [
+        {'name': 'android-1'},
+      ],
+    );
   });
 }

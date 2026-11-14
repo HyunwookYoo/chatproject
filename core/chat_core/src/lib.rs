@@ -4,6 +4,7 @@
 pub mod account;
 pub mod error;
 pub mod event;
+mod mailbox;
 pub mod runtime;
 pub mod message;
 // Only `mls::nse` is public, and only for the notification extension.
@@ -15,7 +16,7 @@ mod storage;
 pub mod transport;
 
 pub use error::{CoreError, ErrorCode};
-pub use event::{ConnectionSnapshot, CoreEvent, EventBus, EventSink};
+pub use event::{ConnectionSnapshot, CoreEvent, EventBus, EventSink, NotifyItem};
 pub use runtime::{CORE_VERSION, CoreConfig, CoreInfo, CoreSlot};
 pub use transport::{
     NetworkHandle, NetworkInfo, NetworkOp, NetworkReply, NetworkState, PeerInfo, PeerPath, PeerPhase,

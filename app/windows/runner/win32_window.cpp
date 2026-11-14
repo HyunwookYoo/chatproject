@@ -179,6 +179,12 @@ Win32Window::MessageHandler(HWND hwnd,
                             WPARAM const wparam,
                             LPARAM const lparam) noexcept {
   switch (message) {
+    case WM_CLOSE:
+      if (!OnCloseRequested()) {
+        return 0;
+      }
+      break;
+
     case WM_DESTROY:
       window_handle_ = nullptr;
       Destroy();
@@ -270,6 +276,10 @@ bool Win32Window::OnCreate() {
 
 void Win32Window::OnDestroy() {
   // No-op; provided for subclasses.
+}
+
+bool Win32Window::OnCloseRequested() {
+  return true;
 }
 
 void Win32Window::UpdateTheme(HWND const window) {

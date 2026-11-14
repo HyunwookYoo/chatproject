@@ -5,9 +5,13 @@ const localRelay = 'http://127.0.0.1:3340';
 
 /// A core command failure, distinct from controller/protocol failures.
 class RpcError implements Exception {
-  const RpcError(this.code, this.detail);
+  const RpcError(this.code, this.detail, {this.op, this.participant});
   final String code;
   final String detail;
+
+  /// The command and the participant it failed on (controller-issued only).
+  final String? op;
+  final String? participant;
   @override
   String toString() => 'RPC failed: $code';
 }
@@ -127,6 +131,7 @@ sealed class WireRecord {
           'account_cache_used',
           'messages_changed',
           'message_state_changed',
+          'notify',
         }.contains(event['kind'])) {
           throw StateError('invalid protocol event kind');
         }

@@ -709,3 +709,309 @@ async fn closing_m4_peer_record_change_requeries_at_most_once() {
     assert!(outbox(&a1, sent.key).await.waiting_peer_update);
     assert_eq!(delivery(&a1, sent.key).await, DeliveryState::Queued);
 }
+
+// ---- M6 Task 8: a ciphertext handed over by another device of its sender's account ----------
+
+use chat_core::storage_fixture::MlsFrame;
+
+/// A third installation of account A.
+const A3: u8 = 15;
+
+/// A's devices `seeds` and B1. Each of A's devices is a contact of B1's with a session to it
+/// (none with each other); B1 makes the group with all of them.
+async fn relay(seeds: &[u8]) -> (Vec<Fixture>, Fixture, Arc<Backend>, ConversationId) {
+    let (ra, rb) = (record(A, seeds, 0), record(B, &[B1], 0));
+    let net = backend(&[(A, ra.clone()), (B, rb.clone())]);
+    let mut a = Vec::new();
+    for seed in seeds {
+        a.push(device(A, *seed, &ra, &net).await);
+    }
+    let b1 = device(B, B1, &rb, &net).await;
+    for x in &a {
+        link(x, &b1).await;
+        befriend(x, &b1).await;
+    }
+    befriend(&b1, &a[0]).await;
+    for x in &a {
+        x.account.connect_account(b1.peer).await.unwrap();
+    }
+    let conv = conversation(&b1, &a[0]).await;
+    for x in &a {
+        conversation(x, &b1).await;
+    }
+    ensure(&b1, a[0].peer).await;
+    let mut all: Vec<&Fixture> = a.iter().collect();
+    all.push(&b1);
+    settle!(all.iter().copied(), {
+        let mut ok = state(&b1, conv).await.deliveries.is_empty();
+        for x in &a {
+            ok = ok && agreed(x, &b1, conv).await;
+        }
+        ok
+    });
+    (a, b1, net, conv)
+}
+
+/// `from` seals text `n` for `to`, its own delivery held: the message and its MLS ciphertext.
+async fn sealed(from: &Fixture, to: &Fixture, n: u8, body: &str) -> (MessageKey, Vec<u8>) {
+    from.account
+        .message_test_hold_scheduler(true)
+        .await
+        .unwrap();
+    let sent = send(from, to, n, body).await;
+    from.account
+        .storage_test_fixture()
+        .messages()
+        .await
+        .unwrap()
+        .mls_seal(sent.key, NOW * 1000)
+        .await
+        .unwrap()
+        .unwrap();
+    let wire = outbox(from, sent.key).await.wire;
+    (sent.key, mls_app_from_wire(&wire).unwrap().1)
+}
+
+/// `via` hands `ciphertext` over to `to` as is, in a kind 17 `App` frame.
+async fn hand_over(
+    via: &Fixture,
+    to: &Fixture,
+    conversation: ConversationId,
+    ciphertext: &[u8],
+) -> Result<MlsReply, chat_core::CoreError> {
+    via.account
+        .mls_test_exchange(
+            installation(to).await,
+            MlsFrame::App {
+                conversation,
+                ciphertext: ciphertext.to_vec(),
+            },
+        )
+        .await
+}
+
+/// Spec 7 and 11: B1 takes A1's ciphertext from A2's session (a mailbox relaying it) and
+/// records A1, the device that sealed it, as its sender.
+#[tokio::test]
+async fn handed_off_ciphertext_is_accepted_and_recorded_as_origin() {
+    let (a, b1, _net, conv) = relay(&[A1, A2]).await;
+    let (a1, a2) = (&a[0], &a[1]);
+    let (key, ct) = sealed(a1, &b1, 1, "handed over as is").await;
+    let reply = hand_over(a2, &b1, conv, &ct).await.unwrap();
+    assert!(acked(&reply), "B1 took it from A2");
+    let got = message(&b1, key).await.expect("stored under A1's key");
+    assert_eq!(got.key.installation, installation(a1).await);
+    assert_eq!(got.body, "handed over as is");
+    assert!(!got.outgoing);
+    assert_eq!(page(&b1, conv).await.len(), 1);
+}
+
+/// Spec 11: a ciphertext sealed by a device A revoked, or by a device of another account than
+/// the one whose session carries it, is refused (the M4 `Reject(InvalidMessage)`) and leaves
+/// nothing stored.
+#[tokio::test]
+async fn revoked_or_foreign_leaf_via_mailbox_is_rejected() {
+    let (a, b1, net, conv) = relay(&[A1, A2, A3]).await;
+    let (a1, a2, a3) = (&a[0], &a[1], &a[2]);
+    let all = [a1, a2, a3, &b1];
+    let kept = |s: &MlsState| (s.kv_digest, s.processed_mls);
+
+    // B1 carries what A2 sealed to A1 as if from B's account.
+    let (foreign, ct) = sealed(a2, &b1, 1, "a leaf of A's, carried by B1").await;
+    let before = state(a1, conv).await;
+    let error = hand_over(&b1, a1, conv, &ct).await.err().unwrap();
+    assert_eq!(error.code, ErrorCode::InvalidMessage);
+    assert!(message(a1, foreign).await.is_none());
+    assert!(page(a1, conv).await.is_empty());
+    // Opened, then refused for its leaf: nothing of it kept.
+    let after = state(a1, conv).await;
+    assert_eq!(kept(&after), kept(&before));
+    assert_eq!(after.open_calls, before.open_calls + 1);
+
+    // A3 seals a message, then A1 revokes A3. B1 takes A's new record (the user confirms the
+    // changed device list) and the Commit that removes A3.
+    let ia3 = installation(a3).await;
+    let (revoked, ct) = sealed(a3, &b1, 2, "sealed before the revocation").await;
+    a1.account.revoke_device(ia3).await.unwrap();
+    // Looking at its own record moves A1's publication on.
+    settle!(
+        all,
+        a1.view().await.publication.pending_count == 0 || {
+            let _ = a1.account.refresh_record(a1.peer).await;
+            false
+        }
+    );
+    // Then A1 has a new session with B1 (B1 dropped A's sessions when it took the record).
+    settle!(
+        all,
+        (!state(&b1, conv).await.members.contains(&ia3)
+            && a1.account.connect_account(b1.peer).await.is_ok())
+            || {
+                let renewed = net.packets.lock().unwrap()[&a1.peer].clone();
+                if b1.account.refresh_record(a1.peer).await.is_err() {
+                    let _ = b1
+                        .account
+                        .confirm_remote_record(a1.peer, chat_core::account::record_hash(&renewed))
+                        .await;
+                }
+                false
+            }
+    );
+    // A1 hands A3's ciphertext over. It is from the epoch before the removal, which B1 still
+    // opens.
+    let before = state(&b1, conv).await;
+    let error = hand_over(a1, &b1, conv, &ct).await.err().unwrap();
+    assert_eq!(error.code, ErrorCode::InvalidMessage);
+    assert!(message(&b1, revoked).await.is_none());
+    // Opened, then refused for its leaf (B1's group state itself may move on meanwhile with
+    // the Commits after the removal, so only what this ciphertext would add is compared).
+    let after = state(&b1, conv).await;
+    assert_eq!(after.processed_mls, before.processed_mls);
+    assert_eq!(after.open_calls, before.open_calls + 1);
+}
+
+/// Review Focus 4: the mailbox A2 and the origin A1 both send B1 the same ciphertext. B1
+/// stores it once and answers both `Ack`, the second without opening it; A1 never seals it
+/// again and shows it delivered once.
+#[tokio::test]
+async fn same_ciphertext_via_origin_and_mailbox_acks_twice_stores_once() {
+    let (a, b1, _net, conv) = relay(&[A1, A2]).await;
+    let (a1, a2) = (&a[0], &a[1]);
+    let (key, ct) = sealed(a1, &b1, 1, "one message, two ways").await;
+    let opened = state(&b1, conv).await.open_calls;
+    assert!(acked(&hand_over(a2, &b1, conv, &ct).await.unwrap()));
+    assert_eq!(state(&b1, conv).await.open_calls, opened + 1);
+
+    // A1 sends the same ciphertext itself: answered from `processed_ct`.
+    a1.account.message_test_hold_scheduler(false).await.unwrap();
+    settle!(
+        [a1, a2, &b1],
+        delivery(a1, key).await == DeliveryState::Delivered
+    );
+    // And the mailbox once more.
+    assert!(acked(&hand_over(a2, &b1, conv, &ct).await.unwrap()));
+    assert_eq!(state(&b1, conv).await.open_calls, opened + 1);
+
+    assert_eq!(page(&b1, conv).await.len(), 1);
+    assert_eq!(
+        message(&b1, key).await.unwrap().body,
+        "one message, two ways"
+    );
+    let cts = app_ciphertexts(a1).await;
+    assert!(!cts.is_empty());
+    assert!(cts.iter().all(|c| *c == ct), "A1 sealed it again");
+    let delivered = a1
+        .events
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|e| match e {
+            CoreEvent::MessageStateChanged { key: k, state, .. } => {
+                *k == key && *state == DeliveryState::Delivered
+            }
+            _ => false,
+        })
+        .count();
+    assert_eq!(delivered, 1);
+}
+
+/// Waits in real time, without moving any clock, until the text shows `expected`.
+async fn shows(f: &Fixture, key: MessageKey, expected: DeliveryState) -> MessageView {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if let Some(view) = message(f, key).await
+                && view.state == expected
+            {
+                return view;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("never {expected:?}"))
+}
+
+/// M4's contact hold is kept (M5 spec: states as in M4; a peer that has not allowed you is
+/// held `ContactRequired`): a text to an account that has not added this one ends `Blocked`,
+/// not waiting for a group forever, and after it adds this one the user's retry delivers it.
+/// No clock moves, as in the e2e m4 scenario. With `a2` A's second device is asked too and
+/// hands a KeyPackage; an own device's answer does not lift the hold.
+async fn held_until_retry(a2: bool) {
+    let own: &[u8] = if a2 { &[A1, A2] } else { &[A1] };
+    let (ra, rb) = (record(A, own, 0), record(B, &[B1], 0));
+    let net = backend(&[(A, ra.clone()), (B, rb.clone())]);
+    let a1 = device(A, A1, &ra, &net).await;
+    let b1 = device(B, B1, &rb, &net).await;
+    link(&a1, &b1).await;
+    let second = if a2 {
+        let a2 = device(A, A2, &ra, &net).await;
+        link(&a1, &a2).await;
+        a1.account.connect_account(a1.peer).await.unwrap();
+        Some(a2)
+    } else {
+        None
+    };
+    // A has B as a contact; B does not have A.
+    befriend(&a1, &b1).await;
+    a1.account.connect_account(b1.peer).await.unwrap();
+    let service = a1.account.messages();
+    let sent = service
+        .send_text(b1.peer, MessageId([7; 16]), "private text".into())
+        .await
+        .unwrap();
+    let held = shows(&a1, sent.key, DeliveryState::Blocked).await;
+    assert_eq!(held.block, Some(BlockReason::ContactRequired));
+    if let Some(a2) = &second {
+        let asked = a1
+            .account
+            .mls_test_sent_frames_to(installation(a2).await)
+            .await
+            .unwrap();
+        assert!(asked.iter().any(|f| f == "key_package_request"));
+    }
+    befriend(&b1, &a1).await;
+    service.retry_send(sent.key).await.unwrap();
+    shows(&a1, sent.key, DeliveryState::Delivered).await;
+    let got = message(&b1, sent.key).await.expect("stored by B");
+    assert_eq!(got.body, "private text");
+}
+
+#[tokio::test]
+async fn text_to_account_without_us_is_held_until_retry() {
+    held_until_retry(false).await;
+}
+
+#[tokio::test]
+async fn own_device_key_package_does_not_lift_the_contact_hold() {
+    held_until_retry(true).await;
+}
+
+/// The user's retry restarts a group setup that is backing off: without it a stopped clock
+/// would never end the back-off, and the retried text would wait forever.
+#[tokio::test]
+async fn retry_restarts_a_group_setup_that_backs_off() {
+    let (ra, rb) = (record(A, &[A1], 0), record(B, &[B1], 0));
+    let net = backend(&[(A, ra.clone()), (B, rb.clone())]);
+    let a1 = device(A, A1, &ra, &net).await;
+    let b1 = device(B, B1, &rb, &net).await;
+    link(&a1, &b1).await;
+    befriend(&a1, &b1).await;
+    a1.account.connect_account(b1.peer).await.unwrap();
+    let service = a1.account.messages();
+    let sent = service
+        .send_text(b1.peer, MessageId([8; 16]), "private text".into())
+        .await
+        .unwrap();
+    shows(&a1, sent.key, DeliveryState::Blocked).await;
+    befriend(&b1, &a1).await;
+    // With no session to B, asking for the group backs off (until a time that never comes).
+    a1.account
+        .mls_test_close_session(installation(&b1).await)
+        .await
+        .unwrap();
+    assert_eq!(ensure(&a1, b1.peer).await, GroupState::WaitingForPeer);
+    a1.account.connect_account(b1.peer).await.unwrap();
+    service.retry_send(sent.key).await.unwrap();
+    shows(&a1, sent.key, DeliveryState::Delivered).await;
+}

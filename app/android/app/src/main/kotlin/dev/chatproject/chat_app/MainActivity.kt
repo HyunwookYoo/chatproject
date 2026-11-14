@@ -29,6 +29,9 @@ class MainActivity : FlutterActivity() {
     private lateinit var accountKeys: AccountKeyStore
     private var accountChannel: MethodChannel? = null
     private var pendingInvite: String? = null
+    private var mailbox: MailboxChannel? = null
+    // A message notification tap that launched this activity.
+    private var launchConversation: Int? = null
     private fun receiveInvite(intent: Intent?) {
         val value = intent?.dataString ?: return
         if (!value.startsWith("chatproject:identity-invite/")) return
@@ -42,6 +45,12 @@ class MainActivity : FlutterActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         receiveInvite(intent)
+        MailboxChannel.conversationOf(intent)?.let { mailbox?.openConversation(it) }
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        mailbox?.onRequestPermissionsResult(requestCode, grantResults)
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -50,6 +59,8 @@ class MainActivity : FlutterActivity() {
         accountKeys = AccountKeyStore(applicationContext)
         check(initializeAccountKeyStore(accountKeys)) { "Account key protection initialization failed" }
         receiveInvite(intent)
+        // A recreated activity keeps its launch intent; that tap was handled.
+        if (savedInstanceState == null) launchConversation = MailboxChannel.conversationOf(intent)
         super.onCreate(savedInstanceState)
     }
 
@@ -97,6 +108,10 @@ class MainActivity : FlutterActivity() {
                     result.error("storage_unavailable", "계정 저장 공간을 열 수 없어요.", null)
                 }
             }
+        mailbox = MailboxChannel(this, flutterEngine.dartExecutor.binaryMessenger).also { channel ->
+            launchConversation?.let(channel::openConversation)
+            launchConversation = null
+        }
         if ((applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0) {
             // Lets Dart check that Kotlin reaches the same Rust core (design 12.3).
             MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "chat_app/native_core")

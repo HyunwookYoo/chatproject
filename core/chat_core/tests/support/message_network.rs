@@ -85,6 +85,9 @@ struct Fixture {
     slot: CoreSlot,
     #[allow(dead_code)]
     bus: EventBus,
+    /// Every event this core published since it started.
+    #[allow(dead_code)]
+    events: Arc<Events>,
     account: AccountHandle,
     peer: PeerId,
     clock: Arc<FakeClock>,
@@ -247,6 +250,7 @@ impl Fixture {
             _dir: dir,
             slot,
             bus,
+            events,
             account,
             peer,
             clock,

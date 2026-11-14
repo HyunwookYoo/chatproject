@@ -18,10 +18,14 @@ use std::sync::Arc;
 
 pub(crate) const MAX_DELAY_MS: u64 = 300_000;
 pub(crate) fn retry_delay(attempts: u64) -> u64 {
+    retry_delay_capped(attempts, MAX_DELAY_MS)
+}
+/// One second after the first attempt, doubling after each one, at most `cap`.
+pub(crate) fn retry_delay_capped(attempts: u64, cap: u64) -> u64 {
     1000u64
         .checked_shl(attempts.saturating_sub(1).min(32) as u32)
-        .unwrap_or(MAX_DELAY_MS)
-        .min(MAX_DELAY_MS)
+        .unwrap_or(cap)
+        .min(cap)
 }
 
 pub(crate) struct Scheduler {

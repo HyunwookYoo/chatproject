@@ -67,6 +67,8 @@ pub(super) struct Runtime {
     recovered: bool,
     /// MLS group lifecycle state (`manager/mls.rs`).
     pub(super) mls: super::mls::Runtime,
+    /// Own-device sync state (`manager/mailbox.rs`).
+    pub(super) mailbox: super::mailbox::Runtime,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     writes: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
@@ -99,6 +101,9 @@ pub(super) struct Runtime {
     /// The recipient epoch each message was last answered class 2 from behind (M2): a repeat at
     /// the same epoch means the Commit carried ahead did not help, and it is counted.
     behind: BTreeMap<MessageKey, u64>,
+    /// Receipts whose last attempt to the message's sender went unanswered, and the connection
+    /// it went out on: while that session lasts their attempts do not prefer it (Ruling 23).
+    unanswered: BTreeMap<MessageKey, usize>,
     /// The text the `Ack` about to be written stores (keys the response checkpoint).
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     pub(super) ack_key: Option<MessageKey>,
@@ -319,20 +324,27 @@ fn app_outcome(body: &[u8], sent: [u8; 32]) -> Result<AttemptOutcome, ErrorCode>
         _ => Err(ErrorCode::InvalidMessage),
     }
 }
-/// The session an application message goes out on: the first to an installation that holds a
-/// leaf in the conversation's group and has not refused kind 17, else the first that has not
-/// refused, else the first.
+/// The session an application message goes out on: to `prefer` if it is a candidate that has
+/// not refused kind 17, else the first to an installation that holds a leaf in the
+/// conversation's group and has not refused, else the first that has not refused, else the
+/// first.
 fn choose_session(
     candidates: Vec<Session>,
     members: &[InstallationId],
+    prefer: Option<InstallationId>,
     refused: impl Fn(InstallationId) -> bool,
 ) -> Option<Session> {
     let rank = |s: &Session| {
         let installation = s.grant.installation;
-        match (refused(installation), members.contains(&installation)) {
-            (false, true) => 0,
-            (false, false) => 1,
-            (true, _) => 2,
+        match (
+            refused(installation),
+            prefer == Some(installation),
+            members.contains(&installation),
+        ) {
+            (false, true, _) => 0,
+            (false, false, true) => 1,
+            (false, false, false) => 2,
+            (true, _, _) => 3,
         }
     };
     candidates.into_iter().min_by_key(rank)
@@ -610,6 +622,10 @@ impl Manager {
         use crate::message::service::{MessageReply as A, MessageRequest as Q};
         let request = self.ready()?;
         let local = self.local()?;
+        let retried = match &operation {
+            Q::Retry(key) => Some(key.conversation),
+            _ => None,
+        };
         // local() requires this owning actor to be Active; Candidate and PendingImport cannot enqueue.
         let op = match operation {
             Q::Open(peer) => MessageDbOp::Open(local.keys.peer_id(), peer),
@@ -618,7 +634,7 @@ impl Manager {
             Q::Send(peer, id, body) => {
                 MessageDbOp::Enqueue(peer, id, body, self.services.clock.wall_ms())
             }
-            Q::Cancel(key) => MessageDbOp::Cancel(key),
+            Q::Cancel(key) => MessageDbOp::Cancel(key, self.services.clock.wall_ms()),
             Q::Retry(key) => MessageDbOp::Retry(key, self.services.clock.wall_ms()),
             Q::Read(id, keys) => MessageDbOp::MarkRead(
                 id,
@@ -627,9 +643,14 @@ impl Manager {
                     .scheduler
                     .as_ref()
                     .map_or_else(|| self.services.clock.wall_ms(), |s| s.now_ms()),
+                self.services.clock.wall_ms(),
             ),
         };
-        Ok(match self.message_db(op, request).await? {
+        let reply = self.message_db(op, request).await?;
+        if let Some(conversation) = retried {
+            self.retry_group_now(conversation);
+        }
+        Ok(match reply {
             MessageDbReply::Conversation(v) => A::Conversation(v),
             MessageDbReply::Conversations(v) => A::Conversations(v),
             MessageDbReply::Messages(v) => A::Messages(v),
@@ -756,7 +777,9 @@ impl Manager {
             self.message_storage_failure(e.code, request);
         }
         match result {
-            Ok(MessageDbReply::Observed(reply, events)) => {
+            Ok(MessageDbReply::Observed(reply, events, head)) => {
+                let mailbox = &mut self.messages.mailbox;
+                mailbox.head = mailbox.head.max(head);
                 self.ensure_ready(request)?;
                 for event in events { self.bus.publish(event); }
                 Ok(*reply)
@@ -878,11 +901,16 @@ impl Manager {
             {
                 return Err(unavailable(ErrorCode::Busy));
             }
-            let MessageDbReply::Peer(peer) = self
+            // A receipt for a message that came over MLS may go to any device of its sender's
+            // account in the group (spec 11: the sender is off, another of its devices takes it
+            // and the sender gets it from that one's log); an M4 receipt only to the sender.
+            let (peer, mls_receipt) = match self
                 .message_db(MessageDbOp::Target(key, receipt), request)
                 .await?
-            else {
-                unreachable!()
+            {
+                MessageDbReply::Peer(peer) => (peer, false),
+                MessageDbReply::ReceiptPeer(peer, mls) => (peer, mls),
+                _ => unreachable!(),
             };
             if let Err(error) = self.message_contact(peer) {
                 if !receipt {
@@ -941,7 +969,7 @@ impl Manager {
                 .iter()
                 .filter(|s| {
                     s.grant.peer == peer
-                        && (!receipt || s.grant.installation == key.installation)
+                        && (!receipt || mls_receipt || s.grant.installation == key.installation)
                         && s.ready
                         && self.grant_authorized(&s.grant)
                         && s.conn.close_reason().is_none()
@@ -950,16 +978,37 @@ impl Manager {
                 .collect();
             // A text goes to an installation that holds a leaf in the group and has not refused
             // kind 17 (an M4 app among the peer's devices); failing that, to one that has not
-            // refused; the receipt goes to the message's sender.
-            let members = if receipt || m4 {
+            // refused. An MLS receipt goes to the message's sender when it is there, else to
+            // another device of its account in the group; an M4 receipt to the sender.
+            let members = if (receipt && !mls_receipt) || m4 {
                 Vec::new()
             } else {
                 self.group_members(key.conversation, request).await?
             };
-            let session = if receipt || m4 {
+            let session = if (receipt && !mls_receipt) || m4 {
                 candidates.into_iter().next()
+            } else if receipt {
+                let candidates: Vec<Session> = candidates
+                    .into_iter()
+                    .filter(|s| {
+                        s.grant.installation == key.installation
+                            || members.contains(&s.grant.installation)
+                    })
+                    .collect();
+                // Not again to a sender that left the last attempt unanswered on this session,
+                // while another device is there.
+                let unanswered = self.messages.unanswered.get(&key);
+                let stale = |s: &Session| Some(&s.conn.stable_id()) == unanswered;
+                let candidates = if candidates.iter().all(stale) {
+                    candidates
+                } else {
+                    candidates.into_iter().filter(|s| !stale(s)).collect()
+                };
+                choose_session(candidates, &members, Some(key.installation), |i| {
+                    self.outdated_now(i)
+                })
             } else {
-                choose_session(candidates, &members, |i| self.outdated_now(i))
+                choose_session(candidates, &members, None, |i| self.outdated_now(i))
             }
             .ok_or_else(|| unavailable(ErrorCode::AccountRestricted))?;
             // Commits/Welcomes this recipient still lacks go ahead of the message, over the
@@ -973,7 +1022,8 @@ impl Manager {
                 .mls_sessions()
                 .into_iter()
                 .filter(|s| {
-                    (s.grant.peer == peer || s.grant.peer == own)
+                    !receipt
+                        && (s.grant.peer == peer || s.grant.peer == own)
                         && s.grant.installation != recipient
                         && members.contains(&s.grant.installation)
                         && !self.outdated_now(s.grant.installation)
@@ -1128,6 +1178,34 @@ impl Manager {
         }
         let mut pending = self.messages.pending.remove(&result.key).unwrap();
         pending.completed = true;
+        // Ruling 23: a receipt the message's sender did not answer is not preferred to it on
+        // that session again; an answer from it, or the job done elsewhere, ends that.
+        if pending.receipt.is_some() {
+            let session = &result.lease.session;
+            if session.grant.installation != result.key.installation {
+                if matches!(
+                    result.outcome,
+                    AttemptOutcome::Acked | AttemptOutcome::ReceiptApplied(_)
+                ) {
+                    self.messages.unanswered.remove(&result.key);
+                }
+            } else if matches!(
+                result.outcome,
+                AttemptOutcome::Written
+                    | AttemptOutcome::NoReply
+                    | AttemptOutcome::Transient(
+                        ErrorCode::NetworkTimeout
+                            | ErrorCode::TransportFailed
+                            | ErrorCode::PeerNotConnected
+                    )
+            ) {
+                self.messages
+                    .unanswered
+                    .insert(result.key, session.conn.stable_id());
+            } else {
+                self.messages.unanswered.remove(&result.key);
+            }
+        }
         let outcome = async {
             let request = self.ready()?;
             if request.ticket != result.lease.ticket {
@@ -1357,7 +1435,7 @@ impl Manager {
     /// * Any other class from a recipient already past this device's epoch: this device lacks
     ///   a Commit; a new ciphertext cannot help yet (budget not spent).
     /// * Otherwise it is sealed again in the current epoch, counted, and is due at once.
-    async fn after_decrypt_failed(
+    pub(super) async fn after_decrypt_failed(
         &mut self,
         key: MessageKey,
         peer: PeerId,
@@ -1598,7 +1676,7 @@ impl Drop for ProofResult {
         }
     }
 }
-fn acquisition_current(shared: &Shared, ticket: u64) -> bool {
+pub(super) fn acquisition_current(shared: &Shared, ticket: u64) -> bool {
     let request = *shared.requests.borrow();
     request.ticket == ticket
         && !request.suspend
@@ -1753,6 +1831,8 @@ impl Manager {
         // MLS group upkeep and its Commit/Welcome deliveries share this tick.
         self.poll_mls().await;
         self.poll_epoch_waits().await;
+        // Own-device sync: device list, retention, pulls and `Notify`s (`manager/mailbox.rs`).
+        self.poll_mailbox().await;
         #[cfg(all(feature = "test-hooks", debug_assertions))]
         if self.messages.scheduler_held {
             return;
@@ -1812,13 +1892,37 @@ impl Manager {
                     .await;
                 continue;
             }
-            let ready = self.auth.registry.0.lock().unwrap().iter().any(|s| {
-                s.grant.peer == job.peer
-                    && (!receipt || s.grant.installation == job.key.installation)
-                    && s.ready
-                    && self.grant_authorized(&s.grant)
-                    && s.conn.close_reason().is_none()
-            });
+            let ready = |original: bool| {
+                self.auth.registry.0.lock().unwrap().iter().any(|s| {
+                    s.grant.peer == job.peer
+                        && (!receipt || !original || s.grant.installation == job.key.installation)
+                        && s.ready
+                        && self.grant_authorized(&s.grant)
+                        && s.conn.close_reason().is_none()
+                })
+            };
+            let (ready, other) = (ready(true), receipt && ready(false));
+            // A receipt whose message's sender has no session may still go to another device
+            // of its account (an MLS receipt, spec 11); if none takes it, the sender is looked up.
+            if !ready && other {
+                let (reply, _) = oneshot::channel();
+                self.start_message_attempt(
+                    job.key,
+                    receipt,
+                    reply,
+                    #[cfg(all(feature = "test-hooks", debug_assertions))]
+                    MessageMutation::None,
+                )
+                .await;
+                if self.messages.pending.contains_key(&job.key) {
+                    self.messages
+                        .scheduler
+                        .as_mut()
+                        .unwrap()
+                        .dispatched(receipt);
+                    continue;
+                }
+            }
             if ready {
                 let (reply, _) = oneshot::channel();
                 self.start_message_attempt(
@@ -1884,7 +1988,6 @@ impl Manager {
                 return;
             }
         };
-        self.restrict_peer_grants(peer, false);
         let cancel = self.auth.cancel.child_token();
         self.messages.acquiring.insert(
             key,

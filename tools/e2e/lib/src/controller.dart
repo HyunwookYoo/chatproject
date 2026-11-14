@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'diagnostic.dart';
 import 'protocol.dart';
 
 /// Owns only its loopback listener, sockets and diagnostic log.
@@ -72,6 +73,9 @@ class Controller {
   int _connectionId = 0;
 
   int get port => _server.port;
+
+  /// The participants connected now, the newest instance of each name.
+  Iterable<Participant> get participants => _participants.values;
 
   Future<Participant> waitParticipant(
     String name, {
@@ -237,7 +241,8 @@ class Controller {
           final op = connection.participant?._operations[safe['id']];
           if (op == null ||
               op.startsWith('account_local_') ||
-              op.startsWith('message_local_')) {
+              op.startsWith('message_local_') ||
+              op.startsWith('mailbox_local_')) {
             return jsonEncode({
               'type': 'result',
               'id': safe['id'],
@@ -433,19 +438,28 @@ class Controller {
       switch (record) {
         case ResultRecord():
           final pending = participant._pending[record.id];
+          // The late reply to a call its caller gave up on without failing.
+          if (pending == null && participant._abandoned.remove(record.id)) {
+            return;
+          }
           if (pending == null || pending.isCompleted) {
             throw StateError('protocol unmatched result id');
           }
           if (record.error != null) {
             pending.completeError(
-              const ['account_local_', 'message_local_'].any(
+              const ['account_local_', 'message_local_', 'mailbox_local_'].any(
                     (prefix) =>
                         participant._operations[record.id]?.startsWith(
                           prefix,
                         ) ==
                         true,
                   )
-                  ? RpcError(record.error!.code, '[redacted]')
+                  ? RpcError(
+                      record.error!.code,
+                      '[redacted]',
+                      op: participant._operations[record.id],
+                      participant: participant.name,
+                    )
                   : record.error!,
             );
           } else {
@@ -565,6 +579,8 @@ class Participant {
   final String instance;
   final _pending = <int, Completer<Object?>>{};
   final _operations = <int, String>{};
+  // Ids of `failOnTimeout: false` calls that timed out; their reply is dropped.
+  final _abandoned = <int>{};
   final _events = <Map<String, Object?>>[];
   final _eventWaiters = <_EventWaiter>[];
   int _id = 0;
@@ -579,6 +595,7 @@ class Participant {
     String op,
     Map<String, Object?> args, {
     Duration timeout = const Duration(seconds: 15),
+    bool failOnTimeout = true,
   }) async {
     _check();
     if (_pending.length >= 64) {
@@ -593,6 +610,7 @@ class Participant {
     _operations[id] = op;
     // Attach the timeout/error handler before any write can fail the scenario.
     final result = completer.future.timeout(timeout);
+    final took = Stopwatch()..start();
     try {
       try {
         _controller._send(_connection, {
@@ -606,11 +624,16 @@ class Participant {
       }
       return await result;
     } on TimeoutException catch (error) {
-      _controller._fail(error);
+      if (failOnTimeout) {
+        _controller._fail(error);
+      } else {
+        _abandoned.add(id);
+      }
       rethrow;
     } finally {
       _pending.remove(id);
       _operations.remove(id);
+      noteWait(op, took.elapsedMilliseconds);
     }
   }
 

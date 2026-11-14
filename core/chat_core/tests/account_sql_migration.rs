@@ -478,7 +478,7 @@ async fn old_binary_guard_survives_cleanup() {
 /// A real M4-shaped database: one conversation, three messages, two codec-1 outbox
 /// rows (distinct retry facts) and one cancelled message. Built by the real message
 /// repo on a fresh DB, then rewritten to the exact v1 shape by the narrow fixture.
-async fn v1_database(root: &Path, p: Arc<dyn KeyProtector>) {
+async fn populated_database(root: &Path, p: Arc<dyn KeyProtector>) {
     use chat_core::account::PeerId;
     use chat_core::storage_fixture::MessageId;
     let f = Fixture::open(root, p.clone()).await.unwrap();
@@ -500,15 +500,36 @@ async fn v1_database(root: &Path, p: Arc<dyn KeyProtector>) {
         .enqueue(peer, MessageId([3; 16]), "cancelled".into(), 3)
         .await
         .unwrap();
-    r.cancel_send(c.key).await.unwrap();
+    r.cancel_send(c.key, 4).await.unwrap();
     f.saturate_message_attempts(a.key, false).await.unwrap();
     f.set_outbox_retry(b.key, 3, 4000, 123_456).await.unwrap();
     f.close().await;
+}
+async fn v1_database(root: &Path, p: Arc<dyn KeyProtector>) {
+    populated_database(root, p.clone()).await;
     Fixture::downgrade_to_v1(root, p).unwrap();
 }
+/// A real M5-shaped database: the v1 content plus `mls_kv`/`mls_conversation` rows and one
+/// sealed (codec 2) and one awaiting-encryption (codec 3) outbox row.
+async fn v2_database(root: &Path, p: Arc<dyn KeyProtector>) {
+    populated_database(root, p.clone()).await;
+    Fixture::seed_v2_rows(root, p.clone()).unwrap();
+    Fixture::downgrade_to_v2(root, p).unwrap();
+}
+const MAILBOX_TABLES: [&str; 9] = [
+    "mailbox_store",
+    "mailbox_cursor",
+    "mailbox_pull",
+    "mailbox_status_ahead",
+    "mailbox_handoff",
+    "mailbox_local",
+    "mailbox_device",
+    "mailbox_uptime",
+    "mailbox_notify",
+];
 
 #[tokio::test]
-async fn v1_db_upgrades_to_v2_preserving_messages_and_outbox() {
+async fn v1_db_upgrades_through_v2_to_v3() {
     let dir = tempfile::tempdir().unwrap();
     let p: Arc<dyn KeyProtector> = protector();
     v1_database(dir.path(), p.clone()).await;
@@ -529,7 +550,7 @@ async fn v1_db_upgrades_to_v2_preserving_messages_and_outbox() {
     assert_eq!(r.list_conversations(None, 50).await.unwrap().items.len(), 1);
     f.close().await;
     let after = Fixture::probe_database(dir.path(), p.clone()).unwrap();
-    assert_eq!((after.user_version, after.schema_version), (2, 2));
+    assert_eq!((after.user_version, after.schema_version), (3, 3));
     for table in [
         "mls_kv",
         "mls_conversation",
@@ -540,6 +561,10 @@ async fn v1_db_upgrades_to_v2_preserving_messages_and_outbox() {
     ] {
         assert!(after.tables.iter().any(|t| t == table), "{table}");
     }
+    for table in MAILBOX_TABLES {
+        assert!(after.tables.iter().any(|t| t == table), "{table}");
+    }
+    assert_eq!(after.mailbox_local, vec![(1, 0, 0)]);
     // `message` rows (cancelled one included) are byte-for-byte unchanged.
     assert_eq!(after.message_rows, before.message_rows);
     assert_eq!(after.outbox.len(), 2);
@@ -563,7 +588,7 @@ async fn v1_db_upgrades_to_v2_preserving_messages_and_outbox() {
 }
 
 #[tokio::test]
-async fn upgraded_schema_matches_a_fresh_v2_schema() {
+async fn upgraded_schema_matches_a_fresh_v3_schema() {
     let upgraded = tempfile::tempdir().unwrap();
     let fresh = tempfile::tempdir().unwrap();
     let p: Arc<dyn KeyProtector> = protector();
@@ -604,7 +629,80 @@ async fn upgrade_interrupted_keeps_v1() {
     // The next open migrates again and succeeds.
     Fixture::open(dir.path(), p.clone()).await.unwrap().close().await;
     let after = Fixture::probe_database(dir.path(), p).unwrap();
-    assert_eq!((after.user_version, after.schema_version), (2, 2));
+    assert_eq!((after.user_version, after.schema_version), (3, 3));
     assert_eq!(after.message_rows, before.message_rows);
     assert!(after.outbox.iter().all(|o| o.codec == 3));
+}
+
+#[tokio::test]
+async fn v2_db_upgrades_to_v3_preserving_everything() {
+    let dir = tempfile::tempdir().unwrap();
+    let p: Arc<dyn KeyProtector> = protector();
+    v2_database(dir.path(), p.clone()).await;
+    let before = Fixture::probe_database(dir.path(), p.clone()).unwrap();
+    assert_eq!((before.user_version, before.schema_version), (2, 2));
+    assert!(!before.tables.iter().any(|t| t.starts_with("mailbox_")));
+    assert_eq!(before.message_count, 3);
+    let codecs: Vec<i64> = before.outbox.iter().map(|o| o.codec).collect();
+    assert!(codecs.contains(&2) && codecs.contains(&3));
+    let rows = |name: &str| {
+        before.v2_rows.iter().find(|(t, _)| t == name).unwrap().1.len()
+    };
+    assert!(rows("mls_kv") > 0 && rows("mls_conversation") > 0);
+
+    Fixture::open(dir.path(), p.clone()).await.unwrap().close().await;
+    let after = Fixture::probe_database(dir.path(), p.clone()).unwrap();
+    assert_eq!((after.user_version, after.schema_version), (3, 3));
+    // Every v2 table is byte-identical; storage_meta is compared without its schema_version,
+    // which is the one value the upgrade rebuilds (asserted above).
+    assert_eq!(after.v2_rows, before.v2_rows);
+    assert_eq!(after.message_rows, before.message_rows);
+    assert_eq!(after.outbox, before.outbox);
+    for table in MAILBOX_TABLES {
+        assert!(after.tables.iter().any(|t| t == table), "{table}");
+    }
+    assert_eq!(after.mailbox_local, vec![(1, 0, 0)]);
+    // A second open is a no-op on a v3 database.
+    Fixture::open(dir.path(), p.clone()).await.unwrap().close().await;
+    assert_eq!(Fixture::probe_database(dir.path(), p).unwrap(), after);
+}
+
+#[tokio::test]
+async fn v3_db_rejected_by_v2_reader() {
+    let dir = tempfile::tempdir().unwrap();
+    let p: Arc<dyn KeyProtector> = protector();
+    Fixture::open(dir.path(), p.clone()).await.unwrap().close().await;
+    let error = Fixture::v2_reader_check(dir.path(), p.clone()).unwrap_err();
+    assert_eq!(error.code, ErrorCode::StorageCorrupt);
+    // The replica is a real v2 reader: it accepts a genuine v2 database.
+    let v2 = tempfile::tempdir().unwrap();
+    v2_database(v2.path(), p.clone()).await;
+    Fixture::v2_reader_check(v2.path(), p).unwrap();
+}
+
+#[tokio::test]
+async fn upgrade_v2_interrupted_keeps_v2() {
+    let dir = tempfile::tempdir().unwrap();
+    let p: Arc<dyn KeyProtector> = protector();
+    v2_database(dir.path(), p.clone()).await;
+    let before = Fixture::probe_database(dir.path(), p.clone()).unwrap();
+    Fixture::fail_next_upgrade(dir.path());
+    assert!(Fixture::open(dir.path(), p.clone()).await.is_err());
+    let interrupted = Fixture::probe_database(dir.path(), p.clone()).unwrap();
+    assert_eq!(interrupted, before);
+    assert_eq!((interrupted.user_version, interrupted.schema_version), (2, 2));
+    assert!(!interrupted.tables.iter().any(|t| t.starts_with("mailbox_")));
+    // The next open migrates again and succeeds.
+    Fixture::open(dir.path(), p.clone()).await.unwrap().close().await;
+    let after = Fixture::probe_database(dir.path(), p).unwrap();
+    assert_eq!((after.user_version, after.schema_version), (3, 3));
+    assert_eq!(after.v2_rows, before.v2_rows);
+}
+
+#[tokio::test]
+async fn mailbox_seq_is_never_reused() {
+    let dir = tempfile::tempdir().unwrap();
+    let p: Arc<dyn KeyProtector> = protector();
+    Fixture::open(dir.path(), p.clone()).await.unwrap().close().await;
+    assert_eq!(Fixture::mailbox_seq_after_clearing(dir.path(), p).unwrap(), 4);
 }

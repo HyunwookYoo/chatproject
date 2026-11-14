@@ -32,7 +32,8 @@ pub use types::{DeviceKind, FlowId, Generation, InstallationId, PeerId, Secret32
 mod manager;
 pub use creation::RecoveryDisplay;
 pub use manager::{
-    AccountHandle, AccountPhase, AccountView, CandidateInfo, GroupState, PublishIntent,
+    AccountHandle, AccountPhase, AccountView, CandidateInfo, GroupState, MailboxStateView,
+    PublishIntent,
 };
 
 mod invite;
@@ -50,4 +51,4 @@ pub use pair::PairTestStop;
 pub use connection::RemoteRecordView;
 
 #[cfg(all(feature="test-hooks",debug_assertions))]
-pub use manager::{MessageMutation,MessagePause,MessagePoint};
+pub use manager::{MailboxCounters,MessageMutation,MessagePause,MessagePoint};

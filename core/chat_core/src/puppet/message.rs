@@ -18,6 +18,7 @@ use zeroize::Zeroize;
 pub(super) struct AckLossControl {
     used: AtomicBool,
     holds: tokio::sync::Mutex<Option<(crate::account::MessagePause, crate::account::MessagePause)>>,
+    key: std::sync::Mutex<Option<MessageKey>>,
     cancel: CancellationToken,
 }
 impl AckLossControl {
@@ -32,6 +33,7 @@ impl AckLossControl {
         let mut holds = self.holds.lock().await;
         let pair = handle.message_ack_pause(key).await?;
         *holds = Some(pair);
+        *self.key.lock().unwrap() = Some(key);
         let weak = Arc::downgrade(self);
         let cancelled = self.cancel.clone();
         tokio::spawn(async move {
@@ -42,14 +44,22 @@ impl AckLossControl {
         });
         Ok(())
     }
-    async fn wait(&self) -> Result<Value, CoreError> {
+    async fn wait(&self, handle: &AccountHandle) -> Result<Value, CoreError> {
         let mut holds = self.holds.lock().await;
         let (response, receipt) = holds.as_mut().ok_or_else(super::protocol::invalid)?;
+        let key = (*self.key.lock().unwrap()).ok_or_else(super::protocol::invalid)?;
         let result = tokio::select! {
             _=self.cancel.cancelled()=>Err(CoreError::new(ErrorCode::NotAvailable,"Ack loss fixture closed")),
             result=tokio::time::timeout(Duration::from_secs(10),async {
-                tokio::try_join!(response.wait_entered_checked(),receipt.wait_entered_checked())?;
-                Ok::<_,CoreError>(json!({"response_checkpoint":true,"receipt_checkpoint":true}))
+                response.wait_entered_checked().await?;
+                // The text is stored before its response. One received over MLS has no
+                // Delivered receipt job (the held `Ack` is its only acknowledgement), so there
+                // is no receipt attempt to hold; an M4 one has, and that attempt is held too.
+                let job = handle.storage_test_fixture().message_facts(key).await?.receipt_retry.is_some();
+                if job {
+                    receipt.wait_entered_checked().await?;
+                }
+                Ok::<_,CoreError>(json!({"response_checkpoint":true,"receipt_checkpoint":job,"receipt_job":job}))
             })=>result.unwrap_or_else(|_|Err(CoreError::new(ErrorCode::NetworkTimeout,"Ack loss checkpoint deadline"))),
         };
         if result.is_err() {
@@ -81,6 +91,11 @@ enum TestAction {
     AckLossWait {},
     AckLossRelease {},
     WriteCounts {},
+    /// A conversation's MLS group and one message's sends, as counts only (e2e diagnostics).
+    GroupFacts {
+        conversation: ConversationId,
+        key: Option<MessageKey>,
+    },
 }
 
 pub(super) async fn execute_test(
@@ -101,7 +116,7 @@ pub(super) async fn execute_test(
             control.arm(&handle, key).await?;
             Ok(Value::Null)
         }
-        TestAction::AckLossWait {} => control.wait().await,
+        TestAction::AckLossWait {} => control.wait(&handle).await,
         TestAction::AckLossRelease {} => {
             control.release().await;
             Ok(Value::Null)
@@ -109,6 +124,24 @@ pub(super) async fn execute_test(
         TestAction::WriteCounts {} => {
             let (payload, response) = handle.message_test_write_starts().await?;
             Ok(json!({"payload_writes":payload,"response_writes":response}))
+        }
+        TestAction::GroupFacts { conversation, key } => {
+            let fixture = handle.storage_test_fixture();
+            let state = fixture.mls_state(conversation).await?;
+            let attempted = match key {
+                Some(key) => fixture.message_facts(key).await?.attempted_receivers.len(),
+                None => 0,
+            };
+            Ok(json!({
+                "group": state.group_epoch.is_some(),
+                "epoch": state.group_epoch,
+                "members": state.members.len(),
+                "processed_mls": state.processed_mls,
+                "deliveries": state.deliveries.len(),
+                "holds": state.holds,
+                "rejoins": state.rejoin_count,
+                "attempted": attempted,
+            }))
         }
     }
 }

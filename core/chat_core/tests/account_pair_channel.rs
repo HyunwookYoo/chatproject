@@ -393,6 +393,40 @@ async fn malformed_expired_qr_and_resume_fail_closed_before_candidate_write() {
         chat_core::account::AccountPhase::Unconfigured
     );
 }
+/// Two devices whose clocks differ by seconds still pair. In the M6 e2e the
+/// scanning emulator's clock was 1 s behind the phone's, and its pair_scan
+/// failed with AuthFailed before dialing. A QR more than 5 minutes beyond
+/// the scanner's own 5-minute window still fails closed.
+#[tokio::test]
+async fn scanner_clock_seconds_behind_the_owner_still_pairs() {
+    let backend = Arc::new(Backend::default());
+    let e = Fixture::new(true, backend.clone()).await;
+    let n = Fixture::with_clock(false, backend, Arc::new(FakeClock::new(NOW - 2, 0))).await;
+    let d =
+        e.a.pair_begin(PairDirection::ExistingDisplays, None)
+            .await
+            .unwrap();
+    n.route_to(&e).await;
+    n.a.pair_scan(d.qr.clone()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while e.a.pair_view().await.unwrap().is_none_or(|v| v.sas.is_none()) {
+            tokio::task::yield_now().await
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        e.a.pair_view().await.unwrap().unwrap().sas,
+        n.a.pair_view().await.unwrap().unwrap().sas
+    );
+    let far = Fixture::with_clock(false, Arc::new(Backend::default()), Arc::new(FakeClock::new(NOW - 301, 0))).await;
+    let error = far.a.pair_scan(d.qr.clone()).await.unwrap_err();
+    assert_eq!(error.code, chat_core::ErrorCode::AuthFailed);
+    assert_eq!(
+        far.a.snapshot().await.unwrap().phase,
+        chat_core::account::AccountPhase::Unconfigured
+    );
+}
 struct Raw {
     conn: iroh::endpoint::Connection,
     send: iroh::endpoint::SendStream,

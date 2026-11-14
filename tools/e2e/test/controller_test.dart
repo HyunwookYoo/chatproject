@@ -4,6 +4,7 @@ import 'dart:io';
 import 'dart:mirrors';
 
 import 'package:chat_e2e/src/controller.dart';
+import 'package:chat_e2e/src/diagnostic.dart';
 import 'package:chat_e2e/src/protocol.dart';
 import 'package:test/test.dart';
 
@@ -266,6 +267,53 @@ void main() {
       expect(wires.first['wire'], contains('chat-test-hooks:v1'));
     },
   );
+
+  test('each call notes how long its op took, failed calls too', () async {
+    waitMs.clear();
+    final peer = await join();
+    final participant = await controller.waitParticipant('node');
+    final call = participant.call('account_local_pair_scan', {'qr': 'x'});
+    final failed = expectLater(call, throwsA(isA<RpcError>()));
+    final command = await peer.next();
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+    peer.send({
+      'type': 'result',
+      'id': command['id'],
+      'ok': false,
+      'error': {'code': 'AuthFailed', 'detail': 'x'},
+    });
+    await failed;
+    expect(waitMs['account_local_pair_scan'], greaterThanOrEqualTo(50));
+    waitMs.clear();
+  });
+
+  test('a late reply to an abandoned diagnostic call is dropped', () async {
+    final peer = await join();
+    final participant = await controller.waitParticipant('node');
+    await expectLater(
+      participant.call(
+        'network_trace',
+        {},
+        timeout: const Duration(milliseconds: 50),
+        failOnTimeout: false,
+      ),
+      throwsA(isA<TimeoutException>()),
+    );
+    final late = await peer.next();
+    peer.result(late['id'] as int, {'dials': <Object?>[]});
+    final next = participant.call('network_stop', {});
+    peer.result((await peer.next())['id'] as int, null);
+    expect(await next, isNull);
+    // Only once: a second reply to that id still fails the scenario.
+    final pending = expectLater(
+      participant.call('network_info', {}),
+      throwsA(scenarioFailure('protocol')),
+    );
+    await peer.next();
+    peer.result(late['id'] as int, null);
+    await pending;
+    await expectLater(controller.close(), throwsA(scenarioFailure('protocol')));
+  });
 
   test('direct-only config has mandatory null relay', () async {
     await controller.close();

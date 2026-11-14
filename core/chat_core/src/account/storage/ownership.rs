@@ -12,6 +12,8 @@ pub(crate) struct Ownership {
 }
 
 fn acquire(root: &Path) -> Result<File, CoreError> {
+    #[cfg(test)]
+    let _no_child_spawning = child::SPAWNING.read().unwrap_or_else(|e| e.into_inner());
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -106,6 +108,32 @@ impl Ownership {
     }
 }
 
+/// Unit tests spawn children only while holding `spawning()`.
+///
+/// A spawned child holds copies of this process's descriptors until its exec
+/// closes them. On Linux such a copy keeps the flock of a lock this process
+/// already released, so a concurrent test that reacquires its account lock
+/// sees WriterBusy. `spawn()` returning does not end that window (the parent
+/// resumes before exec has closed the copies), so the guard is held until the
+/// child has exited, and `acquire` waits for it.
+#[cfg(test)]
+pub(crate) mod child {
+    use std::process::{Command, Output};
+    use std::sync::{RwLock, RwLockWriteGuard};
+
+    pub(super) static SPAWNING: RwLock<()> = RwLock::new(());
+
+    /// Hold until every child spawned under it has been waited for.
+    pub(crate) fn spawning() -> RwLockWriteGuard<'static, ()> {
+        SPAWNING.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub(crate) fn output(command: &mut Command) -> Output {
+        let _spawning = spawning();
+        command.output().unwrap()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{
@@ -113,6 +141,27 @@ mod tests {
         test_support::{protector, state},
     };
     use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn reacquire_never_meets_a_child_holding_the_released_lock() {
+        // One test spawns while another releases and retakes its lock.
+        let dir = tempfile::tempdir().unwrap();
+        std::thread::scope(|scope| {
+            let spawner = scope.spawn(|| {
+                for _ in 0..200 {
+                    assert!(
+                        child::output(&mut std::process::Command::new("true"))
+                            .status
+                            .success()
+                    );
+                }
+            });
+            while !spawner.is_finished() {
+                drop(acquire(dir.path()).unwrap());
+            }
+        });
+    }
 
     #[test]
     fn ios_policy_simulation_releases_between_operations_and_during_suspend() {

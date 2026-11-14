@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'controller.dart';
+import 'diagnostic.dart';
 import 'protocol.dart';
 
 typedef AccountRestart =
@@ -40,17 +41,31 @@ Future<void> runAccountScenario(
     Participant p,
     bool Function(Map<String, Object?>) predicate,
   ) async {
+    // Named as the deadline below, so the literal-sync test sees the text.
+    const name = 'Account state deadline';
+    final took = Stopwatch()..start();
     final deadline = DateTime.now().add(timeout);
+    String? last;
     while (DateTime.now().isBefore(deadline)) {
       try {
         final view = await snapshot(p);
-        if (predicate(view)) return view;
+        last = observedView(view);
+        if (predicate(view)) {
+          noteWait(name, took.elapsedMilliseconds);
+          return view;
+        }
       } on RpcError catch (e) {
         if (e.code != 'NotAvailable') rethrow;
+        last = observedView(e);
       }
       await Future<void>.delayed(const Duration(milliseconds: 100));
     }
-    throw TimeoutException('Account state deadline');
+    noteWait(name, took.elapsedMilliseconds);
+    throw ScenarioDeadline(
+      'Account state deadline',
+      lastView: last,
+      participant: p.name,
+    );
   }
 
   Future<Map<String, Object?>> active(Participant p) =>
@@ -146,7 +161,22 @@ Future<void> runAccountScenario(
     }
     final target = object(await owner.call('network_info', {}))['ticket'];
     await call(scanner, 'route', {'ticket': target});
-    final scanned = await call(scanner, 'pair_scan', {'qr': display['qr']});
+    final Object? scanned;
+    try {
+      scanned = await call(scanner, 'pair_scan', {'qr': display['qr']});
+    } on RpcError {
+      await notePairSide(
+        'owner',
+        () => snapshot(owner),
+        () => owner.call('network_info', {}),
+      );
+      await notePairSide(
+        'scanner',
+        () => snapshot(scanner),
+        () => scanner.call('network_info', {}),
+      );
+      rethrow;
+    }
     display.clear();
     require(same(flow, scanned), 'pair flow mismatch');
     final av = await until(
@@ -312,11 +342,25 @@ Future<void> runAccountScenario(
         }
       }
 
+      // Since M6 connect_account keeps a ready session (it dials only devices
+      // without one), so each later proof starts with no session: A's network
+      // restarts, both sides see the proof gone, and the routes are renewed.
+      Future<void> dropSessions() async {
+        await a.call('network_stop', {});
+        for (final p in [a, b]) {
+          await until(p, (v) => !proved(v));
+        }
+        await a.call('network_start', {});
+        await routeBoth();
+      }
+
       await routeBoth();
       await proof('auth_fresh', a, bPeer, false);
+      await dropSessions();
       controller.recordLookupsPaused = true;
       await proof('auth_cached', a, bPeer, true);
       controller.recordLookupsPaused = false;
+      await dropSessions();
       await proof('auth_fresh_again', a, bPeer, false);
       await b.call('network_stop', {});
       final disconnected = await until(a, (v) => !proved(v));

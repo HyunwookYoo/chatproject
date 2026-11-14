@@ -20,16 +20,29 @@ pub(crate) struct MessageRepo {
     storage: StorageHandle,
     identity: Identity,
 }
+/// Who a received application ciphertext came from (M6 spec 7): the account and device whose
+/// session (or log entry) carried it, and that account's current devices. Any of those may have
+/// sealed it; the MLS leaf that did is its sender.
+pub(crate) struct OpenFrom {
+    pub peer: PeerId,
+    pub transport: InstallationId,
+    pub allowed: Vec<InstallationId>,
+    /// The own device whose log it came from (a pull), if it did: a text from the other account
+    /// stored just now is marked for that pull's notification (Ruling 35).
+    pub pull: Option<InstallationId>,
+}
 pub(crate) enum MessageDbOp {
     Observed(Box<MessageDbOp>),
-    MarkRead(ConversationId, Vec<MessageKey>, u64),
+    /// The user saw these received messages: conversation, keys, scheduler time (receipt jobs)
+    /// and wall time (a `Read` receipt sealed now).
+    MarkRead(ConversationId, Vec<MessageKey>, u64, u64),
     #[cfg(all(feature="test-hooks",debug_assertions))]
     RejectedPrepare(MessageKey, InstallationId, u64, PrepareTransition),
     Due(u64, Vec<PeerId>, [Option<DueCursor>; 2]),
     RecoverScheduler(u64),
     SettleCompleted(MessageKey),
     Defer(MessageKey, bool, u64),
-    Cancel(MessageKey),
+    Cancel(MessageKey, u64),
     Retry(MessageKey, u64),
     ReleasePeer(PeerId, u64),
     ResetUnlaunched(MessageKey, PrepareToken),
@@ -45,12 +58,14 @@ pub(crate) enum MessageDbOp {
     Seal(MessageKey, u64),
     /// Seals every codec 3 row of the conversation, in lamport order.
     SealPending(ConversationId, u64),
+    /// Holds every own text of the conversation that waits for a group (codec 3): `Blocked`
+    /// until the user's retry. Receipts are not held.
+    BlockPending(ConversationId, BlockReason),
     /// Seals a codec 2 row again. Counted (`reencrypts += 1`, the third time it fails) after a
     /// decrypt failure; not counted when only the epoch moved on under it (C1).
     Reencrypt(MessageKey, u64, bool),
-    /// A received MLS application ciphertext: sender peer, sender installation, conversation,
-    /// ciphertext, now.
-    OpenApp(PeerId, InstallationId, ConversationId, Vec<u8>, u64),
+    /// A received MLS application ciphertext: who it came from, conversation, ciphertext, now.
+    OpenApp(OpenFrom, ConversationId, Vec<u8>, u64),
     MarkWaitingPeerUpdate(MessageKey, bool),
     /// The recipient installation `Ack`ed a sent `App` frame: delivered (now).
     MlsAcked(MessageKey, InstallationId, u64),
@@ -61,6 +76,12 @@ pub(crate) enum MessageDbOp {
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     M4Encode(MessageKey),
     MlsGroupOp(ConversationId, super::mls_group::GroupOp),
+    /// The device log: pages, cursors, retention (M6).
+    Mailbox(super::mailbox_store::MailboxDbOp),
+    /// Notification items (M6) for texts just stored: per conversation, those of the keys that
+    /// came from the other account and are still not seen here; and an item (maybe with no new
+    /// message) for each conversation whose messages were read on another own device.
+    NotifyItems(Vec<MessageKey>, Vec<ConversationId>),
     Messages(ConversationId, Option<MessageCursor>, u32),
     Conversations(Option<ConversationCursor>, u32),
 }
@@ -288,15 +309,27 @@ pub(crate) fn execute(
             let cid = match &*op {
                 MessageDbOp::Open(local, peer) => Some(conversation_id(*local, *peer)?),
                 MessageDbOp::ReleasePeer(peer, _) => Some(conversation_id(identity.peer, *peer)?),
-                MessageDbOp::MarkRead(id, _, _) => Some(*id),
-                MessageDbOp::SealPending(id, _) => Some(*id),
+                MessageDbOp::MarkRead(id, ..) => Some(*id),
+                MessageDbOp::SealPending(id, _) | MessageDbOp::BlockPending(id, _) => Some(*id),
                 // Group operations that span conversations (deliveries, holds) pass a zero id.
                 MessageDbOp::MlsGroupOp(id, _) => (id.0 != [0; 32]).then_some(*id),
-                MessageDbOp::OpenApp(_, _, id, _, _) => Some(*id),
+                MessageDbOp::OpenApp(_, id, _, _) => Some(*id),
+                MessageDbOp::Mailbox(super::mailbox_store::MailboxDbOp::ApplyNote { entry, .. }) => {
+                    Some(entry.conversation)
+                }
+                MessageDbOp::Mailbox(super::mailbox_store::MailboxDbOp::StorePlain { record, .. }) => {
+                    Some(record.conversation)
+                }
+                MessageDbOp::Mailbox(super::mailbox_store::MailboxDbOp::HandoffResult { conversation, .. }) => {
+                    Some(*conversation)
+                }
                 _ => key.map(|k| k.conversation),
             };
             let reply = execute(c, identity, local, *op, #[cfg(all(feature="test-hooks",debug_assertions))] fault)?;
             let after = revision(c)?;
+            // The device log's head after the operation: the actor tells the other own devices
+            // when it moved (M6 `Notify`).
+            let head = super::mailbox_store::high_water(c)?;
             let mut events = Vec::new();
             if after > before && let Some(conversation) = cid {
                 events.push(crate::CoreEvent::MessagesChanged { revision: after, conversation });
@@ -305,9 +338,9 @@ pub(crate) fn execute(
                     events.push(crate::CoreEvent::MessageStateChanged { revision: after, key, state: view.state, cancel_requested: view.cancel_requested });
                 }
             }
-            Ok(MessageDbReply::Observed(Box::new(reply), events))
+            Ok(MessageDbReply::Observed(Box::new(reply), events, head))
         }
-        MessageDbOp::MarkRead(id, keys, now) => mark_read(c, identity, id, keys, now, #[cfg(all(feature="test-hooks",debug_assertions))] fault),
+        MessageDbOp::MarkRead(id, keys, now, wall) => mark_read(c, identity, local, id, keys, (now, wall), #[cfg(all(feature="test-hooks",debug_assertions))] fault),
         #[cfg(all(feature="test-hooks",debug_assertions))]
         MessageDbOp::RejectedPrepare(key,receiver,now,transition) => {
             let state:Option<u64>=c.query_row("SELECT dispatch_state FROM outbox WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",params![key.conversation.0.as_slice(),key.sender.0.as_slice(),key.installation.0.as_slice(),key.id.0.as_slice()],|r|uint(r,0)).optional().map_err(sql_error)?;
@@ -324,13 +357,17 @@ pub(crate) fn execute(
             release_blocked(c,peer,None,#[cfg(all(feature="test-hooks",debug_assertions))] fault)?;
             Ok(MessageDbReply::Done)
         }
-        MessageDbOp::Cancel(key) => {
+        MessageDbOp::Cancel(key, now) => {
             let tx=c.transaction().map_err(sql_error)?;
             let view=find(&tx,key)?.ok_or_else(missing)?;
             if !view.outgoing || key.sender!=identity.peer || key.installation!=identity.installation {return Err(invalid());}
             if !view.cancel_requested {
                 tx.execute("UPDATE message SET cancel_requested=1 WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",params![key.conversation.0.as_slice(),key.sender.0.as_slice(),key.installation.0.as_slice(),key.id.0.as_slice()]).map_err(sql_error)?;
-                tx.execute("DELETE FROM outbox WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",params![key.conversation.0.as_slice(),key.sender.0.as_slice(),key.installation.0.as_slice(),key.id.0.as_slice()]).map_err(sql_error)?;
+                let queued=tx.execute("DELETE FROM outbox WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",params![key.conversation.0.as_slice(),key.sender.0.as_slice(),key.installation.0.as_slice(),key.id.0.as_slice()]).map_err(sql_error)?;
+                // Ruling 26: a mailbox this device may have handed the ciphertext to stops trying it.
+                if queued>0 {
+                    super::mailbox_store::record_note(&tx,key.conversation,key.sender,key.installation,&crate::mailbox::wire::EntryBody::HandoffWithdraw{msg_id:key.id},now)?;
+                }
                 let revision=bump(&tx)?;
                 tx.execute("UPDATE conversation SET change_revision=?2 WHERE id=?1",params![key.conversation.0.as_slice(),integer(revision)?]).map_err(sql_error)?;
             }
@@ -342,8 +379,10 @@ pub(crate) fn execute(
         MessageDbOp::RecoverScheduler(now) => {
             let tx = c.transaction().map_err(sql_error)?;
             let now = integer(now)?;
-            // Called only once by a new Manager before any local launch.
-            tx.execute("UPDATE outbox SET dispatch_state=CASE WHEN dispatch_state=1 THEN 0 ELSE dispatch_state END,next_retry_at_ms=?1+min(max(next_retry_at_ms-?1,0),retry_delay_ms,300000)",params![now]).map_err(sql_error)?;
+            // Called only once by a new Manager before any local launch. A mailbox's outbox
+            // waits at most its own cap (Ruling 7).
+            let cap = integer(outbox_delay_cap(&tx)?)?;
+            tx.execute("UPDATE outbox SET dispatch_state=CASE WHEN dispatch_state=1 THEN 0 ELSE dispatch_state END,next_retry_at_ms=?1+min(max(next_retry_at_ms-?1,0),retry_delay_ms,?2)",params![now,cap]).map_err(sql_error)?;
             tx.execute("UPDATE receipt_job SET next_retry_at_ms=?1+min(max(next_retry_at_ms-?1,0),300000)",params![now]).map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
             Ok(MessageDbReply::Done)
@@ -388,8 +427,12 @@ pub(crate) fn execute(
             #[cfg(all(feature = "test-hooks", debug_assertions))]
             fault,
         ),
-        MessageDbOp::Target(key, receipt) => {
-            target(c, identity, key, receipt).map(MessageDbReply::Peer)
+        MessageDbOp::Target(key, true) => {
+            let peer = target(c, identity, key, true)?;
+            Ok(MessageDbReply::ReceiptPeer(peer, super::mls_store::received_over_mls(c, key)?))
+        }
+        MessageDbOp::Target(key, false) => {
+            target(c, identity, key, false).map(MessageDbReply::Peer)
         }
         // A receipt for a message that came over MLS is sealed and goes back over MLS.
         MessageDbOp::Prepare(key, receiver, true, wall, now, _)
@@ -543,14 +586,17 @@ pub(crate) fn execute(
         }
         MessageDbOp::Seal(key, now) => super::mls_store::seal(c, identity, local, key, now, mls_fault!(fault)),
         MessageDbOp::SealPending(id, now) => super::mls_store::seal_pending(c, identity, local, id, now, mls_fault!(fault)),
+        MessageDbOp::BlockPending(id, reason) => super::mls_store::block_pending(c, identity, id, reason, mls_fault!(fault)),
         MessageDbOp::Reencrypt(key, now, counted) => super::mls_store::reencrypt(c, identity, local, key, now, counted, mls_fault!(fault)),
-        MessageDbOp::OpenApp(peer, install, id, ciphertext, now) => super::mls_store::open_app(c, identity, peer, install, id, ciphertext, now, mls_fault!(fault)),
+        MessageDbOp::OpenApp(from, id, ciphertext, now) => super::mls_store::open_app(c, identity, &from, id, ciphertext, now, mls_fault!(fault)),
         MessageDbOp::MarkWaitingPeerUpdate(key, waiting) => super::mls_store::mark_waiting(c, identity, key, waiting, mls_fault!(fault)),
         MessageDbOp::MlsAcked(key, recipient, now) => super::mls_store::acked(c, identity, key, recipient, now, mls_fault!(fault)),
         MessageDbOp::ResealReceipt(key) => super::mls_store::reseal_receipt(c, key, mls_fault!(fault)),
         #[cfg(all(feature = "test-hooks", debug_assertions))]
         MessageDbOp::M4Encode(key) => super::mls_store::m4_encode(c, identity, key),
         MessageDbOp::MlsGroupOp(id, op) => super::mls_group::group_op(c, identity, local, id, op, mls_fault!(fault)),
+        MessageDbOp::Mailbox(op) => super::mailbox_store::mailbox_op(c, identity, op, mls_fault!(fault)),
+        MessageDbOp::NotifyItems(keys, read) => Ok(MessageDbReply::Notify(notify_items(c, &keys, &read)?)),
         MessageDbOp::Messages(id, before, n) => {
             let take = limit(n)?;
             let (lamport, install, msg) = match before {
@@ -745,6 +791,8 @@ pub struct MessageFacts {
     pub dispatch_state: Option<u64>,
     pub retry: Option<(u64, u64, u64)>,
     pub receipt_retry: Option<(u64, u64)>,
+    /// The user saw the message on this device (or on another own device, M6).
+    pub seen_local: bool,
 }
 #[cfg(all(feature = "test-hooks", debug_assertions))]
 pub(crate) enum FixtureOp {
@@ -772,6 +820,29 @@ pub(crate) enum FixtureOp {
     /// Optionally writes one raw `mls_kv` row into the global scope (key, value as given), then
     /// lists the labels of every global-scope row.
     MlsGlobalRows(Option<(Vec<u8>, Vec<u8>)>, tokio::sync::oneshot::Sender<R<Vec<String>>>),
+    /// Writes one raw `mls_kv` row (key, value as given) into a conversation's scope.
+    MlsPlantRow(ConversationId, Vec<u8>, Vec<u8>, tokio::sync::oneshot::Sender<R<()>>),
+    MailboxState(tokio::sync::oneshot::Sender<R<super::mailbox_store::MailboxState>>),
+    /// The database size: `page_count × page_size` (the M6 per-entry size measurement).
+    DbBytes(tokio::sync::oneshot::Sender<R<u64>>),
+    /// Records a `Frame` entry with this body at this time.
+    MailboxRecord(Vec<u8>, u64, tokio::sync::oneshot::Sender<R<Option<u64>>>),
+    /// Records a `Frame` entry of this conversation, sender account and installation.
+    MailboxRecordAs(
+        ConversationId,
+        PeerId,
+        InstallationId,
+        Vec<u8>,
+        u64,
+        tokio::sync::oneshot::Sender<R<Option<u64>>>,
+    ),
+    /// Device, handoff and status-ahead rows of an installation at a time.
+    MailboxSeed(InstallationId, u64, tokio::sync::oneshot::Sender<R<()>>),
+    /// Records an installation as a mailbox device (or not) at a time.
+    MailboxMark(InstallationId, bool, u64, tokio::sync::oneshot::Sender<R<()>>),
+    /// Deletes one message row and the jobs that refer to it (as deleting its conversation
+    /// would).
+    DropMessage(MessageKey, tokio::sync::oneshot::Sender<R<()>>),
 }
 #[cfg(all(feature = "test-hooks", debug_assertions))]
 pub(crate) fn fixture(c: &mut Connection, op: FixtureOp) {
@@ -800,6 +871,7 @@ pub(crate) fn fixture(c: &mut Connection, op: FixtureOp) {
                     receipt_jobs,
                     processed,
                     dispatch_state,
+                    seen_local: c.query_row("SELECT seen_local FROM message WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",params![key.conversation.0.as_slice(),key.sender.0.as_slice(),key.installation.0.as_slice(),key.id.0.as_slice()],|r|r.get(0)).map_err(sql_error)?,
                     messages,
                     jobs,
                     quota_bytes,
@@ -885,6 +957,46 @@ pub(crate) fn fixture(c: &mut Connection, op: FixtureOp) {
                     })
                     .collect())
             })();
+            let _ = reply.send(result);
+        }
+        FixtureOp::MlsPlantRow(id, key, value, reply) => {
+            let result = c
+                .execute(
+                    "INSERT OR REPLACE INTO mls_kv VALUES(?1,?2,?3)",
+                    params![id.0.as_slice(), key, value],
+                )
+                .map(|_| ())
+                .map_err(sql_error);
+            let _ = reply.send(result);
+        }
+        FixtureOp::MailboxState(reply) => {
+            let _ = reply.send(super::mailbox_store::fixture_state(c));
+        }
+        FixtureOp::DbBytes(reply) => {
+            // SQLCipher answers `PRAGMA page_size` itself; the table-valued forms read SQLite's.
+            let _ = reply.send(
+                c.query_row("SELECT page_count*page_size FROM pragma_page_count(),pragma_page_size()", [], |r| r.get::<_, i64>(0))
+                    .map(|v| v as u64)
+                    .map_err(sql_error),
+            );
+        }
+        FixtureOp::MailboxRecord(body, now, reply) => {
+            let _ = reply.send(super::mailbox_store::fixture_record(c, &body, now));
+        }
+        FixtureOp::MailboxRecordAs(conversation, peer, installation, body, now, reply) => {
+            let ids = (conversation, peer, installation);
+            let _ = reply.send(super::mailbox_store::fixture_record_as(c, ids, &body, now));
+        }
+        FixtureOp::MailboxSeed(installation, at, reply) => {
+            let _ = reply.send(super::mailbox_store::fixture_seed(c, installation, at));
+        }
+        FixtureOp::MailboxMark(installation, mailbox, at, reply) => {
+            let _ = reply.send(super::mailbox_store::fixture_mark(c, installation, mailbox, at));
+        }
+        FixtureOp::DropMessage(k, reply) => {
+            let result = ["receipt_job", "mls_receipt", "outbox", "message"].iter().try_for_each(|table| {
+                c.execute(&format!("DELETE FROM {table} WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4"), params![k.conversation.0.as_slice(), k.sender.0.as_slice(), k.installation.0.as_slice(), k.id.0.as_slice()]).map(|_| ()).map_err(sql_error)
+            });
             let _ = reply.send(result);
         }
         FixtureOp::MlsSetDelivery(id, recipient, kind, epoch, row, reply) => {
@@ -992,7 +1104,8 @@ fn fill(c: &mut Connection, key: MessageKey, count: u64, target: Option<u64>) ->
     tx.commit().map_err(sql_error)
 }
 pub(crate) enum MessageDbReply {
-    Observed(Box<MessageDbReply>, Vec<crate::CoreEvent>),
+    /// The reply, its events, and the device log's head (largest seq handed out) afterwards.
+    Observed(Box<MessageDbReply>, Vec<crate::CoreEvent>, u64),
     Due(
         Vec<super::scheduler::Dispatch>,
         Vec<super::scheduler::Dispatch>,
@@ -1010,12 +1123,24 @@ pub(crate) enum MessageDbReply {
     Opened(crate::mls::wire::MlsReply),
     /// A received MLS text that M4 would refuse: answered with an M4 `Reject(InvalidMessage)`.
     Rejected,
-    /// The reply for a received MLS ciphertext that carried (or carried before) this text.
-    OpenedText(crate::mls::wire::MlsReply, MessageKey),
+    /// The reply for a received MLS ciphertext that carried (or carried before) this text; true
+    /// when the text came from the other account and was stored just now.
+    OpenedText(crate::mls::wire::MlsReply, MessageKey, bool),
+    /// The reply for my `Read` receipt from another of my devices that made messages of the
+    /// conversation read here just now (M6, spec 6.4).
+    OpenedRead(crate::mls::wire::MlsReply, ConversationId),
+    /// The account a receipt goes to, and whether the message came over MLS (its receipt may
+    /// then go to any device of that account in the group).
+    ReceiptPeer(PeerId, bool),
     /// A received MLS ciphertext of the current epoch (`epoch`) whose sender's ratchet is too far
     /// ahead of this device's view of it (C1). Nothing changed; only a new epoch can help.
     FarAhead { epoch: u64 },
+    /// A received MLS ciphertext of the right account sealed by a leaf that is not one of its
+    /// current devices (revoked or no longer listed since). Nothing changed; it is not taken.
+    NotCurrent,
     Group(super::mls_group::GroupReply),
+    Mailbox(super::mailbox_store::MailboxDbReply),
+    Notify(Vec<crate::event::NotifyItem>),
     Conversation(ConversationView),
     Message(MessageView),
     Messages(MessagePage),
@@ -1039,8 +1164,8 @@ impl MessageRepo {
             MessageDbReply::Message(view)=>Ok(view), _=>unreachable!()
         }
     }
-    pub(crate) async fn cancel_send(&self, key: MessageKey) -> R<MessageView> {
-        match self.operation(MessageDbOp::Cancel(key)).await? {
+    pub(crate) async fn cancel_send(&self, key: MessageKey, now_ms: u64) -> R<MessageView> {
+        match self.operation(MessageDbOp::Cancel(key, now_ms)).await? {
             MessageDbReply::Message(view)=>Ok(view), _=>unreachable!()
         }
     }
@@ -1111,12 +1236,13 @@ impl MessageDbOp {
     pub(crate) fn faultable(&self, identity: Identity) -> R<bool> {
         Ok(match self {
             Self::Observed(op) => return op.faultable(identity),
-            Self::SealPending(..) | Self::OpenApp(..) => true,
+            Self::SealPending(..) | Self::BlockPending(..) | Self::OpenApp(..) => true,
             // The M4-peer fixture's frame is what its enqueue would have stored: not a step
             // of the attempt that fault tests interrupt.
             #[cfg(all(feature = "test-hooks", debug_assertions))]
             Self::M4Encode(_) => false,
             Self::MlsGroupOp(_, op) => op.writes(),
+            Self::Mailbox(op) => op.writes(),
             _ => self.key(identity)?.is_some(),
         })
     }
@@ -1132,7 +1258,7 @@ impl MessageDbOp {
     pub(crate) fn key(&self, identity: Identity) -> R<Option<MessageKey>> {
         Ok(match self {
             Self::Observed(op) => return op.key(identity),
-            Self::MarkRead(_, keys, _) => keys.first().copied(),
+            Self::MarkRead(_, keys, ..) => keys.first().copied(),
             Self::Enqueue(peer, id, _, _) => Some(MessageKey {
                 conversation: conversation_id(identity.peer, *peer)?,
                 sender: identity.peer,
@@ -1145,7 +1271,7 @@ impl MessageDbOp {
             #[cfg(all(feature="test-hooks",debug_assertions))]
             Self::RejectedPrepare(k,_,_,_) => Some(*k),
             Self::Retry(k, _)
-            | Self::Cancel(k)
+            | Self::Cancel(k, _)
             | Self::SettleCompleted(k)
             | Self::Defer(k, _, _)
             | Self::ResetUnlaunched(k, _)
@@ -1155,6 +1281,49 @@ impl MessageDbOp {
             _ => None,
         })
     }
+}
+/// Of `keys` (texts just stored), those received from the other account and still not seen here,
+/// counted per conversation, with the conversation's peer and unread count. Each conversation of
+/// `read` (read on another own device) gets an item too, with no new message if none counted: the
+/// app clears or updates what it shows for it.
+pub(super) fn notify_items(
+    c: &Connection,
+    keys: &[MessageKey],
+    read: &[ConversationId],
+) -> R<Vec<crate::event::NotifyItem>> {
+    let keys: std::collections::BTreeSet<MessageKey> = keys.iter().copied().collect();
+    let mut counts: std::collections::BTreeMap<ConversationId, u32> =
+        read.iter().map(|id| (*id, 0)).collect();
+    for k in keys {
+        let unseen: bool = c
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM message WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4 AND outgoing=0 AND seen_local=0)",
+                params![k.conversation.0.as_slice(), k.sender.0.as_slice(), k.installation.0.as_slice(), k.id.0.as_slice()],
+                |r| r.get(0),
+            )
+            .map_err(sql_error)?;
+        if unseen {
+            *counts.entry(k.conversation).or_default() += 1;
+        }
+    }
+    counts
+        .into_iter()
+        .map(|(conversation, new_messages)| {
+            let (peer, unread) = c
+                .query_row(
+                    "SELECT peer,unread FROM conversation WHERE id=?1",
+                    params![conversation.0.as_slice()],
+                    |r| Ok((bytes::<32>(r, 0)?, uint(r, 1)?)),
+                )
+                .map_err(sql_error)?;
+            Ok(crate::event::NotifyItem {
+                conversation,
+                peer: PeerId(peer),
+                new_messages,
+                unread,
+            })
+        })
+        .collect()
 }
 impl MessageRepo {
     pub(crate) async fn operation(&self, op: MessageDbOp) -> R<MessageDbReply> {
@@ -1663,6 +1832,15 @@ impl MessageDbOp {
     }
 }
 
+/// The longest an outbox row waits between attempts: 30 s while this device is a mailbox (M6
+/// roadmap, Ruling 7), otherwise `MAX_DELAY_MS`. Read in the transaction that schedules.
+fn outbox_delay_cap(c: &Connection) -> R<u64> {
+    Ok(if super::mailbox_store::mailbox_enabled(c)? {
+        crate::mailbox::MAILBOX_MAX_DELAY_MS
+    } else {
+        super::scheduler::MAX_DELAY_MS
+    })
+}
 pub(super) fn schedule_retry(tx: &Transaction<'_>, k: MessageKey, receipt: bool, now: u64) -> R<()> {
     let table = if receipt { "receipt_job" } else { "outbox" };
     let filter = "conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4";
@@ -1671,7 +1849,11 @@ pub(super) fn schedule_retry(tx: &Transaction<'_>, k: MessageKey, receipt: bool,
         |r| r.get::<_,Option<i64>>(0)).map_err(sql_error)?;
     let Some(count) = count else { return Ok(()) };
     let count = (count as u64).saturating_add(1).min(u32::MAX as u64);
-    let delay = super::scheduler::retry_delay(count);
+    let delay = if receipt {
+        super::scheduler::retry_delay(count)
+    } else {
+        super::scheduler::retry_delay_capped(count, outbox_delay_cap(tx)?)
+    };
     let next = integer(now.checked_add(delay).ok_or_else(invalid)?)?;
     let extra = if receipt { String::new() } else { format!(",retry_delay_ms={delay}") };
     tx.execute(&format!("UPDATE {table} SET attempts=?5,next_retry_at_ms=?6{extra} WHERE {filter}"),
@@ -2122,9 +2304,10 @@ mod due_tests {
 fn mark_read(
     c: &mut Connection,
     identity: Identity,
+    local: &LocalAccount,
     id: ConversationId,
     keys: Vec<MessageKey>,
-    now: u64,
+    (now, wall): (u64, u64),
     #[cfg(all(feature = "test-hooks", debug_assertions))] fault: Option<
         crate::storage::worker::CommitFault,
     >,
@@ -2167,6 +2350,13 @@ fn mark_read(
             ],
         )
         .map_err(sql_error)?;
+        // Ruling 36: only a storage failure fails the read; when the MLS state cannot seal the
+        // receipt here (unreadable, no group, seal failed) the receipt job seals it later.
+        if let Err(e) = super::mls_store::seal_read(&tx, identity, local, k, wall)
+            && matches!(e.code, ErrorCode::StorageUncertain | ErrorCode::StorageFull)
+        {
+            return Err(e);
+        }
     }
     if changed > 0 {
         let rev = bump(&tx)?;

@@ -1,7 +1,8 @@
 //! Conversions between chat_core types and the types Dart sees.
 
 use crate::api::chat::{
-    ChatEvent, CoreError, CoreInfo, ErrorCode, NetworkInfo, NetworkState, PeerInfo, PeerPath, PeerPhase,
+    ChatEvent, CoreError, CoreInfo, ErrorCode, NetworkInfo, NetworkState, NotifyItem, PeerInfo, PeerPath,
+    PeerPhase,
 };
 use crate::frb_generated::StreamSink;
 
@@ -136,6 +137,20 @@ impl From<chat_core::CoreEvent> for ChatEvent {
             chat_core::CoreEvent::ProbeTextReceived { peer_id, text } => {
                 Self::ProbeTextReceived { peer_id, text }
             }
+            chat_core::CoreEvent::Notify { items } => {
+                Self::Notify { items: items.into_iter().map(NotifyItem::from).collect() }
+            }
+        }
+    }
+}
+
+impl From<chat_core::NotifyItem> for NotifyItem {
+    fn from(item: chat_core::NotifyItem) -> Self {
+        Self {
+            conversation: item.conversation.0.to_vec(),
+            peer: item.peer.0.to_vec(),
+            new_messages: item.new_messages,
+            unread: item.unread,
         }
     }
 }
@@ -464,6 +479,40 @@ mod tests {
     }
 
     #[test]
+    fn notify_keeps_every_conversation_item() {
+        let item = |n: u8, new_messages, unread| chat_core::NotifyItem {
+            conversation: chat_core::ConversationId([n; 32]),
+            peer: chat_core::account::PeerId([n + 1; 32]),
+            new_messages,
+            unread,
+        };
+        assert_eq!(
+            ChatEvent::from(chat_core::CoreEvent::Notify { items: vec![item(1, 5, 7), item(3, 0, 0)] }),
+            ChatEvent::Notify {
+                items: vec![
+                    NotifyItem { conversation: vec![1; 32], peer: vec![2; 32], new_messages: 5, unread: 7 },
+                    NotifyItem { conversation: vec![3; 32], peer: vec![4; 32], new_messages: 0, unread: 0 },
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn mailbox_state_keeps_every_field() {
+        use crate::api::mailbox::MailboxStateView;
+        for (enabled, first_link_shown, uptime_7d_permille) in [(true, false, 1000), (false, true, 0)] {
+            assert_eq!(
+                MailboxStateView::from(chat_core::account::MailboxStateView {
+                    enabled,
+                    first_link_shown,
+                    uptime_7d_permille,
+                }),
+                MailboxStateView { enabled, first_link_shown, uptime_7d_permille }
+            );
+        }
+    }
+
+    #[test]
     fn every_network_enum_keeps_its_variant() {
         for (core, ffi) in [
             (chat_core::NetworkState::Stopped, NetworkState::Stopped),
@@ -625,5 +674,11 @@ mod message_event_tests {
         for (from, to) in [(C::Queued,D::Queued),(C::SentDirect,D::SentDirect),(C::Delivered,D::Delivered),(C::Read,D::Read),(C::Blocked,D::Blocked),(C::Failed,D::Failed),(C::Cancelled,D::Cancelled)] {
             assert_eq!(ChatEvent::from(chat_core::CoreEvent::MessageStateChanged { revision: u64::MAX, key, state: from, cancel_requested: true }), ChatEvent::MessageStateChanged { revision: u64::MAX, key: crate::api::chat::MessageKey { conversation: vec![1; 32], sender: vec![2; 32], installation: vec![3; 32], id: vec![4; 16] }, state: to, cancel_requested: true });
         }
+    }
+}
+
+impl From<chat_core::account::MailboxStateView> for crate::api::mailbox::MailboxStateView {
+    fn from(v: chat_core::account::MailboxStateView) -> Self {
+        Self { enabled: v.enabled, first_link_shown: v.first_link_shown, uptime_7d_permille: v.uptime_7d_permille }
     }
 }

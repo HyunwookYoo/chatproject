@@ -9,6 +9,7 @@ import 'account/account_model.dart';
 import 'account/screens/devices_screen.dart';
 import 'account/screens/pair_screen.dart';
 import 'src/rust/api/account.dart' as account;
+import 'mailbox/mailbox_client.dart';
 import 'main.dart';
 import 'network/network_client.dart';
 import 'probe/probe_host.dart';
@@ -47,6 +48,7 @@ Future<Widget> bootstrap(
       core: core,
       account: accountModel,
       messages: core is FrbCoreClient ? core.messages : null,
+      mailbox: core is FrbCoreClient ? const FrbMailboxClient() : null,
       network: core is NetworkClient ? core as NetworkClient : null,
       probe: Platform.isIOS ? IosProbeHost() : null,
     );

@@ -43,20 +43,28 @@ pub(crate) async fn bind_endpoint(
 pub(crate) fn endpoint_ticket(endpoint: &Endpoint, profile: &NetworkProfile) -> String {
     let addr = endpoint.addr();
     #[cfg(any(test, all(feature = "test-hooks", debug_assertions)))]
-    let addr = if matches!(profile, NetworkProfile::Local { relay: None }) {
-        let sockets = endpoint.bound_sockets().into_iter().map(|mut socket| {
-            if socket.ip().is_unspecified() {
-                socket.set_ip(if socket.is_ipv4() {
-                    std::net::Ipv4Addr::LOCALHOST.into()
-                } else {
-                    std::net::Ipv6Addr::LOCALHOST.into()
-                });
-            }
-            iroh::TransportAddr::Ip(socket)
-        });
-        EndpointAddr::from_parts(endpoint.id(), sockets)
-    } else {
-        addr
+    let addr = match profile {
+        NetworkProfile::Local { relay: None } => {
+            let sockets = endpoint.bound_sockets().into_iter().map(|mut socket| {
+                if socket.ip().is_unspecified() {
+                    socket.set_ip(if socket.is_ipv4() {
+                        std::net::Ipv4Addr::LOCALHOST.into()
+                    } else {
+                        std::net::Ipv6Addr::LOCALHOST.into()
+                    });
+                }
+                iroh::TransportAddr::Ip(socket)
+            });
+            EndpointAddr::from_parts(endpoint.id(), sockets)
+        }
+        // The relay only, as public records carry (relay-only address lookup): a dial sends
+        // its handshake to every direct address of a ticket at once, and an Android
+        // emulator's user-mode NAT stalled those handshakes until the dial deadline. Direct
+        // paths are still found after the handshake.
+        NetworkProfile::Local { relay: Some(url) } => {
+            EndpointAddr::from_parts(endpoint.id(), [iroh::TransportAddr::Relay(url.clone())])
+        }
+        NetworkProfile::Public => addr,
     };
     let _ = profile;
     EndpointTicket::new(addr).to_string()
@@ -92,5 +100,21 @@ mod tests {
                 ErrorCode::InvalidPeerAddress
             );
         }
+    }
+    /// Task 18: with a relay configured, a local ticket names the relay only (as public
+    /// records do), never the endpoint's direct addresses.
+    #[tokio::test]
+    async fn local_relay_ticket_names_only_the_relay() {
+        let endpoint = bind_endpoint(&NetworkProfile::Local { relay: None }, SecretKey::generate())
+            .await
+            .unwrap();
+        assert!(endpoint.addr().ip_addrs().count() > 0);
+        let relay: iroh::RelayUrl = "http://127.0.0.1:3340".parse().unwrap();
+        let profile = NetworkProfile::Local { relay: Some(relay.clone()) };
+        let addr = parse_target(&endpoint_ticket(&endpoint, &profile)).unwrap();
+        assert_eq!(addr.id, endpoint.id());
+        assert_eq!(addr.relay_urls().collect::<Vec<_>>(), [&relay]);
+        assert_eq!(addr.ip_addrs().count(), 0);
+        endpoint.close().await;
     }
 }

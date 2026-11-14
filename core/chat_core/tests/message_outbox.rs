@@ -113,7 +113,7 @@ async fn cancel_then_late_receipt_keeps_both_facts() {
         .messages()
         .await
         .unwrap()
-        .cancel_send(m.key)
+        .cancel_send(m.key, NOW * 1000)
         .await
         .unwrap();
     assert!(cancelled.cancel_requested);
@@ -336,6 +336,8 @@ async fn reopen(f: Fixture, backend: Arc<Backend>, now: u64) -> Fixture {
     assert_eq!(observer.live_connections(), 0);
     let slot = CoreSlot::new();
     let bus = EventBus::new();
+    let events = Arc::new(Events::default());
+    bus.subscribe(events.clone());
     slot.start(
         CoreConfig {
             data_dir: _dir.path().into(),
@@ -367,6 +369,7 @@ async fn reopen(f: Fixture, backend: Arc<Backend>, now: u64) -> Fixture {
         _dir,
         slot,
         bus,
+        events,
         account,
         peer,
         clock,
@@ -664,7 +667,7 @@ async fn retry_only_releases_current_resolvable_blocked_and_never_recreates_term
         .enqueue(b.peer, MessageId([88; 16]), "cancelled".into(), NOW * 1000)
         .await
         .unwrap();
-    repo.cancel_send(cancelled.key).await.unwrap();
+    repo.cancel_send(cancelled.key, NOW * 1000).await.unwrap();
     assert_eq!(
         repo.retry_send(cancelled.key, NOW * 1000)
             .await

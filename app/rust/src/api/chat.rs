@@ -113,6 +113,16 @@ pub struct MessageKey {
     pub installation: Vec<u8>,
     pub id: Vec<u8>,
 }
+/// One conversation of a `ChatEvent::Notify`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotifyItem {
+    pub conversation: Vec<u8>,
+    pub peer: Vec<u8>,
+    /// Messages from the other account stored by this processing and still unread at its end.
+    pub new_messages: u32,
+    /// The conversation's unread count (0: clear its notification).
+    pub unread: u64,
+}
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChatEvent {
     MessagesChanged { revision: u64, conversation: Vec<u8> },
@@ -139,6 +149,10 @@ pub enum ChatEvent {
     ProbeTextReceived {
         peer_id: String,
         text: String,
+    },
+    /// New messages to notify about, grouped by conversation.
+    Notify {
+        items: Vec<NotifyItem>,
     },
 }
 

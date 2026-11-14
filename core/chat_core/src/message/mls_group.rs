@@ -2,6 +2,7 @@
 //! conversation's group, the per-installation Commit/Welcome delivery queue (`mls_delivery`) and
 //! the holds for devices missing from a cached record (`mls_hold`). Like the rest of
 //! `mls_store`, every operation is one SQL transaction carrying the MLS state it changed.
+use super::mailbox_store::record_frame;
 use super::mls_store::{Fault, GLOBAL, MAX_FRAME, NO_FAULT, finish};
 use super::store::{Identity, MessageDbReply, bytes, ensure_conversation, integer, invalid, uint};
 use super::types::*;
@@ -99,6 +100,16 @@ pub(crate) enum GroupOp {
         commit: Vec<u8>,
         now: u64,
     },
+    /// A Commit from another own device's log (M6) that cannot be vetted because `peer`'s
+    /// record is not here: held, like one naming a missing device, until the record is looked
+    /// up (`Held(peer)`); `Failed` when it cannot be held.
+    HoldCommit {
+        peer: PeerId,
+        sender_peer: PeerId,
+        epoch: u64,
+        commit: Vec<u8>,
+        now: u64,
+    },
     /// What `diff_members` says the group needs, and whether an own Commit is unacknowledged.
     Plan { peer: PeerId },
     /// One own Commit adding `add` and removing `remove`; queues it for every other member
@@ -122,6 +133,9 @@ pub(crate) enum GroupOp {
         now: u64,
         recipients: Vec<InstallationId>,
     },
+    /// The conversation and recipient of every due Commit/Welcome delivery, whatever session
+    /// this device has: the ones without a session are the recipients to dial.
+    UnreachableDue { now: u64 },
     /// Every queued delivery of the conversation to `recipient`, in the order it must get them
     /// (whatever their retry time): sent ahead of an application message to that recipient so
     /// it holds the group state the message needs.
@@ -171,6 +185,7 @@ impl GroupOp {
                 | Self::OwnWelcome { .. }
                 | Self::Plan { .. }
                 | Self::DueDeliveries { .. }
+                | Self::UnreachableDue { .. }
                 | Self::Pending { .. }
                 | Self::HoldPeers
                 | Self::Groups
@@ -269,6 +284,7 @@ pub(crate) enum GroupReply {
     /// The stored `(rejoin_count, rejoin_after_ms)` after the rejoin, or `None` when refused.
     Rejoin(Option<(u32, u64)>),
     Due(Vec<DueDelivery>),
+    Unreachable(Vec<(ConversationId, InstallationId)>),
     Peers(Vec<PeerId>),
     /// Holds that were settled: conversation, its peer, and what became of the item.
     Reprocessed(Vec<(ConversationId, PeerId, Outcome)>),
@@ -433,23 +449,40 @@ fn drop_deliveries_to(
     .map_err(sql)?;
     Ok(())
 }
-fn commit_frame(conversation: ConversationId, epoch: u64, commit: &[u8]) -> Vec<u8> {
-    MlsFrame::Commit {
+/// The complete kind 17 frame of an own Commit or Welcome, logged (spec 5.1) once however many
+/// members it is queued for.
+fn own_frame(tx: &Transaction<'_>, identity: Identity, frame: MlsFrame, now: u64) -> R<Vec<u8>> {
+    record_frame(tx, identity.peer, identity.installation, None, &frame, now)?;
+    Ok(frame.encode().to_vec())
+}
+fn commit_frame(
+    tx: &Transaction<'_>,
+    identity: Identity,
+    conversation: ConversationId,
+    epoch: u64,
+    commit: &[u8],
+    now: u64,
+) -> R<Vec<u8>> {
+    let frame = MlsFrame::Commit {
         conversation,
         epoch,
         commit: commit.to_vec(),
-    }
-    .encode()
-    .to_vec()
+    };
+    own_frame(tx, identity, frame, now)
 }
-fn welcome_frame(conversation: ConversationId, welcome: &[u8], sender: InstallationId) -> Vec<u8> {
-    MlsFrame::Welcome {
+fn welcome_frame(
+    tx: &Transaction<'_>,
+    identity: Identity,
+    conversation: ConversationId,
+    welcome: &[u8],
+    now: u64,
+) -> R<Vec<u8>> {
+    let frame = MlsFrame::Welcome {
         conversation,
         welcome: welcome.to_vec(),
-        sender_install: sender,
-    }
-    .encode()
-    .to_vec()
+        sender_install: identity.installation,
+    };
+    own_frame(tx, identity, frame, now)
 }
 
 fn key_package_installation(bytes: &[u8]) -> R<InstallationId> {
@@ -696,6 +729,37 @@ pub(super) fn group_op(
             &commit,
             fault,
         )?),
+        GroupOp::HoldCommit {
+            peer,
+            sender_peer,
+            epoch,
+            commit,
+            now,
+        } => {
+            check_conversation(identity, peer, conversation)?;
+            let arrival = Arrival {
+                peer,
+                sender_peer,
+                hold: true,
+                now,
+                wall: now,
+            };
+            let inner = MlsFrame::Commit {
+                conversation,
+                epoch,
+                commit,
+            }
+            .inner();
+            let body = hold_body(HOLD_COMMIT, [0; 32], &arrival, &inner);
+            GroupReply::Outcome(if hold(c, conversation, peer, &body, now)? {
+                Outcome::Held(peer)
+            } else {
+                Outcome::Failed {
+                    class: group::CLASS_OTHER,
+                    epoch: 0,
+                }
+            })
+        }
         GroupOp::JoinRequest {
             peer,
             sender_peer,
@@ -762,6 +826,7 @@ pub(super) fn group_op(
         GroupOp::DueDeliveries { now, recipients } => {
             GroupReply::Due(due_deliveries(c, now, &recipients)?)
         }
+        GroupOp::UnreachableDue { now } => GroupReply::Unreachable(due_recipients(c, now)?),
         GroupOp::Pending { recipient } => {
             GroupReply::Due(pending_deliveries(c, conversation, recipient)?)
         }
@@ -921,17 +986,19 @@ fn create(
             peer_mls: false,
         },
     )?;
-    let frame = welcome_frame(conversation, &created.welcome, identity.installation);
-    for installation in added {
-        deliver(
-            &tx,
-            conversation,
-            installation,
-            DELIVER_WELCOME,
-            epoch,
-            &frame,
-            now,
-        )?;
+    if !added.is_empty() {
+        let frame = welcome_frame(&tx, identity, conversation, &created.welcome, now)?;
+        for installation in added {
+            deliver(
+                &tx,
+                conversation,
+                installation,
+                DELIVER_WELCOME,
+                epoch,
+                &frame,
+                now,
+            )?;
+        }
     }
     finish(tx, fault)?;
     Ok(GroupReply::Created {
@@ -1184,6 +1251,19 @@ fn join(
                 if replacing {
                     unseal_unacked(&tx, conversation)?;
                 }
+                let frame = MlsFrame::Welcome {
+                    conversation,
+                    welcome: welcome.welcome.to_vec(),
+                    sender_install: welcome.sender_install,
+                };
+                record_frame(
+                    &tx,
+                    arrival.sender_peer,
+                    welcome.sender_install,
+                    None,
+                    &frame,
+                    arrival.now,
+                )?;
                 finish(tx, fault)?;
                 true
             }
@@ -1261,6 +1341,7 @@ fn apply(
     let provider = MlsProvider::new(KvStore::load(&tx, conversation.0)?);
     let before = membership::group_installations(&provider, &row.group_id)?;
     if let Ok(applied) = membership::apply_commit(&provider, &row.group_id, commit, &verify) {
+        log_commit(&tx, conversation, &arrival, epoch, commit, applied.committer)?;
         if applied.self_removed {
             forget(&tx, conversation)?;
             finish(tx, fault)?;
@@ -1331,6 +1412,7 @@ fn apply(
     let verify = |credential: &[u8], key: &[u8]| checked.check(credential, key);
     match membership::apply_commit(&provider, &row.group_id, commit, &verify) {
         Ok(applied) if applied.epoch == row.epoch => {
+            log_commit(&tx, conversation, &arrival, epoch, commit, applied.committer)?;
             if applied.self_removed {
                 forget(&tx, conversation)?;
                 finish(tx, fault)?;
@@ -1353,6 +1435,24 @@ fn apply(
         // Not a valid Commit for this epoch: the transaction is dropped, nothing changes.
         _ => Ok(refused),
     }
+}
+
+/// Logs a Commit this device applied (spec 5.1), as it arrived, under the leaf that made it.
+fn log_commit(
+    tx: &Transaction<'_>,
+    conversation: ConversationId,
+    arrival: &Arrival,
+    epoch: u64,
+    commit: &[u8],
+    committer: InstallationId,
+) -> R<()> {
+    let frame = MlsFrame::Commit {
+        conversation,
+        epoch,
+        commit: commit.to_vec(),
+    };
+    record_frame(tx, arrival.sender_peer, committer, None, &frame, arrival.now)?;
+    Ok(())
 }
 
 /// Stores an applied Commit: the new epoch, the state before it as the one kept snapshot, its
@@ -1543,7 +1643,14 @@ fn own_commit(
         .into_iter()
         .filter(|i| *i != identity.installation && !remove.contains(i))
         .collect();
-    let frame = commit_frame(conversation, committed.epoch, &committed.commit);
+    let frame = commit_frame(
+        &tx,
+        identity,
+        conversation,
+        committed.epoch,
+        &committed.commit,
+        now,
+    )?;
     for member in &members {
         deliver(
             &tx,
@@ -1556,7 +1663,7 @@ fn own_commit(
         )?;
     }
     if let Some(welcome) = &committed.welcome {
-        let frame = welcome_frame(conversation, welcome, identity.installation);
+        let frame = welcome_frame(&tx, identity, conversation, welcome, now)?;
         for installation in &added {
             deliver(
                 &tx,
@@ -1612,6 +1719,19 @@ fn due_deliveries(c: &Connection, now: u64, recipients: &[InstallationId]) -> R<
             epoch: uint(r, 3)?,
             body: r.get(4)?,
         })
+    })
+    .map_err(sql)?
+    .collect::<Result<_, _>>()
+    .map_err(sql)
+}
+
+/// Every `(conversation, recipient)` with a delivery due at `now`.
+fn due_recipients(c: &Connection, now: u64) -> R<Vec<(ConversationId, InstallationId)>> {
+    let mut q = c
+        .prepare("SELECT DISTINCT conversation,recipient_install FROM mls_delivery WHERE next_retry_at_ms<=?1 ORDER BY recipient_install,conversation")
+        .map_err(sql)?;
+    q.query_map(params![integer(now)?], |r| {
+        Ok((ConversationId(bytes(r, 0)?), InstallationId(bytes(r, 1)?)))
     })
     .map_err(sql)?
     .collect::<Result<_, _>>()

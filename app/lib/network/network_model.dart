@@ -83,6 +83,7 @@ class NetworkModel extends ChangeNotifier {
       case rust.ChatEvent_AccountAuthChanged():
       case rust.ChatEvent_AccountCacheUsed():
       case rust.ChatEvent_ConnectionState():
+      case rust.ChatEvent_Notify():
         break;
     }
   }

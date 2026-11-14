@@ -4,6 +4,7 @@ import 'package:crypto/crypto.dart';
 
 import 'account_scenario.dart' show AccountRestart;
 import 'controller.dart';
+import 'diagnostic.dart';
 import 'protocol.dart';
 
 /// Native participants own their existing protected account and message store.
@@ -26,37 +27,54 @@ Future<void> runMessageScenario(
     if (!ok) throw StateError('Message scenario: $code');
   }
 
+  // The participant of the latest call, named by a deadline.
+  String? who;
   Future<Object?> call(
     Participant p,
     String op, [
     Map<String, Object?> args = const {},
-  ]) => p.call(op, args, timeout: timeout);
+  ]) {
+    who = p.name;
+    return p.call(op, args, timeout: timeout);
+  }
+
   Future<Map<String, Object?>> snapshot(Participant p) async =>
       object(await call(p, 'account_local_snapshot'));
   Future<Map<String, Object?>> until(
     Future<Map<String, Object?>> Function() read,
     bool Function(Map<String, Object?>) matches,
-    String phase,
-  ) async {
+    String phase, {
+    String Function(Map<String, Object?>) observe = observedView,
+  }) async {
+    final name = 'Message scenario deadline: $phase';
+    final took = Stopwatch()..start();
     final deadline = DateTime.now().add(timeout);
+    String? last;
     while (DateTime.now().isBefore(deadline)) {
       try {
         final view = await read();
-        if (matches(view)) return view;
+        last = observe(view);
+        if (matches(view)) {
+          noteWait(name, took.elapsedMilliseconds);
+          return view;
+        }
       } on RpcError catch (error) {
         if (error.code != 'NotAvailable') rethrow;
+        last = observedView(error);
       }
       await Future<void>.delayed(const Duration(milliseconds: 100));
     }
-    throw TimeoutException('Message scenario deadline: $phase');
+    noteWait(name, took.elapsedMilliseconds);
+    throw ScenarioDeadline(
+      name,
+      lastView: last,
+      participant: who,
+    );
   }
 
-  Future<Map<String, Object?>> create(Participant p) async {
-    await until(
-      () => snapshot(p),
-      (v) => v['phase'] == 'Unconfigured',
-      'initial_account',
-    );
+  // `phase` names which create a deadline was (the first or the fresh-store one).
+  Future<Map<String, Object?>> create(Participant p, String phase) async {
+    await until(() => snapshot(p), (v) => v['phase'] == 'Unconfigured', phase);
     final display = object(await call(p, 'account_local_begin_create'));
     final words = (display['words'] as List).cast<String>();
     final answers = (display['positions'] as List)
@@ -131,10 +149,12 @@ Future<void> runMessageScenario(
       'limit': 50,
     }),
   );
+  // `phase` names the wait; a deadline reports the message's last state.
   Future<Map<String, Object?>> state(
     Participant p,
     Map<String, Object?> key,
     Set<String> states,
+    String phase,
   ) async {
     final result = await until(
       () => page(p, key['conversation']),
@@ -142,7 +162,12 @@ Future<void> runMessageScenario(
         (item) =>
             same((item as Map)['key'], key) && states.contains(item['state']),
       ),
-      'message_state',
+      phase,
+      observe: (v) => observedState(
+        (v['items'] as List)
+            .where((item) => same((item as Map)['key'], key))
+            .firstOrNull,
+      ),
     );
     return object(
       (result['items'] as List).singleWhere(
@@ -151,7 +176,8 @@ Future<void> runMessageScenario(
     );
   }
 
-  var av = await create(a), bv = await create(b);
+  var av = await create(a, 'initial_account'),
+      bv = await create(b, 'initial_account');
   var aPeer = av['public_peer_id'], bPeer = bv['public_peer_id'];
   require(!same(aPeer, bPeer), 'distinct_accounts');
   await contact(b, a);
@@ -165,10 +191,10 @@ Future<void> runMessageScenario(
     }),
   );
   final blockedKey = object(blocked['key']);
-  await state(a, blockedKey, {'Blocked'});
+  await state(a, blockedKey, {'Blocked'}, 'contact_blocked');
   await contact(a, b);
   await call(a, 'message_local_retry_send', {'key': blockedKey});
-  await state(a, blockedKey, {'Delivered'});
+  await state(a, blockedKey, {'Delivered'}, 'contact_delivered');
   final contactRows =
       (await page(b, blockedKey['conversation']))['items'] as List;
   require(
@@ -193,8 +219,8 @@ Future<void> runMessageScenario(
     a.instance != contactA.instance && b.instance != contactB.instance,
     'fresh_store_instances',
   );
-  av = await create(a);
-  bv = await create(b);
+  av = await create(a, 'fresh_initial_account');
+  bv = await create(b, 'fresh_initial_account');
   aPeer = av['public_peer_id'];
   bPeer = bv['public_peer_id'];
   require(
@@ -262,7 +288,11 @@ Future<void> runMessageScenario(
         same(reopened['installation'], av['installation']),
     'same_store_identity',
   );
-  final retained = await state(a, key, {'Queued', 'Blocked', 'SentDirect'});
+  final retained = await state(a, key, {
+    'Queued',
+    'Blocked',
+    'SentDirect',
+  }, 'restart_retained');
   require(
     retained['body'] == retainedBody && retained['lamport'] == sent['lamport'],
     'retained_message',
@@ -316,14 +346,19 @@ Future<void> runMessageScenario(
   );
   await call(b, 'clock_advance', {'seconds': 1});
   final checkpoints = object(await call(b, 'message_local_test_ack_loss_wait'));
+  // Between two M5 cores the text came over MLS: the held `Ack` is B's only
+  // acknowledgement (no Delivered receipt job to hold), and B's response
+  // writes since the baseline include its answers to A's group setup, so the
+  // held Ack shows as A not having it (the state check below).
+  final receiptJob = checkpoints['receipt_job'] != false;
   require(
     checkpoints['response_checkpoint'] == true &&
-        checkpoints['receipt_checkpoint'] == true,
+        (checkpoints['receipt_checkpoint'] == true || !receiptJob),
     'ack_checkpoints',
   );
   final ackHeld = object(await call(b, 'message_local_test_write_counts'));
-  require(same(ackHeld, ackBaseline), 'ack_written_before_kill');
-  await state(a, key, {'Queued', 'SentDirect'});
+  require(!receiptJob || same(ackHeld, ackBaseline), 'ack_written_before_kill');
+  await state(a, key, {'Queued', 'SentDirect'}, 'ack_lost_pending');
   final firstWrites = object(await call(a, 'message_local_test_write_counts'));
   require(firstWrites['payload_writes'] == 1, 'first_actual_payload');
   final beforeDuplicate = object(
@@ -356,7 +391,7 @@ Future<void> runMessageScenario(
   await routes();
   await call(a, 'account_local_connect_account', {'peer': bPeer});
   await wakeSenderBackoff();
-  await state(a, key, {'Delivered'});
+  await state(a, key, {'Delivered'}, 'retransmit_delivered');
   final secondWrites = object(await call(a, 'message_local_test_write_counts'));
   require(
     (secondWrites['payload_writes'] as int) >= 1,
@@ -404,7 +439,7 @@ Future<void> runMessageScenario(
     'conversation': key['conversation'],
     'keys': [key],
   });
-  await state(a, key, {'Read'});
+  await state(a, key, {'Read'}, 'read');
   evidence?.call('durable_ack_and_read', {
     'key': key,
     'receiver_rows': matching.length,

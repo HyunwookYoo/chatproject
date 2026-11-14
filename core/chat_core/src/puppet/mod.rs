@@ -1,4 +1,5 @@
 mod account;
+mod mailbox;
 mod message;
 pub(crate) mod records;
 pub mod protocol;
@@ -218,6 +219,10 @@ async fn run(
                             } else if op == "clock_advance" {
                                 let result = message::advance(&account.lock().expect("account slot lock poisoned"), args);
                                 send(&mut socket, Outgoing::Result { id, result: protocol::Outcome::account(result) }).await?;
+                            } else if op == "network_trace" {
+                                // Fixed kinds, counts and milliseconds only (task 18).
+                                let result = if args.0.as_object().is_some_and(|a| a.is_empty()) { Ok(network.transport_trace_for_test()) } else { Err(protocol::invalid()) };
+                                send(&mut socket, Outgoing::Result { id, result: protocol::Outcome::account(result) }).await?;
                             } else if op.starts_with("message_local_test_") {
                                 let handle = account.lock().expect("account slot lock poisoned").handle.clone();
                                 let control = ack_loss.clone();
@@ -225,6 +230,9 @@ async fn run(
                             } else if op.starts_with("message_local_") {
                                 let handle = account.lock().expect("account slot lock poisoned").handle.clone();
                                 pending.push(Box::pin(async move { (id, protocol::Outcome::account(message::execute(handle, &op, args).await)) }));
+                            } else if op.starts_with("mailbox_local_") {
+                                let handle = account.lock().expect("account slot lock poisoned").handle.clone();
+                                pending.push(Box::pin(async move { (id, protocol::Outcome::account(mailbox::execute(handle, &op, args).await)) }));
                             } else if op.starts_with("account_local_") {
                                 let handle = account.lock().expect("account slot lock poisoned").handle.clone();
                                 let network = network.clone();

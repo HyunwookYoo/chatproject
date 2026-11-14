@@ -72,6 +72,12 @@ pub(crate) struct Gate {
     token_window: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     key_transition: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
+    /// The endpoint id of every account dial asked for (`dial_account`), in order.
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    account_dials: Mutex<Vec<[u8; 32]>>,
+    /// Public-safe timing of each connection attempt (e2e `network_trace`).
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    trace: super::trace::Trace,
 }
 impl Gate {
     pub(crate) fn desired_suspend(&self) -> bool { self.desired_suspend.load(Ordering::Acquire) }
@@ -142,6 +148,8 @@ impl NetworkHandle {
         self.controls.try_send(Control::AccountRegister(input)).map_err(|_|err(ErrorCode::Busy))
     }
     pub(crate) async fn dial_account(&self, target: EndpointAddr)->Result<iroh::endpoint::Connection,CoreError> {
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        self.gate.account_dials.lock().unwrap().push(*target.id.as_bytes());
         if self.gate.blocked(){return Err(err(ErrorCode::Busy));}
         let (reply,result)=oneshot::channel(); self.controls.try_send(Control::AccountDial{target,alpn:crate::account::auth::ALPN,reply}).map_err(|_|err(ErrorCode::Busy))?;
         result.await.map_err(|_|err(ErrorCode::TransportFailed))?
@@ -150,6 +158,16 @@ impl NetworkHandle {
     pub(crate) async fn dial_pair(&self,target:EndpointAddr)->Result<iroh::endpoint::Connection,CoreError>{
         if self.gate.blocked(){return Err(err(ErrorCode::Busy));}
         let(reply,result)=oneshot::channel();self.controls.try_send(Control::AccountDial{target,alpn:crate::account::pair::ALPN,reply}).map_err(|_|err(ErrorCode::Busy))?;result.await.map_err(|_|err(ErrorCode::TransportFailed))?
+    }
+    /// How many account dials to the endpoint `transport` were asked for so far.
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    pub fn account_dials_for_test(&self, transport: [u8; 32]) -> usize {
+        self.gate.account_dials.lock().unwrap().iter().filter(|id| **id == transport).count()
+    }
+    /// Fixed kinds, counts and milliseconds of this network's binds and connection attempts.
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    pub fn transport_trace_for_test(&self) -> serde_json::Value {
+        self.gate.trace.snapshot()
     }
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     pub async fn account_target_for_test(&self, ticket:String)->Result<(),CoreError> {
@@ -392,8 +410,9 @@ impl Manager {
                 #[cfg(all(feature = "test-hooks", debug_assertions))]
                 let target=self.account_targets.get(&target.id).cloned().unwrap_or(target);
                 let cancel=self.cancel.clone();
+                let gate=self.gate.clone();
                 self.tasks.spawn(async move {
-                    let result=tokio::select!{biased;_=cancel.cancelled()=>Err(err(ErrorCode::Busy)),result=tokio::time::timeout(Duration::from_secs(8),endpoint.connect(target,alpn))=>result.map_err(|_|err(ErrorCode::NetworkTimeout)).and_then(|r|r.map_err(|_|err(ErrorCode::TransportFailed)))};
+                    let result=tokio::select!{biased;_=cancel.cancelled()=>Err(err(ErrorCode::Busy)),result=tokio::time::timeout(Duration::from_secs(8),dial(&gate,&endpoint,target,alpn))=>result.map_err(|_|err(ErrorCode::NetworkTimeout)).and_then(|r|r.map_err(|_|err(ErrorCode::TransportFailed)))};
                     if let Err(Ok(conn))=reply.send(result){conn.close(0u32.into(),b"account dial cancelled");}
                 });
             }
@@ -668,18 +687,25 @@ impl Manager {
             let notes = self.notes.clone();
             #[cfg(all(feature = "test-hooks", debug_assertions))]
             let hold = self.gate.hold_bind.lock().unwrap().take();
+            #[cfg(all(feature = "test-hooks", debug_assertions))]
+            let gate = self.gate.clone();
             self.tasks.spawn(async move {
                         #[cfg(all(feature = "test-hooks", debug_assertions))]
                         if let Some(hold) = hold {
                             tokio::select! { biased; _ = cancel.cancelled() => return, _ = hold.notified() => {} }
                         }
+                        let binding = Instant::now();
                         let result = tokio::select! { biased; _ = cancel.cancelled() => return, result = bind_endpoint(&profile, key) => result };
+                        let bound = binding.elapsed();
                         #[cfg(any(test, all(feature = "test-hooks", debug_assertions)))]
                         if let Ok(endpoint) = &result
                             && matches!(profile, NetworkProfile::Local { relay: Some(_) }) {
                                 let ready = tokio::select! { biased; _ = cancel.cancelled() => false, result = tokio::time::timeout(Duration::from_secs(30), endpoint.online()) => result.is_ok() };
                                 if !ready { endpoint.close().await; session::notify(&notes, &cancel, Note::Bound { epoch, result: Err(err(ErrorCode::NetworkTimeout)) }).await; return; }
                         }
+                        #[cfg(all(feature = "test-hooks", debug_assertions))]
+                        if result.is_ok() { gate.trace.bound(bound, binding.elapsed()); }
+                        let _ = bound;
                         session::notify(&notes, &cancel, Note::Bound { epoch, result }).await;
                     });
         }
@@ -808,6 +834,7 @@ impl Manager {
     ) {
         let endpoint = self.endpoint.as_ref().unwrap().clone();
         let notes = self.notes.clone();
+        let gate = self.gate.clone();
         self.tasks.spawn(async move {
             let deadline =
                 tokio::time::Instant::now() + Duration::from_secs(if retry { 30 } else { 10 });
@@ -826,8 +853,7 @@ impl Manager {
                 }
                 let started = if retry { Instant::now() } else { accepted };
                 let work = async {
-                    let connection = endpoint
-                        .connect(target.clone(), ALPN)
+                    let connection = dial(&gate, &endpoint, target.clone(), ALPN)
                         .await
                         .map_err(|_| err(ErrorCode::TransportFailed))?;
                     match session::prepare_session(connection.clone()).await {
@@ -916,6 +942,13 @@ impl Manager {
                                 session::notify(&notes, &cancel, Note::OwnAddress { epoch }).await;
                             }
                         });
+                        #[cfg(all(feature = "test-hooks", debug_assertions))]
+                        {
+                            let gate = self.gate.clone();
+                            let watched = endpoint.clone();
+                            let cancel = self.cancel.clone();
+                            self.tasks.spawn(async move { tokio::select! { biased; _ = cancel.cancelled() => {}, _ = gate.trace.watch_relay(watched) => {} } });
+                        }
                         let accept_endpoint = endpoint.clone();
                         let accepted = self.accepted.clone();
                         let cancel = self.cancel.clone();
@@ -986,10 +1019,12 @@ impl Manager {
                 );
                 let root = self.cancel.clone();
                 let notes = self.notes.clone();
+                let gate = self.gate.clone();
+                let endpoint = self.endpoint.clone();
                 self.tasks.spawn(async move {
                     let mut routed=false;
                     let work = async {
-                        let connection = incoming.await.map_err(|_| err(ErrorCode::TransportFailed))?;
+                        let connection = accept(&gate, endpoint.as_ref(), incoming).await.map_err(|_| err(ErrorCode::TransportFailed))?;
                         if connection.alpn()==crate::account::auth::ALPN || connection.alpn()==crate::account::pair::ALPN {
                             session::notify(&notes,&cancel,Note::AccountConnection{tag:tag.clone(),connection}).await;
                             routed=true;
@@ -1288,6 +1323,25 @@ fn duration_ms(duration: Duration) -> u64 {
 }
 pub(crate) fn retry_delay(attempt: u32) -> Duration {
     Duration::from_secs([1, 2, 4, 8][attempt.min(3) as usize])
+}
+/// `endpoint.connect`; with test hooks also timed into the transport trace.
+async fn dial(gate: &Gate, endpoint: &Endpoint, target: EndpointAddr, alpn: &[u8]) -> Result<iroh::endpoint::Connection, ()> {
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    return gate.trace.connect(endpoint, target, alpn).await;
+    #[cfg(not(all(feature = "test-hooks", debug_assertions)))]
+    {
+        let _ = gate;
+        endpoint.connect(target, alpn).await.map_err(|_| ())
+    }
+}
+/// Completes an incoming handshake; with test hooks also timed into the transport trace.
+async fn accept(gate: &Gate, endpoint: Option<&Endpoint>, incoming: Incoming) -> Result<iroh::endpoint::Connection, ()> {
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    if let Some(endpoint) = endpoint {
+        return gate.trace.accept(endpoint, incoming).await;
+    }
+    let _ = (gate, endpoint);
+    incoming.await.map_err(|_| ())
 }
 pub(crate) async fn within_retry_budget<F: std::future::Future>(
     deadline: tokio::time::Instant,

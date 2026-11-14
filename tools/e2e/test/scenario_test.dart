@@ -6,6 +6,7 @@ import 'dart:mirrors';
 import '../bin/run.dart' as harness;
 
 import 'package:chat_e2e/src/controller.dart';
+import 'package:chat_e2e/src/diagnostic.dart';
 import 'package:chat_e2e/src/owned_resources.dart';
 import 'package:chat_e2e/src/protocol.dart';
 import 'package:chat_e2e/src/scenario.dart';
@@ -171,6 +172,10 @@ class FakeCore {
             remote.restored &&
             connected.contains(remote.endpoint)) {
           error = 'Busy';
+          break;
+        }
+        if (fixture.fault == 'connect timeout' && name == 'android' && remote.name == 'node') {
+          error = 'NetworkTimeout';
           break;
         }
         connected.add(remote.endpoint);
@@ -360,6 +365,7 @@ void main() {
             'phase': entry.$4,
             'failure_kind': entry.$5,
             'command_exit_code': null,
+            'detail': 'Future not completed',
           });
           runner.recordFailure(const FileSystemException('PRIVATE_TOKEN'));
           runner.recordFailure(
@@ -376,6 +382,7 @@ void main() {
           'phase': entry.$4,
           'failure_kind': entry.$5,
           'command_exit_code': null,
+          'detail': 'Future not completed',
         });
         expect(captures, [same(original)]);
         expect(originalStack.toString(), contains('scenario.dart'));
@@ -598,6 +605,7 @@ Future<void> main(List<String> args) async {
     () async {
       final fixture = Fixture()..fault = 'recovery ordering';
       final participants = await fixture.start();
+      waitMs.clear();
       try {
         await runScenario(
           fixture.controller,
@@ -605,6 +613,11 @@ Future<void> main(List<String> args) async {
           restart: fixture.restart,
           timeout: short,
         );
+        expect(
+          waitMs.keys,
+          containsAll(['timeout_probe_event', 'timeout_send_probe_text']),
+        );
+        waitMs.clear();
       } finally {
         await fixture.close();
       }
@@ -705,6 +718,49 @@ Future<void> main(List<String> args) async {
       }
     },
   );
+
+  test('a failed connect names the dialing pair', () async {
+    final fixture = Fixture()..fault = 'connect timeout';
+    final participants = await fixture.start();
+    final failures = <(Object, String?, String?)>[];
+    failureFacts.clear();
+    try {
+      await expectLater(
+        runScenario(
+          fixture.controller,
+          participants,
+          restart: fixture.restart,
+          timeout: const Duration(milliseconds: 40),
+          onFailure: (error, phase, kind) => failures.add((error, phase, kind)),
+        ),
+        throwsA(isA<RpcError>().having((e) => e.code, 'code', 'NetworkTimeout')),
+      );
+      expect(failures, hasLength(1));
+      expect(failures.single.$2, 'scenario_app2_to_node');
+      expect(failures.single.$3, isNull);
+      // Each side's view of the others, and the paths known before, as fixed values.
+      expect(failureFacts, {
+        'm2_path_app1_app2': 'Direct',
+        'm2_path_app2_app1': 'Direct',
+        'm2_path_app1_node': 'Direct',
+        'm2_path_node_app1': 'Direct',
+        'm2_connect_app1_app2': 'lt1s',
+        'm2_connect_app2_app1': 'lt1s',
+        'm2_connect_app1_node': 'lt1s',
+        'm2_connect_node_app1': 'lt1s',
+        'm2_seen_app1_app2': 'Connected_Direct',
+        'm2_seen_app1_node': 'Connected_Direct',
+        'm2_seen_app2_app1': 'Connected_Direct',
+        'm2_seen_app2_node': 'absent',
+        'm2_seen_node_app1': 'Connected_Direct',
+        'm2_seen_node_app2': 'absent',
+      });
+      expect(safeFacts(failureFacts, loadSafeFacts()), failureFacts);
+      failureFacts.clear();
+    } finally {
+      await fixture.close();
+    }
+  });
 
   for (final fault in [
     'wrong body',

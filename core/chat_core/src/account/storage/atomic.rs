@@ -147,6 +147,7 @@ pub(crate) fn with_after_replace_failure<T>(operation: impl FnOnce() -> T) -> T 
 mod tests {
     use super::super::{
         Store,
+        ownership::child,
         test_support::{protector, state},
     };
     use std::{fs, process::Command};
@@ -210,16 +211,16 @@ mod tests {
             let mut store = Store::open(dir.path(), protector()).unwrap();
             store.commit(&state(b"old-complete-snapshot")).unwrap();
             drop(store);
-            let output = Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "account::storage::atomic::tests::crash_child",
-                    "--nocapture",
-                ])
-                .env("CHAT_A2_CRASH_ROOT", dir.path())
-                .env("CHAT_A2_CRASH_BOUNDARY", boundary)
-                .output()
-                .unwrap();
+            let output = child::output(
+                Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "account::storage::atomic::tests::crash_child",
+                        "--nocapture",
+                    ])
+                    .env("CHAT_A2_CRASH_ROOT", dir.path())
+                    .env("CHAT_A2_CRASH_BOUNDARY", boundary),
+            );
             assert_eq!(
                 output.status.code(),
                 Some(86),
@@ -273,17 +274,17 @@ mod tests {
             ("account.bin", "before_replace"),
         ] {
             let dir = tempfile::tempdir().unwrap();
-            let output = Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "account::storage::atomic::tests::crash_child",
-                    "--nocapture",
-                ])
-                .env("CHAT_A2_CRASH_ROOT", dir.path())
-                .env("CHAT_A2_CRASH_FILE", file)
-                .env("CHAT_A2_CRASH_BOUNDARY", boundary)
-                .output()
-                .unwrap();
+            let output = child::output(
+                Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "account::storage::atomic::tests::crash_child",
+                        "--nocapture",
+                    ])
+                    .env("CHAT_A2_CRASH_ROOT", dir.path())
+                    .env("CHAT_A2_CRASH_FILE", file)
+                    .env("CHAT_A2_CRASH_BOUNDARY", boundary),
+            );
             assert_eq!(output.status.code(), Some(86), "{file}/{boundary}");
             let mut store = Store::open(dir.path(), protector()).unwrap();
             assert!(store.load().is_err(), "{file}/{boundary} became fresh");

@@ -10,7 +10,7 @@ import 'package:freezed_annotation/freezed_annotation.dart' hide protected;
 part 'chat.freezed.dart';
 
 // These functions are ignored because they are not marked as `pub`: `done_reply`, `network_info_reply`, `run_network`, `unexpected_network_reply`
-// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`
+// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`
 
 String coreVersion() => RustLib.instance.api.crateApiChatCoreVersion();
 
@@ -91,6 +91,10 @@ sealed class ChatEvent with _$ChatEvent {
     required String peerId,
     required String text,
   }) = ChatEvent_ProbeTextReceived;
+
+  /// New messages to notify about, grouped by conversation.
+  const factory ChatEvent.notify({required List<NotifyItem> items}) =
+      ChatEvent_Notify;
 }
 
 class CoreError implements FrbException {
@@ -244,6 +248,42 @@ class NetworkInfo {
 }
 
 enum NetworkState { stopped, starting, online, failed }
+
+/// One conversation of a `ChatEvent::Notify`.
+class NotifyItem {
+  final Uint8List conversation;
+  final Uint8List peer;
+
+  /// Messages from the other account stored by this processing and still unread at its end.
+  final int newMessages;
+
+  /// The conversation's unread count (0: clear its notification).
+  final BigInt unread;
+
+  const NotifyItem({
+    required this.conversation,
+    required this.peer,
+    required this.newMessages,
+    required this.unread,
+  });
+
+  @override
+  int get hashCode =>
+      conversation.hashCode ^
+      peer.hashCode ^
+      newMessages.hashCode ^
+      unread.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is NotifyItem &&
+          runtimeType == other.runtimeType &&
+          conversation == other.conversation &&
+          peer == other.peer &&
+          newMessages == other.newMessages &&
+          unread == other.unread;
+}
 
 class PeerInfo {
   final String peerId;

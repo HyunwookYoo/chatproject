@@ -3,6 +3,7 @@ import 'dart:io';
 
 import 'package:path/path.dart' as p;
 
+import 'android_probe.dart' show loadX100;
 import 'android_sdk.dart';
 import 'process_runner.dart';
 
@@ -82,6 +83,8 @@ class Emulators {
     this.flutter = 'flutter',
     this.pollInterval = const Duration(seconds: 2),
     this.bootTimeout = const Duration(seconds: 180),
+    this.settleTimeout = const Duration(minutes: 10),
+    this.settlePoll = const Duration(seconds: 15),
     Future<void> Function(Duration)? sleep,
     DateTime Function()? now,
     AvdConfig? config,
@@ -103,6 +106,8 @@ class Emulators {
   final String flutter;
   final Duration pollInterval;
   final Duration bootTimeout;
+  final Duration settleTimeout;
+  final Duration settlePoll;
   final Future<void> Function(Duration) _sleep;
   final DateTime Function() _now;
   final AvdConfig config;
@@ -206,6 +211,7 @@ class Emulators {
       // An emulator that already runs may still be booting: wait for it too, so the
       // snapshot never captures a half-booted state.
       await waitBooted(spec);
+      await settle(spec);
       final saved = await _run(sdk.adb, ['-s', spec.serial, 'emu', 'avd', 'snapshot', 'save', cleanSnapshot]);
       _requireSuccess(saved, 'snapshot save', EmulatorFailureKind.snapshotExit);
       if (!hasCleanSnapshot(spec)) throw EmulatorFailure(EmulatorFailureKind.snapshotMissing, 'Snapshot save did not create the clean snapshot directory');
@@ -270,6 +276,32 @@ class Emulators {
         throw TimeoutException('${spec.serial} did not finish booting within ${bootTimeout.inSeconds} s');
       }
       await _sleep(pollInterval);
+    }
+  }
+
+  /// Before the clean snapshot is saved: animations off, and the first boot's
+  /// post-boot work (BOOT_COMPLETED receivers, first-run jobs) done, i.e. the
+  /// 1- and the 5-minute load at most one per CPU (one snapshot settled on the
+  /// 1-minute load alone restored at load 12-29). Otherwise every test boot restores that
+  /// work and replays it. Gives up after [settleTimeout] or on an unreadable load;
+  /// the snapshot is saved either way.
+  Future<void> settle(EmulatorSpec spec) async {
+    final shell = ['-s', spec.serial, 'shell'];
+    for (final scale in const ['window_animation_scale', 'transition_animation_scale', 'animator_duration_scale']) {
+      await _run(sdk.adb, [...shell, 'settings', 'put', 'global', scale, '0']);
+    }
+    final nproc = await _run(sdk.adb, [...shell, 'nproc']);
+    final cpus = nproc.exitCode == 0 ? int.tryParse((nproc.stdout as String).trim()) ?? 1 : 1;
+    final deadline = _now().add(settleTimeout);
+    while (true) {
+      final read = await _run(sdk.adb, [...shell, 'cat', '/proc/loadavg']);
+      final text = read.exitCode == 0 ? read.stdout as String : '';
+      final load = loadX100(text);
+      final fields = text.trim().split(RegExp(r'\s+'));
+      final load5 = fields.length > 1 ? loadX100(fields[1]) : null;
+      if (load == null || load5 == null) return;
+      if ((load <= 100 * cpus && load5 <= 100 * cpus) || !_now().isBefore(deadline)) return;
+      await _sleep(settlePoll);
     }
   }
 

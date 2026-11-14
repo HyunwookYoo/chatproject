@@ -916,6 +916,7 @@ fn optional_bytes<const N: usize>(d: &mut Decoder<'_>) -> Result<Option<[u8; N]>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::account::storage::ownership::child;
     use crate::account::{Secret32, derive_account, recovery};
     fn local() -> LocalAccount {
         recovery::local_account(
@@ -1082,10 +1083,9 @@ mod tests {
             ("retained_absent", "lookup_present=false retained_before=true"),
         ];
         for (case, facts) in cases {
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
+            let output = child::output(std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", OWN_TEST, "--nocapture"])
-                .env(OWN_CHILD, case)
-                .output().unwrap();
+                .env(OWN_CHILD, case));
             assert!(output.status.success(), "child {case} failed: {}", String::from_utf8_lossy(&output.stderr));
             let stderr = String::from_utf8(output.stderr).unwrap().replace("\r\n", "\n");
             let context = match case {
@@ -1114,6 +1114,7 @@ mod tests {
     fn own_publication_diagnostic_ignores_closed_stderr() {
         use std::io::Write;
         use std::process::Stdio;
+        let _spawning = child::spawning();
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", OWN_TEST, "--nocapture"])
             .env(OWN_CHILD, "stale")

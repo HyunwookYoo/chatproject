@@ -320,6 +320,25 @@ async fn control_ready_reconnect_sequence_pending_rpc_and_disconnect_preserve_ne
         last_seq += 1;
         assert_eq!(message["seq"], last_seq);
     }
+    // The public-safe transport trace (task 18): this core bound once.
+    ws.send(Message::Text(
+        json!({"type":"cmd","id":3,"op":"network_trace","args":{}})
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
+    loop {
+        let message = receive(&mut ws).await;
+        if message["type"] == "result" {
+            assert_eq!(message["id"], 3);
+            assert_eq!(message["value"]["endpoint"]["binds"], 1, "{message}");
+            assert!(message["value"]["dials"].is_array());
+            break;
+        }
+        last_seq += 1;
+        assert_eq!(message["seq"], last_seq);
+    }
     ws.close(None).await.unwrap();
     // Drain records already delivered before the close handshake. They are not
     // lost events; abandoning them here would manufacture a reconnect gap.

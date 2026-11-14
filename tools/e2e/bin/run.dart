@@ -3,14 +3,19 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:args/args.dart';
+import 'package:chat_e2e/src/android_probe.dart';
 import 'package:chat_e2e/src/android_sdk.dart';
 import 'package:chat_e2e/src/controller.dart';
 import 'package:chat_e2e/src/account_scenario.dart';
+import 'package:chat_e2e/src/diagnostic.dart';
+import 'package:chat_e2e/src/mailbox_scenario.dart';
 import 'package:chat_e2e/src/message_scenario.dart';
 import 'package:chat_e2e/src/emulators.dart';
 import 'package:chat_e2e/src/owned_resources.dart';
 import 'package:chat_e2e/src/process_runner.dart';
+import 'package:chat_e2e/src/protocol.dart';
 import 'package:chat_e2e/src/scenario.dart';
+import 'package:chat_e2e/src/transport_trace.dart';
 import 'package:path/path.dart' as p;
 
 Map<String, String>? _androidBuildEnvironment(Map<String, String> inputs) {
@@ -75,7 +80,7 @@ Future<void> main(List<String> arguments) async {
     ..addOption(
       'scenario',
       defaultsTo: 'm2',
-      allowed: ['m2', 'm3', 'm3-auth', 'm4'],
+      allowed: ['m2', 'm3', 'm3-auth', 'm4', 'm6'],
     )
     ..addOption('repo-root', mandatory: true);
   late ArgResults options;
@@ -83,14 +88,17 @@ Future<void> main(List<String> arguments) async {
     options = parser.parse(arguments);
     if (options.rest.isNotEmpty ||
         !p.isAbsolute(options['repo-root'] as String) ||
-        (!Platform.isWindows && options['profile'] != 'android')) {
+        (!Platform.isWindows && options['profile'] != 'android') ||
+        // M6 needs an Android phone: a Windows app or a second emulator is
+        // its mailbox.
+        (options['scenario'] == 'm6' && options['profile'] == 'windows')) {
       throw const FormatException(
         'Profile requires a supported host and absolute repo root',
       );
     }
   } on FormatException {
     stderr.writeln(
-      'Usage: dart run bin/run.dart --profile mixed|android|windows --scenario m2|m3|m3-auth|m4 --repo-root <absolute>',
+      'Usage: dart run bin/run.dart --profile mixed|android|windows --scenario m2|m3|m3-auth|m4|m6 --repo-root <absolute>',
     );
     exitCode = 64;
     return;
@@ -99,7 +107,9 @@ Future<void> main(List<String> arguments) async {
   final profile = options['profile'] as String;
   final authOnly = options['scenario'] == 'm3-auth';
   final messageScenario = options['scenario'] == 'm4';
+  final mailboxScenario = options['scenario'] == 'm6';
   final accountScenario = options['scenario'] != 'm2';
+  final scenarioName = options['scenario'] as String;
   final logs = await Directory(
     p.join(
       root,
@@ -111,6 +121,10 @@ Future<void> main(List<String> arguments) async {
   ).create(recursive: true);
   final run = _Run(logs);
   Controller? controller;
+  // Presence of Android crash-buffer entries only; the entries stay private.
+  Future<bool?> Function()? androidCrashed;
+  // Fixed public state of each owned emulator and its app (account scenarios).
+  final androidProbes = <Future<Map<String, Object?>> Function()>[];
   StreamSubscription<ProcessSignal>? signal;
   Future<void>? interrupted;
   var finished = false;
@@ -234,6 +248,8 @@ Future<void> main(List<String> arguments) async {
     final participants = <Participant>[];
     final appRestarts = <String, AccountRestart>{};
     final appClocks = <String, Future<int> Function()>{};
+    final appAirplane = <String, Future<void> Function(bool)>{};
+    final appForeground = <String, Future<void> Function()>{};
     for (var i = 1; i <= windowsCount; i++) {
       run.phase = _Phase.windowsStart;
       final name = 'windows-$i';
@@ -313,13 +329,32 @@ Future<void> main(List<String> arguments) async {
       await emulators.preflight(specs);
       run.phase = _Phase.avdCreate;
       for (final spec in specs) {
+        // A missing snapshot: first boot (bootTimeout 3 min), settle (at most
+        // 10 min), save and stop.
         await run.wait(
           emulators.ensure(spec),
-          timeout: const Duration(minutes: 5),
+          timeout: const Duration(minutes: 20),
         );
       }
       run.phase = _Phase.avdBoot;
       await run.wait(emulators.up(specs), timeout: const Duration(minutes: 5));
+      androidCrashed = () async {
+        var known = true;
+        for (final spec in specs) {
+          final result = await run.command(
+            sdk.adb,
+            ['-s', spec.serial, 'logcat', '-b', 'crash', '-d'],
+            requireSuccess: false,
+            cleanup: true,
+          );
+          if (result.exitCode != 0) {
+            known = false;
+          } else if ((result.stdout as String).trim().isNotEmpty) {
+            return true;
+          }
+        }
+        return known ? false : null;
+      };
       for (var i = 0; i < specs.length; i++) {
         final spec = specs[i];
         run.phase = _Phase.adbReverse;
@@ -329,20 +364,34 @@ Future<void> main(List<String> arguments) async {
         final name = 'android-${i + 1}';
         final adb = ['-s', spec.serial];
         run.phase = _Phase.androidInstall;
-        await run.command(sdk.adb, [
-          ...adb,
-          'install',
-          '-r',
-          p.join(
-            root,
-            'app',
-            'build',
-            'app',
-            'outputs',
-            'flutter-apk',
-            'app-debug.apk',
+        if (accountScenario) {
+          // A restored snapshot may carry older crash and lmkd entries.
+          await run.command(sdk.adb, [
+            ...adb,
+            'logcat',
+            '-b',
+            'crash',
+            '-b',
+            'main',
+            '-c',
+          ]);
+        }
+        await run.command(
+          sdk.adb,
+          _androidInstall(
+            adb,
+            p.join(
+              root,
+              'app',
+              'build',
+              'app',
+              'outputs',
+              'flutter-apk',
+              'app-debug.apk',
+            ),
           ),
-        ], timeout: const Duration(minutes: 2));
+          timeout: const Duration(minutes: 2),
+        );
         const package = 'dev.chatproject.chat_app';
         final activity = <String, Object?>{
           'serial': spec.serial,
@@ -365,6 +414,27 @@ Future<void> main(List<String> arguments) async {
         var appPid = '';
         var restarting = false;
         var store = 0;
+        // The slowest launch so far: `am start` until the app's control hello.
+        int? launchMsMax;
+        int? launchSkew;
+        // Registered before the first launch, so a first launch that fails is
+        // probed too.
+        androidProbes.add(
+          () => probeAndroid(
+            (args) => run.command(
+              sdk.adb,
+              [...adb, ...args],
+              requireSuccess: false,
+              cleanup: true,
+            ),
+            name: name,
+            package: package,
+            ownedPid: appPid,
+            launchSkew: launchSkew,
+            launchMsMax: launchMsMax,
+            hostLoad: _hostLoad(),
+          ),
+        );
         Future<Participant> launch(
           Participant? old, {
           bool freshStore = false,
@@ -391,6 +461,17 @@ Future<void> main(List<String> arguments) async {
             }
             if (freshStore) store++;
             run.phase = _Phase.androidLaunch;
+            if (accountScenario) {
+              // The probe's lifecycle covers the process launched next.
+              await run.command(sdk.adb, [
+                ...adb,
+                'logcat',
+                '-b',
+                'events',
+                '-c',
+              ]);
+            }
+            final launchClock = Stopwatch()..start();
             final launched = await run.command(sdk.adb, [
               ...adb,
               'shell',
@@ -437,10 +518,18 @@ Future<void> main(List<String> arguments) async {
             run.save();
             Participant? next;
             run.phase = _Phase.androidParticipant;
+            // `am start` to the control hello took up to 17.4 s in a passing run
+            // on the GitHub emulators. waitParticipant's default 10 s, counted
+            // from here, was the tighter limit, not the outer 30 s.
             await run.until(() async {
-              next = await control.waitParticipant(name);
+              next = await control.waitParticipant(
+                name,
+                timeout: const Duration(seconds: 60),
+              );
               return old == null || next!.instance != old.instance;
-            }, const Duration(seconds: 30));
+            }, const Duration(seconds: 60));
+            final took = launchClock.elapsedMilliseconds;
+            if (launchMsMax == null || took > launchMsMax!) launchMsMax = took;
             return next!;
           } finally {
             restarting = false;
@@ -449,8 +538,45 @@ Future<void> main(List<String> arguments) async {
         }
 
         final first = await launch(null);
+        try {
+          final date = await run.command(sdk.adb, [
+            ...adb,
+            'shell',
+            'date',
+            '+%s',
+          ], requireSuccess: false);
+          launchSkew = date.exitCode == 0
+              ? clockSkew(
+                  date.stdout as String,
+                  DateTime.now().millisecondsSinceEpoch ~/ 1000,
+                )
+              : null;
+        } on StateError {
+          /* An unread launch clock stays null. */
+        }
         appRestarts[name] = (old, {bool freshStore = false}) =>
             launch(old, freshStore: freshStore);
+        appAirplane[name] = (on) async {
+          await run.command(sdk.adb, [
+            ...adb,
+            'shell',
+            'cmd',
+            'connectivity',
+            'airplane-mode',
+            on ? 'enable' : 'disable',
+          ]);
+        };
+        // singleTop: the running activity comes to the front (onNewIntent).
+        appForeground[name] = () async {
+          await run.command(sdk.adb, [
+            ...adb,
+            'shell',
+            'am',
+            'start',
+            '-n',
+            '$package/.MainActivity',
+          ], requireSuccess: false);
+        };
         appClocks[name] = () async {
           final result = await run.command(sdk.adb, [
             ...adb,
@@ -476,6 +602,7 @@ Future<void> main(List<String> arguments) async {
         final watching = Completer<void>();
         run.monitorStops.add(watching);
         run.monitorTasks.add(() async {
+          var misses = 0;
           try {
             while (!watching.isCompleted && !run.token.isCancelled) {
               await Future.any([
@@ -484,7 +611,10 @@ Future<void> main(List<String> arguments) async {
                 run.token.cancelled,
               ]);
               if (watching.isCompleted || run.token.isCancelled) return;
-              if (restarting) continue;
+              if (restarting) {
+                misses = 0;
+                continue;
+              }
               final observedPid = appPid;
               final result = await run.command(
                 sdk.adb,
@@ -492,9 +622,12 @@ Future<void> main(List<String> arguments) async {
                 requireSuccess: false,
                 failurePhase: 'android_pid_monitor',
               );
-              if (!restarting &&
-                  appPid == observedPid &&
-                  (result.stdout as String).trim() != appPid) {
+              if (restarting || appPid != observedPid) {
+                misses = 0;
+                continue;
+              }
+              misses = ownedMisses(result, appPid, misses);
+              if (misses >= ownedExitedAfter) {
                 throw StateError('Android owned activity exited');
               }
             }
@@ -550,6 +683,7 @@ Future<void> main(List<String> arguments) async {
         'node',
         '--data-dir',
         p.join(logs.path, 'node'),
+        if (mailboxScenario) '--account',
       ], logDir: logs);
       Participant? next;
       run.phase = _Phase.nodeParticipant;
@@ -561,73 +695,124 @@ Future<void> main(List<String> arguments) async {
       return next!;
     }
 
-    if (!accountScenario) participants.add(await launchNode());
+    if (!accountScenario || mailboxScenario) {
+      participants.add(await launchNode());
+    }
     run.phase = _Phase.scenario;
+    Participant named(String name) =>
+        participants.singleWhere((participant) => participant.name == name);
     await run.wait(
-      messageScenario
-          ? runMessageScenario(
-              control,
-              participants,
-              auditRecovery: (patterns) => _auditRecoveryLogs(logs, patterns),
-              restart: (old, {bool freshStore = false}) {
-                final action = appRestarts[old.name];
-                if (action == null) {
-                  throw StateError('Restart participant is not owned');
-                }
-                return action(old, freshStore: freshStore);
-              },
-              evidence: (stage, data) =>
-                  File(
-                    p.join(logs.path, 'message-public-evidence.jsonl'),
-                  ).writeAsStringSync(
-                    '${jsonEncode({'stage': stage, ...data})}\n',
-                    mode: FileMode.append,
-                    flush: true,
-                  ),
-            )
-          : accountScenario
-          ? runAccountScenario(
-              control,
-              participants,
-              authOnly: authOnly,
-              wallClock: (participant) async =>
-                  appClocks[participant.name] == null
-                  ? DateTime.now().millisecondsSinceEpoch ~/ 1000
-                  : await appClocks[participant.name]!(),
-              restart: (old, {bool freshStore = false}) {
-                final action = appRestarts[old.name];
-                if (action == null) {
-                  throw StateError('Restart participant is not owned');
-                }
-                return action(old, freshStore: freshStore);
-              },
-              evidence: (stage, data) =>
-                  File(
-                    p.join(logs.path, 'account-public-evidence.jsonl'),
-                  ).writeAsStringSync(
-                    '${jsonEncode({'stage': stage, ...data})}\n',
-                    mode: FileMode.append,
-                    flush: true,
-                  ),
-            )
-          : runScenario(
-              control,
-              participants,
-              restart: launchNode,
-              onFailure: (error, phase, kind) => run.recordFailure(
-                error,
-                failurePhase: phase,
-                timeoutKind: kind,
+      _traceOnFailure(
+        mailboxScenario
+            ? runMailboxScenario(
+                control,
+                [
+                  named('android-1'),
+                  named(profile == 'mixed' ? 'windows-1' : 'android-2'),
+                  named('node'),
+                ],
+                airplane: (participant, on) {
+                  final action = appAirplane[participant.name];
+                  if (action == null) {
+                    throw StateError('Airplane participant is not owned');
+                  }
+                  return action(on);
+                },
+                foreground: (participant) {
+                  final action = appForeground[participant.name];
+                  if (action == null) {
+                    throw StateError('Foreground participant is not owned');
+                  }
+                  return action();
+                },
+                evidence: (stage, data) =>
+                    File(
+                      p.join(logs.path, 'mailbox-public-evidence.jsonl'),
+                    ).writeAsStringSync(
+                      '${jsonEncode({'stage': stage, ...data})}\n',
+                      mode: FileMode.append,
+                      flush: true,
+                    ),
+              )
+            : messageScenario
+            ? runMessageScenario(
+                control,
+                participants,
+                auditRecovery: (patterns) => _auditRecoveryLogs(logs, patterns),
+                restart: (old, {bool freshStore = false}) {
+                  final action = appRestarts[old.name];
+                  if (action == null) {
+                    throw StateError('Restart participant is not owned');
+                  }
+                  return action(old, freshStore: freshStore);
+                },
+                evidence: (stage, data) =>
+                    File(
+                      p.join(logs.path, 'message-public-evidence.jsonl'),
+                    ).writeAsStringSync(
+                      '${jsonEncode({'stage': stage, ...data})}\n',
+                      mode: FileMode.append,
+                      flush: true,
+                    ),
+              )
+            : accountScenario
+            ? runAccountScenario(
+                control,
+                participants,
+                authOnly: authOnly,
+                wallClock: (participant) async =>
+                    appClocks[participant.name] == null
+                    ? DateTime.now().millisecondsSinceEpoch ~/ 1000
+                    : await appClocks[participant.name]!(),
+                restart: (old, {bool freshStore = false}) {
+                  final action = appRestarts[old.name];
+                  if (action == null) {
+                    throw StateError('Restart participant is not owned');
+                  }
+                  return action(old, freshStore: freshStore);
+                },
+                evidence: (stage, data) =>
+                    File(
+                      p.join(logs.path, 'account-public-evidence.jsonl'),
+                    ).writeAsStringSync(
+                      '${jsonEncode({'stage': stage, ...data})}\n',
+                      mode: FileMode.append,
+                      flush: true,
+                    ),
+              )
+            : runScenario(
+                control,
+                participants,
+                restart: launchNode,
+                onFailure: (error, phase, kind) => run.recordFailure(
+                  error,
+                  failurePhase: phase,
+                  timeoutKind: kind,
+                ),
               ),
-            ),
+        () async =>
+            run.transport ??= await collectTransport(control.participants),
+      ),
       timeout: Duration(minutes: accountScenario ? 8 : 4),
       failurePhase: 'scenario',
     );
+    run.transport = await collectTransport(control.participants);
+    // Every Android run, m2 too (no Android owned: null).
+    run.android = await _probeAll(androidProbes);
   } catch (error, stack) {
     run.recordFailure(error);
     code = userInterrupted ? 130 : 1;
     run.token.cancel();
+    // Before the controller closes: the apps still run as the failure left them.
+    run.android ??= await _probeAll(androidProbes);
     await run.interrupt(controller);
+    if (accountScenario && androidCrashed != null) {
+      try {
+        run.androidCrash = await androidCrashed();
+      } catch (_) {
+        /* Unknown stays null in the retained summary. */
+      }
+    }
     File(
       p.join(logs.path, 'failure.log'),
     ).writeAsStringSync('${jsonEncode(run.safeFailure)}\n$stack', flush: true);
@@ -667,7 +852,9 @@ Future<void> main(List<String> arguments) async {
     if (userInterrupted && code == 0) code = 130;
     if (code == 0) {
       stdout.writeln(
-        messageScenario
+        mailboxScenario
+            ? '$profile M6 PASS: phone in airplane mode, mailbox kept three texts, phone got them in order once with one notification.'
+            : messageScenario
             ? '$profile M4 PASS: native retained message restart, durable ack and read.'
             : accountScenario
             ? authOnly
@@ -696,14 +883,24 @@ Future<void> main(List<String> arguments) async {
     if (diagnostic != null) {
       try {
         File(diagnostic).writeAsStringSync(
-          jsonEncode(
-            run.safeFailure ??
+          jsonEncode({
+            ...run.safeFailure ??
                 {
                   'phase': _Phase.complete.value,
                   'failure_kind': null,
                   'command_exit_code': null,
+                  'detail': null,
                 },
-          ),
+            'scenario': scenarioName,
+            'android_crash': run.androidCrash,
+            'last_view': run.lastView,
+            'participant': run.lastParticipant,
+            'rpc_op': run.rpcOp,
+            'facts': run.facts(),
+            'android': run.android,
+            'waits': run.waits(),
+            'transport': run.transport,
+          }),
           flush: true,
         );
       } on FileSystemException {
@@ -711,6 +908,20 @@ Future<void> main(List<String> arguments) async {
       }
     }
     exit(code);
+  }
+}
+
+/// [work]; when it fails, [trace] runs first: the run's cancellation that
+/// follows a failure closes the controller and with it every participant.
+Future<T> _traceOnFailure<T>(
+  Future<T> work,
+  Future<void> Function() trace,
+) async {
+  try {
+    return await work;
+  } catch (_) {
+    await trace();
+    rethrow;
   }
 }
 
@@ -819,12 +1030,39 @@ class _Run extends IoProcessRunner {
   bool finishing = false;
   _Phase phase = _Phase.preflight;
   Map<String, Object?>? safeFailure;
+  bool? androidCrash;
+  String? lastView;
+  String? lastParticipant;
+  String? rpcOp;
+  List<Map<String, Object?>>? android;
+  List<Map<String, Object?>>? transport;
+  final safeDetails = loadSafeDetails();
+  final safeViews = loadSafeValues('last_view');
+  final safeParticipants = loadSafeValues('participants');
+  final safeFactValues = loadSafeFacts();
+  Map<String, String>? facts() => safeFacts(failureFacts, safeFactValues);
+  final safeWaitKinds = loadSafeValues('wait_kinds');
+  List<Map<String, Object>>? waits() =>
+      safeWaits(waitMs, safeDetails, safeWaitKinds);
 
   void recordFailure(
     Object? error, {
     String? failurePhase,
     String? timeoutKind,
   }) {
+    if (safeFailure == null && error is ScenarioDeadline) {
+      lastView = safeViews.contains(error.lastView) ? error.lastView : null;
+      lastParticipant = safeParticipants.contains(error.participant)
+          ? error.participant
+          : null;
+    }
+    if (safeFailure == null && error is RpcError) {
+      final op = error.op;
+      rpcOp = op != null && _rpcOp.hasMatch(op) ? op : null;
+      lastParticipant = safeParticipants.contains(error.participant)
+          ? error.participant
+          : null;
+    }
     safeFailure ??= {
       'phase': failurePhase ?? phase.value,
       'failure_kind': switch (error) {
@@ -849,6 +1087,7 @@ class _Run extends IoProcessRunner {
         _OwnedChildFailure() => error.code,
         _ => null,
       },
+      'detail': safeDetail(error, safeDetails),
     };
   }
 
@@ -1246,6 +1485,46 @@ class _Managed implements OwnedProcess {
   Future<void> stop() => _stopping ??= run.stop(process);
 }
 
+/// A fixed scenario op name (tools/ci/write_e2e_summary.py `RPC_OP`).
+final _rpcOp = RegExp(r'^(?:account|message|mailbox)_local_[a-z_]{1,48}$');
+
+/// The host's 1-minute load average times 100 (Linux), or null.
+int? _hostLoad() {
+  try {
+    return loadX100(File('/proc/loadavg').readAsStringSync());
+  } on FileSystemException {
+    return null;
+  }
+}
+
+/// Probes every owned emulator; one that cannot be read is left out. A run
+/// without emulators (Windows) has no Android state.
+Future<List<Map<String, Object?>>?> _probeAll(
+  List<Future<Map<String, Object?>> Function()> probes,
+) async {
+  if (probes.isEmpty) return null;
+  final states = <Map<String, Object?>>[];
+  for (final probe in probes) {
+    try {
+      states.add(await probe());
+    } catch (_) {
+      /* The summary keeps the emulators that could be read. */
+    }
+  }
+  return states;
+}
+
+/// `-g` grants the runtime permissions: the notification prompt an active
+/// account opens (M6) would otherwise stay over the task after a force-stop,
+/// and the next launch would only bring that task to the front.
+List<String> _androidInstall(List<String> adb, String apk) => [
+  ...adb,
+  'install',
+  '-r',
+  '-g',
+  apk,
+];
+
 Future<void> _captureAndroidLaunch(
   ProcessResult launch,
   Future<ProcessResult> Function() samplePid,
@@ -1259,4 +1538,9 @@ Future<void> _captureAndroidLaunch(
     save();
   }
   if (launch.exitCode != 0) throw _CommandFailure(launch.exitCode, 'adb');
+  // `am start` exits 0 when it only brought an existing task to the front or
+  // handed the intent to a running activity; no new app process runs then.
+  if ((launch.stdout as String).contains('Activity not started')) {
+    throw StateError('Android launch did not start the activity');
+  }
 }

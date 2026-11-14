@@ -6,13 +6,15 @@
 //! A `KvStore` is loaded per operation and `flush`ed into the operation's transaction only on
 //! success. `flush` clears its dirty set before the caller commits, so after any failure the
 //! store (and its provider) is dropped; the next operation loads a fresh one.
+use super::mailbox_store::{record_frame, record_note};
 use super::mls_group::{check_own, group_row, signer_of, sql};
 use super::store::{
-    Identity, MessageDbReply, bump, bytes, commit, ensure_conversation, find, integer, invalid,
-    missing, receipt_for, schedule_retry, target, uint,
+    Identity, MessageDbReply, OpenFrom, bump, bytes, commit, ensure_conversation, find, integer,
+    invalid, missing, receipt_for, schedule_retry, target, uint,
 };
 use super::types::*;
 use super::wire::ReceiptKind;
+use crate::mailbox::wire::{EntryBody, PlainRecord};
 use crate::mls::{
     MlsProvider,
     group::{self, OpenFailure, Opened},
@@ -176,18 +178,18 @@ fn seal_one(
     now: u64,
 ) -> R<([u8; 32], Vec<u8>)> {
     let ciphertext = group::seal(provider, signer, group_id, message)?;
-    let frame = MlsFrame::App {
+    let hash: [u8; 32] = Sha256::digest(&ciphertext).into();
+    let app = MlsFrame::App {
         conversation: key.conversation,
-        ciphertext: ciphertext.clone(),
-    }
-    .encode();
+        ciphertext,
+    };
+    let frame = app.encode();
     if frame.len() > MAX_FRAME {
         return Err(CoreError::new(
             ErrorCode::MessageTooLarge,
             "message_frame_too_large",
         ));
     }
-    let hash: [u8; 32] = Sha256::digest(&ciphertext).into();
     tx.execute(
         "INSERT OR IGNORE INTO processed_ct VALUES(2,?1,?2,?3,?4)",
         params![
@@ -198,6 +200,10 @@ fn seal_one(
         ],
     )
     .map_err(sql)?;
+    // Every sealed frame goes into the device log (spec 5.1): a message names its id, a
+    // receipt does not.
+    let text = matches!(message.content, Content::Text { .. }).then_some(message.msg_id);
+    record_frame(tx, identity.peer, identity.installation, text, &app, now)?;
     Ok((hash, frame.to_vec()))
 }
 
@@ -321,6 +327,51 @@ pub(super) fn seal_pending(
     provider.storage().flush(&tx, conversation.0)?;
     finish(tx, fault)?;
     Ok(MessageDbReply::Count(ids.len() as u64))
+}
+
+/// Holds the conversation's own texts that wait for a group (codec 3, not cancelled, not
+/// delivered, not in flight) as `Blocked(reason)`, in one transaction, as an M4 refusal holds
+/// one text; the user's retry releases them (`release_blocked`). Receipt jobs are not touched.
+pub(super) fn block_pending(
+    c: &mut Connection,
+    identity: Identity,
+    conversation: ConversationId,
+    reason: BlockReason,
+    fault: Fault,
+) -> R<MessageDbReply> {
+    let reason = match reason {
+        BlockReason::Account => 1,
+        BlockReason::ContactRequired => 2,
+        BlockReason::Storage => 3,
+    };
+    let tx = c.transaction().map_err(sql)?;
+    let args = params![
+        conversation.0.as_slice(),
+        identity.peer.0.as_slice(),
+        identity.installation.0.as_slice(),
+        reason
+    ];
+    let held = tx
+        .execute(
+            "UPDATE message SET outcome=2,block_reason=?4 WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND outgoing=1 AND cancel_requested=0 AND delivered_at_ms IS NULL AND outcome IN (0,1) AND EXISTS(SELECT 1 FROM outbox o WHERE o.conversation=message.conversation AND o.sender_peer=message.sender_peer AND o.sender_install=message.sender_install AND o.msg_id=message.msg_id AND o.codec=3 AND o.dispatch_state=0)",
+            args,
+        )
+        .map_err(sql)?;
+    if held > 0 {
+        tx.execute(
+            "UPDATE outbox SET dispatch_state=2 WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND codec=3 AND dispatch_state=0 AND EXISTS(SELECT 1 FROM message m WHERE m.conversation=outbox.conversation AND m.sender_peer=outbox.sender_peer AND m.sender_install=outbox.sender_install AND m.msg_id=outbox.msg_id AND m.outcome=2 AND m.block_reason=?4)",
+            args,
+        )
+        .map_err(sql)?;
+        let revision = bump(&tx)?;
+        tx.execute(
+            "UPDATE conversation SET change_revision=?2 WHERE id=?1",
+            params![conversation.0.as_slice(), integer(revision)?],
+        )
+        .map_err(sql)?;
+    }
+    finish(tx, fault)?;
+    Ok(MessageDbReply::Count(held as u64))
 }
 
 /// Seals a sent message again after the receiver could not open the first ciphertext. The
@@ -474,9 +525,6 @@ pub(super) fn prepare_receipt(
     fault: Fault,
 ) -> R<MessageDbReply> {
     target(c, identity, key, true)?;
-    if receiver != key.installation {
-        return Err(invalid());
-    }
     let tx = c.transaction().map_err(sql)?;
     let kind: u64 = tx
         .query_row(
@@ -500,13 +548,17 @@ pub(super) fn prepare_receipt(
     let Some(group) = group_row(&tx, key.conversation)? else {
         return Ok(MessageDbReply::NeedGroup(key.conversation));
     };
-    let (lamport, prev): (u64, Vec<u8>) = tx
-        .query_row(
-            "SELECT lamport_max,local_prev_hash FROM conversation WHERE id=?1",
-            params![key.conversation.0.as_slice()],
-            |r| Ok((uint(r, 0)?, r.get(1)?)),
-        )
-        .map_err(sql)?;
+    // The message's sender, or (spec 11: it is off) another device of its account that holds a
+    // leaf in the group: any of them can open it, and the sender gets it from that one's log.
+    if receiver != key.installation
+        && !crate::mls::membership::group_installations(
+            &MlsProvider::new(KvStore::load_scope(&tx, key.conversation.0)?),
+            &group.group_id,
+        )?
+        .contains(&receiver)
+    {
+        return Err(invalid());
+    }
     schedule_retry(&tx, key, true, now)?;
     let cache = params![
         key.conversation.0.as_slice(),
@@ -524,13 +576,78 @@ pub(super) fn prepare_receipt(
         )
         .optional()
         .map_err(sql)?;
-    if let Some(frame) = sealed {
-        finish(tx, fault)?;
-        return Ok(MessageDbReply::Prepared(
-            zeroize::Zeroizing::new(frame),
-            Some(receipt),
-        ));
+    let frame = match sealed {
+        Some(frame) => frame,
+        None => seal_receipt(
+            &tx,
+            identity,
+            local,
+            key,
+            &group.group_id,
+            receipt.kind,
+            wall,
+        )?,
+    };
+    finish(tx, fault)?;
+    Ok(MessageDbReply::Prepared(
+        zeroize::Zeroizing::new(frame),
+        Some(receipt),
+    ))
+}
+
+/// Final review I2: the `Read` receipt for received message `key` that `mark_read` just made
+/// seen, sealed now when the message came over MLS and its conversation has a group, in the
+/// `mark_read` transaction. Sealing logs it (spec 6.4: my other devices take my read from my
+/// log), so my read reaches them whether or not the contact can be reached; the receipt job's
+/// attempts then send this same frame. Without a group nothing happens here: the attempt
+/// seals it, or waits for a group, as before.
+pub(super) fn seal_read(
+    tx: &Transaction<'_>,
+    identity: Identity,
+    local: &LocalAccount,
+    key: MessageKey,
+    wall: u64,
+) -> R<()> {
+    if !received_over_mls(tx, key)? {
+        return Ok(());
     }
+    let Some(group) = group_row(tx, key.conversation)? else {
+        return Ok(());
+    };
+    seal_receipt(
+        tx,
+        identity,
+        local,
+        key,
+        &group.group_id,
+        ReceiptKind::Read,
+        wall,
+    )
+    .map(|_| ())
+}
+
+/// Seals receipt `kind` for received message `key` in group `group_id` at `wall`: logged (as
+/// every sealed frame) and kept in `mls_receipt`, so the job's attempts resend this frame.
+fn seal_receipt(
+    tx: &Transaction<'_>,
+    identity: Identity,
+    local: &LocalAccount,
+    key: MessageKey,
+    group_id: &[u8],
+    kind: ReceiptKind,
+    wall: u64,
+) -> R<Vec<u8>> {
+    let (lamport, prev): (u64, Vec<u8>) = tx
+        .query_row(
+            "SELECT lamport_max,local_prev_hash FROM conversation WHERE id=?1",
+            params![key.conversation.0.as_slice()],
+            |r| Ok((uint(r, 0)?, r.get(1)?)),
+        )
+        .map_err(sql)?;
+    let number: u8 = match kind {
+        ReceiptKind::Delivered => 1,
+        ReceiptKind::Read => 2,
+    };
     // A receipt is not a message of its own: an id derived from what it acknowledges.
     let mut id = Sha256::new();
     id.update(b"ChatProject/m5/receipt-id/v1");
@@ -538,7 +655,7 @@ pub(super) fn prepare_receipt(
     id.update(key.sender.0);
     id.update(key.installation.0);
     id.update(key.id.0);
-    id.update([kind as u8]);
+    id.update([number]);
     id.update(wall.to_be_bytes());
     let id: [u8; 32] = id.finalize().into();
     let message = ChatMessage {
@@ -547,21 +664,14 @@ pub(super) fn prepare_receipt(
         prev_hash: prev.try_into().map_err(|_| invalid())?,
         sent_at_ms: wall,
         content: Content::Receipt {
-            kind: receipt.kind,
+            kind,
             targets: vec![key.id],
         },
     };
-    let provider = MlsProvider::new(KvStore::load_scope(&tx, key.conversation.0)?);
+    let provider = MlsProvider::new(KvStore::load_scope(tx, key.conversation.0)?);
     let (signer, _) = signer_of(local);
     let (_, frame) = seal_one(
-        &tx,
-        &provider,
-        &signer,
-        identity,
-        key,
-        &group.group_id,
-        &message,
-        wall,
+        tx, &provider, &signer, identity, key, group_id, &message, wall,
     )?;
     tx.execute(
         "INSERT OR REPLACE INTO mls_receipt VALUES(?1,?2,?3,?4,?5,?6)",
@@ -570,17 +680,13 @@ pub(super) fn prepare_receipt(
             key.sender.0.as_slice(),
             key.installation.0.as_slice(),
             key.id.0.as_slice(),
-            kind as i64,
+            i64::from(number),
             frame.as_slice()
         ],
     )
     .map_err(sql)?;
-    provider.storage().flush(&tx, key.conversation.0)?;
-    finish(tx, fault)?;
-    Ok(MessageDbReply::Prepared(
-        zeroize::Zeroizing::new(frame),
-        Some(receipt),
-    ))
+    provider.storage().flush(tx, key.conversation.0)?;
+    Ok(frame)
 }
 
 /// The recipient could not open the sealed receipt for received message `key`: it is
@@ -642,6 +748,19 @@ pub(super) fn acked(
             params![key.conversation.0.as_slice(), integer(revision)?],
         )
         .map_err(sql)?;
+        // The other own devices learn it from the log (spec 6.4): their copies show it too.
+        record_note(
+            &tx,
+            key.conversation,
+            key.sender,
+            key.installation,
+            &EntryBody::Delivered {
+                msg_id: key.id,
+                receiver: recipient,
+                at_ms: now,
+            },
+            now,
+        )?;
     }
     finish(tx, fault)?;
     Ok(MessageDbReply::Done)
@@ -703,11 +822,13 @@ fn decrypt_failed(class: u8, epoch: u64) -> MessageDbReply {
 }
 
 /// Opens one received application ciphertext and stores the message it carries, in one
-/// transaction. `sender_peer`/`sender_install` are what the authenticated transport says; the
-/// MLS credential must agree.
+/// transaction. `from` is the account the authenticated transport (or log entry) names and its
+/// current devices; the MLS leaf that sealed it must be one of them (M6 spec 7: another device
+/// of the account may hand it over as is), and is its sender here.
 ///
-/// * the device's own ciphertext coming back, or one already in `processed_ct`, is acknowledged
-///   without opening (a replay would only fail with secret reuse);
+/// * the device's own ciphertext coming back, or one already in `processed_ct` from that
+///   account (whichever of its devices carried it), is acknowledged without opening (a replay
+///   would only fail with secret reuse);
 /// * a ciphertext that cannot be opened changes nothing and answers `DecryptFailed`;
 /// * an undecodable plaintext or unknown content still advances the ratchet and is
 ///   acknowledged, so its sender stops retrying;
@@ -717,13 +838,14 @@ fn decrypt_failed(class: u8, epoch: u64) -> MessageDbReply {
 /// * the same message id again (a re-encrypted resend) stores nothing new;
 /// * a copy of a text another device of this account sent (spec 5.3) is stored as that
 ///   device's outgoing message, shown sent (`SentDirect`), never unread and never answered with
-///   a receipt; a receipt copy is acknowledged and dropped.
-#[allow(clippy::too_many_arguments)]
+///   a receipt;
+/// * a `Read` receipt another device of this account sent means the user read those messages
+///   there (spec 6.4): they are read here too, and no receipt goes from here. Its `Delivered`
+///   receipt says nothing to this device and is dropped.
 pub(super) fn open_app(
     c: &mut Connection,
     identity: Identity,
-    sender_peer: PeerId,
-    sender_install: InstallationId,
+    from: &OpenFrom,
     conversation: ConversationId,
     ciphertext: Vec<u8>,
     now: u64,
@@ -731,9 +853,10 @@ pub(super) fn open_app(
 ) -> R<MessageDbReply> {
     let ct_hash: [u8; 32] = Sha256::digest(&ciphertext).into();
     let ack = MessageDbReply::Opened(MlsReply::Ack { ct_hash });
-    if sender_install == identity.installation {
+    if from.transport == identity.installation {
         return Ok(ack);
     }
+    let sender_peer = from.peer;
     // A copy from another device of this account: the conversation must have a group here,
     // which the caller checked is one with a contact.
     let own = sender_peer == identity.peer;
@@ -742,36 +865,39 @@ pub(super) fn open_app(
     }
     let now = integer(now)?;
     let tx = c.transaction().map_err(sql)?;
-    // Seen before: answered as it was answered then. A ciphertext whose text was refused stays
-    // refused (never an `Ack`, which would mean stored).
+    // Seen before, from whichever device of the account carried it then: answered as it was
+    // answered then. A ciphertext whose text was refused stays refused (never an `Ack`, which
+    // would mean stored).
     let seen: Option<u8> = tx
         .query_row(
-            "SELECT max(codec) FROM processed_ct WHERE codec IN (2,3) AND sender_peer=?1 AND sender_install=?2 AND hash=?3",
-            params![sender_peer.0.as_slice(), sender_install.0.as_slice(), ct_hash.as_slice()],
+            "SELECT max(codec) FROM processed_ct WHERE codec IN (2,3) AND sender_peer=?1 AND hash=?2",
+            params![sender_peer.0.as_slice(), ct_hash.as_slice()],
             |r| r.get(0),
         )
         .map_err(sql)?;
     match seen {
         Some(REJECTED_CT) => return Ok(MessageDbReply::Rejected),
         Some(_) => {
-            // The text it carried, if any (its first ciphertext is its payload hash).
-            let text: Option<[u8; 16]> = tx
+            // The text it carried, if any (its first ciphertext is its payload hash), under the
+            // leaf that sealed it.
+            let text: Option<([u8; 32], [u8; 16])> = tx
                 .query_row(
-                    "SELECT msg_id FROM message WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND payload_hash=?4",
-                    params![conversation.0.as_slice(), sender_peer.0.as_slice(), sender_install.0.as_slice(), ct_hash.as_slice()],
-                    |r| bytes::<16>(r, 0),
+                    "SELECT sender_install,msg_id FROM message WHERE conversation=?1 AND sender_peer=?2 AND payload_hash=?3",
+                    params![conversation.0.as_slice(), sender_peer.0.as_slice(), ct_hash.as_slice()],
+                    |r| Ok((bytes::<32>(r, 0)?, bytes::<16>(r, 1)?)),
                 )
                 .optional()
                 .map_err(sql)?;
             return Ok(match text {
-                Some(id) => MessageDbReply::OpenedText(
+                Some((installation, id)) => MessageDbReply::OpenedText(
                     MlsReply::Ack { ct_hash },
                     MessageKey {
                         conversation,
                         sender: sender_peer,
-                        installation: sender_install,
+                        installation: InstallationId(installation),
                         id: MessageId(id),
                     },
+                    false,
                 ),
                 None => ack,
             });
@@ -796,24 +922,30 @@ pub(super) fn open_app(
         }
         Err(failure) => return Ok(decrypt_failed(failure.class, group.epoch)),
     };
-    let message = match opened {
-        Opened::Application { sender, message } => {
-            if sender != sender_install {
-                return Err(invalid());
-            }
-            Some(message)
-        }
-        Opened::Undecodable { sender } => {
-            if sender != sender_install {
-                return Err(invalid());
-            }
-            None
-        }
+    // The leaf that sealed it: a current device of the account, which is the sender here. Its
+    // credential must name that account too (an installation id is unique only within one
+    // record, so another account's record could list it).
+    let (account, sender_install, message) = match opened {
+        Opened::Application {
+            account,
+            sender,
+            message,
+        } => (account, sender, Some(message)),
+        Opened::Undecodable { account, sender } => (account, sender, None),
         // A Commit is applied through the group protocol (with its members vetted), never here.
         Opened::Commit { .. } => return Ok(decrypt_failed(group::CLASS_OTHER, group.epoch)),
     };
+    if account != sender_peer {
+        return Err(invalid());
+    }
+    // A leaf of the account that is not (any more) a current device: nothing kept, whatever
+    // path brought it (the caller decides what that means).
+    if !from.allowed.contains(&sender_install) {
+        return Ok(MessageDbReply::NotCurrent);
+    }
     let mut stored = Stored::Yes;
     let mut text = None;
+    let mut read = false;
     if let Some(message) = message {
         if matches!(message.content, Content::Text { .. }) {
             text = Some(MessageKey {
@@ -835,7 +967,15 @@ pub(super) fn open_app(
                 now,
                 own,
             )?,
-            // A receipt copy is about the other device's own messages, not this one's.
+            Content::Receipt {
+                kind: ReceiptKind::Read,
+                targets,
+            } if own => {
+                if let Some(peer) = conversation_peer(&tx, conversation)? {
+                    read = !apply_own_read(&tx, conversation, peer, targets, now)?.is_empty();
+                }
+                Stored::Yes
+            }
             Content::Receipt { .. } if own => Stored::Yes,
             Content::Receipt { kind, targets } => {
                 apply_receipt(&tx, identity, conversation, *kind, targets, now)?;
@@ -849,7 +989,7 @@ pub(super) fn open_app(
         "INSERT INTO processed_ct VALUES(?1,?2,?3,?4,?5)",
         params![
             match stored {
-                Stored::Yes => 2,
+                Stored::Yes | Stored::New => 2,
                 Stored::Rejected => REJECTED_CT,
             },
             sender_peer.0.as_slice(),
@@ -859,6 +999,20 @@ pub(super) fn open_app(
         ],
     )
     .map_err(sql)?;
+    // A taken frame goes into the device log as received, under the leaf that sent it.
+    if matches!(stored, Stored::Yes | Stored::New) {
+        let app = MlsFrame::App {
+            conversation,
+            ciphertext,
+        };
+        let id = text.map(|key| key.id);
+        record_frame(&tx, sender_peer, sender_install, id, &app, now as u64)?;
+    }
+    // Ruling 35: a new text from the other account that a pull brought is notified at that
+    // pull's end; marked here so that a device dying first still notifies it.
+    if let (Stored::New, Some(key), false, Some(holder)) = (&stored, text, own, from.pull) {
+        super::mailbox_store::mark_notify(&tx, key, holder)?;
+    }
     if !own {
         tx.execute(
             "UPDATE mls_conversation SET peer_mls=1 WHERE conversation=?1 AND peer_mls=0",
@@ -871,9 +1025,107 @@ pub(super) fn open_app(
     finish(tx, fault)?;
     Ok(match (stored, text) {
         (Stored::Rejected, _) => MessageDbReply::Rejected,
-        (Stored::Yes, Some(key)) => MessageDbReply::OpenedText(MlsReply::Ack { ct_hash }, key),
-        (Stored::Yes, None) => ack,
+        // Only a text stored just now from the other account is new for a notification.
+        (Stored::New, Some(key)) => {
+            MessageDbReply::OpenedText(MlsReply::Ack { ct_hash }, key, !own)
+        }
+        (Stored::Yes, Some(key)) => {
+            MessageDbReply::OpenedText(MlsReply::Ack { ct_hash }, key, false)
+        }
+        (Stored::Yes | Stored::New, None) if read => {
+            MessageDbReply::OpenedRead(MlsReply::Ack { ct_hash }, conversation)
+        }
+        (Stored::Yes | Stored::New, None) => ack,
     })
+}
+
+/// The other account of a conversation, if this device has the conversation.
+fn conversation_peer(tx: &Transaction<'_>, conversation: ConversationId) -> R<Option<PeerId>> {
+    tx.query_row(
+        "SELECT peer FROM conversation WHERE id=?1",
+        params![conversation.0.as_slice()],
+        |r| bytes::<32>(r, 0),
+    )
+    .optional()
+    .map_err(sql)
+    .map(|peer| peer.map(PeerId))
+}
+
+/// My `Read` receipt from another of my devices (spec 6.4): the user read `targets` (messages
+/// of the conversation's `peer`) there. Each one here becomes seen and leaves `unread`, and its
+/// receipt jobs and sealed receipts go (the peer has my other device's receipt; nothing is sent
+/// from here). A target not here yet is kept in `mailbox_status_ahead` (kind 1) for when it
+/// comes. Returns the messages that became read just now.
+fn apply_own_read(
+    tx: &Transaction<'_>,
+    conversation: ConversationId,
+    peer: PeerId,
+    targets: &[MessageId],
+    now: i64,
+) -> R<Vec<MessageKey>> {
+    let mut read = Vec::new();
+    for id in targets {
+        let found: Option<([u8; 32], bool)> = tx
+            .query_row(
+                "SELECT sender_install,seen_local FROM message WHERE conversation=?1 AND sender_peer=?2 AND msg_id=?3 AND outgoing=0",
+                params![conversation.0.as_slice(), peer.0.as_slice(), id.0.as_slice()],
+                |r| Ok((bytes::<32>(r, 0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(sql)?;
+        let Some((installation, seen)) = found else {
+            tx.execute(
+                "INSERT OR IGNORE INTO mailbox_status_ahead VALUES(?1,?2,?3,1,?4)",
+                params![
+                    conversation.0.as_slice(),
+                    peer.0.as_slice(),
+                    id.0.as_slice(),
+                    now
+                ],
+            )
+            .map_err(sql)?;
+            continue;
+        };
+        let key = MessageKey {
+            conversation,
+            sender: peer,
+            installation: InstallationId(installation),
+            id: *id,
+        };
+        let row = params![
+            key.conversation.0.as_slice(),
+            key.sender.0.as_slice(),
+            key.installation.0.as_slice(),
+            key.id.0.as_slice()
+        ];
+        for statement in [
+            "DELETE FROM receipt_job WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",
+            "DELETE FROM mls_receipt WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",
+        ] {
+            tx.execute(statement, row).map_err(sql)?;
+        }
+        if !seen {
+            tx.execute(
+                "UPDATE message SET seen_local=1 WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",
+                row,
+            )
+            .map_err(sql)?;
+            read.push(key);
+        }
+    }
+    if !read.is_empty() {
+        let revision = bump(tx)?;
+        tx.execute(
+            "UPDATE conversation SET unread=unread-?2,change_revision=?3 WHERE id=?1",
+            params![
+                conversation.0.as_slice(),
+                read.len() as i64,
+                integer(revision)?
+            ],
+        )
+        .map_err(sql)?;
+    }
+    Ok(read)
 }
 
 /// `processed_ct` codec of a received MLS ciphertext whose text was refused (2 is one that was
@@ -900,12 +1152,16 @@ pub(super) fn mark_peer_mls(
 /// store) or refused the way M4 refuses a text frame.
 enum Stored {
     Yes,
+    /// Taken, and its text was inserted just now.
+    New,
     Rejected,
 }
 
-/// Applies a received MLS `Receipt` to this device's own sent messages (M4 `apply_receipt`
-/// rules): `Read` implies delivered, neither is ever undone, and a delivered message leaves the
-/// outbox. Targets that are not this device's sent messages are ignored.
+/// Applies the peer's MLS `Receipt` to this account's sent messages (M4 `apply_receipt` rules):
+/// `Read` implies delivered and neither is ever undone. It counts for the message whichever of
+/// my devices sent it (spec 6.4: the copies of my other devices' messages show it too); only
+/// this device's own outbox row is removed. A target not here yet is kept in
+/// `mailbox_status_ahead` (kind 2 delivered, 3 read) for when it comes.
 fn apply_receipt(
     tx: &Transaction<'_>,
     identity: Identity,
@@ -917,40 +1173,64 @@ fn apply_receipt(
     let read = kind == ReceiptKind::Read;
     let mut changed = 0;
     for id in targets {
-        let key = params![
-            conversation.0.as_slice(),
-            identity.peer.0.as_slice(),
-            identity.installation.0.as_slice(),
-            id.0.as_slice()
-        ];
-        let outgoing: bool = tx
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM message WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4 AND outgoing=1)",
-                key,
-                |r| r.get(0),
-            )
-            .map_err(sql)?;
-        if !outgoing {
-            continue;
-        }
-        changed += tx
-            .execute(
-                "UPDATE message SET delivered_at_ms=coalesce(delivered_at_ms,?5),read_at_ms=CASE WHEN ?6 THEN coalesce(read_at_ms,?5) ELSE read_at_ms END WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4 AND (delivered_at_ms IS NULL OR (?6 AND read_at_ms IS NULL))",
+        let senders: Vec<[u8; 32]> = {
+            let mut q = tx
+                .prepare("SELECT sender_install FROM message WHERE conversation=?1 AND sender_peer=?2 AND msg_id=?3 AND outgoing=1")
+                .map_err(sql)?;
+            q.query_map(
                 params![
                     conversation.0.as_slice(),
                     identity.peer.0.as_slice(),
-                    identity.installation.0.as_slice(),
+                    id.0.as_slice()
+                ],
+                |r| bytes::<32>(r, 0),
+            )
+            .map_err(sql)?
+            .collect::<Result<_, _>>()
+            .map_err(sql)?
+        };
+        if senders.is_empty() {
+            tx.execute(
+                "INSERT OR IGNORE INTO mailbox_status_ahead VALUES(?1,?2,?3,?4,?5)",
+                params![
+                    conversation.0.as_slice(),
+                    identity.peer.0.as_slice(),
                     id.0.as_slice(),
-                    now,
-                    read
+                    if read { 3 } else { 2 },
+                    now
                 ],
             )
             .map_err(sql)?;
-        tx.execute(
-            "DELETE FROM outbox WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",
-            key,
-        )
-        .map_err(sql)?;
+            continue;
+        }
+        for installation in senders {
+            let key = params![
+                conversation.0.as_slice(),
+                identity.peer.0.as_slice(),
+                installation.as_slice(),
+                id.0.as_slice()
+            ];
+            changed += tx
+                .execute(
+                    "UPDATE message SET delivered_at_ms=coalesce(delivered_at_ms,?5),read_at_ms=CASE WHEN ?6 THEN coalesce(read_at_ms,?5) ELSE read_at_ms END WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4 AND (delivered_at_ms IS NULL OR (?6 AND read_at_ms IS NULL))",
+                    params![
+                        conversation.0.as_slice(),
+                        identity.peer.0.as_slice(),
+                        installation.as_slice(),
+                        id.0.as_slice(),
+                        now,
+                        read
+                    ],
+                )
+                .map_err(sql)?;
+            if installation == identity.installation.0 {
+                tx.execute(
+                    "DELETE FROM outbox WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",
+                    key,
+                )
+                .map_err(sql)?;
+            }
+        }
     }
     if changed > 0 {
         let revision = bump(tx)?;
@@ -1031,6 +1311,33 @@ fn store_text(
     if collision {
         return Ok(Stored::Rejected);
     }
+    // What another own device learned about this message before it came here (spec 6.4,
+    // Review Focus 1): read by me (kind 1), or delivered (2) or read (3) by the peer.
+    let ahead: Vec<(u8, i64)> = {
+        let mut q = tx
+            .prepare("SELECT kind,at_ms FROM mailbox_status_ahead WHERE conversation=?1 AND sender_peer=?2 AND msg_id=?3")
+            .map_err(sql)?;
+        q.query_map(
+            params![
+                conversation.0.as_slice(),
+                sender_peer.0.as_slice(),
+                key.id.0.as_slice()
+            ],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map_err(sql)?
+        .collect::<Result<_, _>>()
+        .map_err(sql)?
+    };
+    let at = |kinds: &[u8]| {
+        ahead
+            .iter()
+            .filter(|(kind, _)| kinds.contains(kind))
+            .map(|(_, at)| *at)
+            .min()
+    };
+    // Read on another of my devices: stored seen, never counted unread.
+    let seen = !own && at(&[1]).is_some();
     let values = params![
         conversation.0.as_slice(),
         sender_peer.0.as_slice(),
@@ -1041,30 +1348,120 @@ fn store_text(
         ct_hash.as_slice(),
         sent_at,
         now,
-        body
+        body,
+        if own { at(&[2, 3]) } else { None },
+        if own { at(&[3]) } else { None },
+        own || seen
     ];
     if own {
-        // Sent by this account (outgoing, outcome 1 = sent), seen, nothing to deliver from here.
+        // Sent by this account (outgoing, outcome 1 = sent), seen, nothing to deliver from here;
+        // delivered or read as far as the peer already said.
         tx.execute(
-            "INSERT INTO message VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,1,1,NULL,NULL,1,0,NULL,NULL,X'')",
+            "INSERT INTO message VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,1,1,?11,?12,?13,0,NULL,NULL,X'')",
             values,
         )
         .map_err(sql)?;
     } else {
         ensure_conversation(tx, conversation, sender_peer)?;
         tx.execute(
-            "INSERT INTO message VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,0,0,?9,NULL,0,0,NULL,NULL,X'')",
+            "INSERT INTO message VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,0,0,?9,NULL,?13,0,NULL,NULL,X'')",
             values,
+        )
+        .map_err(sql)?;
+    }
+    if !ahead.is_empty() {
+        tx.execute(
+            // A withdrawal (kind 4) stays: it keeps a late handoff of the message out (Ruling 27).
+            "DELETE FROM mailbox_status_ahead WHERE conversation=?1 AND sender_peer=?2 AND msg_id=?3 AND kind<>4",
+            params![
+                conversation.0.as_slice(),
+                sender_peer.0.as_slice(),
+                key.id.0.as_slice()
+            ],
         )
         .map_err(sql)?;
     }
     let revision = bump(tx)?;
     tx.execute(
         "UPDATE conversation SET lamport_max=max(lamport_max,?2),unread=unread+?4,change_revision=?3 WHERE id=?1",
-        params![conversation.0.as_slice(), lamport, integer(revision)?, i64::from(!own)],
+        params![
+            conversation.0.as_slice(),
+            lamport,
+            integer(revision)?,
+            i64::from(!own && !seen)
+        ],
     )
     .map_err(sql)?;
-    Ok(Stored::Yes)
+    Ok(Stored::New)
+}
+
+/// A text another own device handed over as plaintext (M6 spec 6.3) because this device could
+/// not open the logged ciphertext hashing to `ct_hash`. Stored under its logical key by the
+/// rules `open_app` stores an opened text with (`store_text`: a copy of my own text as sent and
+/// seen, the other account's as unread, what `mailbox_status_ahead` kept applied), and with the
+/// ciphertext hash as its payload hash like every text received over MLS, and its `processed_ct`
+/// row (codec 2). Nothing else `open_app` writes: no log entry, no receipt now (the peer has its
+/// `Delivered` from the other device; a later Read follows spec 6.4). `peer` is the
+/// conversation's other account. True when it was stored just now; false when it is here
+/// already or not taken.
+pub(super) fn store_plain(
+    tx: &Transaction<'_>,
+    identity: Identity,
+    record: &PlainRecord,
+    peer: PeerId,
+    ct_hash: &[u8; 32],
+    now: u64,
+) -> R<bool> {
+    let own = record.sender_peer == identity.peer;
+    if record.kind != 1
+        || record.sender_install == identity.installation
+        || (!own && peer != record.sender_peer)
+        || super::store::conversation_id(identity.peer, peer)? != record.conversation
+    {
+        return Ok(false);
+    }
+    // My other device's copy may be the first message of the conversation here.
+    if own {
+        ensure_conversation(tx, record.conversation, peer)?;
+    }
+    let message = ChatMessage {
+        msg_id: record.msg_id,
+        lamport: record.lamport,
+        prev_hash: record.prev_hash,
+        sent_at_ms: record.sent_at_ms,
+        content: Content::Text {
+            body: record.body.clone(),
+        },
+    };
+    let stored = store_text(
+        tx,
+        record.sender_peer,
+        record.sender_install,
+        record.conversation,
+        &message,
+        &record.body,
+        ct_hash,
+        integer(now)?,
+        own,
+    )?;
+    if !matches!(stored, Stored::New) {
+        return Ok(false);
+    }
+    // Ruling 24: the ciphertext counts as taken here (codec 2), as `open_app` would have
+    // recorded it. The row is then a text received over MLS (`received_over_mls`), so a later
+    // Read is sealed in the group or waits for one, never sent as an M4 receipt; and the same
+    // ciphertext arriving again is answered as already processed.
+    tx.execute(
+        "INSERT OR IGNORE INTO processed_ct VALUES(2,?1,?2,?3,?4)",
+        params![
+            record.sender_peer.0.as_slice(),
+            record.sender_install.0.as_slice(),
+            ct_hash.as_slice(),
+            integer(now)?
+        ],
+    )
+    .map_err(sql)?;
+    Ok(true)
 }
 
 // ---- test-hooks fixtures -------------------------------------------------------------------
@@ -1367,8 +1764,12 @@ mod tests {
             open_app(
                 c,
                 identity,
-                a_peer,
-                a_device.installation_id(),
+                &OpenFrom {
+                    peer: a_peer,
+                    transport: a_device.installation_id(),
+                    allowed: vec![a_device.installation_id()],
+                    pull: None,
+                },
                 conversation,
                 ciphertext.clone(),
                 5,

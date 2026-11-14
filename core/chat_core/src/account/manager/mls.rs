@@ -28,8 +28,8 @@ use crate::account::{
 use crate::message::mls_group::{
     Committed, Delivery, DueDelivery, GroupOp, GroupReply, Outcome, OwnWelcome,
 };
-use crate::message::store::{MessageDbOp, MessageDbReply, conversation_id};
-use crate::message::types::ConversationId;
+use crate::message::store::{MessageDbOp, MessageDbReply, OpenFrom, conversation_id};
+use crate::message::types::{BlockReason, ConversationId};
 use crate::message::wire::{Frame, RejectReason};
 use crate::mls::{
     group::{CLASS_FUTURE_EPOCH, CLASS_OTHER, CLASS_OUT_OF_ORDER, inspect_key_package},
@@ -47,6 +47,12 @@ const RETRY_MS: u64 = 2_000;
 const LOOKUP_RETRY_MS: u64 = 30_000;
 /// Pause before planning again while the own Commit is unacknowledged.
 const SYNC_RETRY_MS: u64 = 1_000;
+/// A recipient of a queued Commit/Welcome without a session is dialed at most this often.
+const DIAL_RETRY_MS: u64 = 30_000;
+/// Limit for one such dial and its handshake.
+const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
+/// The queued deliveries are looked through for recipients to dial at most this often.
+const DIAL_CHECK_MS: u64 = 1_000;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often an empty `mls_hold` is looked at again (rows can be written outside this actor).
@@ -92,6 +98,11 @@ enum Phase {
         peer: PeerId,
         waiting: BTreeSet<InstallationId>,
         key_packages: Vec<Vec<u8>>,
+        /// The peer account's installations asked; whether one of them sent a KeyPackage, and
+        /// whether one answered `ContactRequired` (it has not added this account).
+        peer_devices: BTreeSet<InstallationId>,
+        peer_answered: bool,
+        peer_refused: bool,
     },
     Joining {
         since: u64,
@@ -126,6 +137,11 @@ pub(crate) struct Runtime {
     collecting: BTreeMap<ConversationId, Collect>,
     /// One delivery per recipient of a conversation at a time, in epoch order.
     pub(super) inflight: BTreeSet<(ConversationId, InstallationId)>,
+    /// When each recipient of a queued delivery without a session was last dialed (or found not
+    /// to be dialed), within `DIAL_RETRY_MS`.
+    dials: BTreeMap<InstallationId, u64>,
+    /// Scheduler time from which `dial_unreachable` may read the queue again.
+    dial_check_at: u64,
     /// `(rejoin_count, rejoin_after_ms)` of a conversation that left its group to rejoin, for
     /// the group it joins or creates next.
     rejoins: BTreeMap<ConversationId, (u32, u64)>,
@@ -172,14 +188,22 @@ pub(crate) struct Runtime {
     /// Every kind 16/17 request frame this actor sent (group requests and message attempts).
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     pub(super) frames: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    /// The recipient and label of every kind 17 request frame this actor sent.
     #[cfg(all(feature = "test-hooks", debug_assertions))]
-    sent: Vec<String>,
+    sent: Vec<(InstallationId, String)>,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     held: u64,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     rejoined: u64,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     recovered: u64,
+    /// While true, the dials `start_dial` spawns wait before they connect.
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    dial_hold: tokio::sync::watch::Sender<bool>,
+    /// How many connections this actor finished with: results of the dials `start_dial`
+    /// spawned, and accepted ones.
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    pub(super) settled: u64,
 }
 
 /// Back-off of an installation that refused kind 17.
@@ -232,11 +256,38 @@ enum Task {
     Lookup {
         peer: PeerId,
     },
+    /// A dial of a delivery recipient that had no session.
+    Dial,
 }
 
 enum Answer {
     Reply(Result<MlsReply, ErrorCode>),
     Lookup(Result<Lookup, CoreError>),
+    /// A dial run outside the actor (`dial_unreachable`): the connection and its proof.
+    Dial(Result<(iroh::endpoint::Connection, auth::AuthGrant), CoreError>),
+}
+
+/// Who made a received kind 17 request: the account and installation that sent it (its MLS
+/// sender), which for an entry of another own device's log (M6) is not the session's device.
+/// An `App` it carries may have been sealed by any current device of that account (M6 spec 7).
+#[derive(Clone, Copy)]
+pub(super) struct Origin {
+    pub peer: PeerId,
+    pub installation: InstallationId,
+}
+
+/// How a received kind 17 request reached this device.
+pub(super) enum Via {
+    /// Over an authenticated session with the device that sent it; it waits for the answer.
+    Direct(Session),
+    /// Entry `seq` of own device `holder`'s log (M6 sync): nobody waits for an answer, and
+    /// nothing is sent to the original sender.
+    Mailbox {
+        holder: InstallationId,
+        // Names the entry for the plaintext hand-over (Task 7).
+        #[allow(dead_code)]
+        seq: u64,
+    },
 }
 
 /// The answer to one kind 17 request, or one record lookup, this actor started.
@@ -339,6 +390,8 @@ pub(crate) enum MlsTest {
     Rejoin(PeerId),
     HoldDelivery(bool),
     Sent,
+    SentTo(InstallationId),
+    CloseSession(InstallationId),
     Held,
     Rejoined,
     Recovered,
@@ -347,16 +400,22 @@ pub(crate) enum MlsTest {
     M4Peer(bool),
     M4Close(bool),
     Frames,
+    Exchange(InstallationId, MlsFrame),
+    HoldDials(bool),
+    Dial(PeerId, InstallationId),
+    Sessions,
 }
 #[cfg(all(feature = "test-hooks", debug_assertions))]
 pub(crate) enum MlsTestReply {
     State(GroupState),
+    Reply(MlsReply),
     Allowed(bool),
     Done,
     Sent(Vec<String>),
     Count(u64),
     Answers(Vec<(InstallationId, bool)>),
     Frames(Vec<Vec<u8>>),
+    Sessions(u64, Vec<(InstallationId, bool)>),
 }
 
 #[cfg(all(feature = "test-hooks", debug_assertions))]
@@ -388,6 +447,25 @@ impl AccountHandle {
             MlsTestReply::Sent(sent) => Ok(sent),
             _ => unreachable!(),
         }
+    }
+    /// Every kind 17 frame this actor sent to `installation`, as `op` or `op:content type`.
+    pub async fn mls_test_sent_frames_to(
+        &self,
+        installation: InstallationId,
+    ) -> Result<Vec<String>, CoreError> {
+        match self.mls_test(MlsTest::SentTo(installation)).await? {
+            MlsTestReply::Sent(sent) => Ok(sent),
+            _ => unreachable!(),
+        }
+    }
+    /// Closes this device's sessions with `installation` (both ends see the connection close).
+    pub async fn mls_test_close_session(
+        &self,
+        installation: InstallationId,
+    ) -> Result<(), CoreError> {
+        self.mls_test(MlsTest::CloseSession(installation))
+            .await
+            .map(|_| ())
     }
     /// How many received Commits/Welcomes were held for a missing device.
     pub async fn mls_test_held_total(&self) -> Result<u64, CoreError> {
@@ -450,6 +528,46 @@ impl AccountHandle {
             _ => unreachable!(),
         }
     }
+    /// Sends `frame` as is to `installation` (any account) over the ready session with it and
+    /// returns the answer; a kind 16 refusal is its error code.
+    pub async fn mls_test_exchange(
+        &self,
+        installation: InstallationId,
+        frame: MlsFrame,
+    ) -> Result<MlsReply, CoreError> {
+        match self
+            .mls_test(MlsTest::Exchange(installation, frame))
+            .await?
+        {
+            MlsTestReply::Reply(reply) => Ok(reply),
+            _ => unreachable!(),
+        }
+    }
+    /// Holds the dials this core spawns (`start_dial`) before they connect, or lets them go.
+    pub async fn mls_test_hold_dials(&self, hold: bool) -> Result<(), CoreError> {
+        self.mls_test(MlsTest::HoldDials(hold)).await.map(|_| ())
+    }
+    /// Spawns a dial of `peer`'s device `installation` (`start_dial`); false when there is no
+    /// record to dial it under.
+    pub async fn mls_test_dial(
+        &self,
+        peer: PeerId,
+        installation: InstallationId,
+    ) -> Result<bool, CoreError> {
+        match self.mls_test(MlsTest::Dial(peer, installation)).await? {
+            MlsTestReply::Allowed(started) => Ok(started),
+            _ => unreachable!(),
+        }
+    }
+    /// How many connections this core finished with so far (results of the dials it spawned,
+    /// and connections it accepted), and its live ready sessions: with which installation, and
+    /// whether this device dialed it.
+    pub async fn mls_test_sessions(&self) -> Result<(u64, Vec<(InstallationId, bool)>), CoreError> {
+        match self.mls_test(MlsTest::Sessions).await? {
+            MlsTestReply::Sessions(settled, sessions) => Ok((settled, sessions)),
+            _ => unreachable!(),
+        }
+    }
 }
 
 impl Manager {
@@ -469,7 +587,31 @@ impl Manager {
                 self.messages.mls.hold_delivery = hold;
                 MlsTestReply::Done
             }
-            MlsTest::Sent => MlsTestReply::Sent(self.messages.mls.sent.clone()),
+            MlsTest::Sent => MlsTestReply::Sent(
+                self.messages
+                    .mls
+                    .sent
+                    .iter()
+                    .map(|(_, label)| label.clone())
+                    .collect(),
+            ),
+            MlsTest::SentTo(installation) => MlsTestReply::Sent(
+                self.messages
+                    .mls
+                    .sent
+                    .iter()
+                    .filter(|(to, _)| *to == installation)
+                    .map(|(_, label)| label.clone())
+                    .collect(),
+            ),
+            MlsTest::CloseSession(installation) => {
+                for session in self.auth.registry.0.lock().unwrap().iter() {
+                    if session.grant.installation == installation {
+                        session.conn.close(0u32.into(), b"test close");
+                    }
+                }
+                MlsTestReply::Done
+            }
             MlsTest::M4Peer(m4) => {
                 self.messages.mls.m4_peer = m4;
                 self.messages.mls.m4_close = false;
@@ -483,9 +625,41 @@ impl Manager {
             MlsTest::Frames => {
                 MlsTestReply::Frames(self.messages.mls.frames.lock().unwrap().clone())
             }
+            MlsTest::Exchange(installation, frame) => {
+                // Test only: this actor waits on the answer.
+                let session = self
+                    .mls_sessions()
+                    .into_iter()
+                    .find(|s| s.grant.installation == installation)
+                    .ok_or_else(|| unavailable(ErrorCode::PeerNotConnected))?;
+                let reply = exchange(&session, &frame.encode())
+                    .await
+                    .map_err(unavailable)?;
+                MlsTestReply::Reply(reply)
+            }
             MlsTest::Held => MlsTestReply::Count(self.messages.mls.held),
             MlsTest::Rejoined => MlsTestReply::Count(self.messages.mls.rejoined),
             MlsTest::Recovered => MlsTestReply::Count(self.messages.mls.recovered),
+            MlsTest::HoldDials(hold) => {
+                self.messages.mls.dial_hold.send_replace(hold);
+                MlsTestReply::Done
+            }
+            MlsTest::Dial(peer, installation) => {
+                let request = self.ready()?;
+                MlsTestReply::Allowed(self.start_dial(peer, installation, request))
+            }
+            MlsTest::Sessions => MlsTestReply::Sessions(
+                self.messages.mls.settled,
+                self.auth
+                    .registry
+                    .0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|s| s.ready && s.conn.close_reason().is_none())
+                    .map(|s| (s.grant.installation, s.conn.side().is_client()))
+                    .collect(),
+            ),
             MlsTest::AskKeyPackage(peer) => {
                 // Test only: this actor waits on the answers.
                 let body = MlsFrame::KeyPackageRequest.encode().to_vec();
@@ -564,7 +738,10 @@ impl Manager {
     fn launch(&mut self, session: &Session, body: Vec<u8>, task: Task, request: Request) {
         #[cfg(all(feature = "test-hooks", debug_assertions))]
         {
-            self.messages.mls.sent.push(label(&body));
+            self.messages
+                .mls
+                .sent
+                .push((session.grant.installation, label(&body)));
             self.messages.mls.frames.lock().unwrap().push(body.clone());
         }
         let mailbox = self.auth.send.clone();
@@ -768,7 +945,7 @@ impl Manager {
 
     /// The peer of a conversation a request may concern: the sending account itself when it is
     /// a contact, or, for this account's other devices, the contact the conversation is with.
-    fn conversation_peer(&self, conversation: ConversationId, sender: PeerId) -> Option<PeerId> {
+    pub(super) fn conversation_peer(&self, conversation: ConversationId, sender: PeerId) -> Option<PeerId> {
         let local = self.local().ok()?;
         let own = local.keys.peer_id();
         if sender == own {
@@ -932,6 +1109,17 @@ impl Manager {
         Ok(GroupState::WaitingForPeer)
     }
 
+    /// The user retried a text of the conversation: a group setup that is backing off asks
+    /// again at the text's next attempt instead of after the back-off.
+    pub(super) fn retry_group_now(&mut self, conversation: ConversationId) {
+        if matches!(
+            self.messages.mls.phases.get(&conversation),
+            Some(Phase::Idle { .. })
+        ) {
+            self.messages.mls.phases.remove(&conversation);
+        }
+    }
+
     fn idle(&mut self, conversation: ConversationId) {
         let until = self.schedule_now().saturating_add(RETRY_MS);
         self.messages
@@ -1028,6 +1216,13 @@ impl Manager {
                 peer,
                 waiting: sessions.iter().map(|s| s.grant.installation).collect(),
                 key_packages: Vec::new(),
+                peer_devices: sessions
+                    .iter()
+                    .filter(|s| s.grant.peer == peer)
+                    .map(|s| s.grant.installation)
+                    .collect(),
+                peer_answered: false,
+                peer_refused: false,
             },
         );
         let body = MlsFrame::KeyPackageRequest.encode().to_vec();
@@ -1052,24 +1247,54 @@ impl Manager {
         let Some(Phase::Collecting {
             waiting,
             key_packages,
+            peer_devices,
+            peer_answered,
+            peer_refused,
             ..
         }) = self.messages.mls.phases.get_mut(&conversation)
         else {
             return Ok(());
         };
         waiting.remove(&installation);
-        if let Ok(MlsReply::KeyPackage(bytes)) = result {
-            key_packages.push(bytes);
+        let of_peer = peer_devices.contains(&installation);
+        match result {
+            Ok(MlsReply::KeyPackage(bytes)) => {
+                key_packages.push(bytes);
+                *peer_answered |= of_peer;
+            }
+            Ok(MlsReply::ContactRequired) => *peer_refused |= of_peer,
+            _ => {}
         }
         if !waiting.is_empty() {
             return Ok(());
         }
         let Some(Phase::Collecting {
-            peer, key_packages, ..
+            peer,
+            key_packages,
+            peer_answered,
+            peer_refused,
+            ..
         }) = self.messages.mls.phases.remove(&conversation)
         else {
             return Ok(());
         };
+        if peer_refused && !peer_answered {
+            // The peer has not added this account: M4's contact hold (spec 3, 4.4a). Nothing is
+            // asked again; the texts waiting for the group stay held until the user's retry.
+            match self
+                .message_db(
+                    MessageDbOp::BlockPending(conversation, BlockReason::ContactRequired),
+                    request,
+                )
+                .await
+            {
+                Ok(_) => {
+                    self.messages.mls.wanted.remove(&conversation);
+                }
+                Err(_) => self.idle(conversation),
+            }
+            return Ok(());
+        }
         if key_packages.is_empty() {
             self.idle(conversation);
             return Ok(());
@@ -1435,17 +1660,23 @@ impl Manager {
 
     /// Sends due Commits/Welcomes over ready sessions, one per recipient of a conversation at a
     /// time and in epoch order. Only rows of recipients with a ready session are read, so a
-    /// recipient without one simply waits (no attempt counted) and never holds others back.
+    /// recipient without one waits (no attempt counted) and never holds others back; it is
+    /// dialed instead (`dial_unreachable`).
     async fn poll_deliveries(&mut self, request: Request) {
         #[cfg(all(feature = "test-hooks", debug_assertions))]
         if self.messages.mls.hold_delivery {
             return;
         }
         let sessions = self.mls_sessions();
+        let now = self.schedule_now();
+        self.deliver_due(&sessions, now, request).await;
+        self.dial_unreachable(&sessions, now, request).await;
+    }
+
+    async fn deliver_due(&mut self, sessions: &[Session], now: u64, request: Request) {
         if sessions.is_empty() {
             return;
         }
-        let now = self.schedule_now();
         let recipients = sessions.iter().map(|s| s.grant.installation).collect();
         let Ok(GroupReply::Due(rows)) = self
             .group_db(
@@ -1484,6 +1715,243 @@ impl Manager {
             };
             self.launch(session, row.body, task, request);
         }
+    }
+
+    /// Dials one recipient of a due delivery that has no session (spec 10.1): a device in this
+    /// account's record (not a revoked one), or else in the conversation peer's record; any
+    /// other recipient is not dialed. The queue is read at most once per `DIAL_CHECK_MS` (not
+    /// every tick), one dial is started per read, and one per installation within
+    /// `DIAL_RETRY_MS`. No lookup: the record this device holds is used, and a stale record or
+    /// one with a conflict pending is left to the hold and record-review flows (no dial). The
+    /// dial and handshake run in a spawned task; `dialed` installs the session.
+    async fn dial_unreachable(&mut self, sessions: &[Session], now: u64, request: Request) {
+        if now < self.messages.mls.dial_check_at {
+            return;
+        }
+        self.messages.mls.dial_check_at = now.saturating_add(DIAL_CHECK_MS);
+        self.messages
+            .mls
+            .dials
+            .retain(|_, at| now < at.saturating_add(DIAL_RETRY_MS));
+        let Ok(GroupReply::Unreachable(rows)) = self
+            .group_db(NO_CONVERSATION, GroupOp::UnreachableDue { now }, request)
+            .await
+        else {
+            return;
+        };
+        let rows: Vec<_> = rows
+            .into_iter()
+            .filter(|(_, to)| {
+                !sessions.iter().any(|s| s.grant.installation == *to)
+                    && !self.messages.mls.dials.contains_key(to)
+            })
+            .collect();
+        if rows.is_empty() {
+            return;
+        }
+        let Ok(GroupReply::Groups(groups)) = self
+            .group_db(NO_CONVERSATION, GroupOp::Groups, request)
+            .await
+        else {
+            return;
+        };
+        for (conversation, recipient) in rows {
+            if self.messages.mls.dials.contains_key(&recipient) {
+                continue;
+            }
+            self.messages.mls.dials.insert(recipient, now);
+            let Some(peer) = groups
+                .iter()
+                .find(|(c, _)| *c == conversation)
+                .and_then(|(_, peer)| self.recipient_account(*peer, recipient))
+            else {
+                continue;
+            };
+            if self.start_dial(peer, recipient, request) {
+                return;
+            }
+        }
+    }
+
+    /// Spawns the dial of `peer`'s device `installation` under the record this device holds;
+    /// false when there is no record to dial it under.
+    pub(super) fn start_dial(
+        &mut self,
+        peer: PeerId,
+        installation: InstallationId,
+        request: Request,
+    ) -> bool {
+        if !self.local_authorized() {
+            return false;
+        }
+        let Some(record) = self.held_record(peer) else {
+            return false;
+        };
+        let Some(id) = self
+            .dial_target(peer, &record, installation)
+            .and_then(|key| iroh::EndpointId::from_bytes(&key).ok())
+        else {
+            return false;
+        };
+        let Some(AccountState::Active(local)) = self.copy_state() else {
+            return false;
+        };
+        let shared = self.shared.clone();
+        let clock = self.services.clock.clone();
+        let cancel = self.auth.cancel.child_token();
+        let mailbox = self.auth.send.clone();
+        let ticket = request.ticket;
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        let mut hold = self.messages.mls.dial_hold.subscribe();
+        tokio::spawn(async move {
+            #[cfg(all(feature = "test-hooks", debug_assertions))]
+            tokio::select! {biased;
+                _ = cancel.cancelled() => {},
+                _ = hold.wait_for(|held| !*held) => {},
+            }
+            let mut conn = None;
+            let work = async {
+                if !super::messages::acquisition_current(&shared, ticket) {
+                    return Err(unavailable(ErrorCode::StorageLocked));
+                }
+                let connected = shared
+                    .network
+                    .dial_account(iroh::EndpointAddr::from(id))
+                    .await?;
+                conn = Some(connected.clone());
+                if !super::messages::acquisition_current(&shared, ticket) {
+                    return Err(unavailable(ErrorCode::StorageLocked));
+                }
+                // A device presenting another record than this one fails the handshake. The
+                // record it showed is not observed here: record changes belong to the lookup
+                // and record-review flows (a lagging device must not raise a conflict).
+                let mut evidence = None;
+                let grant = auth::authenticate(
+                    connected.clone(),
+                    peer,
+                    &local,
+                    &record,
+                    &*clock,
+                    &mut evidence,
+                    None,
+                )
+                .await?;
+                Ok((connected, grant))
+            };
+            let result = tokio::select! {biased;
+                _ = cancel.cancelled() => Err(unavailable(ErrorCode::StorageLocked)),
+                result = tokio::time::timeout(DIAL_TIMEOUT, work) =>
+                    result.unwrap_or_else(|_| Err(unavailable(ErrorCode::NetworkTimeout))),
+            };
+            if result.is_err()
+                && let Some(conn) = &conn
+            {
+                conn.close(0u32.into(), b"account authentication failed");
+            }
+            let _ = mailbox
+                .send(Input::Mls(MlsEvent {
+                    ticket,
+                    peer,
+                    installation: None,
+                    task: Task::Dial,
+                    answer: Answer::Dial(result),
+                }))
+                .await;
+        });
+        true
+    }
+
+    /// `peer`'s record as this device holds it, if it is fit to authenticate with: current, not
+    /// expired and (another account's) without a conflict pending.
+    fn held_record(&self, peer: PeerId) -> Option<crate::account::publication::SignedRecord> {
+        let local = self.local().ok()?;
+        let record = if peer == local.keys.peer_id() {
+            local.records.accepted.clone()?
+        } else {
+            let remote = local.remote.iter().find(|r| r.peer == peer)?;
+            if remote.conflict.is_some() || remote.accepted.seq < remote.floor {
+                return None;
+            }
+            remote.accepted.clone()
+        };
+        let now = self.services.clock.unix_seconds();
+        (record.current(now) && !record.record.is_expired(now)).then_some(record)
+    }
+
+    /// A spawned dial came back: the session is installed (checked again here, as for
+    /// `connect_account`).
+    async fn dialed(
+        &mut self,
+        dialed: Result<(iroh::endpoint::Connection, auth::AuthGrant), CoreError>,
+    ) {
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        {
+            self.messages.mls.settled += 1;
+        }
+        if let Ok((conn, grant)) = dialed {
+            let _ = self.install_grant(conn, grant, None).await;
+        }
+    }
+
+    /// The account to dial `recipient` under: this one if its record lists the device (none if
+    /// this account revoked it), else the conversation's `peer` if its record lists it.
+    fn recipient_account(&self, peer: PeerId, recipient: InstallationId) -> Option<PeerId> {
+        let local = self.local().ok()?;
+        let lists = |record: &crate::account::publication::SignedRecord| {
+            record
+                .record
+                .devices
+                .iter()
+                .any(|d| d.installation_id == recipient)
+        };
+        if local.records.accepted.as_ref().is_some_and(lists) {
+            let revoked = local
+                .records
+                .tombstones
+                .iter()
+                .any(|t| t.target_installation == recipient);
+            return (!revoked).then(|| local.keys.peer_id());
+        }
+        local
+            .remote
+            .iter()
+            .find(|r| r.peer == peer)
+            .filter(|r| lists(&r.accepted))
+            .map(|_| peer)
+    }
+
+    /// The current devices of `peer` as this device holds its record: those its accepted
+    /// record lists, and for this account without the ones it revoked (by installation or
+    /// transport key, as the group's leaf vetting drops them).
+    fn current_installations(&self, peer: PeerId) -> Vec<InstallationId> {
+        let Ok(local) = self.local() else {
+            return Vec::new();
+        };
+        let record = if peer == local.keys.peer_id() {
+            local.records.accepted.as_ref()
+        } else {
+            local
+                .remote
+                .iter()
+                .find(|r| r.peer == peer)
+                .map(|r| &r.accepted)
+        };
+        let Some(record) = record else {
+            return Vec::new();
+        };
+        let own = peer == local.keys.peer_id();
+        record
+            .record
+            .devices
+            .iter()
+            .filter(|d| {
+                !own || !local.records.tombstones.iter().any(|t| {
+                    t.target_installation == d.installation_id
+                        || t.target_transport == d.transport_public_key
+                })
+            })
+            .map(|d| d.installation_id)
+            .collect()
     }
 
     fn mls_fingerprint(&self) -> [u8; 32] {
@@ -1629,6 +2097,7 @@ impl Manager {
             (Task::Lookup { peer }, Answer::Lookup(lookup)) => {
                 self.looked_up(peer, lookup, request).await
             }
+            (_, Answer::Dial(dialed)) => self.dialed(dialed).await,
             (task, Answer::Reply(result)) => {
                 let _ = self.mls_answer(task, result, request).await;
             }
@@ -1712,7 +2181,7 @@ impl Manager {
                 };
                 self.group_db(conversation, op, request).await.map(|_| ())
             }
-            Task::Lookup { .. } => Ok(()),
+            Task::Lookup { .. } | Task::Dial => Ok(()),
         }
     }
 
@@ -1737,12 +2206,17 @@ impl Manager {
                 .envelope()
                 .to_vec());
         }
+        let from = Origin {
+            peer: session.grant.peer,
+            installation: session.grant.installation,
+        };
+        let via = Via::Direct(session);
         let reply = match MlsFrame::decode(inner) {
             Ok(MlsFrame::App {
                 conversation,
                 ciphertext,
             }) => match self
-                .receive_app(&session, conversation, ciphertext, request)
+                .receive_app(from, conversation, ciphertext, &via, request)
                 .await
             {
                 Ok(Some(reply)) => reply,
@@ -1763,7 +2237,7 @@ impl Manager {
                 }
                 Err(_) => MlsReply::Busy,
             },
-            Ok(frame) => match self.mls_request(&session, frame, request).await {
+            Ok(frame) => match self.mls_request(from, frame, &via, request).await {
                 Ok(reply) => reply,
                 Err(error)
                     if matches!(
@@ -1784,13 +2258,17 @@ impl Manager {
         Ok(reply.encode().to_vec())
     }
 
-    async fn mls_request(
+    /// A kind 17 request other than `App`, made by `from`. Authority (contact rule, member
+    /// leaves) is decided by `from`, however it came; what needs the session (asking the sender
+    /// back) runs only `Via::Direct`.
+    pub(super) async fn mls_request(
         &mut self,
-        session: &Session,
+        from: Origin,
         frame: MlsFrame,
+        via: &Via,
         request: Request,
     ) -> Result<MlsReply, CoreError> {
-        let sender = session.grant.peer;
+        let sender = from.peer;
         let now = self.schedule_now();
         // An authenticated kind 17 request from another account shows it speaks MLS (for the
         // M4-refusal decision only; the downgrade guard needs an accepted App/Commit/Welcome).
@@ -1798,7 +2276,7 @@ impl Manager {
             .local()
             .is_ok_and(|local| local.keys.peer_id() != sender)
         {
-            self.speaks_mls(session.grant.installation);
+            self.speaks_mls(from.installation);
         }
         Ok(match frame {
             MlsFrame::GroupQuery { conversation } => {
@@ -1824,7 +2302,7 @@ impl Manager {
                 }
                 // Each KeyPackage keeps private keys here until it is used: an installation gets
                 // at most one per `KEY_PACKAGE_GAP_MS`, and only its newest few are kept.
-                let asker = session.grant.installation;
+                let asker = from.installation;
                 let (handed, last) = self
                     .messages
                     .mls
@@ -1865,8 +2343,7 @@ impl Manager {
                     .ok()
                     .and_then(|info| MlsCredential::decode(&info.credential).ok());
                 if !asker.is_some_and(|credential| {
-                    credential.peer == sender
-                        && credential.installation == session.grant.installation
+                    credential.peer == sender && credential.installation == from.installation
                 }) {
                     return Ok(MlsReply::Busy);
                 }
@@ -1899,6 +2376,10 @@ impl Manager {
                     });
                 };
                 let ct_hash = sha256(&commit);
+                // Ruling 25: a logged Commit that cannot be vetted because the peer's record is
+                // not here is held and the record looked up (as for a missing device), so the
+                // log behind it goes on.
+                let logged = matches!(via, Via::Mailbox { .. }).then(|| commit.clone());
                 let op = GroupOp::ApplyCommit {
                     peer,
                     sender_peer: sender,
@@ -1906,8 +2387,20 @@ impl Manager {
                     commit,
                     now,
                 };
-                let GroupReply::Outcome(outcome) = self.group_db(conversation, op, request).await?
-                else {
+                let result = match (self.group_db(conversation, op, request).await, logged) {
+                    (Err(error), Some(commit)) if error.code == ErrorCode::RecordUnavailable => {
+                        let op = GroupOp::HoldCommit {
+                            peer,
+                            sender_peer: sender,
+                            epoch,
+                            commit,
+                            now,
+                        };
+                        self.group_db(conversation, op, request).await
+                    }
+                    (result, _) => result,
+                };
+                let GroupReply::Outcome(outcome) = result? else {
                     return Ok(MlsReply::Busy);
                 };
                 match outcome {
@@ -1923,7 +2416,7 @@ impl Manager {
                     }
                 }
                 if sender == peer && matches!(outcome, Outcome::Ack | Outcome::Adopted) {
-                    self.peer_spoke(conversation, session.grant.installation, request)
+                    self.peer_spoke(conversation, from.installation, request)
                         .await?;
                 }
                 let reply = match outcome {
@@ -1946,10 +2439,10 @@ impl Manager {
                 welcome,
                 sender_install,
             } => {
-                let Some(from) = self.welcome_peer(conversation, sender) else {
+                let Some(welcome_from) = self.welcome_peer(conversation, sender) else {
                     return Ok(MlsReply::ContactRequired);
                 };
-                if sender_install != session.grant.installation {
+                if sender_install != from.installation {
                     return Ok(MlsReply::Busy);
                 }
                 let ct_hash = sha256(&welcome);
@@ -1960,12 +2453,14 @@ impl Manager {
                     .remove(&(conversation, sender_install))
                 else {
                     // Learn the group's first-Commit hash from the sender; its next attempt
-                    // is joined.
-                    if self
-                        .messages
-                        .mls
-                        .learning
-                        .insert((conversation, sender_install))
+                    // is joined. A logged Welcome has no sender to ask: the sender's own
+                    // delivery of it is joined instead.
+                    if let Via::Direct(session) = via
+                        && self
+                            .messages
+                            .mls
+                            .learning
+                            .insert((conversation, sender_install))
                     {
                         let body = MlsFrame::GroupQuery { conversation }.encode().to_vec();
                         let task = Task::Learn {
@@ -1976,7 +2471,7 @@ impl Manager {
                     }
                     return Ok(MlsReply::Busy);
                 };
-                let peer = match from {
+                let peer = match welcome_from {
                     WelcomeFrom::Contact(peer) => peer,
                     WelcomeFrom::OwnDevice => match self
                         .own_welcome_peer(conversation, &welcome, sender_install, request)
@@ -2022,7 +2517,7 @@ impl Manager {
                     _ => {}
                 }
                 if sender == peer && matches!(outcome, Outcome::Ack | Outcome::Joined) {
-                    self.peer_spoke(conversation, session.grant.installation, request)
+                    self.peer_spoke(conversation, from.installation, request)
                         .await?;
                 }
                 self.after_outcome(conversation, peer, outcome, request)
@@ -2106,16 +2601,22 @@ impl Manager {
         self.group_db(conversation, op, request).await.map(|_| ())
     }
 
-    /// A received application message (spec 5.2): opened and stored in one transaction. `None`
-    /// when it carried a text M4 would refuse (nothing stored; the ratchet still moved).
-    async fn receive_app(
+    /// A received application message (spec 5.2): opened and stored in one transaction. Its MLS
+    /// sender may be any current device of `from`'s account, not only the one that carried it
+    /// (M6 spec 7: a mailbox hands it over as is); that leaf is its sender. `None` when it
+    /// carried a text M4
+    /// would refuse (nothing stored; the ratchet still moved). A text from the other account
+    /// stored just now is notified: at once `Via::Direct`, with the rest of the sync
+    /// `Via::Mailbox`; so is my read on another own device.
+    pub(super) async fn receive_app(
         &mut self,
-        session: &Session,
+        from: Origin,
         conversation: ConversationId,
         ciphertext: Vec<u8>,
+        via: &Via,
         request: Request,
     ) -> Result<Option<MlsReply>, CoreError> {
-        let sender = session.grant.peer;
+        let sender = from.peer;
         // Application messages come from the conversation's peer account, or (spec 5.3) are a
         // copy of what another device of this account sent in a conversation with a contact.
         let own = sender == self.local()?.keys.peer_id();
@@ -2125,31 +2626,66 @@ impl Manager {
         else {
             return Ok(Some(MlsReply::ContactRequired));
         };
+        let open = OpenFrom {
+            peer: sender,
+            transport: from.installation,
+            allowed: self.current_installations(sender),
+            pull: match via {
+                Via::Mailbox { holder, .. } => Some(*holder),
+                Via::Direct(_) => None,
+            },
+        };
         let op = MessageDbOp::OpenApp(
-            sender,
-            session.grant.installation,
+            open,
             conversation,
             ciphertext,
             self.services.clock.wall_ms(),
         );
         let result = self.message_db(op, request).await;
         if result.is_ok() && !own {
-            self.speaks_mls(session.grant.installation);
+            self.speaks_mls(from.installation);
         }
         match result {
             Ok(MessageDbReply::Opened(reply)) => Ok(Some(reply)),
-            Ok(MessageDbReply::OpenedText(reply, _key)) => {
+            Ok(MessageDbReply::OpenedText(reply, key, new)) => {
                 // The keyed response checkpoint of tests: the Ack that stores this text.
                 #[cfg(all(feature = "test-hooks", debug_assertions))]
-                {
-                    self.messages.ack_key = Some(_key);
+                if matches!(via, Via::Direct(_)) {
+                    self.messages.ack_key = Some(key);
+                }
+                if new {
+                    self.text_stored(key, via, request).await;
                 }
                 Ok(Some(reply))
             }
+            // My read on another own device: shown here as read, its notification cleared.
+            Ok(MessageDbReply::OpenedRead(reply, conversation)) => {
+                self.read_synced(conversation, via, request).await;
+                Ok(Some(reply))
+            }
             Ok(MessageDbReply::Rejected) => Ok(None),
-            Ok(MessageDbReply::FarAhead { epoch }) => Ok(Some(
-                self.move_epoch(conversation, peer, epoch, request).await?,
-            )),
+            // Sealed by a device of the account that is not current here. Directly: refused,
+            // whoever carries it. From another own device's log (final review I3): that device
+            // took it while the leaf was current (it was a member of the group the message
+            // opened in), so it is not taken from the ciphertext but goes to the plaintext
+            // hand-over (spec 6.3), not skipped.
+            Ok(MessageDbReply::NotCurrent) => match via {
+                Via::Direct(_) => Ok(None),
+                Via::Mailbox { .. } => Ok(Some(MlsReply::DecryptFailed {
+                    class: CLASS_OTHER,
+                    epoch: 0,
+                })),
+            },
+            Ok(MessageDbReply::FarAhead { epoch }) => match via {
+                Via::Direct(_) => Ok(Some(
+                    self.move_epoch(conversation, peer, epoch, request).await?,
+                )),
+                // No sender waits to seal it again in a new epoch: it is not opened here.
+                Via::Mailbox { .. } => Ok(Some(MlsReply::DecryptFailed {
+                    class: CLASS_OUT_OF_ORDER,
+                    epoch,
+                })),
+            },
             Ok(_) => Err(unavailable(ErrorCode::InvalidMessage)),
             // The MLS sender is not the authenticated device, or the message conflicts.
             Err(error)

@@ -17,6 +17,10 @@ required-features = ["harness"]
 name = "cli"
 required-features = ["harness"]
 
+[[test]]
+name = "relay_ticket"
+required-features = ["harness"]
+
 [dependencies]
 chat_core = { path = "../../core/chat_core" }
 clap = { version = "4", features = ["derive"] }

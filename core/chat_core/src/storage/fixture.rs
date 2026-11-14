@@ -2,6 +2,8 @@
 pub use crate::account::storage::migration_fixtures::{
     MlsAccount, assert_account_preserved, migration_states, mls_account,
 };
+pub use crate::message::mailbox_store::{HandoffRow, MailboxPage, MailboxRow, MailboxState};
+use crate::message::mailbox_store::{MailboxDbOp, MailboxDbReply};
 pub use crate::message::mls_store::{MlsOutbox, MlsState};
 pub use crate::message::store::MessageFacts;
 use crate::message::mls_group::{Committed, GroupOp, GroupReply, Outcome};
@@ -45,8 +47,8 @@ impl Messages {
     pub async fn retry_send(&self, key: MessageKey, now_ms: u64) -> Result<MessageView,CoreError> {
         self.0.retry_send(key,now_ms).await
     }
-    pub async fn cancel_send(&self, key: MessageKey) -> Result<MessageView,CoreError> {
-        self.0.cancel_send(key).await
+    pub async fn cancel_send(&self, key: MessageKey, now_ms: u64) -> Result<MessageView,CoreError> {
+        self.0.cancel_send(key,now_ms).await
     }
     async fn mls(&self, op: MessageDbOp) -> Result<MessageDbReply, CoreError> {
         self.0.operation(op).await
@@ -85,12 +87,26 @@ impl Messages {
         first_commit_hash: [u8; 32],
         now: u64,
     ) -> Result<u64, CoreError> {
+        let nobody = crate::account::InstallationId([0; 32]);
+        self.mls_join_group_from(conversation, peer, nobody, welcome, first_commit_hash, now)
+            .await
+    }
+    /// `mls_join_group` with the Welcome sent by `sender_install` of `peer`.
+    pub async fn mls_join_group_from(
+        &self,
+        conversation: ConversationId,
+        peer: crate::account::PeerId,
+        sender_install: crate::account::InstallationId,
+        welcome: Vec<u8>,
+        first_commit_hash: [u8; 32],
+        now: u64,
+    ) -> Result<u64, CoreError> {
         let op = MessageDbOp::MlsGroupOp(
             conversation,
             GroupOp::Join {
                 peer,
                 sender_peer: peer,
-                sender_install: crate::account::InstallationId([0; 32]),
+                sender_install,
                 welcome,
                 first_commit_hash,
                 rejoin: None,
@@ -214,6 +230,8 @@ impl Messages {
             _ => unreachable!(),
         }
     }
+    /// A ciphertext `installation` of `sender` carried itself, the one current device of its
+    /// account here.
     pub async fn mls_open_app(
         &self,
         sender: crate::account::PeerId,
@@ -222,9 +240,26 @@ impl Messages {
         ciphertext: Vec<u8>,
         now: u64,
     ) -> Result<crate::mls::wire::MlsReply, CoreError> {
-        let op = MessageDbOp::OpenApp(sender, installation, conversation, ciphertext, now);
+        self.mls_open_app_from(sender, installation, vec![installation], conversation, ciphertext, now)
+            .await
+    }
+    /// `mls_open_app` carried by `transport` of `sender`'s account, whose current devices are
+    /// `allowed` (any of them may have sealed it, M6 spec 7).
+    pub async fn mls_open_app_from(
+        &self,
+        sender: crate::account::PeerId,
+        transport: crate::account::InstallationId,
+        allowed: Vec<crate::account::InstallationId>,
+        conversation: ConversationId,
+        ciphertext: Vec<u8>,
+        now: u64,
+    ) -> Result<crate::mls::wire::MlsReply, CoreError> {
+        let from = crate::message::store::OpenFrom { peer: sender, transport, allowed, pull: None };
+        let op = MessageDbOp::OpenApp(from, conversation, ciphertext, now);
         match self.mls(op).await? {
-            MessageDbReply::Opened(reply) | MessageDbReply::OpenedText(reply, _) => Ok(reply),
+            MessageDbReply::Opened(reply)
+            | MessageDbReply::OpenedText(reply, ..)
+            | MessageDbReply::OpenedRead(reply, _) => Ok(reply),
             // Without the actor no new epoch is made: the sender is told it is out of order.
             MessageDbReply::FarAhead { epoch } => Ok(crate::mls::wire::MlsReply::DecryptFailed {
                 class: crate::mls::group::CLASS_OUT_OF_ORDER,
@@ -232,6 +267,8 @@ impl Messages {
             }),
             // Answered with the M4 `Reject(InvalidMessage)` on the wire.
             MessageDbReply::Rejected => Err(CoreError::new(ErrorCode::InvalidMessage, "mls_text_rejected")),
+            // Refused for its leaf, as the actor does on a direct session.
+            MessageDbReply::NotCurrent => Err(CoreError::new(ErrorCode::InvalidMessage, "mls_leaf_not_current")),
             _ => unreachable!(),
         }
     }
@@ -251,7 +288,7 @@ impl Messages {
     }
     /// The user saw these received messages (queues their `Read` receipt jobs).
     pub async fn mark_read(&self, conversation: ConversationId, keys: Vec<MessageKey>, now: u64) -> Result<(), CoreError> {
-        match self.mls(MessageDbOp::MarkRead(conversation, keys, now)).await? {
+        match self.mls(MessageDbOp::MarkRead(conversation, keys, now, now)).await? {
             MessageDbReply::Done => Ok(()),
             _ => unreachable!(),
         }
@@ -325,6 +362,73 @@ impl Messages {
             _ => unreachable!(),
         }
     }
+    async fn mailbox(&self, op: MailboxDbOp) -> Result<MailboxDbReply, CoreError> {
+        match self.0.operation(MessageDbOp::Mailbox(op)).await? {
+            MessageDbReply::Mailbox(reply) => Ok(reply),
+            _ => unreachable!(),
+        }
+    }
+    /// The page served to own device `puller` for its `SyncReq { since_seq }`.
+    pub async fn mailbox_page(&self, puller: crate::account::InstallationId, since_seq: u64, now: u64) -> Result<MailboxPage, CoreError> {
+        match self.mailbox(MailboxDbOp::Page { puller, since_seq, now }).await? {
+            MailboxDbReply::Page(page) => Ok(page),
+            _ => unreachable!(),
+        }
+    }
+    pub async fn mailbox_pulled(&self, holder: crate::account::InstallationId, next_seq: u64) -> Result<u64, CoreError> {
+        match self.mailbox(MailboxDbOp::Pulled { holder, next_seq }).await? {
+            MailboxDbReply::Since(since) => Ok(since),
+            _ => unreachable!(),
+        }
+    }
+    pub async fn mailbox_pull_from(&self, holder: crate::account::InstallationId) -> Result<u64, CoreError> {
+        match self.mailbox(MailboxDbOp::PullFrom(holder)).await? {
+            MailboxDbReply::Since(since) => Ok(since),
+            _ => unreachable!(),
+        }
+    }
+    /// The account's other devices that are not revoked; how many entries were pruned.
+    pub async fn mailbox_devices(&self, others: Vec<crate::account::InstallationId>, now: u64) -> Result<u64, CoreError> {
+        match self.mailbox(MailboxDbOp::Devices { others, now }).await? {
+            MailboxDbReply::Count(n) => Ok(n),
+            _ => unreachable!(),
+        }
+    }
+    pub async fn mailbox_prune(&self, now: u64) -> Result<u64, CoreError> {
+        match self.mailbox(MailboxDbOp::Prune(now)).await? {
+            MailboxDbReply::Count(n) => Ok(n),
+            _ => unreachable!(),
+        }
+    }
+    /// Applies a note as if it was pulled from another own device's log; rows it changed.
+    pub async fn mailbox_apply_note(&self, entry: LogEntry, now: u64) -> Result<u64, CoreError> {
+        match self.mailbox(MailboxDbOp::ApplyNote { entry, now }).await? {
+            MailboxDbReply::Count(n) => Ok(n),
+            _ => unreachable!(),
+        }
+    }
+    /// The plaintext record this device hands over for entry `seq` of its log.
+    pub async fn mailbox_plain(&self, seq: u64) -> Result<Option<PlainRecord>, CoreError> {
+        match self.mailbox(MailboxDbOp::Plain { seq }).await? {
+            MailboxDbReply::Plain(record) => Ok(record),
+            _ => unreachable!(),
+        }
+    }
+    /// Stores a handed-over plaintext record (conversation peer, ciphertext hash); whether it
+    /// was stored just now.
+    pub async fn mailbox_store_plain(
+        &self,
+        record: PlainRecord,
+        peer: crate::account::PeerId,
+        ct_hash: [u8; 32],
+        now: u64,
+    ) -> Result<bool, CoreError> {
+        let holder = crate::account::InstallationId([0; 32]);
+        match self.mailbox(MailboxDbOp::StorePlain { record: Box::new(record), peer, ct_hash, holder, now }).await? {
+            MailboxDbReply::Stored(stored) => Ok(stored),
+            _ => unreachable!(),
+        }
+    }
     pub fn local_peer(&self) -> crate::account::PeerId {
         self.0.local_peer()
     }
@@ -373,6 +477,11 @@ pub struct DbProbe {
     /// Canonical, type-tagged dump of every `message` row (all columns, primary-key order).
     pub message_rows: Vec<u8>,
     pub outbox: Vec<OutboxProbe>,
+    /// Canonical dump of every table that exists in v2 (all columns, row order), keyed by name.
+    /// `storage_meta` omits `schema_version`, the one column a later upgrade rewrites.
+    pub v2_rows: Vec<(String, Vec<u8>)>,
+    /// `mailbox_local` rows as (singleton, enabled, first_link_shown); empty before v3.
+    pub mailbox_local: Vec<(i64, i64, i64)>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboxProbe {
@@ -429,11 +538,34 @@ DROP TABLE outbox;
 ALTER TABLE outbox_v1 RENAME TO outbox;
 CREATE INDEX outbox_due ON outbox(dispatch_state,next_retry_at_ms,conversation);
 ";
+const V2_DOWNGRADE: &str = "
+DROP TABLE mailbox_store;
+DROP TABLE mailbox_cursor;
+DROP TABLE mailbox_pull;
+DROP TABLE mailbox_status_ahead;
+DROP TABLE mailbox_handoff;
+DROP TABLE mailbox_local;
+DROP TABLE mailbox_device;
+DROP TABLE mailbox_uptime;
+DROP TABLE mailbox_notify;
+CREATE TABLE storage_meta_v2 (
+    singleton INTEGER PRIMARY KEY NOT NULL CHECK(singleton = 1),
+    schema_version INTEGER NOT NULL CHECK(schema_version = 2),
+    db_id BLOB NOT NULL CHECK(length(db_id) = 16),
+    binding BLOB NOT NULL,
+    legacy_hash BLOB CHECK(legacy_hash IS NULL OR length(legacy_hash) = 32),
+    migration_ready INTEGER NOT NULL CHECK(migration_ready IN (0, 1)),
+    message_revision INTEGER NOT NULL CHECK(message_revision BETWEEN 0 AND 9223372036854775807)
+) STRICT;
+INSERT INTO storage_meta_v2
+    SELECT singleton,2,db_id,binding,legacy_hash,migration_ready,message_revision FROM storage_meta;
+DROP TABLE storage_meta;
+ALTER TABLE storage_meta_v2 RENAME TO storage_meta;
+";
 fn probe_error(_: rusqlite::Error) -> CoreError {
     CoreError::new(ErrorCode::StorageCorrupt, "fixture_probe_failed")
 }
 fn probe(c: &rusqlite::Connection) -> Result<DbProbe, CoreError> {
-    use rusqlite::types::ValueRef;
     let user_version = c
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .map_err(probe_error)?;
@@ -460,36 +592,34 @@ fn probe(c: &rusqlite::Connection) -> Result<DbProbe, CoreError> {
         .map_err(probe_error)?
         .collect::<Result<_, _>>()
         .map_err(probe_error)?;
-    let mut message_rows = Vec::new();
-    let mut message_count = 0;
-    {
-        let mut stmt = c
-            .prepare("SELECT * FROM message ORDER BY conversation,sender_peer,sender_install,msg_id")
-            .map_err(probe_error)?;
-        let columns = stmt.column_count();
-        let mut rows = stmt.query([]).map_err(probe_error)?;
-        while let Some(row) = rows.next().map_err(probe_error)? {
-            message_count += 1;
-            for i in 0..columns {
-                match row.get_ref(i).map_err(probe_error)? {
-                    ValueRef::Null => message_rows.push(0),
-                    ValueRef::Integer(n) => {
-                        message_rows.push(1);
-                        message_rows.extend(n.to_be_bytes());
-                    }
-                    ValueRef::Real(f) => {
-                        message_rows.push(2);
-                        message_rows.extend(f.to_be_bytes());
-                    }
-                    ValueRef::Text(t) | ValueRef::Blob(t) => {
-                        message_rows.push(3);
-                        message_rows.extend((t.len() as u64).to_be_bytes());
-                        message_rows.extend(t);
-                    }
-                }
-            }
+    let (message_rows, message_count) = dump_rows(
+        c,
+        "SELECT * FROM message ORDER BY conversation,sender_peer,sender_install,msg_id",
+    )?;
+    let mut v2_rows = Vec::new();
+    for table in &tables {
+        if table.starts_with("mailbox_") || table == "sqlite_sequence" {
+            continue;
         }
+        let sql = if table == "storage_meta" {
+            "SELECT singleton,db_id,binding,legacy_hash,migration_ready,message_revision \
+             FROM storage_meta ORDER BY rowid"
+                .to_string()
+        } else {
+            format!("SELECT * FROM {table} ORDER BY rowid")
+        };
+        v2_rows.push((table.clone(), dump_rows(c, &sql)?.0));
     }
+    let mailbox_local = if tables.iter().any(|t| t == "mailbox_local") {
+        c.prepare("SELECT singleton,enabled,first_link_shown FROM mailbox_local ORDER BY singleton")
+            .map_err(probe_error)?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .map_err(probe_error)?
+            .collect::<Result<_, _>>()
+            .map_err(probe_error)?
+    } else {
+        Vec::new()
+    };
     let has_v2_columns = c
         .query_row(
             "SELECT count(*) FROM pragma_table_info('outbox') WHERE name='reencrypts'",
@@ -533,7 +663,40 @@ fn probe(c: &rusqlite::Connection) -> Result<DbProbe, CoreError> {
         message_count,
         message_rows,
         outbox,
+        v2_rows,
+        mailbox_local,
     })
+}
+/// Canonical, type-tagged dump of every row `sql` returns, and the row count.
+fn dump_rows(c: &rusqlite::Connection, sql: &str) -> Result<(Vec<u8>, u64), CoreError> {
+    use rusqlite::types::ValueRef;
+    let mut out = Vec::new();
+    let mut count = 0;
+    let mut stmt = c.prepare(sql).map_err(probe_error)?;
+    let columns = stmt.column_count();
+    let mut rows = stmt.query([]).map_err(probe_error)?;
+    while let Some(row) = rows.next().map_err(probe_error)? {
+        count += 1;
+        for i in 0..columns {
+            match row.get_ref(i).map_err(probe_error)? {
+                ValueRef::Null => out.push(0),
+                ValueRef::Integer(n) => {
+                    out.push(1);
+                    out.extend(n.to_be_bytes());
+                }
+                ValueRef::Real(f) => {
+                    out.push(2);
+                    out.extend(f.to_be_bytes());
+                }
+                ValueRef::Text(t) | ValueRef::Blob(t) => {
+                    out.push(3);
+                    out.extend((t.len() as u64).to_be_bytes());
+                    out.extend(t);
+                }
+            }
+        }
+    }
+    Ok((out, count))
 }
 
 /// What `Messages::mls_create_group` produced for the peer.
@@ -742,6 +905,65 @@ impl Fixture {
         self.handle.0.test(TestOp::Message(FixtureOp::MlsGlobalRows(plant, tx))).await;
         rx.await.unwrap()
     }
+    /// Writes one raw `mls_kv` row (key, value as given) into `conversation`'s scope.
+    pub async fn mls_plant_row(&self, conversation: ConversationId, key: Vec<u8>, value: Vec<u8>) -> Result<(), CoreError> {
+        let (tx, rx) = oneshot::channel();
+        self.handle.0.test(TestOp::Message(FixtureOp::MlsPlantRow(conversation, key, value, tx))).await;
+        rx.await.unwrap()
+    }
+    /// The device log, cursors and pulls, and counts of the other per-device tables.
+    pub async fn mailbox_state(&self) -> Result<MailboxState, CoreError> {
+        let (tx, rx) = oneshot::channel();
+        self.handle.0.test(TestOp::Message(FixtureOp::MailboxState(tx))).await;
+        rx.await.unwrap()
+    }
+    /// The database size in bytes, `page_count × page_size`.
+    pub async fn db_bytes(&self) -> Result<u64, CoreError> {
+        let (tx, rx) = oneshot::channel();
+        self.handle.0.test(TestOp::Message(FixtureOp::DbBytes(tx))).await;
+        rx.await.unwrap()
+    }
+    /// Records a `Frame` entry (fixed ids) with `body` at `now`; its seq, or `None` if refused.
+    pub async fn mailbox_record(&self, body: Vec<u8>, now: u64) -> Result<Option<u64>, CoreError> {
+        let (tx, rx) = oneshot::channel();
+        self.handle.0.test(TestOp::Message(FixtureOp::MailboxRecord(body, now, tx))).await;
+        rx.await.unwrap()
+    }
+    /// Records a `Frame` entry with `body` as sent by `sender_install` of `sender_peer` in
+    /// `conversation`; its seq, or `None` if refused.
+    pub async fn mailbox_record_as(
+        &self,
+        conversation: ConversationId,
+        sender_peer: crate::account::PeerId,
+        sender_install: crate::account::InstallationId,
+        body: Vec<u8>,
+        now: u64,
+    ) -> Result<Option<u64>, CoreError> {
+        let (tx, rx) = oneshot::channel();
+        let op = FixtureOp::MailboxRecordAs(conversation, sender_peer, sender_install, body, now, tx);
+        self.handle.0.test(TestOp::Message(op)).await;
+        rx.await.unwrap()
+    }
+    /// A `mailbox_device` and a `mailbox_handoff` row of `installation`, and a
+    /// `mailbox_status_ahead` row, all at `at`.
+    pub async fn mailbox_seed(&self, installation: crate::account::InstallationId, at: u64) -> Result<(), CoreError> {
+        let (tx, rx) = oneshot::channel();
+        self.handle.0.test(TestOp::Message(FixtureOp::MailboxSeed(installation, at, tx))).await;
+        rx.await.unwrap()
+    }
+    /// Records `installation` as a mailbox device of this account, or not, as its `Announce`
+    /// does (for a test that needs it recorded at a precise moment).
+    pub async fn mailbox_mark(&self, installation: crate::account::InstallationId, mailbox: bool, at: u64) -> Result<(), CoreError> {
+        let (tx, rx) = oneshot::channel();
+        self.handle.0.test(TestOp::Message(FixtureOp::MailboxMark(installation, mailbox, at, tx))).await;
+        rx.await.unwrap()
+    }
+    /// Deletes the message and what refers to it, as deleting its conversation would.
+    pub async fn drop_message(&self, key: MessageKey) -> Result<(), CoreError> {
+        let (tx, rx) = oneshot::channel();
+        self.handle.0.test(TestOp::Message(FixtureOp::DropMessage(key, tx))).await;
+        rx.await.unwrap()
+    }
     pub async fn due_hint(&self, now: u64) -> Result<bool, CoreError> {
         self.handle.0.due_hint(now).await
     }
@@ -807,7 +1029,7 @@ impl Fixture {
             })
         })
     }
-    /// Rewrite a closed, migrated store into the exact M4 (schema v1) shape: the four MLS tables
+    /// Rewrite a closed, migrated store into the exact M4 (schema v1) shape: the mailbox and MLS tables
     /// and the v2 outbox columns go away, `user_version` and `schema_version` return to 1, and
     /// every queued row becomes the M4 plaintext job (codec 1) with the canonical text frame an
     /// M4 app would have queued for it. Only valid while no row is sealed (codec 2).
@@ -850,9 +1072,72 @@ impl Fixture {
                 )
                 .map_err(probe_error)?;
             }
+            tx.execute_batch(V2_DOWNGRADE).map_err(probe_error)?;
             tx.execute_batch(V1_DOWNGRADE).map_err(probe_error)?;
             tx.pragma_update(None, "user_version", 1).map_err(probe_error)?;
             tx.commit().map_err(probe_error)
+        })
+    }
+    /// Rewrite a closed, migrated store into the exact M5 (schema v2) shape: the mailbox tables
+    /// go away and `user_version` and `schema_version` return to 2.
+    pub fn downgrade_to_v2(root: &Path, p: Arc<dyn KeyProtector>) -> Result<(), CoreError> {
+        crate::storage::migration::with_raw_connection(root, &*p, |c| {
+            let tx = c.transaction().map_err(probe_error)?;
+            tx.execute_batch(V2_DOWNGRADE).map_err(probe_error)?;
+            tx.pragma_update(None, "user_version", 2).map_err(probe_error)?;
+            tx.commit().map_err(probe_error)
+        })
+    }
+    /// Give a closed v2 store's first conversation two `mls_kv` rows and an `mls_conversation`
+    /// row, and seal its first outbox row (codec 2) so both outbox codecs are present.
+    pub fn seed_v2_rows(root: &Path, p: Arc<dyn KeyProtector>) -> Result<(), CoreError> {
+        crate::storage::migration::with_raw_connection(root, &*p, |c| {
+            let tx = c.transaction().map_err(probe_error)?;
+            let conversation: Vec<u8> = tx
+                .query_row("SELECT id FROM conversation ORDER BY id LIMIT 1", [], |r| r.get(0))
+                .map_err(probe_error)?;
+            for (key, value) in [(b"k1", b"v1"), (b"k2", b"v2")] {
+                tx.execute(
+                    "INSERT INTO mls_kv VALUES(?1,?2,?3)",
+                    rusqlite::params![[7u8; 32].as_slice(), key.as_slice(), value.as_slice()],
+                )
+                .map_err(probe_error)?;
+            }
+            tx.execute(
+                "INSERT INTO mls_conversation VALUES(?1,?2,?3,5,NULL,0,0,0,1,NULL)",
+                rusqlite::params![conversation, [9u8; 16].as_slice(), [8u8; 32].as_slice()],
+            )
+            .map_err(probe_error)?;
+            tx.execute(
+                "UPDATE outbox SET codec=2,wire=x'0a0b' WHERE msg_id=(SELECT min(msg_id) FROM outbox)",
+                [],
+            )
+            .map_err(probe_error)?;
+            tx.commit().map_err(probe_error)
+        })
+    }
+    /// On a closed v3 store: insert three `mailbox_store` rows, delete them all, insert one more,
+    /// and return that row's `seq`.
+    pub fn mailbox_seq_after_clearing(root: &Path, p: Arc<dyn KeyProtector>) -> Result<i64, CoreError> {
+        crate::storage::migration::with_raw_connection(root, &*p, |c| {
+            let tx = c.transaction().map_err(probe_error)?;
+            let insert = |n: u8| {
+                tx.execute(
+                    "INSERT INTO mailbox_store(conversation,sender_peer,sender_install,kind,msg_id,hash,body,recorded_at_ms) \
+                     VALUES(?1,?1,?1,1,NULL,?2,x'01',0)",
+                    rusqlite::params![[1u8; 32].as_slice(), [n; 32].as_slice()],
+                )
+            };
+            for n in 0..3 {
+                insert(n).map_err(probe_error)?;
+            }
+            tx.execute("DELETE FROM mailbox_store", []).map_err(probe_error)?;
+            insert(3).map_err(probe_error)?;
+            let seq = tx
+                .query_row("SELECT seq FROM mailbox_store", [], |r| r.get(0))
+                .map_err(probe_error)?;
+            tx.commit().map_err(probe_error)?;
+            Ok(seq)
         })
     }
     /// Inspect a closed store without upgrading it.
@@ -863,6 +1148,12 @@ impl Fixture {
     pub fn v1_reader_check(root: &Path, p: Arc<dyn KeyProtector>) -> Result<(), CoreError> {
         crate::storage::migration::with_raw_connection(root, &*p, |c| {
             crate::storage::migration::ready_v1(c)
+        })
+    }
+    /// Run the M5 (v2) reader's version check against a closed store.
+    pub fn v2_reader_check(root: &Path, p: Arc<dyn KeyProtector>) -> Result<(), CoreError> {
+        crate::storage::migration::with_raw_connection(root, &*p, |c| {
+            crate::storage::migration::ready_v2(c)
         })
     }
     /// The next schema upgrade of the store under `root` fails after its DDL, before commit.
@@ -971,3 +1262,10 @@ impl Fixture {
 pub use crate::message::wire::{decode as decode_message, Frame as MessageFrame};
 pub use crate::account::MessageMutation;
 pub use crate::mls::wire::{MlsFrame, MlsReply};
+pub use crate::mailbox::wire::{
+    EntryBody, HandoffEntry, LogEntry, MailboxFrame, MailboxReply, PlainRecord,
+};
+pub const MAILBOX_MAX_ENTRY_BODY: usize = crate::mailbox::wire::MAX_ENTRY_BODY;
+pub fn mailbox_page(entries: impl Iterator<Item = LogEntry>) -> (Vec<LogEntry>, bool) {
+    crate::mailbox::wire::page(entries)
+}

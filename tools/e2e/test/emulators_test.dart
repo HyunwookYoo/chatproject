@@ -507,6 +507,59 @@ void main() {
     expect(runner.stopped, ['emulator-5554']);
   });
 
+  test('ensure turns animations off and waits for the post-boot load before it saves the snapshot', () async {
+    final avdHome = await Directory.systemTemp.createTemp('avd_home_');
+    addTearDown(() => avdHome.delete(recursive: true));
+    var clock = DateTime(2026);
+    final loads = ['18.40 9.10 3.20 5/900 4000', '1.90 5.00 3.00 1/900 4000', '1.60 2.10 2.00 1/900 4000', '1.50 1.90 2.00 1/900 4000'];
+    var reads = 0;
+    final runner = FakeRunner((exe, args) {
+      if (args.first == 'devices') return ok('List of devices attached\n');
+      if (args.contains('getprop')) return ok('1\n');
+      if (args.contains('nproc')) return ok('2\n');
+      if (args.contains('/proc/loadavg')) return ok('${loads[reads++]}\n');
+      if (args.contains('create')) writeConfig(avdHome);
+      if (args.contains('save')) writeSnapshot(avdHome);
+      return ok('');
+    });
+    final emulators = Emulators(sdk: AndroidSdk('/sdk', windows: false), runner: runner,
+      avdHome: avdHome.path, config: AvdConfig.load(ci: false), checkPort: (_) async {},
+      now: () => clock, sleep: (duration) async { clock = clock.add(duration); });
+    await emulators.ensure(testEmulators.first);
+    for (final scale in ['window_animation_scale', 'transition_animation_scale', 'animator_duration_scale']) {
+      expect(runner.calls.any((c) => c.endsWith('-s emulator-5554 shell settings put global $scale 0')), isTrue);
+    }
+    // Both the 1- and the 5-minute load must be at most one per CPU (2): a
+    // dip of the 1-minute load (1.90 with 5.00) is not the end of the work.
+    expect(reads, 4);
+    final saved = runner.calls.indexWhere((c) => c.endsWith('emu avd snapshot save clean'));
+    expect(saved, greaterThan(runner.calls.lastIndexWhere((c) => c.contains('/proc/loadavg'))));
+    expect(saved, greaterThan(runner.calls.lastIndexWhere((c) => c.contains('animator_duration_scale'))));
+  });
+
+  test('ensure saves the snapshot after the settle timeout when the load stays high', () async {
+    final avdHome = await Directory.systemTemp.createTemp('avd_home_');
+    addTearDown(() => avdHome.delete(recursive: true));
+    var clock = DateTime(2026);
+    var reads = 0;
+    final runner = FakeRunner((exe, args) {
+      if (args.first == 'devices') return ok('List of devices attached\n');
+      if (args.contains('getprop')) return ok('1\n');
+      if (args.contains('nproc')) return ok('2\n');
+      if (args.contains('/proc/loadavg')) { reads++; return ok('30.00 30.00 30.00 9/900 4000\n'); }
+      if (args.contains('create')) writeConfig(avdHome);
+      if (args.contains('save')) writeSnapshot(avdHome);
+      return ok('');
+    });
+    final emulators = Emulators(sdk: AndroidSdk('/sdk', windows: false), runner: runner,
+      avdHome: avdHome.path, config: AvdConfig.load(ci: false), checkPort: (_) async {},
+      now: () => clock, sleep: (duration) async { clock = clock.add(duration); });
+    await emulators.ensure(testEmulators.first);
+    // 10 min of 15 s polls: the read at 0 s and one after each of the 40 sleeps.
+    expect(reads, 41);
+    expect(runner.calls.any((c) => c.endsWith('emu avd snapshot save clean')), isTrue);
+  });
+
   test('ensure waits for a running emulator to finish booting before it saves the snapshot', () async {
     final avdHome = await Directory.systemTemp.createTemp('avd_home_');
     addTearDown(() => avdHome.delete(recursive: true));
