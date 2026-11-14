@@ -42,6 +42,7 @@ use crate::push::{
     HandleRequest, Platform, PushConfig, PushError, PushProxy, PushResult, PushStatus,
     RenewSummary, Tag,
 };
+use crate::mailbox::wire::HandoffEntry;
 use push_wire::BASE64URL_NOPAD;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -316,6 +317,44 @@ impl Manager {
             self.push_send(batch, request.ticket);
         }
         Ok(MessageDbReply::Done)
+    }
+
+    /// The own texts of `entries` go to a mailbox now: those whose push is not decided yet (no
+    /// attempt had a result) are decided as reached by no device, and pushed (spec 6.1). Best
+    /// effort: a failure leaves them to their next attempt. Nothing without a proxy.
+    pub(super) async fn push_handed_off(&mut self, entries: &[HandoffEntry], request: Request) {
+        if self.messages.push.proxy.is_none() || entries.is_empty() {
+            return;
+        }
+        let Ok(local) = self.local() else {
+            return;
+        };
+        let (sender, installation) = (local.keys.peer_id(), local.device.installation_id());
+        let mut devices: BTreeMap<PeerId, Vec<InstallationId>> = BTreeMap::new();
+        let texts = entries
+            .iter()
+            .map(|entry| {
+                let key = MessageKey {
+                    conversation: entry.conversation,
+                    sender,
+                    installation,
+                    id: entry.msg_id,
+                };
+                let current = devices
+                    .entry(entry.peer)
+                    .or_insert_with(|| self.current_installations(entry.peer))
+                    .clone();
+                (key, current)
+            })
+            .collect();
+        if let Ok(PushDbReply::Batches(batches)) = self
+            .push_db(PushDbOp::HandedOff { texts }, request)
+            .await
+        {
+            for batch in batches {
+                self.push_send(batch, request.ticket);
+            }
+        }
     }
 
     /// Messages were read here just now (spec 7): the read clear goes `READ_CLEAR_MS` after the

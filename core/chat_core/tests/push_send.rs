@@ -209,6 +209,64 @@ async fn retries_and_mailbox_handoff_do_not_push_again() {
     assert_eq!(text_pushes(&proxy).len(), 1);
 }
 
+/// A1 goes to the background (handing the text to its mailbox A2) before any attempt of the
+/// text has a result, and may be suspended right after: the handoff itself pushes, once. A2
+/// never pushes, and A1's later attempts do not push again.
+#[tokio::test]
+async fn handoff_before_first_outcome_pushes_once() {
+    let (mut a, b1, net, conv) = accounts(&[A1, A2], &[B1]).await;
+    let a2 = a.pop().unwrap();
+    let a1 = a.pop().unwrap();
+    let proxy = proxy(&net);
+    let b1_id = installation(&b1).await;
+    android(&b1, "token-b1").await;
+    settle!(
+        [&a1, &a2, &b1],
+        peer_handle(&a1, conv, b1_id).await.flatten().is_some()
+            && peer_handle(&a2, conv, b1_id).await.flatten().is_some()
+    );
+    let handle = own_tag_handle(&b1, conv).await.unwrap();
+    for f in [&a1, &a2] {
+        f.account.push_configure(config(None)).unwrap();
+    }
+    a2.account.set_mailbox(true).await.unwrap();
+    let a2_id = installation(&a2).await;
+    a1.account
+        .storage_test_fixture()
+        .mailbox_mark(a2_id, true, NOW * 1000)
+        .await
+        .unwrap();
+    let b_peer = b1.peer;
+    let _b = stop(b1);
+    // No attempt starts: the text has no outcome when it is handed over.
+    a1.account.message_test_hold_scheduler(true).await.unwrap();
+    // The configuration is taken at the next poll.
+    quiet(&[&a1, &a2]).await;
+
+    let key = send_to(&a1, b_peer, 1, "handed over at once").await;
+    assert_eq!(outbox(&a1, key).await.attempts, 0);
+    assert_eq!(a1.account.mailbox_background().await.unwrap(), 1);
+    assert!(outbox(&a1, key).await.pushed);
+    settle!([&a1, &a2], !text_pushes(&proxy).is_empty());
+    let pushes = text_pushes(&proxy);
+    assert_eq!(pushes.len(), 1);
+    assert_eq!(pushes[0].items.len(), 1);
+    assert_eq!(pushes[0].items[0].handle, b64(&handle));
+    assert!(matches!(pushes[0].items[0].kind, PushItemKind::Cipher { .. }));
+
+    // A1's attempts and A2's handed-over retries push nothing more; a second handoff neither.
+    a1.account.message_test_hold_scheduler(false).await.unwrap();
+    settle!([&a1, &a2], !mailbox(&a2).await.handoff_rows.is_empty());
+    settle!(
+        [&a1, &a2],
+        outbox(&a1, key).await.attempts >= 3
+            && mailbox(&a2).await.handoff_rows[0].attempts >= 3
+    );
+    assert!(a1.account.mailbox_background().await.unwrap() >= 1);
+    quiet(&[&a1, &a2]).await;
+    assert_eq!(text_pushes(&proxy).len(), 1);
+}
+
 /// A text whose stripped ciphertext is over `PUSH_CIPHER_MAX` (the 16 KiB bucket) only wakes.
 #[tokio::test]
 async fn large_text_sends_wake() {

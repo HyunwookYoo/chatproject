@@ -235,6 +235,13 @@ pub(crate) enum PushDbOp {
         conversation: Option<ConversationId>,
         gone: Vec<(InstallationId, Vec<u8>)>,
     },
+    /// These own texts (each with its peer's current devices) go to a mailbox before their
+    /// first attempt had a result: their push is decided now as if no device was reached, in
+    /// one transaction (spec 6.1: the mailbox never pushes, and this device may be suspended
+    /// before its next attempt). Replies `Batches`.
+    HandedOff {
+        texts: Vec<(MessageKey, Vec<InstallationId>)>,
+    },
 }
 
 impl PushDbOp {
@@ -276,6 +283,8 @@ pub(crate) enum PushDbReply {
     Status(PushStatus),
     /// The push to send, if any.
     Batch(Option<PushBatch>),
+    /// The pushes to send, one per message.
+    Batches(Vec<PushBatch>),
 }
 
 pub(super) fn push_op(
@@ -499,6 +508,21 @@ pub(super) fn push_op(
             }
             finish(tx, fault)?;
             PushDbReply::Count(changed as u64)
+        }
+        PushDbOp::HandedOff { texts } => {
+            let tx = c.transaction().map_err(sql)?;
+            let mut batches = Vec::new();
+            for (key, devices) in texts {
+                let mut first = FirstAttempt {
+                    devices,
+                    reached: Vec::new(),
+                    batch: None,
+                };
+                first.decide(&tx, key)?;
+                batches.extend(first.batch);
+            }
+            finish(tx, fault)?;
+            PushDbReply::Batches(batches)
         }
     };
     Ok(MessageDbReply::Push(reply))
