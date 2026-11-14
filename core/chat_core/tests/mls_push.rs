@@ -199,13 +199,14 @@ async fn push_handle_opens_into_push_peer_not_messages() {
             .await
             .unwrap();
     assert_eq!(ack(&open(ct.clone()).await.unwrap()), hash(&ct));
-    let row = PushPeerRow {
+    let row = |handle: Option<Vec<u8>>, sent_at_ms: u64| PushPeerRow {
         conversation,
         installation: a.install,
-        handle: handle.clone(),
+        handle,
+        sent_at_ms,
         received_at_ms: NOW,
     };
-    assert_eq!(peers(&b).await, vec![row.clone()]);
+    assert_eq!(peers(&b).await, vec![row(Some(handle.clone()), 1_000)]);
     // Not a message: no row, nothing unread, nothing to notify. Taken (processed_ct) and in
     // the device log like any frame.
     let after = b.f().message_counts().await.unwrap();
@@ -219,7 +220,7 @@ async fn push_handle_opens_into_push_peer_not_messages() {
 
     // The same ciphertext again: acknowledged, nothing changes.
     assert_eq!(ack(&open(ct.clone()).await.unwrap()), hash(&ct));
-    assert_eq!(peers(&b).await, vec![row.clone()]);
+    assert_eq!(peers(&b).await, vec![row(Some(handle), 1_000)]);
     assert_eq!(b.f().message_counts().await.unwrap(), after);
 
     // A newer handle replaces it; the longest allowed one is kept.
@@ -229,13 +230,7 @@ async fn push_handle_opens_into_push_peer_not_messages() {
             .await
             .unwrap();
     ack(&open(ct).await.unwrap());
-    assert_eq!(
-        peers(&b).await,
-        vec![PushPeerRow {
-            handle: longest.clone(),
-            ..row.clone()
-        }]
-    );
+    assert_eq!(peers(&b).await, vec![row(Some(longest.clone()), 2_000)]);
 
     // A handle longer than `push_peer` takes is acknowledged and ignored.
     let ct =
@@ -243,25 +238,73 @@ async fn push_handle_opens_into_push_peer_not_messages() {
             .await
             .unwrap();
     ack(&open(ct).await.unwrap());
-    assert_eq!(
-        peers(&b).await,
-        vec![PushPeerRow {
-            handle: longest,
-            ..row
-        }]
-    );
+    assert_eq!(peers(&b).await, vec![row(Some(longest), 2_000)]);
 
-    // An empty handle withdraws it.
+    // An empty handle withdraws it: the row stays as a tombstone (handle NULL).
     let ct =
         a.m.mls_seal_push_handle(conversation, Vec::new(), 4_000)
             .await
             .unwrap();
     ack(&open(ct).await.unwrap());
-    assert_eq!(peers(&b).await, vec![]);
+    assert_eq!(peers(&b).await, vec![row(None, 4_000)]);
     let last = b.f().message_counts().await.unwrap();
     assert_eq!((last.0, last.2), (counts.0, counts.2));
     assert_eq!(
         unread(b.m.list_conversations(None, 50).await.unwrap()),
         unread_before
     );
+}
+
+/// `to` opens `from`'s ciphertext (acknowledged) and returns its `push_peer` rows.
+async fn open_then_peers(
+    from: &Side,
+    to: &Side,
+    conversation: ConversationId,
+    ct: Vec<u8>,
+) -> Vec<PushPeerRow> {
+    let reply =
+        to.m.mls_open_app(from.peer, from.install, conversation, ct, NOW)
+            .await
+            .unwrap();
+    ack(&reply);
+    peers(to).await
+}
+
+/// Ruling R10: frames arrive out of order (the device log, a hand-over); a `PushHandle` sent
+/// earlier than the stored one, or at the same time, never replaces it, whether that is a handle
+/// or a withdrawal.
+#[tokio::test]
+async fn older_push_handles_never_replace_newer_or_withdrawn() {
+    let (a, b, conversation, _) = linked().await;
+    let seal = |handle: &[u8], sent_at: u64| {
+        a.m.mls_seal_push_handle(conversation, handle.to_vec(), sent_at)
+    };
+    // Sealed in this order, opened below in another.
+    let h1 = seal(b"handle one", 1_000).await.unwrap();
+    let h2 = seal(b"handle two", 2_000).await.unwrap();
+    let h3 = seal(b"handle three", 2_500).await.unwrap();
+    let withdrawn = seal(b"", 3_000).await.unwrap();
+    let h4 = seal(b"handle four", 4_000).await.unwrap();
+    let h5 = seal(b"handle five", 4_000).await.unwrap();
+    let open = |ct: Vec<u8>| open_then_peers(&a, &b, conversation, ct);
+    let row = |handle: Option<&[u8]>, sent_at_ms: u64| {
+        vec![PushPeerRow {
+            conversation,
+            installation: a.install,
+            handle: handle.map(<[u8]>::to_vec),
+            sent_at_ms,
+            received_at_ms: NOW,
+        }]
+    };
+
+    // An older handle after a newer one: the newer stays.
+    assert_eq!(open(h2).await, row(Some(b"handle two"), 2_000));
+    assert_eq!(open(h1).await, row(Some(b"handle two"), 2_000));
+    // An older handle after a withdrawal: it stays withdrawn.
+    assert_eq!(open(withdrawn).await, row(None, 3_000));
+    assert_eq!(open(h3).await, row(None, 3_000));
+    // A newer handle after the withdrawal replaces it.
+    assert_eq!(open(h4).await, row(Some(b"handle four"), 4_000));
+    // The same send time: the stored row stays.
+    assert_eq!(open(h5).await, row(Some(b"handle four"), 4_000));
 }

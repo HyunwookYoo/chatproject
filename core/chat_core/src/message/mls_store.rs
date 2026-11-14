@@ -843,8 +843,9 @@ fn decrypt_failed(class: u8, epoch: u64) -> MessageDbReply {
 ///   there (spec 6.4): they are read here too, and no receipt goes from here. Its `Delivered`
 ///   receipt says nothing to this device and is dropped.
 /// * a `PushHandle` (M7 spec 5.2) is no message: from the other account it becomes (or, empty,
-///   removes) the `push_peer` row of the leaf that sealed it; another device of this account's
-///   is only taken. Neither is stored, counted unread or notified.
+///   withdraws) the `push_peer` row of the leaf that sealed it, unless that row is from a frame
+///   sent no earlier (Ruling R10); another device of this account's is only taken. Neither is
+///   stored, counted unread or notified.
 pub(super) fn open_app(
     c: &mut Connection,
     identity: Identity,
@@ -992,6 +993,7 @@ pub(super) fn open_app(
                         conversation,
                         sender_install,
                         handle,
+                        message.sent_at_ms,
                         now,
                     )?;
                 }
@@ -1840,17 +1842,20 @@ mod tests {
                 installation,
             } if ct_hash == hash && c == conversation && installation == a1.installation_id()
         ));
-        let stored: (Vec<u8>, Vec<u8>, Vec<u8>, i64) = b1_connection
-            .query_row("SELECT * FROM push_peer", [], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-            })
+        let stored: (Vec<u8>, Vec<u8>, Option<Vec<u8>>, i64, i64) = b1_connection
+            .query_row(
+                "SELECT conversation,installation,handle,sent_at_ms,received_at_ms FROM push_peer",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
             .unwrap();
         assert_eq!(
             stored,
             (
                 conversation.0.to_vec(),
                 a1.installation_id().0.to_vec(),
-                handle,
+                Some(handle),
+                1,
                 7
             )
         );

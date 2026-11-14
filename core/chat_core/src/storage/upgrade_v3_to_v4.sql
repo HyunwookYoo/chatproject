@@ -17,10 +17,12 @@ CREATE TABLE push_tag (
     announced INTEGER NOT NULL CHECK(announced IN (0,1))   -- 현재 handle(또는 철회)을 봉인했나
 ) STRICT;
 -- 상대 기기가 알린 handle: (대화, 상대 leaf installation)마다 최신 하나 (spec 5.2)
+-- handle NULL = 철회(묘비). sent_at_ms(그 frame의 ChatMessage.sent_at_ms)가 더 큰 것만 덮어쓴다 (Ruling R10)
 CREATE TABLE push_peer (
     conversation BLOB NOT NULL CHECK(length(conversation)=32),
     installation BLOB NOT NULL CHECK(length(installation)=32),
-    handle BLOB NOT NULL CHECK(length(handle) BETWEEN 1 AND 1024),
+    handle BLOB CHECK(handle IS NULL OR length(handle) BETWEEN 1 AND 1024),
+    sent_at_ms INTEGER NOT NULL CHECK(sent_at_ms>=0),
     received_at_ms INTEGER NOT NULL CHECK(received_at_ms>=0),
     PRIMARY KEY(conversation, installation)
 ) STRICT;
