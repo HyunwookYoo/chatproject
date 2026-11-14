@@ -158,6 +158,8 @@ impl CoreSlot {
     /// Native lifecycle callers do not wait for initialization or another slot caller.
     pub fn account_suspend(&self) -> i32 { self.account_lifecycle(true) }
     pub fn account_resume(&self) -> i32 { self.account_lifecycle(false) }
+    /// Whether the last lifecycle request was a suspension (iOS scene in the background).
+    pub fn account_suspended(&self) -> bool { self.gate.desired_suspend() }
     fn account_lifecycle(&self, suspend: bool) -> i32 {
         self.gate.lifecycle(suspend);
         let Ok(running) = self.running.try_lock() else { return 1; };

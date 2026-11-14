@@ -302,10 +302,56 @@ fn background_renew_in(
     timeout_ms: u32,
     provider: Provider,
 ) -> Result<u32, NativeError> {
-    let started = Instant::now();
+    let deadline = Instant::now() + Duration::from_millis(u64::from(timeout_ms));
     start_in(slot, bus, data_dir, None, Platform::Apns, provider)?;
-    let budget = Duration::from_millis(u64::from(timeout_ms)).saturating_sub(started.elapsed());
-    renew_in(slot, budget)
+    resumed_for(slot, deadline, |budget| renew_in(slot, budget))
+}
+
+/// Kept free at the end of a background renewal for suspending the account again.
+const LIFECYCLE_WAIT: Duration = Duration::from_secs(2);
+/// How often a lifecycle request is asked again while it is pending.
+const LIFECYCLE_LOOK: Duration = Duration::from_millis(10);
+
+/// Asks `request` (`account_suspend` / `account_resume`) until it completed (0), failed (2) or
+/// `until`; true when it completed.
+fn lifecycle_until(request: impl Fn() -> i32, until: Instant) -> bool {
+    loop {
+        match request() {
+            0 => return true,
+            1 if Instant::now() < until => std::thread::sleep(LIFECYCLE_LOOK),
+            _ => return false,
+        }
+    }
+}
+
+/// Suspends the account again when dropped, also after an error or a panic: iOS kills a
+/// suspended app that holds file locks (0xdead10cc).
+struct Resuspend<'a>(&'a CoreSlot);
+
+impl Drop for Resuspend<'_> {
+    fn drop(&mut self) {
+        let slot = self.0;
+        lifecycle_until(|| slot.account_suspend(), Instant::now() + LIFECYCLE_WAIT);
+    }
+}
+
+/// Runs `renew` with the budget left until `deadline`. An account the iOS scene suspended (the
+/// app is alive in the background) is resumed for it and suspended again before this returns;
+/// one that was not suspended is left as it was.
+fn resumed_for(
+    slot: &CoreSlot,
+    deadline: Instant,
+    renew: impl FnOnce(Duration) -> Result<u32, NativeError>,
+) -> Result<u32, NativeError> {
+    if !slot.account_suspended() {
+        return renew(deadline.saturating_duration_since(Instant::now()));
+    }
+    let _again = Resuspend(slot);
+    let until = deadline.checked_sub(LIFECYCLE_WAIT).unwrap_or(deadline);
+    if !lifecycle_until(|| slot.account_resume(), until) {
+        return Err(if Instant::now() < until { NativeError::core(ErrorCode::StorageLocked) } else { NativeError::Timeout });
+    }
+    renew(until.saturating_duration_since(Instant::now()))
 }
 
 /// `cp_push_renew`'s status for a renewal result.
@@ -779,6 +825,75 @@ mod tests {
         let result = background_renew_in(&slot, &bus, &root(&dir), 10_000, test_keys);
         assert!(slot.account().is_ok());
         assert!(matches!(result, Ok(0) | Err(NativeError::Core { .. })), "{result:?}");
+    }
+
+    /// Suspends `slot`'s account as `cp_account_suspend` does, until that completed.
+    fn suspend(slot: &CoreSlot) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while slot.account_suspend() != 0 {
+            assert!(Instant::now() < deadline, "suspension did not complete");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(slot.account_suspended());
+    }
+    /// The account is suspended and that completed (its storage locks are given up).
+    fn suspended_again(slot: &CoreSlot) {
+        assert!(slot.account_suspended());
+        assert_eq!(slot.account_suspend(), 0);
+    }
+    fn suspended_account() -> (tempfile::TempDir, CoreSlot, EventBus) {
+        let dir = tempfile::tempdir().unwrap();
+        let (slot, bus) = (CoreSlot::new(), EventBus::new());
+        start_in(&slot, &bus, &root(&dir), None, Platform::Apns, test_keys).unwrap();
+        suspend(&slot);
+        (dir, slot, bus)
+    }
+
+    /// Review finding (iOS): the app process is alive in the background, its scene suspended
+    /// the account. The background renewal resumes it, renews as for an account never
+    /// suspended, and leaves it suspended again.
+    #[test]
+    fn background_renewal_resumes_a_suspended_account_and_suspends_it_again() {
+        let control_dir = tempfile::tempdir().unwrap();
+        let control = background_renew_in(&CoreSlot::new(), &EventBus::new(), &root(&control_dir), 10_000, test_keys);
+        assert_ne!(control, Err(NativeError::core(ErrorCode::StorageLocked)));
+
+        let (dir, slot, bus) = suspended_account();
+        let result = background_renew_in(&slot, &bus, &root(&dir), 10_000, test_keys);
+        assert_eq!(result, control);
+        suspended_again(&slot);
+
+        // An account that was not suspended is left as it was found.
+        let (slot, bus) = (CoreSlot::new(), EventBus::new());
+        let other = tempfile::tempdir().unwrap();
+        assert_eq!(background_renew_in(&slot, &bus, &root(&other), 10_000, test_keys), control);
+        assert!(!slot.account_suspended());
+    }
+
+    /// A renewal that runs out of time still leaves the account suspended again.
+    #[test]
+    fn background_renewal_suspends_again_after_a_timeout() {
+        let (dir, slot, bus) = suspended_account();
+        assert_eq!(background_renew_in(&slot, &bus, &root(&dir), 0, test_keys), Err(NativeError::Timeout));
+        suspended_again(&slot);
+    }
+
+    /// A renewal that fails or panics after the resume still leaves the account suspended.
+    #[test]
+    fn background_renewal_suspends_again_after_an_error_or_a_panic() {
+        let (_dir, slot, _bus) = suspended_account();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let failed = resumed_for(&slot, deadline, |_| {
+            assert!(!slot.account_suspended(), "renewing on a resumed account");
+            Err(NativeError::Timeout)
+        });
+        assert_eq!(failed, Err(NativeError::Timeout));
+        suspended_again(&slot);
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            resumed_for(&slot, deadline, |_| panic!("renewal failed"))
+        }));
+        assert!(panicked.is_err());
+        suspended_again(&slot);
     }
 
     #[tokio::test]

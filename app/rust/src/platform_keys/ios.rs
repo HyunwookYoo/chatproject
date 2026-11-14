@@ -116,7 +116,8 @@ pub extern "C" fn cp_account_resume() -> i32 {
 
 /// BGAppRefresh push renewal (M7 spec 5.1, 5.6): starts the core for `data_dir` (or reaches
 /// the running one), opens the account, issues the handles due and gives the peers the new
-/// ones, within `timeout_ms`. Blocks; call it off the main thread. 0 done; -1 a null or
+/// ones, within `timeout_ms`. An account the scene suspended is resumed for this and suspended
+/// again before it returns. Blocks; call it off the main thread. 0 done; -1 a null or
 /// non-UTF-8 `data_dir`, -2 invalid configuration, -3 timed out, -4 the core could not do it,
 /// -5 an internal failure.
 #[no_mangle]
