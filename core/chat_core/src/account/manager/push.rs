@@ -98,12 +98,14 @@ pub(super) struct Shared {
     network: tokio::sync::Mutex<NetworkLease>,
 }
 
-/// Received pushes fetching now, and whether they started the network (they stop it once the
-/// last of them ends).
+/// Received pushes fetching now, and whether they started the network: the last of them to end
+/// stops it, unless a start was asked for since by anyone else (the app came to the foreground,
+/// pairing): `starts` is the network's start count right after the push's own start.
 #[derive(Default)]
 struct NetworkLease {
     users: u32,
     started: bool,
+    starts: u64,
 }
 
 /// The latest `push_configure` and its version, for the actor to take.
@@ -1479,8 +1481,9 @@ impl Manager {
 }
 
 /// One received push's use of the network: it starts the network if it is off and nobody else
-/// uses it, and the last use to end stops what a push started. A use dropped before it ended
-/// (its task cancelled) ends in a task of its own.
+/// uses it, and the last use to end stops what a push started, unless another start was asked
+/// for meanwhile (the network is the app's then). A use dropped before it ended (its task
+/// cancelled) ends in a task of its own.
 struct NetworkUse {
     shared: Option<Arc<super::Shared>>,
 }
@@ -1495,7 +1498,14 @@ impl NetworkUse {
                     Ok(NetworkReply::Info(info))
                         if matches!(info.state, NetworkState::Stopped | NetworkState::Failed)
                 );
-                lease.started = off && shared.network.execute(NetworkOp::Start).await.is_ok();
+                lease.started = false;
+                if off {
+                    let before = shared.network.starts();
+                    let started = shared.network.execute(NetworkOp::Start).await.is_ok();
+                    lease.starts = shared.network.starts();
+                    // Another start at the same moment: the network is not only the push's.
+                    lease.started = started && lease.starts == before + 1;
+                }
             }
             lease.users = lease.users.saturating_add(1);
         }
@@ -1547,7 +1557,9 @@ async fn end_network_use(shared: &super::Shared) {
     lease.users = lease.users.saturating_sub(1);
     if lease.users == 0 && lease.started {
         lease.started = false;
-        let _ = shared.network.execute(NetworkOp::Stop).await;
+        if shared.network.starts() == lease.starts {
+            let _ = shared.network.execute(NetworkOp::Stop).await;
+        }
     }
 }
 

@@ -994,8 +994,10 @@ pub(super) fn generic_pending(c: &Connection, conversation: ConversationId) -> R
     .unwrap_or(false))
 }
 
-/// In the transaction that read messages of the conversation: once nothing is unread, a
-/// generic push notification no longer keeps its new texts from alerting (Ruling R13).
+/// In the transaction of a read of the conversation (here, synced from another of my devices,
+/// or a text stored already read): once nothing is unread, a generic push notification no
+/// longer keeps its new texts from alerting (Ruling R13). Other frames never clear it: a wake's
+/// generic notification shows before its text is stored, while `unread` may still be 0.
 pub(super) fn read_up(tx: &Transaction<'_>, conversation: ConversationId) -> R<()> {
     tx.execute(
         "UPDATE push_tag SET generic=0 WHERE conversation=?1 AND generic=1 AND (SELECT unread FROM conversation WHERE id=?1)=0",

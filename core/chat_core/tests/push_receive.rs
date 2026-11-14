@@ -674,3 +674,140 @@ fn preview_cuts_on_char_boundary_within_48_bytes() {
     assert_eq!(preview_text("짧은 글", 0), "짧은 글");
     assert_eq!(preview_text("짧은 글", 1), "짧은 글 외 1개");
 }
+
+/// Review finding 1: A1's generic notification showed while nothing was unread; the text was
+/// read on A2. A1 takes A2's read first (its sync from A2 starts at the receipt, and A3 holds
+/// back), and then the text from A3, stored read. That read ends the generic notification: the
+/// next text alerts.
+#[tokio::test]
+async fn generic_ends_when_its_text_comes_read_from_my_device() {
+    let (mut a, b1, net, conv) = accounts(&[A1, A2, A3], &[B1]).await;
+    let a3 = a.pop().unwrap();
+    let a2 = a.pop().unwrap();
+    let a1 = a.pop().unwrap();
+    let _proxy = proxy(&net);
+    let a1_id = installation(&a1).await;
+    android(&a1, "token-a1").await;
+    settle!(
+        [&a1, &a2, &a3, &b1],
+        own_tag_handle(&a1, conv).await.is_some()
+    );
+    let tag = own_tag(&a1, conv).await;
+    network(&a1, NetworkOp::Stop).await;
+    settle!(
+        [&a1, &a2, &a3, &b1],
+        !ready_with(&b1, a1_id) && !ready_with(&a2, a1_id) && !ready_with(&a3, a1_id)
+    );
+    let push = ReceivedPush::Cipher {
+        tag,
+        ciphertext: vec![0xff; 40],
+    };
+    assert_eq!(
+        a1.account.push_received(push, WAIT).await.unwrap(),
+        PushOutcome::Notified
+    );
+    assert_eq!(alerts(&a1, conv), 1);
+
+    let key = send_to(&b1, a1.peer, 1, "read on the pc").await;
+    settle!(
+        [&a2, &a3, &b1],
+        message(&a2, key).await.is_some() && message(&a3, key).await.is_some()
+    );
+    a2.account
+        .messages()
+        .mark_read(conv, vec![key])
+        .await
+        .unwrap();
+    let a2_id = installation(&a2).await;
+    let mut receipt = None;
+    settle!([&a2, &a3, &b1], {
+        receipt = mailbox(&a2)
+            .await
+            .entries
+            .into_iter()
+            .rev()
+            .find(|e| e.sender_install == a2_id && e.kind == 1 && e.msg_id.is_none());
+        receipt.is_some()
+    });
+    a1.account
+        .storage_test_fixture()
+        .messages()
+        .await
+        .unwrap()
+        .mailbox_pulled(a2_id, receipt.unwrap().seq)
+        .await
+        .unwrap();
+    // A3 answers `Busy` until A1 has taken the receipt.
+    a3.account.mailbox_test_hold(true).await.unwrap();
+    back_online(&a1, &[&a2, &a3]).await;
+    a1.account.mailbox_sync_now().await.unwrap();
+    settle!(
+        [&a1, &a2, &a3, &b1],
+        caught_up(&a1, &a2).await && mailbox(&a1).await.status_ahead == 1
+    );
+    assert!(message(&a1, key).await.is_none());
+    a3.account.mailbox_test_hold(false).await.unwrap();
+    settle!(
+        [&a1, &a2, &a3, &b1],
+        message(&a1, key).await.is_some() && unread(&a1, b1.peer).await == 0
+    );
+    quiet(&[&a1, &a2, &a3, &b1]).await;
+    assert_eq!(alerts(&a1, conv), 1);
+
+    link(&a1, &b1).await;
+    let next = send_to(&b1, a1.peer, 2, "the next one").await;
+    settle!([&a1, &a2, &a3, &b1], message(&a1, next).await.is_some());
+    quiet(&[&a1, &a2, &a3, &b1]).await;
+    assert_eq!(alerts(&a1, conv), 2);
+}
+
+/// Review finding 1: a generic notification whose text never comes; the user opens the
+/// conversation (a read with nothing unread). The next text alerts.
+#[tokio::test]
+async fn read_with_nothing_unread_ends_generic() {
+    let (a1, b1, conv, _net, _proxy) = offline_receiver().await;
+    let push = ReceivedPush::Cipher {
+        tag: own_tag(&b1, conv).await,
+        ciphertext: vec![0xff; 40],
+    };
+    assert_eq!(
+        b1.account.push_received(push, WAIT).await.unwrap(),
+        PushOutcome::Notified
+    );
+    b1.account
+        .messages()
+        .mark_read(conv, Vec::new())
+        .await
+        .unwrap();
+    back_online(&b1, &[&a1]).await;
+    let key = send_to(&a1, b1.peer, 1, "alerts again").await;
+    settle!([&a1, &b1], message(&b1, key).await.is_some());
+    quiet(&[&a1, &b1]).await;
+    assert_eq!(alerts(&b1, conv), 2);
+    assert_eq!(notify_events(&b1).last().unwrap().new_messages, 1);
+}
+
+/// Review finding 2: a wake push started the network; the app started it too (it came to the
+/// foreground) while the push fetched. The push's end leaves the network running.
+#[tokio::test]
+async fn network_started_by_the_app_meanwhile_stays_on() {
+    let (a1, b1, conv, _net, _proxy) = offline_receiver().await;
+    let _a = stop(a1);
+    let push = ReceivedPush::Wake {
+        tag: own_tag(&b1, conv).await,
+    };
+    let account = b1.account.clone();
+    let task =
+        tokio::spawn(async move { account.push_received(push, Duration::from_secs(3)).await });
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while network_state(&b1).await != NetworkState::Online {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the push started the network");
+    assert!(!task.is_finished());
+    network(&b1, NetworkOp::Start).await;
+    assert_eq!(task.await.unwrap().unwrap(), PushOutcome::Notified);
+    assert_eq!(network_state(&b1).await, NetworkState::Online);
+}

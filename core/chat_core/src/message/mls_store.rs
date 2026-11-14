@@ -1152,8 +1152,9 @@ fn apply_own_read(
             ],
         )
         .map_err(sql)?;
-        super::push_store::read_up(tx, conversation)?;
     }
+    // A read on another of my devices (whether or not it lowered `unread` here, Ruling R13).
+    super::push_store::read_up(tx, conversation)?;
     Ok(read)
 }
 
@@ -1421,6 +1422,10 @@ fn store_text(
         ],
     )
     .map_err(sql)?;
+    if seen {
+        // Read on another of my devices before it came here (Ruling R13).
+        super::push_store::read_up(tx, conversation)?;
+    }
     Ok(Stored::New)
 }
 

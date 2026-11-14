@@ -2481,8 +2481,9 @@ fn mark_read(
             params![id.0.as_slice(), changed as i64, integer(rev)?],
         )
         .map_err(sql_error)?;
-        super::push_store::read_up(&tx, id)?;
     }
+    // The user read the conversation here (also when nothing was unread, Ruling R13).
+    super::push_store::read_up(&tx, id)?;
     commit(
         tx,
         #[cfg(all(feature = "test-hooks", debug_assertions))]
