@@ -282,7 +282,7 @@ async fn renewal_reaches_offline_contact_through_my_mailbox() {
         [&a2, &b1],
         peer_handle(&b1, conv, a1_id).await == Some(Some(handle.clone()))
     );
-    assert!(proxy.handle_requests().len() >= 1);
+    assert!(!proxy.handle_requests().is_empty());
 }
 
 /// Spec 5.2: an Android device's own-device handle rides its `Announce`, and my other device

@@ -342,7 +342,7 @@ async fn already_read_on_other_device_push_shows_nothing() {
 /// nothing, stores nothing and does not fail.
 #[tokio::test]
 async fn push_for_unknown_tag_shows_nothing() {
-    let (a1, b1, conv, _net, proxy) = offline_receiver().await;
+    let (a1, b1, _conv, _net, proxy) = offline_receiver().await;
     let sent = pushed(&a1, b1.peer, &proxy, &["withdrawn"]).await;
     let (key, tag, kind) = &sent[0];
     b1.account.push_set_enabled(false).await.unwrap();
@@ -719,22 +719,23 @@ async fn generic_ends_when_its_text_comes_read_from_my_device() {
         .await
         .unwrap();
     let a2_id = installation(&a2).await;
-    let mut receipt = None;
-    settle!([&a2, &a3, &b1], {
-        receipt = mailbox(&a2)
+    // The seq of A2's logged receipt.
+    let receipt = || async {
+        mailbox(&a2)
             .await
             .entries
             .into_iter()
             .rev()
-            .find(|e| e.sender_install == a2_id && e.kind == 1 && e.msg_id.is_none());
-        receipt.is_some()
-    });
+            .find(|e| e.sender_install == a2_id && e.kind == 1 && e.msg_id.is_none())
+            .map(|e| e.seq)
+    };
+    settle!([&a2, &a3, &b1], receipt().await.is_some());
     a1.account
         .storage_test_fixture()
         .messages()
         .await
         .unwrap()
-        .mailbox_pulled(a2_id, receipt.unwrap().seq)
+        .mailbox_pulled(a2_id, receipt().await.unwrap())
         .await
         .unwrap();
     // A3 answers `Busy` until A1 has taken the receipt.
