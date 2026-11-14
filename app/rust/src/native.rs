@@ -17,7 +17,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use chat_core::account::storage::KeyProtector;
 use chat_core::push::{PushConfig, PushOutcome, ReceivedPush, Tag, FETCH_MAX_MS};
 use chat_core::{CoreConfig, CoreError, CoreEvent, CoreSlot, ErrorCode, EventBus, EventSink};
-use chat_core::{NetworkOp, NetworkReply, NetworkState};
 use push_wire::{Platform, BASE64URL_NOPAD, PUSH_CIPHER_MAX};
 
 use crate::global::{BUS, CORE};
@@ -117,9 +116,7 @@ const RECEIVE_MARGIN: Duration = Duration::from_secs(2);
 /// Bound of `native_push_renew` (the Android renewal job): the renewal's `/handle` requests and
 /// the delivery window after it.
 const RENEW_WAIT: Duration = Duration::from_secs(60);
-/// Longest the network stays up after a renewal sealed frames, for the peers to get them.
-const DELIVERY_WINDOW: Duration = Duration::from_secs(10);
-/// Kept free at the end of a renewal's budget for stopping the network again.
+/// Kept free at the end of a renewal's budget for giving the network back.
 const STOP_MARGIN: Duration = Duration::from_secs(1);
 
 /// The push proxy address: the caller's, else this build's (`CHATPROJECT_PUSH_URL` at build
@@ -271,33 +268,15 @@ fn wall_ms() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
-/// Issues the handles due now. When that sealed frames for peers, the network is kept up for a
-/// while (at most `DELIVERY_WINDOW`, within `budget`) so they are sent, and stopped again only
-/// if this call started it. Returns the handles issued.
+/// Issues the handles due now (`push_renew_background`): when that sealed frames for peers, the
+/// core holds the network through its push lease for a while, within `budget`, so they are
+/// sent; a network the app or a push started meanwhile stays on. Returns the handles issued.
 fn renew_in(slot: &CoreSlot, budget: Duration) -> Result<u32, NativeError> {
-    let started = Instant::now();
     let account = slot.account()?;
-    let summary = wait_on(slot, budget, async move { account.push_renew_due(wall_ms()).await })?;
-    let window = budget
-        .saturating_sub(started.elapsed())
-        .saturating_sub(STOP_MARGIN)
-        .min(DELIVERY_WINDOW);
-    if summary.announced + summary.withdrawn > 0 && !window.is_zero() {
-        let network = slot.network()?;
-        wait_on(slot, window + STOP_MARGIN, async move {
-            let off = matches!(
-                network.execute(NetworkOp::Info).await,
-                Ok(NetworkReply::Info(info))
-                    if matches!(info.state, NetworkState::Stopped | NetworkState::Failed)
-            );
-            let ours = off && network.execute(NetworkOp::Start).await.is_ok();
-            tokio::time::sleep(window).await;
-            if ours {
-                network.execute(NetworkOp::Stop).await?;
-            }
-            Ok(())
-        })?;
-    }
+    let hold = budget.saturating_sub(STOP_MARGIN);
+    let summary = wait_on(slot, budget, async move {
+        account.push_renew_background(wall_ms(), hold).await
+    })?;
     Ok(summary.issued)
 }
 

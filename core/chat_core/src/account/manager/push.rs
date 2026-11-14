@@ -88,6 +88,8 @@ const NETWORK_LOOK: Duration = Duration::from_millis(50);
 const FETCH_LINGER: Duration = Duration::from_millis(1_000);
 /// While `push_messages_deleted` waits for the network to start, it looks this often.
 const FULL_SYNC_LOOK_MS: u64 = 1_000;
+/// Longest a background renewal holds the network for the frames it sealed.
+const RENEW_DELIVERY: Duration = Duration::from_secs(10);
 
 /// What `AccountHandle` shares with the actor for push.
 #[derive(Default)]
@@ -398,6 +400,26 @@ impl AccountHandle {
     pub async fn push_renew_due(&self, now_ms: u64) -> Result<RenewSummary, CoreError> {
         self.send(|reply| Command::PushRenewDue(now_ms, reply))
             .await
+    }
+    /// The background renewal (Android job, iOS BGAppRefresh): `push_renew_due`, then, when it
+    /// sealed frames for peers, the network is held through the push lease (started if it is
+    /// off) for at most `RENEW_DELIVERY` so they are sent, ending by `budget` after the call
+    /// began. A start by the app or a pairing meanwhile keeps the network on at the end.
+    pub async fn push_renew_background(
+        &self,
+        now_ms: u64,
+        budget: Duration,
+    ) -> Result<RenewSummary, CoreError> {
+        let until = tokio::time::Instant::now() + budget;
+        let summary = self.push_renew_due(now_ms).await?;
+        let deliver_until = until.min(tokio::time::Instant::now() + RENEW_DELIVERY);
+        if summary.announced + summary.withdrawn > 0 && tokio::time::Instant::now() < deliver_until
+        {
+            let lease = NetworkUse::acquire(self.shared.clone()).await;
+            tokio::time::sleep_until(deliver_until).await;
+            lease.release().await;
+        }
+        Ok(summary)
     }
 }
 

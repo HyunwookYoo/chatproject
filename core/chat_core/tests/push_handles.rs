@@ -411,6 +411,96 @@ async fn renew_due_right_after_configure_issues() {
     );
 }
 
+async fn network_state(f: &Fixture) -> NetworkState {
+    match f.slot.network().unwrap().execute(NetworkOp::Info).await.unwrap() {
+        NetworkReply::Info(info) => info.state,
+        _ => panic!("no network info"),
+    }
+}
+
+/// A1's handle is issued and announced, then A1's network goes off (the app is in the
+/// background): a background renewal 7 days later seals a new handle for B1.
+async fn renewal_with_network_off() -> (Fixture, Fixture, Arc<Backend>, u64) {
+    let (a1, b1, net, conv) = setup(&[B1]).await;
+    grouped(&a1, &b1, conv).await;
+    proxy(&net);
+    let a1_id = installation(&a1).await;
+    android(&a1, "token-a1").await;
+    settle!(
+        [&a1, &b1],
+        peer_handle(&b1, conv, a1_id).await.flatten().is_some()
+            && push_state(&a1).await.deliveries.is_empty()
+    );
+    let issued = push_state(&a1).await.tags[0].issued_at_ms.unwrap();
+    a1.slot.network().unwrap().execute(NetworkOp::Stop).await.unwrap();
+    assert_eq!(network_state(&a1).await, NetworkState::Stopped);
+    (a1, b1, net, issued + RENEW_AFTER_MS)
+}
+
+async fn until_online(f: &Fixture) {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while network_state(f).await != NetworkState::Online {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the renewal started the network");
+}
+
+/// Ruling R15: the background renewal holds the network through the push lease for what it
+/// sealed, and gives back only what it started: with no other start the network is off again.
+#[tokio::test]
+async fn background_renewal_starts_the_network_and_stops_it_again() {
+    let (a1, _b1, _net, due) = renewal_with_network_off().await;
+    let account = a1.account.clone();
+    let task = tokio::spawn(async move {
+        account
+            .push_renew_background(due, Duration::from_secs(3))
+            .await
+    });
+    until_online(&a1).await;
+    let summary = task.await.unwrap().unwrap();
+    assert_eq!((summary.issued, summary.announced), (1, 1));
+    assert_eq!(network_state(&a1).await, NetworkState::Stopped);
+}
+
+/// Ruling R15: the app starts the network (it came to the foreground) while the background
+/// renewal holds it: the renewal's end leaves it running.
+#[tokio::test]
+async fn background_renewal_leaves_an_app_start_running() {
+    let (a1, _b1, _net, due) = renewal_with_network_off().await;
+    let account = a1.account.clone();
+    let task = tokio::spawn(async move {
+        account
+            .push_renew_background(due, Duration::from_secs(3))
+            .await
+    });
+    until_online(&a1).await;
+    assert!(!task.is_finished());
+    a1.slot
+        .network()
+        .unwrap()
+        .execute(NetworkOp::Start)
+        .await
+        .unwrap();
+    let summary = task.await.unwrap().unwrap();
+    assert_eq!((summary.issued, summary.announced), (1, 1));
+    assert_eq!(network_state(&a1).await, NetworkState::Online);
+}
+
+/// Nothing sealed (nothing due yet): the network is not touched.
+#[tokio::test]
+async fn background_renewal_with_nothing_due_leaves_the_network_off() {
+    let (a1, _b1, _net, due) = renewal_with_network_off().await;
+    let summary = a1
+        .account
+        .push_renew_background(due - 3_600_000, Duration::from_secs(3))
+        .await
+        .unwrap();
+    assert_eq!(summary, RenewSummary::default());
+    assert_eq!(network_state(&a1).await, NetworkState::Stopped);
+}
+
 #[tokio::test]
 async fn windows_and_disabled_devices_never_call_proxy() {
     let (a1, b1, net, conv) = setup(&[B1]).await;
