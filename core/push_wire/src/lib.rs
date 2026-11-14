@@ -43,14 +43,15 @@ pub enum Platform {
 }
 
 impl Platform {
-    fn to_byte(self) -> u8 {
+    /// The one byte for a platform: in the handle plaintext and in `push_local.platform`.
+    pub fn to_byte(self) -> u8 {
         match self {
             Platform::Fcm => 1,
             Platform::Apns => 2,
         }
     }
 
-    fn from_byte(b: u8) -> Option<Self> {
+    pub fn from_byte(b: u8) -> Option<Self> {
         match b {
             1 => Some(Platform::Fcm),
             2 => Some(Platform::Apns),

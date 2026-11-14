@@ -93,6 +93,10 @@ enum Command {
     MailboxState(oneshot::Sender<Result<MailboxStateView,CoreError>>),
     SetMailbox(bool,oneshot::Sender<Result<(),CoreError>>),
     MailboxFirstLinkShown(oneshot::Sender<Result<(),CoreError>>),
+    PushSetToken(crate::push::Platform,String,oneshot::Sender<Result<(),CoreError>>),
+    PushSetEnabled(bool,oneshot::Sender<Result<(),CoreError>>),
+    PushStatus(oneshot::Sender<Result<crate::push::PushStatus,CoreError>>),
+    PushRenewDue(u64,oneshot::Sender<Result<crate::push::RenewSummary,CoreError>>),
     Retry(oneshot::Sender<Result<u64, CoreError>>),
     #[cfg(all(feature="test-hooks",debug_assertions))]
     PairTestStop(super::PairTestStop,oneshot::Sender<Result<(),CoreError>>),
@@ -169,6 +173,9 @@ impl Command {
             Self::MailboxState(reply)=>{let _=reply.send(Err(error));}
             Self::SetMailbox(_,reply)=>{let _=reply.send(Err(error));}
             Self::MailboxFirstLinkShown(reply)=>{let _=reply.send(Err(error));}
+            Self::PushSetToken(_,_,reply)|Self::PushSetEnabled(_,reply)=>{let _=reply.send(Err(error));}
+            Self::PushStatus(reply)=>{let _=reply.send(Err(error));}
+            Self::PushRenewDue(_,reply)=>{let _=reply.send(Err(error));}
             Self::Retry(reply) => { let _ = reply.send(Err(error)); }
             #[cfg(all(feature="test-hooks",debug_assertions))]
             Self::PairTestStop(_,reply)=>{let _=reply.send(Err(error));}
@@ -230,6 +237,8 @@ struct Shared {
     // ticket << 2 | 0 pending / 1 complete / 2 failed. Monotonic revisions
     // prevent an obsolete completion from reporting success for a newer request.
     status: AtomicU64,
+    /// The latest `push_configure`, taken by the actor at its next poll (M7).
+    push: push::ConfigSlot,
 }
 #[derive(Clone)]
 pub struct AccountHandle {
@@ -292,6 +301,7 @@ impl AccountHandle {
             network,
             requests,
             status: AtomicU64::new(ticket << 2),
+            push: Default::default(),
         });
         let (commands, input) = mpsc::channel(32);
         let auth = super::connection::Runtime::default();
@@ -1264,6 +1274,10 @@ impl Manager {
                         Command::MailboxState(reply)=>{let result=self.mailbox_state().await;let _=reply.send(result);}
                         Command::SetMailbox(enabled,reply)=>{let result=self.set_mailbox(enabled).await;let _=reply.send(result);}
                         Command::MailboxFirstLinkShown(reply)=>{let result=self.mark_first_link_shown().await;let _=reply.send(result);}
+                        Command::PushSetToken(platform,token,reply)=>{let result=self.push_set_token(platform,token).await;let _=reply.send(result);}
+                        Command::PushSetEnabled(enabled,reply)=>{let result=self.push_set_enabled(enabled).await;let _=reply.send(result);}
+                        Command::PushStatus(reply)=>{let result=self.push_status().await;let _=reply.send(result);}
+                        Command::PushRenewDue(now,reply)=>{self.push_renew_due(now,reply).await;}
                         Command::Retry(reply) => { let result = self.retry_open(); let _ = reply.send(result); }
                         #[cfg(all(feature="test-hooks",debug_assertions))]
                         Command::PairTestStop(stop,reply)=>{self.pair.stop=Some(stop);self.pair.reached=None;let _=reply.send(Ok(()));}
@@ -2056,6 +2070,7 @@ mod tests {
             network: network.clone(),
             requests,
             status: AtomicU64::new((ticket << 2) | 1),
+            push: Default::default(),
         });
         let sink = Arc::new(BoundarySink {
             network,
@@ -2188,6 +2203,7 @@ mod tests {
             network: network.clone(),
             requests,
             status: AtomicU64::new(ticket << 2),
+            push: Default::default(),
         });
         let backend = Arc::new(Backend {
             absent: AtomicBool::new(false),
@@ -2299,6 +2315,7 @@ mod tests {
                     network: network.clone(),
                     requests,
                     status: AtomicU64::new(ticket << 2),
+                    push: Default::default(),
                 }),
                 services: offline_services(),
             };
@@ -2430,6 +2447,7 @@ mod tests {
             network: network.clone(),
             requests,
             status: AtomicU64::new(ticket << 2),
+            push: Default::default(),
         });
         let mut manager = Manager {
             messages: Default::default(),
@@ -2528,6 +2546,7 @@ mod tests {
             network: network.clone(),
             requests,
             status: AtomicU64::new(ticket << 2),
+            push: Default::default(),
         });
         let mut manager = Manager {
             messages: Default::default(),
@@ -3158,6 +3177,7 @@ impl Manager {
             Input::MessageProof(result)=>self.message_proof(result).await,
             Input::Mls(event)=>self.mls_event(event).await,
             Input::Mailbox(event)=>self.mailbox_event(event).await,
+            Input::Push(event)=>self.push_event(event).await,
             Input::Incoming(conn) => {
                 let result = async {
                     let request = self.ready()?;
@@ -3999,5 +4019,6 @@ pub use messages::{MessageMutation,MessagePause,MessagePoint};
 pub(super) mod mls;
 pub use mls::GroupState;
 pub(super) mod mailbox;
+pub(super) mod push;
 #[cfg(all(feature="test-hooks",debug_assertions))]
 pub use mailbox::MailboxCounters;

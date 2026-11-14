@@ -82,6 +82,8 @@ pub(crate) enum MessageDbOp {
     MlsGroupOp(ConversationId, super::mls_group::GroupOp),
     /// The device log: pages, cursors, retention (M6).
     Mailbox(super::mailbox_store::MailboxDbOp),
+    /// This device's push handles and their delivery (M7).
+    Push(super::push_store::PushDbOp),
     /// Notification items (M6) for texts just stored: per conversation, those of the keys that
     /// came from the other account and are still not seen here; and an item (maybe with no new
     /// message) for each conversation whose messages were read on another own device.
@@ -602,6 +604,7 @@ pub(crate) fn execute(
         MessageDbOp::SealPushHandle(id, handle, issued_at_ms) => super::mls_store::fixture_seal_push_handle(c, identity, local, id, handle, issued_at_ms),
         MessageDbOp::MlsGroupOp(id, op) => super::mls_group::group_op(c, identity, local, id, op, mls_fault!(fault)),
         MessageDbOp::Mailbox(op) => super::mailbox_store::mailbox_op(c, identity, op, mls_fault!(fault)),
+        MessageDbOp::Push(op) => super::push_store::push_op(c, identity, local, op, mls_fault!(fault)),
         MessageDbOp::NotifyItems(keys, read) => Ok(MessageDbReply::Notify(notify_items(c, &keys, &read)?)),
         MessageDbOp::Messages(id, before, n) => {
             let take = limit(n)?;
@@ -851,6 +854,8 @@ pub(crate) enum FixtureOp {
     DropMessage(MessageKey, tokio::sync::oneshot::Sender<R<()>>),
     /// The `push_peer` rows and the number of `mailbox_notify` marks.
     PushPeerState(tokio::sync::oneshot::Sender<R<super::push_store::PushPeerState>>),
+    /// This device's push rows (`push_local`, `push_tag`, `push_own`, `push_delivery`).
+    PushState(tokio::sync::oneshot::Sender<R<super::push_store::PushState>>),
 }
 #[cfg(all(feature = "test-hooks", debug_assertions))]
 pub(crate) fn fixture(c: &mut Connection, op: FixtureOp) {
@@ -1003,6 +1008,9 @@ pub(crate) fn fixture(c: &mut Connection, op: FixtureOp) {
         }
         FixtureOp::PushPeerState(reply) => {
             let _ = reply.send(super::push_store::fixture_peer_state(c));
+        }
+        FixtureOp::PushState(reply) => {
+            let _ = reply.send(super::push_store::fixture_state(c));
         }
         FixtureOp::DropMessage(k, reply) => {
             let result = ["receipt_job", "mls_receipt", "outbox", "message"].iter().try_for_each(|table| {
@@ -1158,6 +1166,7 @@ pub(crate) enum MessageDbReply {
     NotCurrent,
     Group(super::mls_group::GroupReply),
     Mailbox(super::mailbox_store::MailboxDbReply),
+    Push(super::push_store::PushDbReply),
     Notify(Vec<crate::event::NotifyItem>),
     Conversation(ConversationView),
     Message(MessageView),
@@ -1264,6 +1273,7 @@ impl MessageDbOp {
             Self::M4Encode(_) | Self::SealPushHandle(..) => false,
             Self::MlsGroupOp(_, op) => op.writes(),
             Self::Mailbox(op) => op.writes(),
+            Self::Push(op) => op.writes(),
             _ => self.key(identity)?.is_some(),
         })
     }

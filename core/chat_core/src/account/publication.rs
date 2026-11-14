@@ -17,6 +17,8 @@ pub struct AccountServices {
     pub(crate) backend: Option<Arc<dyn RecordBackend>>,
     pub(crate) clock: Arc<dyn Clock>,
     pub(crate) notifier: Option<Arc<dyn RevocationNotifier>>,
+    /// The push proxy used for any configured address instead of `HttpPushProxy` (tests).
+    pub(crate) push: Option<Arc<dyn crate::push::PushProxy>>,
 }
 impl AccountServices {
     /// Local bridge/storage fixture only. It never constructs a production backend.
@@ -40,6 +42,7 @@ impl AccountServices {
             backend: Some(backend),
             clock,
             notifier: None,
+            push: None,
         }
     }
     #[cfg(all(feature = "test-hooks", debug_assertions))]
@@ -47,11 +50,18 @@ impl AccountServices {
         self.notifier = Some(notifier);
         self
     }
+    /// The push proxy every configured proxy address reaches (a test's in-memory proxy).
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    pub fn with_push_proxy(mut self, proxy: Arc<dyn crate::push::PushProxy>) -> Self {
+        self.push = Some(proxy);
+        self
+    }
     pub(crate) fn production() -> Self {
         Self {
             backend: None,
             clock: Arc::new(SystemClock::default()),
             notifier: None,
+            push: None,
         }
     }
     pub(crate) fn backend(&mut self) -> Result<Arc<dyn RecordBackend>, CoreError> {

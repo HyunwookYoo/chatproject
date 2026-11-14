@@ -1923,7 +1923,7 @@ impl Manager {
     /// The current devices of `peer` as this device holds its record: those its accepted
     /// record lists, and for this account without the ones it revoked (by installation or
     /// transport key, as the group's leaf vetting drops them).
-    fn current_installations(&self, peer: PeerId) -> Vec<InstallationId> {
+    pub(super) fn current_installations(&self, peer: PeerId) -> Vec<InstallationId> {
         let Ok(local) = self.local() else {
             return Vec::new();
         };

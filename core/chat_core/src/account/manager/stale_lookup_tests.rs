@@ -192,6 +192,7 @@ impl Harness {
             network,
             requests,
             status: AtomicU64::new((ticket << 2) | 1),
+            push: Default::default(),
         });
         let backend = Arc::new(Backend {
             lookup: Mutex::new(packet),
@@ -227,6 +228,7 @@ impl Harness {
                 backend: Some(backend.clone()),
                 clock: clock.clone(),
                 notifier: Some(backend.clone()),
+                push: None,
             },
         };
         Self {

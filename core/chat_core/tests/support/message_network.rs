@@ -33,6 +33,35 @@ struct Backend {
     publishes: Mutex<Vec<SignedPacket>>,
     lookup_holds: Mutex<BTreeMap<PeerId,Arc<tokio::sync::Notify>>>,
     lookup_starts: Mutex<Vec<PeerId>>,
+    /// The push proxy every core started on this backend reaches (M7 `push_network.rs`).
+    push: Mutex<Option<Arc<dyn chat_core::push::PushProxy>>>,
+}
+/// The services of a core on `backend`: its records, `clock`, and the backend's push proxy.
+fn services(backend: Arc<Backend>, clock: Arc<FakeClock>) -> AccountServices {
+    AccountServices::new(backend.clone(), clock).with_push_proxy(Arc::new(BackendPush(backend)))
+}
+/// Forwards each push request to the proxy the backend holds at that time (none: unreachable).
+/// A core sends none before `push_configure` gives it a proxy address.
+struct BackendPush(Arc<Backend>);
+impl chat_core::push::PushProxy for BackendPush {
+    fn handle(
+        &self,
+        request: chat_core::push::HandleRequest,
+    ) -> chat_core::push::PushFuture<chat_core::push::HandleResponse> {
+        match self.0.push.lock().unwrap().clone() {
+            Some(proxy) => proxy.handle(request),
+            None => Box::pin(async { Err(chat_core::push::PushError::Network) }),
+        }
+    }
+    fn push(
+        &self,
+        request: chat_core::push::PushRequest,
+    ) -> chat_core::push::PushFuture<chat_core::push::PushResponse> {
+        match self.0.push.lock().unwrap().clone() {
+            Some(proxy) => proxy.push(request),
+            None => Box::pin(async { Err(chat_core::push::PushError::Network) }),
+        }
+    }
 }
 impl RecordBackend for Backend {
     fn lookup(&self, peer: PeerId) -> RecordFuture<'_, Lookup> {
@@ -219,7 +248,7 @@ impl Fixture {
         network.configure_local(None).await.unwrap();
         let clock = Arc::new(FakeClock::new(NOW, 0));
         let account = slot
-            .open_account_with_services(protector, AccountServices::new(backend, clock.clone()))
+            .open_account_with_services(protector, services(backend, clock.clone()))
             .unwrap();
         tokio::time::timeout(Duration::from_secs(10), async {
             while account.lifecycle_status() == 1 {

@@ -663,10 +663,23 @@ impl Manager {
             .mailbox
             .announces
             .push((session.grant.installation, mailbox));
-        let body = MailboxFrame::Announce { mailbox }.encode();
+        // M7 spec 5.2: an Android device's own-device push handle rides along.
+        let handle = self.push_own_handle();
+        let body = MailboxFrame::Announce { mailbox, handle }.encode();
         tokio::spawn(async move {
             let _ = exchange(&session, &body).await;
         });
+    }
+
+    /// My other devices with a ready session are told again at the next poll (the own-device
+    /// push handle changed, M7 spec 5.2).
+    pub(super) fn announce_again(&mut self) {
+        let sessions: Vec<InstallationId> = self
+            .own_sessions()
+            .iter()
+            .map(|s| s.grant.installation)
+            .collect();
+        self.messages.mailbox.announce_due.extend(sessions);
     }
 
     /// The app goes to the background or exits (spec 7): hands what this device has not
@@ -714,11 +727,21 @@ impl Manager {
                 .message_db(MessageDbOp::SealPending(conversation, now), request)
                 .await;
         }
-        let MailboxDbReply::Handoff(entries) =
+        let MailboxDbReply::Handoff(mut entries) =
             self.mailbox_db(MailboxDbOp::HandoffRows, request).await?
         else {
             return Err(unavailable(ErrorCode::InvalidMessage));
         };
+        // M7: the queued `PushHandle` frames go along (one per conversation and frame).
+        if let MessageDbReply::Push(crate::message::push_store::PushDbReply::Handoff(push)) = self
+            .message_db(
+                MessageDbOp::Push(crate::message::push_store::PushDbOp::HandOff),
+                request,
+            )
+            .await?
+        {
+            entries.extend(push);
+        }
         let batches = handoff_batches(entries);
         let handed: usize = batches.iter().map(Vec::len).sum();
         let frames: Vec<_> = batches
@@ -859,10 +882,11 @@ impl Manager {
             }
             // Spec 8.4: whether that device is a mailbox, recorded for handoffs, dialing order
             // and `mailbox_ok`.
-            Ok(MailboxFrame::Announce { mailbox }) => {
+            Ok(MailboxFrame::Announce { mailbox, handle }) => {
                 let op = MailboxDbOp::Announced {
                     installation,
                     mailbox,
+                    handle,
                     at: self.services.clock.wall_ms(),
                 };
                 match self.mailbox_db(op, request).await {

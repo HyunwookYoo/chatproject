@@ -69,6 +69,8 @@ pub(super) struct Runtime {
     pub(super) mls: super::mls::Runtime,
     /// Own-device sync state (`manager/mailbox.rs`).
     pub(super) mailbox: super::mailbox::Runtime,
+    /// Push handle state (`manager/push.rs`).
+    pub(super) push: super::push::Runtime,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     writes: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
@@ -1831,6 +1833,9 @@ impl Manager {
         // MLS group upkeep and its Commit/Welcome deliveries share this tick.
         self.poll_mls().await;
         self.poll_epoch_waits().await;
+        // Push handles (`manager/push.rs`): before own-device sync, whose `Announce` carries the
+        // own-device handle.
+        self.poll_push().await;
         // Own-device sync: device list, retention, pulls and `Notify`s (`manager/mailbox.rs`).
         self.poll_mailbox().await;
         #[cfg(all(feature = "test-hooks", debug_assertions))]

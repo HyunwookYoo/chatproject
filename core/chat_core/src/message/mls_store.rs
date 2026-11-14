@@ -167,7 +167,7 @@ fn load_outgoing(tx: &Transaction<'_>, key: MessageKey) -> R<Outgoing> {
 /// Seals `message`, remembers the ciphertext hash (so this device recognises it if it comes
 /// back) and returns the hash and the complete kind 17 frame.
 #[allow(clippy::too_many_arguments)]
-fn seal_one(
+pub(super) fn seal_one(
     tx: &Transaction<'_>,
     provider: &MlsProvider,
     signer: &SignatureKeyPair,

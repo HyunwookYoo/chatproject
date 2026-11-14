@@ -1014,6 +1014,12 @@ impl Fixture {
         self.handle.0.test(TestOp::Message(FixtureOp::PushPeerState(tx))).await;
         rx.await.unwrap()
     }
+    /// This device's push setting, handles and their queued deliveries.
+    pub async fn push_state(&self) -> Result<PushState, CoreError> {
+        let (tx, rx) = oneshot::channel();
+        self.handle.0.test(TestOp::Message(FixtureOp::PushState(tx))).await;
+        rx.await.unwrap()
+    }
     /// The device log, cursors and pulls, and counts of the other per-device tables.
     pub async fn mailbox_state(&self) -> Result<MailboxState, CoreError> {
         let (tx, rx) = oneshot::channel();
@@ -1384,7 +1390,9 @@ pub use crate::message::wire::{decode as decode_message, Frame as MessageFrame};
 pub use crate::account::MessageMutation;
 pub use crate::mls::wire::{MlsFrame, MlsReply};
 pub use crate::mls::push_ct::{PushCtError, restore_group_id, strip_group_id};
-pub use crate::message::push_store::{PushPeerRow, PushPeerState};
+pub use crate::message::push_store::{
+    PushDeliveryRow, PushPeerRow, PushPeerState, PushState, PushTagRow,
+};
 pub use crate::mailbox::wire::{
     EntryBody, HandoffEntry, LogEntry, MailboxFrame, MailboxReply, PlainRecord,
 };
