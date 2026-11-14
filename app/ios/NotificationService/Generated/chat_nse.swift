@@ -625,7 +625,8 @@ public func FfiConverterTypeNseNotice_lower(_ value: NseNotice) -> RustBuffer {
  * file has one.
  * * Otherwise the alias and the start of the text.
  *
- * Reads one file, writes nothing, and never fails.
+ * Reads one file, writes nothing, and never fails: a panic inside is caught and shows the
+ * generic notice ("새 메시지").
  */
 public func nseOpen(pushDir: String, tagB64: String, strippedB64: String) -> NseNotice  {
     return try!  FfiConverterTypeNseNotice_lift(try! rustCall() {
@@ -653,7 +654,7 @@ private let initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
-    if (uniffi_chat_nse_checksum_func_nse_open() != 7747) {
+    if (uniffi_chat_nse_checksum_func_nse_open() != 49635) {
         return InitializationResult.apiChecksumMismatch
     }
 

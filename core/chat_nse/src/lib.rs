@@ -14,8 +14,10 @@ use chat_core::mls::nse;
 use chat_core::push::ios_state::{decode_state, state_file_name};
 use push_wire::{BASE64URL_NOPAD, PUSH_CIPHER_MAX, Tag};
 
-// UniFFI turns a panic into a Swift error only if panics unwind. With `panic = "abort"` the
-// notification extension would die without an error, so the build refuses it.
+// `nse_open` catches a panic and returns the generic notice, so the extension still shows
+// "새 메시지" (its Swift binding cannot throw: UniFFI lifts it with `try!`). Catching needs
+// panics to unwind; with `panic = "abort"` the extension would die instead, so the build
+// refuses it.
 #[cfg(not(panic = "unwind"))]
 compile_error!("chat_nse needs panic = \"unwind\"; do not set panic = \"abort\" in a profile");
 
@@ -93,9 +95,20 @@ fn read_state(path: &Path) -> std::io::Result<Vec<u8>> {
 ///   file has one.
 /// * Otherwise the alias and the start of the text.
 ///
-/// Reads one file, writes nothing, and never fails.
+/// Reads one file, writes nothing, and never fails: a panic inside is caught and shows the
+/// generic notice ("새 메시지").
 #[uniffi::export]
 pub fn nse_open(push_dir: String, tag_b64: String, stripped_b64: String) -> NseNotice {
+    guarded(|| open(&push_dir, &tag_b64, &stripped_b64))
+}
+
+/// `notice()`, or the generic notice if it panics: no panic crosses the FFI boundary.
+fn guarded(notice: impl FnOnce() -> NseNotice) -> NseNotice {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(notice))
+        .unwrap_or_else(|_| NseNotice::generic(""))
+}
+
+fn open(push_dir: &str, tag_b64: &str, stripped_b64: &str) -> NseNotice {
     let Some(tag) = BASE64URL_NOPAD
         .decode(tag_b64.as_bytes())
         .ok()
@@ -103,7 +116,7 @@ pub fn nse_open(push_dir: String, tag_b64: String, stripped_b64: String) -> NseN
     else {
         return NseNotice::generic("");
     };
-    let bytes = match read_state(&Path::new(&push_dir).join(state_file_name(&tag))) {
+    let bytes = match read_state(&Path::new(push_dir).join(state_file_name(&tag))) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return NseNotice::silent(),
         Err(_) => return NseNotice::generic(""),
@@ -226,8 +239,18 @@ mod tests {
         assert_eq!(nse_open(push, b64(&TAG), String::new()), NseNotice::generic(""));
     }
 
-    /// The build refuses `panic = "abort"` (see the top of this file), and a profile setting it
-    /// is caught here as well, because cargo's test profile ignores it.
+    /// A panic inside `nse_open` shows the generic notice instead of crossing into Swift, whose
+    /// binding lifts the result with `try!` and would crash the extension.
+    #[test]
+    fn a_panic_shows_the_generic_notice() {
+        assert_eq!(guarded(|| panic!("inside the decrypt")), NseNotice::generic(""));
+        let fine = NseNotice::silent();
+        assert_eq!(guarded(|| fine.clone()), fine);
+    }
+
+    /// Catching a panic needs unwinding: the build refuses `panic = "abort"` (see the top of
+    /// this file), and a profile setting it is caught here as well, because cargo's test
+    /// profile ignores it.
     #[test]
     fn panic_unwind_is_kept() {
         assert!(std::panic::catch_unwind(|| panic!("caught")).is_err());
