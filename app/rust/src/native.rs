@@ -244,8 +244,10 @@ fn received_in(
 }
 
 /// A received FCM data message (`onMessageReceived`), processed within `deadline_ms` (at most
-/// 20,000 ms) plus a 2-second margin. Notifications go to the `NativeNotifier`. On `Err` the
-/// receiver shows its own "새 메시지", except for `BadPayload` (not a push of this app).
+/// 20,000 ms) plus a 2-second margin. Notifications go to the `NativeNotifier`. On `Err` for a
+/// `cipher` or `wake` push the receiver shows its own "새 메시지", `BadPayload` included; only
+/// `Core { code: "AccountRestricted" }` (no active account, so no tag can be this device's)
+/// shows nothing.
 #[uniffi::export]
 pub fn native_push_received(
     data: HashMap<String, String>,

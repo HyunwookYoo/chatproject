@@ -48,7 +48,10 @@ class PushService : FirebaseMessagingService() {
         // Within FCM's processing time: the core waits up to this and Rust adds at most 2 s.
         private const val RECEIVE_DEADLINE_MS = 8_000
         // A wake that returns this close to its deadline did not see its text arrive (the core
-        // lingers 1 s after it does), so the fetch goes on in push_fetch.
+        // lingers 1 s after it does), so the fetch goes on in push_fetch. Lossy: a text that
+        // arrives in this last stretch also triggers it, and the re-run wake replaces that
+        // text's notification with the generic count, silently. Exact needs the FFI to say
+        // whether the fetch completed.
         private const val FETCH_LINGER_MS = 1_500
 
         // One received push, from PushService or the debug TestPushReceiver; blocks. Returns the
@@ -57,9 +60,12 @@ class PushService : FirebaseMessagingService() {
         // text was read already (spec 5.3).
         fun handle(context: Context, data: Map<String, String>): NativePushOutcome? {
             val wake = "w" in data
-            val started = SystemClock.elapsedRealtime()
+            // The receive call alone: its deadline is what a finished fetch returns before. A
+            // cold core start before it does not count.
+            var started = 0L
             val outcome = try {
                 NativeCore.ensureStarted(context)
+                started = SystemClock.elapsedRealtime()
                 // The core shows the notification through Notifications, or the wake's
                 // "새 메시지" first and its text once fetched.
                 nativePushReceived(data, RECEIVE_DEADLINE_MS.toUInt())

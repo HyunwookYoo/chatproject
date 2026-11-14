@@ -880,7 +880,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if ((lib.uniffi_chat_ffi_checksum_func_native_push_deleted() and 0xFFFF) != 21936) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if ((lib.uniffi_chat_ffi_checksum_func_native_push_received() and 0xFFFF) != 15990) {
+    if ((lib.uniffi_chat_ffi_checksum_func_native_push_received() and 0xFFFF) != 41642) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_chat_ffi_checksum_func_native_push_renew() and 0xFFFF) != 55729) {
@@ -1700,8 +1700,10 @@ public object FfiConverterMapStringString: FfiConverterRustBuffer<Map<kotlin.Str
 
         /**
          * A received FCM data message (`onMessageReceived`), processed within `deadline_ms` (at most
-         * 20,000 ms) plus a 2-second margin. Notifications go to the `NativeNotifier`. On `Err` the
-         * receiver shows its own "새 메시지", except for `BadPayload` (not a push of this app).
+         * 20,000 ms) plus a 2-second margin. Notifications go to the `NativeNotifier`. On `Err` for a
+         * `cipher` or `wake` push the receiver shows its own "새 메시지", `BadPayload` included; only
+         * `Core { code: "AccountRestricted" }` (no active account, so no tag can be this device's)
+         * shows nothing.
          */
     @Throws(NativeException::class) fun `nativePushReceived`(`data`: Map<kotlin.String, kotlin.String>, `deadlineMs`: kotlin.UInt): NativePushOutcome {
             return FfiConverterTypeNativePushOutcome.lift(
