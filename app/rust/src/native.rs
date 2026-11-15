@@ -221,7 +221,7 @@ fn parse_push(data: &HashMap<String, String>) -> Result<ReceivedPush, NativeErro
             Ok(ReceivedPush::Cipher { tag, ciphertext })
         }
         (2, None, Some("1"), None) => Ok(ReceivedPush::Wake { tag }),
-        (2, None, None, Some("1")) => Ok(ReceivedPush::ReadClear),
+        (2, None, None, Some("1")) => Ok(ReceivedPush::ReadClear { tag }),
         _ => Err(NativeError::BadPayload),
     }
 }
@@ -663,7 +663,7 @@ mod tests {
             Ok(ReceivedPush::Cipher { tag, ciphertext: b"cipher bytes".to_vec() })
         );
         assert_eq!(parse_push(&data(&[("t", &t), ("w", "1")])), Ok(ReceivedPush::Wake { tag }));
-        assert_eq!(parse_push(&data(&[("t", &t), ("r", "1")])), Ok(ReceivedPush::ReadClear));
+        assert_eq!(parse_push(&data(&[("t", &t), ("r", "1")])), Ok(ReceivedPush::ReadClear { tag }));
         let largest = BASE64URL_NOPAD.encode(&vec![7u8; PUSH_CIPHER_MAX]);
         assert!(parse_push(&data(&[("t", &t), ("e", &largest)])).is_ok());
 

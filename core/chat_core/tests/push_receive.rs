@@ -570,13 +570,21 @@ async fn wake_without_reach_leaves_generic_notification() {
 }
 
 /// Spec 7: A1 showed a text, A2 read it while A1 was off; A1's read clear push syncs with A2 and
-/// clears the notification.
+/// clears the notification. A read clear that names another tag than A1's own-device one (final
+/// triage) is not one: nothing happens.
 #[tokio::test]
 async fn read_clear_syncs_and_cancels_notification() {
-    let (mut a, b1, _net, conv) = accounts(&[A1, A2], &[B1]).await;
+    let (mut a, b1, net, conv) = accounts(&[A1, A2], &[B1]).await;
     let a2 = a.pop().unwrap();
     let a1 = a.pop().unwrap();
     let a1_id = installation(&a1).await;
+    let _proxy = proxy(&net);
+    android(&a1, "token-a1").await;
+    settle!(
+        [&a1, &a2, &b1],
+        push_state(&a1).await.own_handle.is_some() && own_tag_handle(&a1, conv).await.is_some()
+    );
+    let own = push_state(&a1).await.own_tag;
     let key = delivered(&b1, &a1, &[&a2], 1).await;
     settle!(
         [&a1, &a2, &b1],
@@ -591,6 +599,16 @@ async fn read_clear_syncs_and_cancels_notification() {
         .await
         .unwrap();
 
+    for tag in [own_tag(&a1, conv).await, [7; 16]] {
+        let push = ReceivedPush::ReadClear { tag };
+        assert_eq!(
+            a1.account.push_received(push, WAIT).await.unwrap(),
+            PushOutcome::UnknownTag
+        );
+    }
+    assert!(a1.account.push_test_fetches().is_empty());
+    assert_eq!(unread(&a1, b1.peer).await, 1);
+
     let before = notify_events(&a1).len();
     let a1_was = a1.account.mailbox_test_sync_trace().await.unwrap();
     let a2_was = a2.account.mailbox_test_sync_trace().await.unwrap();
@@ -598,7 +616,7 @@ async fn read_clear_syncs_and_cancels_notification() {
     // network is given back (Android then goes on in its fetch worker, e2e m7 run 5).
     let short = a1
         .account
-        .push_received(ReceivedPush::ReadClear, Duration::from_millis(1))
+        .push_received(ReceivedPush::ReadClear { tag: own }, Duration::from_millis(1))
         .await
         .unwrap();
     assert_eq!(short, PushOutcome::Nothing);
@@ -606,7 +624,11 @@ async fn read_clear_syncs_and_cancels_notification() {
     assert_eq!(a1.account.push_test_fetches(), vec![(false, false)]);
     let account = a1.account.clone();
     let task =
-        tokio::spawn(async move { account.push_received(ReceivedPush::ReadClear, WAIT).await });
+        tokio::spawn(async move {
+            account
+                .push_received(ReceivedPush::ReadClear { tag: own }, WAIT)
+                .await
+        });
     settle!([&a1, &a2, &b1], task.is_finished());
     assert_eq!(task.await.unwrap().unwrap(), PushOutcome::Updated);
     assert_eq!(

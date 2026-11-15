@@ -87,15 +87,16 @@ pub struct RenewSummary {
 pub const FETCH_MAX_MS: u64 = 20_000;
 
 /// A push this device received (plan 2, spec 5.3), as the platform receiver parsed it: `t` and
-/// `e` (base64url-decoded), `t` with `w`, or `r`.
+/// `e` (base64url-decoded), `t` with `w`, or `t` with `r`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReceivedPush {
     /// A text's MLS ciphertext with its group id taken out (`strip_group_id`).
     Cipher { tag: Tag, ciphertext: Vec<u8> },
     /// A text too large to carry: fetched from the sender and my mailbox.
     Wake { tag: Tag },
-    /// Messages were read on another of my devices (spec 7).
-    ReadClear,
+    /// Messages were read on another of my devices (spec 7). `tag` must be this device's
+    /// own-device tag (the one its current `Announce` handle holds); any other is unknown.
+    ReadClear { tag: Tag },
 }
 
 /// What processing a received push showed.

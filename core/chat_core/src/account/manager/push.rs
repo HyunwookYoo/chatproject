@@ -239,9 +239,11 @@ pub(super) enum PushCommand {
         tag: Tag,
         reply: oneshot::Sender<Result<Option<Waking>, CoreError>>,
     },
-    /// Replies what tells a sync with one of my devices ended (a read clear push).
+    /// Replies what tells a sync with one of my devices ended (a read clear push; `None`: `tag`
+    /// is not this device's current own-device tag).
     ReadClear {
-        reply: oneshot::Sender<Result<oneshot::Receiver<()>, CoreError>>,
+        tag: Tag,
+        reply: oneshot::Sender<Result<Option<oneshot::Receiver<()>>, CoreError>>,
     },
     /// Dials the devices of `peer` without a session, and syncs with my devices.
     Fetch {
@@ -270,7 +272,7 @@ impl PushCommand {
             Self::Wake { reply, .. } => {
                 let _ = reply.send(Err(error));
             }
-            Self::ReadClear { reply } => {
+            Self::ReadClear { reply, .. } => {
                 let _ = reply.send(Err(error));
             }
             Self::Fetch { reply, .. } | Self::MessagesDeleted { reply } => {
@@ -339,10 +341,13 @@ impl AccountHandle {
                 self.push_fetch(Some(peer), fetched, until).await;
                 Ok(PushOutcome::Notified)
             }
-            ReceivedPush::ReadClear => {
-                let synced = self
-                    .send(|reply| Command::Push(PushCommand::ReadClear { reply }))
-                    .await?;
+            ReceivedPush::ReadClear { tag } => {
+                let Some(synced) = self
+                    .send(|reply| Command::Push(PushCommand::ReadClear { tag, reply }))
+                    .await?
+                else {
+                    return Ok(PushOutcome::UnknownTag);
+                };
                 Ok(if self.push_fetch(None, synced, until).await {
                     PushOutcome::Updated
                 } else {
@@ -1274,14 +1279,8 @@ impl Manager {
                 let result = self.push_wake(tag).await;
                 let _ = reply.send(result);
             }
-            PushCommand::ReadClear { reply } => {
-                let result = self.ready().map(|_| {
-                    let (tell, told) = oneshot::channel();
-                    let syncs = &mut self.messages.push.syncs;
-                    syncs.retain(|sync| !sync.is_closed());
-                    syncs.push(tell);
-                    told
-                });
+            PushCommand::ReadClear { tag, reply } => {
+                let result = self.push_read_clear_received(tag).await;
                 let _ = reply.send(result);
             }
             PushCommand::Fetch { peer, reply } => {
@@ -1568,6 +1567,24 @@ impl Manager {
                 .send(Input::Push(PushEvent::Network { ticket, online }))
                 .await;
         });
+    }
+
+    /// A read clear push: what tells a sync with one of my devices ended, if `tag` is this
+    /// device's current own-device tag (`None` otherwise: nothing happens, as for a withdrawn
+    /// conversation tag).
+    async fn push_read_clear_received(
+        &mut self,
+        tag: Tag,
+    ) -> Result<Option<oneshot::Receiver<()>>, CoreError> {
+        let request = self.ready()?;
+        let PushDbReply::Own(true) = self.push_db(PushDbOp::OwnTag(tag), request).await? else {
+            return Ok(None);
+        };
+        let (tell, told) = oneshot::channel();
+        let syncs = &mut self.messages.push.syncs;
+        syncs.retain(|sync| !sync.is_closed());
+        syncs.push(tell);
+        Ok(Some(told))
     }
 
     /// The iOS extension's ciphertexts, taken without a notification; how many were stored.

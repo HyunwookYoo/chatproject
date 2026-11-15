@@ -255,6 +255,9 @@ pub(crate) enum PushDbOp {
     Tagged(Tag),
     /// Whether a received text is seen here already (`None`: not stored). Replies `Seen`.
     Seen(MessageKey),
+    /// Whether a read clear push's tag is this device's own-device tag with a current handle
+    /// (spec 7; withdrawn, it names nothing). Replies `Own`.
+    OwnTag(Tag),
     /// A "새 메시지" notification alerts for a push of the conversation (Ruling R13): marks it,
     /// and replies `Generic` with its unread count and whether one alerted already.
     Generic(ConversationId),
@@ -271,6 +274,7 @@ impl PushDbOp {
                 | Self::ReadClear { .. }
                 | Self::Tagged(_)
                 | Self::Seen(_)
+                | Self::OwnTag(_)
         )
     }
 }
@@ -305,6 +309,7 @@ pub(crate) enum PushDbReply {
     Batches(Vec<PushBatch>),
     Tagged(Option<Tagged>),
     Seen(Option<bool>),
+    Own(bool),
     Generic { unread: u64, pending: bool },
 }
 
@@ -575,6 +580,14 @@ pub(super) fn push_op(
                 |r| r.get(0),
             )
             .optional()
+            .map_err(sql)?,
+        ),
+        PushDbOp::OwnTag(tag) => PushDbReply::Own(
+            c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM push_local WHERE id=1 AND own_tag=?1 AND own_handle IS NOT NULL)",
+                params![tag.as_slice()],
+                |r| r.get(0),
+            )
             .map_err(sql)?,
         ),
         PushDbOp::Generic(conversation) => {
