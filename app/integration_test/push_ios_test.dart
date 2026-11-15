@@ -43,6 +43,13 @@ void main() {
     }
   }, skip: !Platform.isIOS);
 
+  // Final review 2: the state files hold MLS epoch secrets, so the folder, and with it all it
+  // holds, is excluded from backups (the app marks it at launch and before Dart gets it).
+  testWidgets('push_dir_is_excluded_from_backup', (tester) async {
+    final dir = await _pushDir();
+    expect(await _channel.invokeMethod<bool>('isExcludedFromBackup', dir.path), true);
+  }, skip: !Platform.isIOS);
+
   // What the extension appends is taken by the ingest the app runs at launch and on every
   // return to the foreground (Task 12 calls it there), and the inbox is gone afterwards.
   testWidgets('inbox_is_ingested_and_cleared_on_resume', (tester) async {

@@ -22,6 +22,9 @@
 //! * Files are created with the app's default data protection class
 //!   (`NSFileProtectionCompleteUntilFirstUserAuthentication`): the extension can read them on a
 //!   locked phone after the first unlock, never `NSFileProtectionNone`.
+//! * The folder is excluded from backups, and with it every file in it: the app (Swift
+//!   `PushHost.pushDir`) makes and marks it at launch and before Dart gets the snapshot
+//!   directory, which Dart does not pass when that fails (no file is written then).
 //! * A failed write keeps the old file (or none); it never fails the database operation, which
 //!   is committed already.
 use std::cell::RefCell;

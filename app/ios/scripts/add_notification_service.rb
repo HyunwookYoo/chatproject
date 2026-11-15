@@ -90,7 +90,8 @@ runner.add_resources([file_ref.(project.main_group['Runner'], 'Localizable.strin
 runner.build_configurations.each do |config|
   set.(config, 'PRODUCT_BUNDLE_IDENTIFIER', APP_ID)
   set.(config, 'CODE_SIGN_ENTITLEMENTS', 'Runner/Runner.entitlements')
-  # `#if DEBUG` in Runner's Swift (the integration-test-only `fileProtection` of `chat_app/push`).
+  # `#if DEBUG` in Runner's Swift (the integration-test-only `fileProtection` and
+  # `isExcludedFromBackup` of `chat_app/push`).
   # Flutter's template defines it for RunnerTests only; Release and Profile stay without it.
   set.(config, 'SWIFT_ACTIVE_COMPILATION_CONDITIONS', ['$(inherited)', 'DEBUG']) if config.name == 'Debug'
 end

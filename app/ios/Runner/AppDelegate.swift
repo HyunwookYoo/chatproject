@@ -70,7 +70,8 @@ import UserNotifications
 ///
 /// Dart calls `requestPermission()` (alert permission, then APNs registration; true when
 /// granted), `token()` (the APNs token in hex, or nil before iOS gave one), `appGroupDir()` (the
-/// App Group folder: Dart passes it as `snapshot_dir`, and `<it>/push` is the inbox folder) and
+/// App Group folder: Dart passes it as `snapshot_dir`, and `<it>/push` is the inbox folder; an
+/// error when that folder cannot be excluded from backups, so no state file is written) and
 /// `takeOpenedTag()` (the `t` of a notification tapped before Dart listened, once),
 /// `permissionStatus()` ("granted", "denied", or "notDetermined" while neither iOS nor the
 /// permission screen's "나중에" answered), `markPermissionAsked()` ("나중에") and
@@ -95,6 +96,7 @@ final class PushHost: NSObject, UNUserNotificationCenterDelegate {
   private var openedTag: String?
 
   func launch() {
+    _ = Self.pushDir()
     UNUserNotificationCenter.current().delegate = self
     BGTaskScheduler.shared.register(forTaskWithIdentifier: Self.renewTask, using: nil) { [weak self] task in
       self?.renew(task)
@@ -144,7 +146,8 @@ final class PushHost: NSObject, UNUserNotificationCenterDelegate {
       case "token":
         result(self.token)
       case "appGroupDir":
-        if let dir = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: Self.appGroup) {
+        if let dir = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: Self.appGroup),
+           Self.pushDir() != nil {
           result(dir.path)
         } else {
           result(FlutterError(code: "app_group_unavailable", message: nil, details: nil))
@@ -160,10 +163,37 @@ final class PushHost: NSObject, UNUserNotificationCenterDelegate {
         else { return result(nil) }
         let protection = attributes[.protectionKey]
         result((protection as? FileProtectionType)?.rawValue ?? (protection as? String) ?? "")
+      // Integration tests only: whether a folder is excluded from backups (final review 2).
+      case "isExcludedFromBackup":
+        guard let path = call.arguments as? String,
+              let values = try? URL(fileURLWithPath: path, isDirectory: true)
+                .resourceValues(forKeys: [.isExcludedFromBackupKey])
+        else { return result(nil) }
+        result(values.isExcludedFromBackup)
       #endif
       default:
         result(FlutterMethodNotImplemented)
       }
+    }
+  }
+
+  /// `<App Group>/push`, made and excluded from backups (iCloud and computer): its state files
+  /// hold the conversations' MLS epoch secrets (spec 5.6). Excluding the folder excludes all
+  /// it holds, also the files the core and the extension create later, as the account storage
+  /// folder is excluded (`AccountStorage.root`). Nil when that fails.
+  static func pushDir() -> URL? {
+    guard let group = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroup) else {
+      return nil
+    }
+    var dir = group.appendingPathComponent("push", isDirectory: true)
+    do {
+      try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+      var flags = URLResourceValues()
+      flags.isExcludedFromBackup = true
+      try dir.setResourceValues(flags)
+      return dir
+    } catch {
+      return nil
     }
   }
 
