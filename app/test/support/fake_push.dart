@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:typed_data';
 
 import 'package:chat_app/push/push_client.dart';
@@ -72,6 +73,9 @@ class FakePushHost implements PushHost {
   /// What the OS prompt answers.
   bool grant = true;
   String? currentToken = 'TOKEN';
+
+  /// When set, `token()` waits for it (a hanging Firebase `getToken`).
+  Completer<String?>? tokenPending;
   String? groupDir = '/group';
   String? openedTag;
   final calls = <String>[];
@@ -104,7 +108,7 @@ class FakePushHost implements PushHost {
   Future<void> openSettings() async => calls.add('openSettings');
 
   @override
-  Future<String?> token() async => currentToken;
+  Future<String?> token() async => tokenPending?.future ?? currentToken;
 
   @override
   Future<String?> appGroupDir() async => groupDir;

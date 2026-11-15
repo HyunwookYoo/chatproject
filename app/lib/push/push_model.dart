@@ -44,6 +44,11 @@ class PushModel extends ChangeNotifier {
   /// a setting change.
   Future<void> _tail = Future.value();
 
+  /// The longest wait for the OS token (Android's Firebase `getToken` can
+  /// hang offline or without Play Services). A token missed here comes at the
+  /// next start or resume, or from Kotlin's `onNewToken`.
+  static const tokenWait = Duration(seconds: 5);
+
   static bool get android => defaultTargetPlatform == TargetPlatform.android;
   static bool get ios => defaultTargetPlatform == TargetPlatform.iOS;
 
@@ -90,14 +95,15 @@ class PushModel extends ChangeNotifier {
     );
   }
 
-  /// The permission screen's "알림 켜기": push follows the answer.
+  /// The permission screen's "알림 켜기": push follows the answer. Returns
+  /// once it is answered; the token follows as a later step.
   Future<void> allow() => _busy(() async {
     final granted = await host.requestPermission();
     permission = await host.permission();
     if (!_active) return; // start() applies it.
     await _core(() => client.setEnabled(granted));
-    if (granted) await _handToken();
     await _status();
+    if (granted) unawaited(_queue(_handToken));
   });
 
   /// The permission screen's "나중에": not asked again, push stays off.
@@ -187,7 +193,7 @@ class PushModel extends ChangeNotifier {
 
   Future<void> _handToken() async {
     final platform = _platform;
-    final token = await host.token();
+    final token = await host.token().timeout(tokenWait, onTimeout: () => null);
     if (platform == null || token == null || token.isEmpty) return;
     await _core(() => client.setToken(platform, token));
   }

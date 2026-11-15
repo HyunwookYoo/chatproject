@@ -160,6 +160,7 @@ void main() {
     await model.start();
     client.calls.clear();
     await model.allow();
+    await pumpEventQueue();
     expect(client.calls, ['setEnabled:true', 'setToken:fcm:TOKEN']);
 
     create(TargetPlatform.android);

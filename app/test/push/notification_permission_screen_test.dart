@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:chat_app/account/account_model.dart';
 import 'package:chat_app/account/account_routes.dart';
 import 'package:chat_app/push/notification_permission_screen.dart';
@@ -53,6 +55,30 @@ void main() {
       expect(client.calls, ['setEnabled:true', 'setToken:fcm:TOKEN']);
       expect(done, ['done']);
       expect(model.askDue, isFalse);
+    },
+    variant: TargetPlatformVariant.only(TargetPlatform.android),
+  );
+
+  testWidgets(
+    'a token that never comes neither holds the screen nor the later steps',
+    (tester) async {
+      final (model, done) = await mountScreen(tester);
+      host.tokenPending = Completer<String?>();
+      client.calls.clear();
+      await tester.tap(find.text('알림 켜기'));
+      await tester.pump();
+      await tester.pump();
+      expect(done, ['done'], reason: 'answered: the screen finishes');
+      expect(client.calls, ['setEnabled:true']);
+
+      host.state = NotificationPermission.denied;
+      model.lifecycle(AppLifecycleState.resumed);
+      await tester.pump();
+      expect(client.calls, ['setEnabled:true'], reason: 'queued behind it');
+      await tester.pump(PushModel.tokenWait);
+      await tester.pump();
+      expect(client.calls, ['setEnabled:true', 'setEnabled:false']);
+      expect(model.busy, isFalse);
     },
     variant: TargetPlatformVariant.only(TargetPlatform.android),
   );
