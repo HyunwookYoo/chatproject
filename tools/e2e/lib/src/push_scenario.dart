@@ -408,30 +408,8 @@ Future<void> runPushScenario(
     Object? conversation,
     List<int> textId,
   ) async {
-    Future<Object?> read(
-      Participant p,
-      String op,
-      Map<String, Object?> args,
-    ) async {
-      try {
-        return await p.call(
-          op,
-          args,
-          timeout: const Duration(seconds: 5),
-          failOnTimeout: false,
-        );
-      } catch (_) {
-        return null;
-      }
-    }
-
-    String bucket(Object? n, String prefix, int top) => n is! int
-        ? 'unknown'
-        : n >= top
-        ? '$prefix${top}plus'
-        : '$prefix$n';
     Future<String> has(Participant p) async {
-      final page = await read(p, 'message_local_load_messages', {
+      final page = await _factCall(p, 'message_local_load_messages', {
         'conversation': conversation,
         'before': null,
         'limit': 50,
@@ -452,25 +430,25 @@ Future<void> runPushScenario(
         const {'Stopped', 'Starting', 'Online', 'Failed'}.contains(phoneBefore)
         ? phoneBefore as String
         : 'unknown';
-    final group = await read(b1, 'message_local_test_group_facts', {
+    final group = await _factCall(b1, 'message_local_test_group_facts', {
       'conversation': conversation,
       'key': key,
     });
-    failureFacts['m7_wake_sender_attempted'] = bucket(
+    failureFacts['m7_wake_sender_attempted'] = factBucket(
       group is Map ? group['attempted'] : null,
       'r',
       2,
     );
-    final sender = await read(b1, 'push_local_test_counts', const {});
-    failureFacts['m7_wake_sender_handles'] = bucket(
+    final sender = await _factCall(b1, 'push_local_test_counts');
+    failureFacts['m7_wake_sender_handles'] = factBucket(
       sender is Map ? sender['peer_handles'] : null,
       'h',
       1,
     );
     failureFacts['m7_wake_phone_text'] = await has(a1);
     failureFacts['m7_wake_mailbox_text'] = await has(a2);
-    final mailbox = await read(a2, 'push_local_test_counts', const {});
-    failureFacts['m7_wake_mailbox_sessions'] = bucket(
+    final mailbox = await _factCall(a2, 'push_local_test_counts');
+    failureFacts['m7_wake_mailbox_sessions'] = factBucket(
       mailbox is Map ? mailbox['own_sessions'] : null,
       's',
       1,
@@ -479,27 +457,16 @@ Future<void> runPushScenario(
 
   // On a missing `read` push: what A2 decided (`m7_read_*`, fixed buckets).
   Future<void> noteReadClear() async {
-    Object? value;
-    try {
-      value = await a2.call(
-        'push_local_test_counts',
-        const {},
-        timeout: const Duration(seconds: 5),
-        failOnTimeout: false,
-      );
-    } catch (_) {
-      value = null;
-    }
+    final value = await _factCall(a2, 'push_local_test_counts');
     final map = value is Map ? value : const {};
-    String bucket(Object? n, String prefix, int top) => n is! int
-        ? 'unknown'
-        : n >= top
-        ? '$prefix${top}plus'
-        : '$prefix$n';
-    failureFacts['m7_read_own_handles'] = bucket(map['own_handles'], 'h', 1);
-    failureFacts['m7_read_sessions'] = bucket(map['own_sessions'], 's', 1);
-    failureFacts['m7_read_clears'] = bucket(map['read_clears'], 'c', 2);
-    failureFacts['m7_read_items'] = bucket(map['read_items'], 'i', 1);
+    failureFacts['m7_read_own_handles'] = factBucket(
+      map['own_handles'],
+      'h',
+      1,
+    );
+    failureFacts['m7_read_sessions'] = factBucket(map['own_sessions'], 's', 1);
+    failureFacts['m7_read_clears'] = factBucket(map['read_clears'], 'c', 2);
+    failureFacts['m7_read_items'] = factBucket(map['read_items'], 'i', 1);
   }
 
   // On a notification a push should have changed: A1's fetches for received pushes
@@ -556,14 +523,9 @@ Future<void> runPushScenario(
       /* What could not be read stays unknown. */
     }
     final map = value is Map ? value : const {};
-    String bucket(Object? n, String prefix, int top) => n is! int
-        ? 'unknown'
-        : n >= top
-        ? '$prefix${top}plus'
-        : '$prefix$n';
-    failureFacts['m7_fetch_all'] = bucket(map['fetches'], 'f', 2);
-    failureFacts['m7_fetch_online'] = bucket(map['fetches_online'], 'o', 2);
-    failureFacts['m7_fetch_done'] = bucket(map['fetches_done'], 'd', 2);
+    failureFacts['m7_fetch_all'] = factBucket(map['fetches'], 'f', 2);
+    failureFacts['m7_fetch_online'] = factBucket(map['fetches_online'], 'o', 2);
+    failureFacts['m7_fetch_done'] = factBucket(map['fetches_done'], 'd', 2);
     const errors = {
       'none',
       'NetworkTimeout',
@@ -577,8 +539,8 @@ Future<void> runPushScenario(
     };
     String error(Object? code) =>
         errors.contains(code) ? code as String : 'unknown';
-    failureFacts['m7_fetch_dials_ok'] = bucket(map['own_dials_ok'], 'k', 2);
-    failureFacts['m7_fetch_dials_failed'] = bucket(
+    failureFacts['m7_fetch_dials_ok'] = factBucket(map['own_dials_ok'], 'k', 2);
+    failureFacts['m7_fetch_dials_failed'] = factBucket(
       map['own_dials_failed'],
       'x',
       2,
@@ -597,25 +559,25 @@ Future<void> runPushScenario(
     String check(Object? name) =>
         checks.contains(name) ? name as String : 'unknown';
     failureFacts['m7_fetch_dial_check'] = check(map['own_dial_check']);
-    failureFacts['m7_fetch_pulls'] = bucket(map['pulls'], 'p', 2);
-    failureFacts['m7_fetch_pulls_failed'] = bucket(
+    failureFacts['m7_fetch_pulls'] = factBucket(map['pulls'], 'p', 2);
+    failureFacts['m7_fetch_pulls_failed'] = factBucket(
       map['pulls_failed'],
       'pf',
       2,
     );
-    failureFacts['m7_fetch_pulls_stopped'] = bucket(
+    failureFacts['m7_fetch_pulls_stopped'] = factBucket(
       map['pulls_stopped'],
       'ps',
       1,
     );
     final held = mailbox is Map ? mailbox : const {};
     // A2 took A1's dial once in setup already.
-    failureFacts['m7_mailbox_accepts_ok'] = bucket(
+    failureFacts['m7_mailbox_accepts_ok'] = factBucket(
       held['own_accepts_ok'],
       'a',
       3,
     );
-    failureFacts['m7_mailbox_accepts_failed'] = bucket(
+    failureFacts['m7_mailbox_accepts_failed'] = factBucket(
       held['own_accepts_failed'],
       'r',
       2,
@@ -981,7 +943,19 @@ Future<void> runPushScenario(
   // off line again as in step 3.
   final phoneBefore = (await network(a1))['state'];
   await call(a1, 'network_stop');
+  // A1's own network is Stopped (not only gone from A2's and B1's peer lists), also right
+  // before B1 sends: a start the app makes on its own would let B1 reach A1 directly.
+  Future<void> phoneStopped() async {
+    await until<Map<String, Object?>>(
+      () => network(a1),
+      (v) => v['state'] == 'Stopped',
+      'phone_stopped',
+    );
+  }
+
+  await phoneStopped();
   await isolated(endpoint);
+  await phoneStopped();
   final large = 'm7 wake text '.padRight(16384, 'w');
   final wakeKey = object(
     await call(b1, 'message_local_send_text', {
@@ -1031,4 +1005,23 @@ Future<void> runPushScenario(
     'notifications': 1,
     'texts': 4,
   });
+}
+
+/// One read for a failure fact: [op] on [p] within 5 s, or null on any failure (the fact is
+/// then `unknown`).
+Future<Object?> _factCall(
+  Participant p,
+  String op, [
+  Map<String, Object?> args = const {},
+]) async {
+  try {
+    return await p.call(
+      op,
+      args,
+      timeout: const Duration(seconds: 5),
+      failOnTimeout: false,
+    );
+  } catch (_) {
+    return null;
+  }
 }

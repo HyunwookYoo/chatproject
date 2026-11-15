@@ -133,6 +133,7 @@
     "Push scenario deadline: pair_code",
     "Push scenario deadline: pair_joined",
     "Push scenario deadline: pair_listed",
+    "Push scenario deadline: phone_stopped",
     "Push scenario deadline: phone_texts",
     "Push scenario deadline: read_cleared",
     "Push scenario deadline: reopened",

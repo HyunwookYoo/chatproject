@@ -122,6 +122,11 @@ Future<void> notePairSide(
       : 'unknown';
 }
 
+/// [value] as a fixed fact bucket: `<prefix><n>`, `<prefix><top>plus`, or
+/// `unknown` when it is not a count.
+String factBucket(Object? value, String prefix, int top) =>
+    _bucket(value, prefix, top);
+
 String _bucket(Object? value, String prefix, int top) => value is! int
     ? 'unknown'
     : value >= top

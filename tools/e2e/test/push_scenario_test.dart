@@ -316,10 +316,35 @@ NOTIFICATION MANAGER (dumpsys notification)
     await fixture.start();
     try {
       await fixture.run();
+      expect(fixture.phoneStoppedAtWakeSend, isTrue);
     } finally {
       await fixture.close();
     }
   });
+
+  // Re-review I1: the phone's network must be Stopped right before B1 sends; one that comes
+  // back on by itself (an app start) fails at a named deadline instead of a missing wake.
+  test(
+    'a phone that comes back on line before the wake send fails at phone_stopped',
+    () async {
+      final fixture = PushFixture()..fault = 'restarts_after_stop';
+      await fixture.start();
+      try {
+        await expectLater(
+          fixture.run(),
+          throwsA(
+            isA<ScenarioDeadline>().having(
+              (e) => e.message,
+              'text',
+              'Push scenario deadline: phone_stopped',
+            ),
+          ),
+        );
+      } finally {
+        await fixture.close();
+      }
+    },
+  );
 
   test(
     'a missing wake push notes what the sender and both A sides held',
@@ -478,6 +503,10 @@ class PushFixture {
   var token = false;
   var killed = false;
   var stopped = false;
+  // Whether A1's network was stopped when B1 sent the large (wake) text.
+  bool? phoneStoppedAtWakeSend;
+  // A read clear came (step 3 is done).
+  var readCleared = false;
   // The relaunched app's network is off until `network_start` (the core's `restore`).
   var offAfterRelaunch = false;
   var lingering = 3;
@@ -577,6 +606,7 @@ class PushFixture {
       });
     } else if (extras.containsKey('r')) {
       fetches++;
+      readCleared = true;
       // The read clear's fetch leaves A1's network on (an app start meanwhile, M7 B1).
       if (fault == 'online_after_read') stopped = false;
       if (fault == 'no_cancel') return;
@@ -709,6 +739,8 @@ class PushFixture {
         };
       case 'network_stop':
         stopped = true;
+        // The app starts its network again on its own after step 4's stop (an app start).
+        if (fault == 'restarts_after_stop' && readCleared) stopped = false;
       case 'message_local_open_dm':
         return {'id': conversation};
       case 'message_local_send_text':
@@ -724,6 +756,7 @@ class PushFixture {
           'state': 'Delivered',
         };
         bodies[idOf(text['key'])] = body;
+        if (utf8.encode(body).length > 2900) phoneStoppedAtWakeSend = stopped;
         texts['node']!.add(text);
         texts['mailbox']!.add(text);
         if (reachable) {
