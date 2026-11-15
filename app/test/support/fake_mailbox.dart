@@ -67,7 +67,6 @@ class FakeMailboxPlatform implements MailboxPlatform {
   /// What `setMailbox(true)` answers (Android: false unless the app is on screen).
   bool mailboxResult = true;
   bool autostartValue = false;
-  bool permissionResult = true;
   final calls = <String>[];
   final notifications = <({int id, String title, String body, bool update})>[];
   final cancelled = <int>[];
@@ -105,12 +104,6 @@ class FakeMailboxPlatform implements MailboxPlatform {
   @override
   Future<void> requestBatteryExemption() async =>
       calls.add('requestBatteryExemption');
-
-  @override
-  Future<bool> requestNotificationPermission() async {
-    calls.add('requestNotificationPermission');
-    return permissionResult;
-  }
 
   @override
   Future<void> quit() async => calls.add('quit');

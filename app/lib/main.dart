@@ -17,6 +17,9 @@ import 'message/message_client.dart';
 import 'message/message_model.dart';
 import 'message/screens/conversation_screen.dart';
 import 'network/network_client.dart';
+import 'push/push_client.dart';
+import 'push/push_model.dart';
+import 'push/push_platform.dart';
 import 'src/rust/frb_generated.dart';
 import 'theme/app_theme.dart';
 
@@ -43,6 +46,9 @@ class ChatApp extends StatefulWidget {
     this.messages,
     this.mailbox,
     this.mailboxPlatform = const ChannelMailboxPlatform(),
+    this.push,
+    this.pushHost = const ChannelPushHost(),
+    this.pushUrl,
   });
 
   final CoreClient core;
@@ -51,6 +57,11 @@ class ChatApp extends StatefulWidget {
   final MailboxClient? mailbox;
   final MailboxPlatform mailboxPlatform;
   final NetworkClient? network;
+  final PushClient? push;
+  final PushHost pushHost;
+
+  /// Debug `--push-url`.
+  final String? pushUrl;
 
   @override
   State<ChatApp> createState() => _ChatAppState();
@@ -61,17 +72,26 @@ class _ChatAppState extends State<ChatApp> {
   final _navigator = GlobalKey<NavigatorState>();
   MailboxModel? _mailbox;
   Notifier? _notifier;
+  PushModel? _push;
 
   @override
   void initState() {
     super.initState();
-    final client = widget.mailbox;
     final account = widget.account;
-    if (client == null || account == null) return;
+    if (account == null) return;
+    if (widget.push case final PushClient push) {
+      _push = PushModel(push, widget.pushHost, proxyUrl: widget.pushUrl)
+        ..onOpen = (conversation) =>
+            unawaited(_openNotification(notificationId(conversation)));
+    }
+    final client = widget.mailbox;
+    if (client == null) return;
     final platform = widget.mailboxPlatform;
     final mailbox = _mailbox = MailboxModel(client, platform);
     final messages = widget.messages;
-    if (messages != null) {
+    // Android's notifications are Kotlin's, with or without Flutter (M7 spec
+    // 5.5); posting from Dart too would alert twice.
+    if (messages != null && !MailboxModel.android) {
       _notifier =
           Notifier(
               events: messages.events(),
@@ -89,7 +109,7 @@ class _ChatAppState extends State<ChatApp> {
     }
     platform.listen(
       onExitRequested: mailbox.exit,
-      onOpenConversation: (id) => unawaited(_notifier?.open(id)),
+      onOpenConversation: (id) => unawaited(_openNotification(id)),
     );
   }
 
@@ -97,7 +117,21 @@ class _ChatAppState extends State<ChatApp> {
   void dispose() {
     unawaited(_notifier?.dispose());
     _mailbox?.dispose();
+    _push?.dispose();
     super.dispose();
+  }
+
+  /// A tapped notification's conversation (its notification id, untrusted).
+  Future<void> _openNotification(int id) async {
+    final notifier = _notifier;
+    if (notifier != null) return notifier.open(id);
+    final messages = widget.messages;
+    if (messages == null) return;
+    final peer = await conversationPeer(messages, id);
+    final context = _navigator.currentContext;
+    if (peer != null && context != null && context.mounted) {
+      await _openConversation(context, peer);
+    }
   }
 
   Future<void> _openConversation(BuildContext context, List<int> peer) async {
@@ -113,12 +147,14 @@ class _ChatAppState extends State<ChatApp> {
             account: account,
             messages: messages,
             peer: List.of(peer),
+            onShown: _push?.conversationShown,
           ),
         ),
       );
     } finally {
       _roomOpen = false;
       _notifier?.openPeer = null;
+      _push?.conversationShown(null);
     }
   }
 
@@ -142,6 +178,7 @@ class _ChatAppState extends State<ChatApp> {
               : AccountRoutes(
                   model: widget.account!,
                   mailbox: _mailbox,
+                  push: _push,
                   onOpenConversation: widget.messages == null
                       ? null
                       : (peer) => _openConversation(context, peer),
@@ -160,21 +197,41 @@ class _ConversationRoute extends StatefulWidget {
     required this.account,
     required this.messages,
     required this.peer,
+    this.onShown,
   });
   final AccountModel account;
   final MessageClient messages;
   final List<int> peer;
+
+  /// The id of the conversation on screen, once it is known.
+  final ValueChanged<List<int>?>? onShown;
   @override
   State<_ConversationRoute> createState() => _ConversationRouteState();
 }
 
 class _ConversationRouteState extends State<_ConversationRoute> {
   late final _model = MessageModel(widget.messages, account: widget.account);
+  List<int>? _shown;
+
+  @override
+  void initState() {
+    super.initState();
+    _model.addListener(_conversationChanged);
+  }
+
+  void _conversationChanged() {
+    final id = _model.currentConversation?.id;
+    if (id == null || listEquals(id, _shown)) return;
+    _shown = List.of(id);
+    widget.onShown?.call(_shown);
+  }
+
   @override
   Widget build(BuildContext context) =>
       ConversationScreen(model: _model, peer: widget.peer);
   @override
   void dispose() {
+    _model.removeListener(_conversationChanged);
     _model.dispose();
     super.dispose();
   }

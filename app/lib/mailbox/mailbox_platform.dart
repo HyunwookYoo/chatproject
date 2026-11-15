@@ -27,10 +27,6 @@ abstract interface class MailboxPlatform {
   /// Android.
   Future<void> requestBatteryExemption();
 
-  /// Android 13+. Prompts only the first time ever; later calls answer the
-  /// current state.
-  Future<bool> requestNotificationPermission();
-
   /// Windows: ends the app after an `exitRequested`.
   Future<void> quit();
 
@@ -83,9 +79,6 @@ class ChannelMailboxPlatform implements MailboxPlatform {
   @override
   Future<void> requestBatteryExemption() =>
       _call<void>('requestBatteryExemption');
-  @override
-  Future<bool> requestNotificationPermission() async =>
-      await _call<bool>('requestNotificationPermission') ?? false;
   @override
   Future<void> quit() => _call<void>('quit');
   @override

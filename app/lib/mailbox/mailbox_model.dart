@@ -65,9 +65,6 @@ class MailboxModel extends ChangeNotifier {
     // Every start, so a restarted Android app restores its service and a
     // Windows --tray start learns the setting.
     _platformPending = !await platform.setMailbox(enabled) && enabled;
-    // Android prompts only on the first run with an active account; it
-    // remembers that it asked.
-    if (android) await platform.requestNotificationPermission();
   }
 
   void lifecycle(AppLifecycleState state) {

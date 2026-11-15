@@ -4,12 +4,15 @@ import 'package:chat_app/account/account_model.dart';
 import 'package:chat_app/account/account_routes.dart';
 import 'package:chat_app/account/sensitive_screen.dart';
 import 'package:chat_app/account/screens/recover_screen.dart';
+import 'package:chat_app/push/push_model.dart';
 import 'package:chat_app/src/rust/api/account.dart' as a;
 import 'package:chat_app/src/rust/api/chat.dart' as r;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter/scheduler.dart';
 import 'package:flutter_test/flutter_test.dart';
+
+import 'support/fake_push.dart';
 
 // Public invalid fixture words, never a real mnemonic.
 class ScreenClient implements AccountClient {
@@ -231,6 +234,7 @@ Future<AccountModel> mountAccount(
   WidgetTester t,
   ScreenClient c, {
   double scale = 1,
+  PushModel? push,
 }) async {
   TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
       .setMockMethodCallHandler(
@@ -243,7 +247,11 @@ Future<AccountModel> mountAccount(
     MaterialApp(
       home: MediaQuery(
         data: MediaQueryData(textScaler: TextScaler.linear(scale)),
-        child: AccountRoutes(model: m, child: const Text('diagnostic host')),
+        child: AccountRoutes(
+          model: m,
+          push: push,
+          child: const Text('diagnostic host'),
+        ),
       ),
     ),
   );
@@ -851,6 +859,54 @@ void main() {
     expect(c.saved, isEmpty);
     expect(find.text('공개 목록 반영을 기다리고 있어요.'), findsOneWidget);
   });
+  Future<PushModel> pushModel(WidgetTester t) async {
+    final push = PushModel(FakePushClient(), FakePushHost());
+    addTearDown(push.dispose);
+    await t.pump();
+    return push;
+  }
+
+  testWidgets('the notification question follows the recovery phrase check, '
+      'once', (t) async {
+    final c = ScreenClient();
+    await mountAccount(t, c, push: await pushModel(t));
+    await tapText(t, '새 계정 만들기');
+    await tapText(t, '적어 두었어요');
+    expect(find.text('새 메시지를 알림으로 알려 드릴까요?'), findsNothing);
+    await tapText(t, '확인하고 계정 만들기');
+    expect(find.text('새 메시지를 알림으로 알려 드릴까요?'), findsOneWidget);
+    await tapText(t, '알림 켜기');
+    expect(find.text('새 메시지를 알림으로 알려 드릴까요?'), findsNothing);
+    expect(find.text('공개 목록 반영을 기다리고 있어요.'), findsOneWidget);
+  }, variant: TargetPlatformVariant.only(TargetPlatform.android));
+  testWidgets(
+    'the notification question follows a recovery',
+    (t) async {
+      final c = ScreenClient();
+      await mountAccount(t, c, push: await pushModel(t));
+      await tapText(t, '복구 문구로 복구');
+      await t.enterText(find.byType(TextField), 'PUBLIC_INVALID_RECOVERY');
+      await tapText(t, '기존 기기 교체에 동의해요');
+      await tapText(t, '계정 복구');
+      expect(find.text('새 메시지를 알림으로 알려 드릴까요?'), findsOneWidget);
+      await tapText(t, '나중에');
+      expect(find.text('공개 목록 반영을 기다리고 있어요.'), findsOneWidget);
+    },
+    variant: TargetPlatformVariant.only(TargetPlatform.iOS),
+  );
+  testWidgets(
+    'Windows goes home after the check without asking',
+    (t) async {
+      final c = ScreenClient();
+      await mountAccount(t, c, push: await pushModel(t));
+      await tapText(t, '새 계정 만들기');
+      await tapText(t, '적어 두었어요');
+      await tapText(t, '확인하고 계정 만들기');
+      expect(find.text('새 메시지를 알림으로 알려 드릴까요?'), findsNothing);
+      expect(find.text('공개 목록 반영을 기다리고 있어요.'), findsOneWidget);
+    },
+    variant: TargetPlatformVariant.only(TargetPlatform.windows),
+  );
   testWidgets('active does not offer overwrite recovery', (t) async {
     final c = ScreenClient()..phase = a.AccountPhase.active;
     await mountAccount(t, c);

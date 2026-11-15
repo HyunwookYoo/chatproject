@@ -41,6 +41,7 @@ void main() {
     expect(find.text('아직 대화가 없어요'), findsOneWidget);
     expect(find.text('코어 9.9.9-test'), findsOneWidget);
     expect(find.text('코어 시작 중'), findsOneWidget);
+    expect(find.byTooltip('알림 측정'), findsNothing, reason: 'probe removed');
   });
 
   testWidgets('shows the connection state from the event stream', (tester) async {

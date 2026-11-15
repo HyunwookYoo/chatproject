@@ -12,6 +12,8 @@ import android.os.Build
 import android.os.PowerManager
 import android.provider.Settings
 import androidx.lifecycle.Lifecycle
+import com.google.firebase.FirebaseApp
+import com.google.firebase.messaging.FirebaseMessaging
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.plugin.common.BinaryMessenger
 import io.flutter.plugin.common.MethodCall
@@ -86,6 +88,17 @@ class MailboxChannel(private val activity: FlutterActivity, messenger: BinaryMes
                 result.success(null)
             }
             "requestNotificationPermission" -> requestNotificationPermission(result)
+            // M7 push (spec 8): the permission screen and settings ask without prompting.
+            "notificationPermission" -> result.success(notificationPermission())
+            "markNotificationPermissionAsked" -> {
+                prefs().edit().putBoolean(PERMISSION_ASKED, true).apply()
+                result.success(null)
+            }
+            "openNotificationSettings" -> {
+                openNotificationSettings()
+                result.success(null)
+            }
+            "pushToken" -> pushToken(result)
             // Windows posts these for Dart. On Android the core's events reach Notifications
             // directly, with or without Flutter (spec 5.5); posting here too would alert twice.
             "notify" -> {
@@ -168,11 +181,43 @@ class MailboxChannel(private val activity: FlutterActivity, messenger: BinaryMes
         if (pendingPermission != null) return result.success(false)
         // Asked once, on the first run with an active account; later runs
         // answer the current state without a prompt.
-        val prefs = activity.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val prefs = prefs()
         if (prefs.getBoolean(PERMISSION_ASKED, false)) return result.success(false)
         prefs.edit().putBoolean(PERMISSION_ASKED, true).apply()
         pendingPermission = result
         activity.requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), PERMISSION_REQUEST)
+    }
+
+    private fun prefs() = activity.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+
+    // "granted", "denied", or "notDetermined" while Android 13+ has not asked yet.
+    private fun notificationPermission(): String = when {
+        notifications.areNotificationsEnabled() -> "granted"
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            activity.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED &&
+            !prefs().getBoolean(PERMISSION_ASKED, false) -> "notDetermined"
+        else -> "denied"
+    }
+
+    private fun openNotificationSettings() {
+        try {
+            activity.startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                .putExtra(Settings.EXTRA_APP_PACKAGE, activity.packageName))
+        } catch (_: ActivityNotFoundException) {
+            // No such screen on this device.
+        }
+    }
+
+    // The current FCM token, for Dart to hand to the core: PushService.onNewToken drops one that
+    // arrives before the permission (spec 8). Null without Firebase (no google-services.json:
+    // FirebaseMessaging.getInstance() would throw) or without notification permission.
+    private fun pushToken(result: MethodChannel.Result) {
+        if (FirebaseApp.getApps(activity).isEmpty() || !notifications.areNotificationsEnabled()) {
+            return result.success(null)
+        }
+        FirebaseMessaging.getInstance().token.addOnCompleteListener { task ->
+            result.success(if (task.isSuccessful) task.result else null)
+        }
     }
 
     companion object {

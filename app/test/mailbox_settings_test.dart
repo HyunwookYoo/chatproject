@@ -78,7 +78,8 @@ void main() {
     await tester.tap(find.text(_deviceSwitch));
     await tester.pumpAndSettle();
     expect(client.sets, [true]);
-    expect(platform.calls.skip(2), [
+    // After the start's setMailbox:false.
+    expect(platform.calls.skip(1), [
       'setMailbox:true',
       'requestBatteryExemption',
     ]);
@@ -101,7 +102,7 @@ void main() {
   }, variant: TargetPlatformVariant.only(TargetPlatform.android));
 
   test('the stored setting reaches the platform once the account is Active; '
-      'Android asks the notification permission once', () async {
+      'the notification permission is asked elsewhere (M7)', () async {
     debugDefaultTargetPlatformOverride = TargetPlatform.android;
     addTearDown(() => debugDefaultTargetPlatformOverride = null);
     final client = FakeMailboxClient()..enabled = true;
@@ -112,10 +113,7 @@ void main() {
     await model.accountActive();
     expect(client.states, 1);
     expect(model.enabled, isTrue);
-    expect(platform.calls, [
-      'setMailbox:true',
-      'requestNotificationPermission',
-    ]);
+    expect(platform.calls, ['setMailbox:true']);
   });
 
   test('Windows never asks a notification permission at startup', () async {

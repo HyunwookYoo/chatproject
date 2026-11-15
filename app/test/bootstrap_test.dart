@@ -197,6 +197,8 @@ void main() {
       '--control-url=http://127.0.0.1',
       '--name',
       '--name=probe',
+      '--push-url',
+      '--push-url=http://10.0.2.2:8080',
     ]) {
       expect(
         () => startupDataDir([flag], releaseMode: true),
@@ -214,6 +216,19 @@ void main() {
       () => startupDataDir(['--data-dir'], releaseMode: false),
       throwsFormatException,
     );
+  });
+
+  test("--push-url overrides the build's proxy address in debug", () {
+    expect(startupPushUrl([]), isNull);
+    expect(
+      startupPushUrl(['--push-url', 'http://10.0.2.2:8080']),
+      'http://10.0.2.2:8080',
+    );
+    expect(
+      startupPushUrl(['--push-url=https://push.test']),
+      'https://push.test',
+    );
+    expect(() => startupPushUrl(['--push-url']), throwsFormatException);
   });
 
   test(

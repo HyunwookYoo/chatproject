@@ -37,7 +37,8 @@ Future<List<int>?> conversationPeer(MessageClient messages, int id) async {
 }
 
 /// One notification per conversation from `ChatEvent.notify` (M6 spec 4):
-/// the contact's alias and the unread count, never message text.
+/// the contact's alias, and the core's preview or else the unread count
+/// (M7). Not on Android, where Kotlin posts them (M7 spec 5.5).
 class Notifier {
   Notifier({
     required Stream<rust.ChatEvent> events,
@@ -86,7 +87,7 @@ class Notifier {
       platform.notify(
         id: id,
         title: alias == null ? '새 메시지' : isolatedName(alias),
-        body: '새 메시지 ${item.unread}개',
+        body: item.preview ?? '새 메시지 ${item.unread}개',
         update: item.newMessages == 0,
       ),
     );

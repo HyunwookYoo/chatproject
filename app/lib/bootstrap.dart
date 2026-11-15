@@ -12,6 +12,7 @@ import 'src/rust/api/account.dart' as account;
 import 'mailbox/mailbox_client.dart';
 import 'main.dart';
 import 'network/network_client.dart';
+import 'push/push_client.dart';
 import 'src/rust/api/chat.dart' as rust;
 import 'startup_error_app.dart';
 
@@ -25,6 +26,7 @@ Future<Widget> bootstrap(
   var startingHooks = false;
   try {
     final dataDir = startupDataDir(arguments, releaseMode: kReleaseMode);
+    final pushUrl = startupPushUrl(arguments);
     await initializeRust();
     final core = createClient(dataDir);
     await core.start();
@@ -49,6 +51,8 @@ Future<Widget> bootstrap(
       messages: core is FrbCoreClient ? core.messages : null,
       mailbox: core is FrbCoreClient ? const FrbMailboxClient() : null,
       network: core is NetworkClient ? core as NetworkClient : null,
+      push: core is FrbCoreClient ? const FrbPushClient() : null,
+      pushUrl: pushUrl,
     );
     return accountModel == null
         ? app
@@ -75,6 +79,7 @@ String? startupDataDir(List<String> arguments, {required bool releaseMode}) {
           '--debug-hooks',
           '--control-url',
           '--name',
+          '--push-url',
         ].any((flag) => argument == flag || argument.startsWith('$flag='))) {
       throw const FormatException(
         'Debug control arguments are unavailable in Release',
@@ -96,6 +101,24 @@ String? startupDataDir(List<String> arguments, {required bool releaseMode}) {
     throw const FormatException('--data-dir requires an absolute path');
   }
   return dataDir;
+}
+
+/// Debug `--push-url <url>`: the push proxy instead of the build's
+/// `CHATPROJECT_PUSH_URL` (Release refuses it in [startupDataDir]).
+String? startupPushUrl(List<String> arguments) {
+  String? url;
+  for (var i = 0; i < arguments.length; i++) {
+    final argument = arguments[i];
+    if (argument == '--push-url') {
+      if (++i >= arguments.length) {
+        throw const FormatException('--push-url requires a URL');
+      }
+      url = arguments[i];
+    } else if (argument.startsWith('--push-url=')) {
+      url = argument.substring('--push-url='.length);
+    }
+  }
+  return url;
 }
 
 Future<void> _startTestHooks(String url, String name) =>

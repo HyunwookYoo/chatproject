@@ -71,7 +71,10 @@ import UserNotifications
 /// Dart calls `requestPermission()` (alert permission, then APNs registration; true when
 /// granted), `token()` (the APNs token in hex, or nil before iOS gave one), `appGroupDir()` (the
 /// App Group folder: Dart passes it as `snapshot_dir`, and `<it>/push` is the inbox folder) and
-/// `takeOpenedTag()` (the `t` of a notification tapped before Dart listened, once). Swift calls
+/// `takeOpenedTag()` (the `t` of a notification tapped before Dart listened, once),
+/// `permissionStatus()` ("granted", "denied", or "notDetermined" while neither iOS nor the
+/// permission screen's "나중에" answered), `markPermissionAsked()` ("나중에") and
+/// `openNotificationSettings()` (this app's page in Settings). Swift calls
 /// `tokenChanged(hex)` when iOS gives a token and `notificationOpened(t)` on a tap; Dart answers
 /// true when it took the tap.
 ///
@@ -84,6 +87,8 @@ final class PushHost: NSObject, UNUserNotificationCenterDelegate {
   /// The renewal's share of the about 30 seconds iOS gives a refresh task.
   private static let renewBudgetMs: UInt32 = 25_000
   private static let renewEvery: TimeInterval = 12 * 60 * 60
+  /// Set by the permission screen's "나중에", so it is shown once (M7 spec 4).
+  private static let permissionAsked = "notification_permission_asked"
 
   private var channel: FlutterMethodChannel?
   private var token: String?
@@ -115,6 +120,27 @@ final class PushHost: NSObject, UNUserNotificationCenterDelegate {
             result(granted)
           }
         }
+      case "permissionStatus":
+        UNUserNotificationCenter.current().getNotificationSettings { settings in
+          let status: String
+          switch settings.authorizationStatus {
+          case .authorized, .provisional, .ephemeral:
+            status = "granted"
+          case .notDetermined:
+            status = UserDefaults.standard.bool(forKey: Self.permissionAsked) ? "denied" : "notDetermined"
+          default:
+            status = "denied"
+          }
+          DispatchQueue.main.async { result(status) }
+        }
+      case "markPermissionAsked":
+        UserDefaults.standard.set(true, forKey: Self.permissionAsked)
+        result(nil)
+      case "openNotificationSettings":
+        if let url = URL(string: UIApplication.openSettingsURLString) {
+          UIApplication.shared.open(url)
+        }
+        result(nil)
       case "token":
         result(self.token)
       case "appGroupDir":
