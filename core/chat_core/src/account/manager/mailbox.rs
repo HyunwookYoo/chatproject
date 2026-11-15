@@ -85,6 +85,12 @@ const RESTART_NOTIFY_MS: u64 = 60_000;
 /// for as long as the session lasts: the cap keeps that to one `Announce` per 5 minutes.
 const ANNOUNCE_RETRY_MIN_MS: u64 = 5_000;
 const ANNOUNCE_RETRY_MAX_MS: u64 = 300_000;
+/// A session whose pull was answered `Refused` or broke the order rules is not synced over for
+/// `STOPPED_RETRY_MIN_MS`, doubling with each such stop in a row from the same device up to
+/// `STOPPED_RETRY_MAX_MS`; then that device is pulled from again (user decision 2026-11-16: a
+/// device that refused right after a join serves the new device a moment later).
+const STOPPED_RETRY_MIN_MS: u64 = 5_000;
+const STOPPED_RETRY_MAX_MS: u64 = 300_000;
 
 /// What an `Announce` says: whether this device is a mailbox, its own-device push handle.
 type Told = (bool, Option<Vec<u8>>);
@@ -101,9 +107,12 @@ pub(crate) struct Runtime {
     /// Own devices whose last pull failed: the scheduler time it is tried again (`u64::MAX`:
     /// it was), and the back-off that wait was. Gone once a pull from it gets to the end.
     retry: BTreeMap<InstallationId, (u64, u64)>,
-    /// Connections (`stable_id`) this device stopped syncing over: `Refused`, or a page that
-    /// broke the order rules.
-    stopped: BTreeSet<usize>,
+    /// Connections (`stable_id`) this device stopped syncing over for now (`Refused`, or a page
+    /// that broke the order rules): the device, and the scheduler time it is pulled from again.
+    stopped: BTreeMap<usize, (InstallationId, u64)>,
+    /// Per own device: the last wait of `stopped` (`STOPPED_RETRY_MIN_MS` doubling). Gone once a
+    /// pull from it gets to the end.
+    stop_delay: BTreeMap<InstallationId, u64>,
     /// The log's head (largest seq handed out) after the last storage operation.
     pub(super) head: u64,
     /// Per own device: the head it was last told about, and when (scheduler time).
@@ -179,6 +188,9 @@ pub(crate) struct Runtime {
     /// Page requests still to fail as timed out, without being sent.
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     fail_pulls: u32,
+    /// Page requests from my other devices still to answer `Refused`.
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    refuse_pulls: u32,
     /// How sessions with my other devices came about and how pulls ended (e2e m7).
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     trace: SyncTrace,
@@ -205,6 +217,20 @@ impl Runtime {
             });
         self.retry
             .insert(installation, (now.saturating_add(delay), delay));
+    }
+    /// Sync over connection `conn` with `installation` stops for now (`Refused`, or a page out
+    /// of order): that device is pulled from again after a back-off twice the last one
+    /// (`STOPPED_RETRY_MIN_MS` the first time), at most `STOPPED_RETRY_MAX_MS`.
+    fn stop(&mut self, conn: usize, installation: InstallationId, now: u64) {
+        let delay = self
+            .stop_delay
+            .get(&installation)
+            .map_or(STOPPED_RETRY_MIN_MS, |last| {
+                last.saturating_mul(2).min(STOPPED_RETRY_MAX_MS)
+            });
+        self.stop_delay.insert(installation, delay);
+        self.stopped
+            .insert(conn, (installation, now.saturating_add(delay)));
     }
     /// The `Announce` saying `told` was not taken by `installation`: it is told again after a
     /// back-off twice the last one for the same value (`ANNOUNCE_RETRY_MIN_MS` the first time),
@@ -425,6 +451,8 @@ pub(crate) enum MailboxTest {
     Hold(bool),
     /// The next this many page requests of pulls fail as timed out, without being sent.
     FailPulls(u32),
+    /// The next this many page requests from my other devices are answered `Refused`.
+    RefusePulls(u32),
     Counters,
     /// My other devices with a ready session now.
     OwnSessions,
@@ -560,6 +588,12 @@ impl AccountHandle {
             .await
             .map(|_| ())
     }
+    /// The next `requests` page requests from my other devices are answered `Refused`.
+    pub async fn mailbox_test_refuse_pulls(&self, requests: u32) -> Result<(), CoreError> {
+        self.mailbox_test(MailboxTest::RefusePulls(requests))
+            .await
+            .map(|_| ())
+    }
     /// Each attempt this device (as a mailbox) made of a handed-off ciphertext, in order: the
     /// scheduler time it was sent at and the SHA-256 of the ciphertext.
     pub async fn mailbox_test_handoff_sends(&self) -> Result<Vec<(u64, [u8; 32])>, CoreError> {
@@ -629,6 +663,10 @@ impl Manager {
             }
             MailboxTest::FailPulls(requests) => {
                 self.messages.mailbox.fail_pulls = requests;
+                MailboxTestReply::Done
+            }
+            MailboxTest::RefusePulls(requests) => {
+                self.messages.mailbox.refuse_pulls = requests;
                 MailboxTestReply::Done
             }
             MailboxTest::SyncTrace => MailboxTestReply::Trace(self.messages.mailbox.trace),
@@ -880,7 +918,8 @@ impl Manager {
             .own_sessions()
             .into_iter()
             .filter(|s| {
-                mailboxes.contains(&s.grant.installation) && !stopped.contains(&s.conn.stable_id())
+                mailboxes.contains(&s.grant.installation)
+                    && !stopped.contains_key(&s.conn.stable_id())
             })
             .collect();
         if targets.is_empty() {
@@ -995,6 +1034,13 @@ impl Manager {
         };
         if self.messages.mailbox.held() {
             return Ok(MailboxReply::Busy.encode().to_vec());
+        }
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        if self.messages.mailbox.refuse_pulls > 0
+            && matches!(MailboxFrame::decode(inner), Ok(MailboxFrame::SyncReq { .. }))
+        {
+            self.messages.mailbox.refuse_pulls -= 1;
+            return Ok(MailboxReply::Refused.encode().to_vec());
         }
         let reply = match MailboxFrame::decode(inner) {
             Ok(MailboxFrame::SyncReq { since_seq }) => {
@@ -1150,12 +1196,21 @@ impl Manager {
         }
         let sessions = self.own_sessions();
         let mailbox = &mut self.messages.mailbox;
-        mailbox
-            .stopped
-            .retain(|id| sessions.iter().any(|s| s.conn.stable_id() == *id));
+        let Runtime { stopped, due, .. } = mailbox;
+        // A stopped session whose wait is over is synced over again: its device is due.
+        stopped.retain(|id, (installation, until)| {
+            if !sessions.iter().any(|s| s.conn.stable_id() == *id) {
+                return false;
+            }
+            if now >= *until {
+                due.insert(*installation);
+                return false;
+            }
+            true
+        });
         let usable: Vec<Session> = sessions
             .into_iter()
-            .filter(|s| !mailbox.stopped.contains(&s.conn.stable_id()))
+            .filter(|s| !mailbox.stopped.contains_key(&s.conn.stable_id()))
             .collect();
         let ok = mailbox
             .mailboxes
@@ -1605,9 +1660,10 @@ impl Manager {
                         self.end_pull(holder, Ended::Failed, request).await;
                         return;
                     }
-                    // `Refused`, or a page out of order: no more syncing over this session.
+                    // `Refused`, or a page out of order: no syncing over this session for now.
                     Ok(_) => {
-                        self.messages.mailbox.stopped.insert(conn);
+                        let now = self.schedule_now();
+                        self.messages.mailbox.stop(conn, holder, now);
                         self.end_pull(holder, Ended::Stopped, request).await;
                         return;
                     }
@@ -1877,7 +1933,8 @@ impl Manager {
                     return false;
                 }
                 Ok(_) => {
-                    self.messages.mailbox.stopped.insert(conn);
+                    let now = self.schedule_now();
+                    self.messages.mailbox.stop(conn, holder, now);
                     self.end_pull(holder, Ended::Stopped, request).await;
                     return false;
                 }
@@ -1996,6 +2053,7 @@ impl Manager {
         match ended {
             Ended::Done => {
                 mailbox.retry.remove(&holder);
+                mailbox.stop_delay.remove(&holder);
             }
             Ended::Failed => mailbox.back_off(holder, now),
             Ended::Stopped => {}

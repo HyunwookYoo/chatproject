@@ -338,6 +338,35 @@ async fn failed_or_busy_pull_is_retried_without_a_new_trigger() {
     );
 }
 
+/// User decision 2026-11-16 (f): A2 answers A1's first pull `Refused` (as right after a join,
+/// before it serves the new device). Over the same session, with nothing else happening, A1
+/// pulls again after a back-off and gets what A2 kept; before, sync over that session ended for
+/// good.
+#[tokio::test]
+async fn refused_pull_is_tried_again_over_the_same_session() {
+    let (mut a, b1, net, conv) = accounts(&[A1, A2], &[B1]).await;
+    let a2 = a.pop().unwrap();
+    let dir = stop(a.pop().unwrap());
+    for n in 1..=2 {
+        delivered(&b1, &a2, &[], n).await;
+    }
+    a2.account.mailbox_test_refuse_pulls(1).await.unwrap();
+    let a1 = start(dir, net.clone()).await;
+    link(&a1, &a2).await;
+    a1.account.mailbox_sync_now().await.unwrap();
+    settle!(
+        [&a1, &a2],
+        a1.account.mailbox_test_sync_trace().await.unwrap().pulls_stopped == 1
+    );
+    assert!(texts_from(&a1, conv, b1.peer).await.is_empty(), "the first pull was refused");
+    settle!(
+        [&a1, &a2],
+        texts_from(&a1, conv, b1.peer).await.len() == 2 && caught_up(&a1, &a2).await
+    );
+    let trace = a1.account.mailbox_test_sync_trace().await.unwrap();
+    assert_eq!(trace.pulls_stopped, 1, "{trace:?}");
+}
+
 /// Spec 11 (both ways): A2 is off while A1 and B1 talk. A2 comes back and has the six texts in
 /// their order; those A1 sent are A2's own sent messages.
 #[tokio::test]
