@@ -386,6 +386,54 @@ async fn own_handle_reaches_my_device_that_was_busy_when_announced() {
     );
 }
 
+/// An own device that keeps answering `Busy` (an M6 device cannot decode the four-field
+/// `Announce`) is told again with gaps doubling from 5 s, never more often than every 5 minutes
+/// once at the cap, and still told (the cap does not stop it).
+#[tokio::test]
+async fn announce_to_a_busy_device_backs_off_to_a_cap() {
+    let (mut a, b1, net, _conv) = accounts(&[A1, A2], &[B1]).await;
+    let a2 = a.pop().unwrap();
+    let a1 = a.pop().unwrap();
+    let _proxy = proxy(&net);
+    let a2_id = installation(&a2).await;
+    a2.account.mailbox_test_hold(true).await.unwrap();
+    android(&a1, "token-a1").await;
+    settle!([&a1, &b1], push_state(&a1).await.own_handle.is_some());
+    async fn sent(a1: &Fixture, to: chat_core::account::InstallationId) -> usize {
+        let all = a1.account.mailbox_test_announces().await.unwrap();
+        all.iter().filter(|(i, _)| *i == to).count()
+    }
+    // Scheduler time in 5 s steps, each step long enough for the Busy answer to come back.
+    async fn run(a1: &Fixture, seconds: u64) {
+        for _ in 0..seconds / 5 {
+            a1.clock.advance_monotonic_ms(5_000);
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+    }
+    let start = sent(&a1, a2_id).await;
+    // 0–1,200 s: retries at about 5, 15, 35, 75, 155, 315, 615, 915 s (5 s every time would
+    // be 240).
+    run(&a1, 1_200).await;
+    let first = sent(&a1, a2_id).await - start;
+    assert!((5..=12).contains(&first), "first 1,200 s: {first} Announces");
+    // At the cap: one per 300 s, still going.
+    let capped = sent(&a1, a2_id).await;
+    run(&a1, 1_500).await;
+    let later = sent(&a1, a2_id).await - capped;
+    assert!((4..=6).contains(&later), "next 1,500 s: {later} Announces");
+    // It takes it once it answers again; then nothing more is sent.
+    a2.account.mailbox_test_hold(false).await.unwrap();
+    run(&a1, 300).await;
+    let own = push_state(&a1).await.own_handle.unwrap();
+    settle!(
+        [&a1, &a2, &b1],
+        push_state(&a2).await.own.iter().any(|(_, h)| *h == own)
+    );
+    let taken = sent(&a1, a2_id).await;
+    run(&a1, 1_200).await;
+    assert_eq!(sent(&a1, a2_id).await, taken);
+}
+
 /// Spec 5.2: what a device announced goes once it is revoked (M3) or no longer listed.
 #[tokio::test]
 async fn revoked_device_handles_are_dropped() {

@@ -79,8 +79,15 @@ const PULL_RETRY_MAX_MS: u64 = 30_000;
 /// notified with the next pull from that device that ends, or this long after the start when no
 /// pull from it runs by then.
 const RESTART_NOTIFY_MS: u64 = 60_000;
-/// An `Announce` my other device did not take (`Busy`, no answer) is sent again this much later.
-const ANNOUNCE_RETRY_MS: u64 = 5_000;
+/// An `Announce` my other device did not take (`Busy`, no answer) is sent again after a
+/// back-off, `ANNOUNCE_RETRY_MIN_MS` doubling with each failure in a row up to
+/// `ANNOUNCE_RETRY_MAX_MS`. An M6 device answers `Busy` to the four-field form it cannot read,
+/// for as long as the session lasts: the cap keeps that to one `Announce` per 5 minutes.
+const ANNOUNCE_RETRY_MIN_MS: u64 = 5_000;
+const ANNOUNCE_RETRY_MAX_MS: u64 = 300_000;
+
+/// What an `Announce` says: whether this device is a mailbox, its own-device push handle.
+type Told = (bool, Option<Vec<u8>>);
 
 /// A handed-off ciphertext's row: the device that handed it over, conversation, message.
 type HandoffKey = (InstallationId, ConversationId, MessageId);
@@ -128,11 +135,13 @@ pub(crate) struct Runtime {
     /// a mailbox, its own-device push handle), over its current session. A device whose entry
     /// differs from what holds now is told at the next poll, one `Announce` at a time, until it
     /// takes it: a lost or `Busy` answer is not the end (e2e m7 run 2).
-    told: BTreeMap<InstallationId, (bool, Option<Vec<u8>>)>,
+    told: BTreeMap<InstallationId, Told>,
     /// Own devices an `Announce` is on its way to.
     telling: BTreeSet<InstallationId>,
-    /// Own devices whose last `Announce` was not taken: told again at this scheduler time.
-    tell_at: BTreeMap<InstallationId, u64>,
+    /// Own devices whose last `Announce` was not taken: the scheduler time they are told again,
+    /// the back-off that wait was, and what that `Announce` said (a changed value is told at
+    /// once, with the back-off from the start).
+    tell_at: BTreeMap<InstallationId, (u64, u64, Told)>,
     /// Scheduler time this device, while a mailbox, next records that it is up.
     uptime_at: u64,
     /// Each `Announce` sent: to which device, saying what.
@@ -194,6 +203,19 @@ impl Runtime {
         self.retry
             .insert(installation, (now.saturating_add(delay), delay));
     }
+    /// The `Announce` saying `told` was not taken by `installation`: it is told again after a
+    /// back-off twice the last one for the same value (`ANNOUNCE_RETRY_MIN_MS` the first time),
+    /// at most `ANNOUNCE_RETRY_MAX_MS`.
+    fn tell_later(&mut self, installation: InstallationId, told: Told, now: u64) {
+        let delay = match self.tell_at.get(&installation) {
+            Some((_, last, tried)) if *tried == told => {
+                last.saturating_mul(2).min(ANNOUNCE_RETRY_MAX_MS)
+            }
+            _ => ANNOUNCE_RETRY_MIN_MS,
+        };
+        self.tell_at
+            .insert(installation, (now.saturating_add(delay), delay, told));
+    }
     fn halted(&self) -> bool {
         #[cfg(all(feature = "test-hooks", debug_assertions))]
         {
@@ -247,7 +269,7 @@ enum Step {
     },
     /// The answer of my other device (the event's `holder`) to an `Announce` saying `told`.
     Announced {
-        told: (bool, Option<Vec<u8>>),
+        told: Told,
         answer: Result<MailboxReply, ErrorCode>,
     },
     /// The peer's answer to one attempt of a handed-off ciphertext (`grant`: the session it
@@ -661,7 +683,7 @@ impl Manager {
     /// Spec 8.4: tells another own device whether this one is a mailbox, with the own-device
     /// push handle (M7 spec 5.2), in a spawned task; its answer comes back as
     /// `Step::Announced`. Never a contact: the role is for my devices to know.
-    fn announce(&mut self, session: Session, told: (bool, Option<Vec<u8>>), ticket: u64) {
+    fn announce(&mut self, session: Session, told: Told, ticket: u64) {
         if self.local().map(|local| local.keys.peer_id()).ok() != Some(session.grant.peer) {
             return;
         }
@@ -688,14 +710,15 @@ impl Manager {
         });
     }
 
-    /// My other device's answer to an `Announce`: taken (`Ok`, or `Refused`: an M6 device that
-    /// does not read the M7 form, or no longer mine; not sent again over this session until it
-    /// changes), otherwise told again `ANNOUNCE_RETRY_MS` later.
+    /// My other device's answer to an `Announce`: taken (`Ok`, or `Refused`: not mine any more;
+    /// not sent again over this session until it changes), otherwise told again after a growing
+    /// back-off (`tell_later`). An M6 device answers `Busy` to the four-field form it cannot
+    /// decode, so it is asked at most every `ANNOUNCE_RETRY_MAX_MS` while the session lasts.
     fn announce_answered(
         &mut self,
         ticket: u64,
         installation: InstallationId,
-        told: (bool, Option<Vec<u8>>),
+        told: Told,
         answer: Result<MailboxReply, ErrorCode>,
     ) {
         self.messages.mailbox.telling.remove(&installation);
@@ -709,11 +732,7 @@ impl Manager {
                 mailbox.tell_at.remove(&installation);
                 mailbox.told.insert(installation, told);
             }
-            _ => {
-                mailbox
-                    .tell_at
-                    .insert(installation, now.saturating_add(ANNOUNCE_RETRY_MS));
-            }
+            _ => mailbox.tell_later(installation, told, now),
         }
     }
 
@@ -1035,7 +1054,10 @@ impl Manager {
                 let i = &s.grant.installation;
                 !mailbox.telling.contains(i)
                     && mailbox.told.get(i) != Some(&want)
-                    && mailbox.tell_at.get(i).is_none_or(|at| now_tell >= *at)
+                    && mailbox
+                        .tell_at
+                        .get(i)
+                        .is_none_or(|(at, _, tried)| now_tell >= *at || *tried != want)
             })
             .cloned()
             .collect();
