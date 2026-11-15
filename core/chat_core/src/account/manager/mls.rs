@@ -271,7 +271,7 @@ enum Answer {
     Lookup(Result<Lookup, CoreError>),
     /// A dial run outside the actor (`dial_unreachable`): the connection and its proof.
     /// The connection and grant, with my own record the grant was made on when my other device
-    /// showed a renewal of it this device has not taken yet (Ruling R31).
+    /// showed a renewal of it this device has not taken yet (Ruling R35).
     Dial(Result<DialedAccount, CoreError>),
 }
 
@@ -1844,7 +1844,7 @@ impl Manager {
                 // A device presenting another record than this one fails the handshake. The
                 // record it showed is not observed here: record changes belong to the lookup
                 // and record-review flows (a lagging device must not raise a conflict). One
-                // exception (Ruling R31): my other device's renewal of my record, which the
+                // exception (Ruling R35): my other device's renewal of my record, which the
                 // grant was made on; the actor takes it only as a renewal (`dialed`).
                 let mut evidence = None;
                 let grant = auth::authenticate(
@@ -1911,7 +1911,7 @@ impl Manager {
         }
         let installed = match dialed {
             Ok((conn, grant, renewal)) => {
-                // Ruling R31: the grant is on my other device's renewal of my record. Taken
+                // Ruling R35: the grant is on my other device's renewal of my record. Taken
                 // here only if it is one (my exact pending packet, or `is_renewal`); anything
                 // else is left to the lookup flows and the grant then fails as before.
                 if let Some(signed) = renewal {
@@ -1927,21 +1927,16 @@ impl Manager {
         let _ = (peer, installed);
     }
 
-    /// Takes my own record `signed` that my other device showed while this one dialed it, when
-    /// it is my exact pending packet or a renewal of what this device holds (never a conflict).
+    /// Takes my own record `signed` that my other device showed while this one dialed it, by
+    /// the same acceptance as `apply_record_change` (`RecordState::accept_own`); anything else
+    /// is left as it is (never a conflict on the dial path).
     async fn take_own_renewal(&mut self, signed: &crate::account::publication::SignedRecord) {
         let (Ok(request), Ok(local)) = (self.ready(), self.local()) else {
             return;
         };
-        let records = &local.records;
-        let exact = records.pending.iter().any(|p| {
-            p.signed.hash == signed.hash
-                && p.status == crate::account::publication::PacketStatus::Ready
-        });
-        if (exact && records.conflict.is_none())
-            || records.is_renewal(signed, self.services.clock.unix_seconds())
-        {
-            let _ = self.apply_record_change(signed, request).await;
+        let mut records = local.records.clone();
+        if records.accept_own(signed, self.services.clock.unix_seconds()) {
+            let _ = self.commit_records(records, request).await;
         }
     }
 

@@ -359,12 +359,16 @@ async fn refused_pull_is_tried_again_over_the_same_session() {
         a1.account.mailbox_test_sync_trace().await.unwrap().pulls_stopped == 1
     );
     assert!(texts_from(&a1, conv, b1.peer).await.is_empty(), "the first pull was refused");
+    let stopped = a1.account.mailbox_test_sync_trace().await.unwrap();
+    let sessions_at_stop = (stopped.dials_ok, stopped.accepts_ok);
     settle!(
         [&a1, &a2],
         texts_from(&a1, conv, b1.peer).await.len() == 2 && caught_up(&a1, &a2).await
     );
     let trace = a1.account.mailbox_test_sync_trace().await.unwrap();
     assert_eq!(trace.pulls_stopped, 1, "{trace:?}");
+    // The same session all along: no new dial or accept brought the texts.
+    assert_eq!((trace.dials_ok, trace.accepts_ok), sessions_at_stop, "{trace:?}");
 }
 
 /// Spec 11 (both ways): A2 is off while A1 and B1 talk. A2 comes back and has the six texts in
@@ -612,6 +616,48 @@ async fn older_own_record_shown_at_auth_after_a_renewal_is_ignored() {
             (t1.dials_failed, t1.accepts_failed, t2.dials_failed, t2.accepts_failed),
             (was1.dials_failed, was1.accepts_failed, was2.dials_failed, was2.accepts_failed),
             "A2 dials {a2_dials}: {t1:?} {t2:?}"
+        );
+    }
+}
+
+/// Re-review I1 of R35: my two devices hold two different packets of my record with the same
+/// seq (an IdentityKey holder signed twice: equivocation, M3 5.2 same-seq conflict). Neither
+/// direction authenticates: the dialer's handshake is refused on the record check.
+#[tokio::test]
+async fn own_records_with_equal_seq_and_another_hash_never_authenticate() {
+    for a2_dials in [false, true] {
+        let (mut a, _b1, net, _conv) = accounts(&[A1, A2], &[B1]).await;
+        let a2 = a.pop().unwrap();
+        let a1 = a.pop().unwrap();
+        for f in [&a1, &a2] {
+            f.slot.network().unwrap().execute(NetworkOp::Stop).await.unwrap();
+        }
+        settle!([&a1, &a2], !own_session(&a1, &a2).await && !own_session(&a2, &a1).await);
+        let seq = (NOW + 1) * 1_000_000;
+        publish(&net, A, &packet(A, &[A1, A2], A, NOW + 1, NOW + 601, seq));
+        a1.account.refresh_record(a1.peer).await.unwrap();
+        publish(&net, A, &packet(A, &[A1, A2], A, NOW + 2, NOW + 602, seq));
+        a2.account.refresh_record(a2.peer).await.unwrap();
+        let (h1, h2) = (
+            a1.view().await.publication.accepted_hash,
+            a2.view().await.publication.accepted_hash,
+        );
+        assert_ne!(h1, h2, "each holds its own packet");
+        for f in [&a1, &a2] {
+            online(f).await;
+        }
+        link(&a1, &a2).await;
+        let dialer = if a2_dials { &a2 } else { &a1 };
+        settle!([&a1, &a2], {
+            let _ = dialer.account.mailbox_sync_now().await;
+            dialer.account.mailbox_test_sync_trace().await.unwrap().dials_failed > 0
+        });
+        quiet(&[&a1, &a2]).await;
+        let trace = dialer.account.mailbox_test_sync_trace().await.unwrap();
+        assert_eq!(trace.dial_check, Some("record"), "A2 dials {a2_dials}: {trace:?}");
+        assert!(
+            !own_session(&a1, &a2).await && !own_session(&a2, &a1).await,
+            "A2 dials {a2_dials}: a session came up"
         );
     }
 }

@@ -2654,8 +2654,7 @@ impl Manager {
         now: u64,
     ) -> bool {
         candidate.seq < accepted.seq
-            && candidate.record.generation == accepted.record.generation
-            && candidate.record.devices == accepted.record.devices
+            && super::publication::same_shape(candidate, accepted, &[])
             && candidate.current(now)
             && !candidate.record.is_expired(now)
             && accepted.current(now)
@@ -3184,7 +3183,8 @@ impl Manager {
             Input::Mailbox(event)=>self.mailbox_event(event).await,
             Input::Push(event)=>self.push_event(event).await,
             Input::Incoming(conn) => {
-                // Ruling R30: my device that showed an older record of the accepted shape.
+                // My device that showed an older record of the accepted shape (Ruling R30), dialed
+                // back if its authentication still fails (Ruling R31).
                 let mut stale_own = None;
                 let result = async {
                     let request = self.ready()?;
@@ -3291,31 +3291,10 @@ impl Manager {
             .accepted
             .as_ref()
             .ok_or_else(|| unavailable(ErrorCode::AccountRestricted))?;
-        let current = signed.current(self.services.clock.unix_seconds());
-        let exact = records
-            .pending
-            .iter()
-            .position(|p| p.signed.hash == signed.hash && p.status == PacketStatus::Ready);
-        let renewal = records.is_renewal(signed, self.services.clock.unix_seconds());
         let result = if records.conflict.is_none() && signed.hash == previous.hash
             || records.is_stale_renewal(signed)
+            || records.accept_own(signed, self.services.clock.unix_seconds())
         {
-            Ok(())
-        } else if records.conflict.is_none()
-            && signed.seq >= records.observed_seq
-            && (exact.is_some() || renewal)
-            && current
-        {
-            records.observed_seq = signed.seq;
-            records.accepted = Some(signed.clone());
-            if let Some(index) = exact {
-                records.pending.remove(index);
-            }
-            records.state = if records.pending.is_empty() {
-                PublicationState::Observed
-            } else {
-                PublicationState::Pending
-            };
             Ok(())
         } else {
             records.observed_seq = records.observed_seq.max(signed.seq);

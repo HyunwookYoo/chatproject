@@ -76,6 +76,61 @@ mod tests {
         bad.peer = PeerId([0; 32]);
         assert!(AuthHello::decode(&bad.encode()).is_err());
     }
+
+    /// Ruling R35: a renewal of my own record (same generation and devices, another seq) is the
+    /// same authority, on the newer packet; an equal seq with another packet, another
+    /// generation, other devices, and another account's differing record are refused.
+    #[test]
+    fn grant_record_takes_only_a_renewal_of_my_own_record() {
+        use crate::account::{
+            IdentityRecord, PublishIntent, RecordDevice, publication::SignedRecord, record_packet,
+            recovery,
+        };
+        let local =
+            recovery::local_account(derive_account(&Secret32::from([1; 32])).unwrap(), PublishIntent::LocalCreate, 1)
+                .unwrap();
+        let other = derive_account(&Secret32::from([2; 32])).unwrap();
+        let device = |seed: u8| {
+            let d = derive_device(Secret32::from([seed; 32])).unwrap();
+            RecordDevice {
+                installation_id: d.installation_id(),
+                transport_public_key: d.transport_public_key(),
+                kind: DeviceKind::Desktop,
+            }
+        };
+        let record = |generation: u8, seeds: &[u8], issued: u64| IdentityRecord {
+            generation: Generation([generation; 16]),
+            issued_at: issued,
+            expires_at: issued + 600,
+            devices: seeds.iter().map(|s| device(*s)).collect(),
+        };
+        let sign = |keys: &crate::account::AccountKeys, r: &IdentityRecord, seq: u64| {
+            SignedRecord::new(record_packet(keys, r, seq).unwrap(), keys.peer_id()).unwrap()
+        };
+        let me = local.keys.peer_id();
+        let held = sign(&local.keys, &record(1, &[7, 8], 1000), 1_000_000);
+        let newer = sign(&local.keys, &record(1, &[7, 8], 1001), 1_000_001);
+        let older = sign(&local.keys, &record(1, &[7, 8], 999), 999_999);
+        let pick = |exchanged: &SignedRecord| grant_record(&local, me, &held, exchanged).map(|r| r.hash);
+        assert_eq!(pick(&held).unwrap(), held.hash);
+        assert_eq!(pick(&newer).unwrap(), newer.hash);
+        assert_eq!(pick(&older).unwrap(), held.hash);
+        let refused = |result: Result<[u8; 32], CoreError>| {
+            result.is_err_and(|e| e.code == crate::ErrorCode::AuthFailed && e.detail == AuthCheck::Record.detail())
+        };
+        for (name, exchanged) in [
+            ("equal seq", sign(&local.keys, &record(1, &[7, 8], 1002), 1_000_000)),
+            ("generation", sign(&local.keys, &record(2, &[7, 8], 1001), 1_000_001)),
+            ("devices", sign(&local.keys, &record(1, &[7], 1001), 1_000_001)),
+        ] {
+            assert!(refused(pick(&exchanged)), "{name}");
+        }
+        let theirs = sign(&other, &record(1, &[7, 8], 1000), 1_000_000);
+        let theirs_newer = sign(&other, &record(1, &[7, 8], 1001), 1_000_001);
+        assert!(refused(
+            grant_record(&local, other.peer_id(), &theirs, &theirs_newer).map(|r| r.hash)
+        ));
+    }
 }
 
 use super::{
@@ -139,7 +194,8 @@ impl AuthCheck {
             Self::Grant => "grant",
         }
     }
-    /// The check an `AuthFailed` error of `finish` names; `None` for any other error.
+    /// The check an `AuthFailed` error of `finish` names; `None` for any other error, including
+    /// the unnamed `AuthFailed` ones (an undecodable or future record, I/O): e2e notes `none`.
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     pub fn of(error: &CoreError) -> Option<Self> {
         Self::ALL.into_iter().find(|c| error.detail == c.detail())
@@ -398,21 +454,7 @@ async fn finish(
     // Identity-signature/canonical evidence survives a denied installation proof.
     *evidence = Some(exchanged.clone());
     super::parse_record(&exchanged.packet, expected, clock.unix_seconds())?;
-    // Ruling R31 (e2e m7 run 43728038578): my other device may hold a renewal of my record that
-    // this one has not taken yet, or the reverse (each renews on its own, R28/R30). The same
-    // generation and devices at another seq is the same authority: the session is granted on the
-    // newer of the two, which the caller takes from the evidence (or keeps) right after. Any
-    // other difference, and any difference for another account, is refused as before.
-    let record = if exchanged.hash == record.hash {
-        record
-    } else if expected == local.keys.peer_id()
-        && exchanged.record.generation == record.record.generation
-        && exchanged.record.devices == record.record.devices
-    {
-        if exchanged.seq > record.seq { &exchanged } else { record }
-    } else {
-        return Err(AuthCheck::Record.refuse());
-    };
+    let record = grant_record(local, expected, record, &exchanged)?;
     if remote.generation != record.record.generation {
         return Err(AuthCheck::Record.refuse());
     }
@@ -465,6 +507,32 @@ async fn finish(
     }
     send.finish().map_err(|_| io_error(gate.is_some()))?;
     Ok(grant)
+}
+
+/// The record a session is granted on: the one this device holds for the account, which the
+/// peer showed too. Ruling R35 (e2e m7 run 43728038578): my other device may hold a renewal of
+/// my record this one has not taken yet, or the reverse (each renews on its own, R28/R30). Of
+/// my own account, a record of the same shape (`RecordState::same_shape`) at another seq is the
+/// same authority: the newer of the two, which the caller takes from the evidence (or keeps)
+/// right after. An equal seq with another packet is a same-seq conflict (M3 5.2), refused; so is
+/// any other difference, and any difference for another account.
+fn grant_record<'a>(
+    local: &LocalIdentity,
+    expected: PeerId,
+    record: &'a SignedRecord,
+    exchanged: &'a SignedRecord,
+) -> Result<&'a SignedRecord, CoreError> {
+    if exchanged.hash == record.hash {
+        return Ok(record);
+    }
+    if expected != local.keys.peer_id() || !local.records.same_shape(exchanged, record) {
+        return Err(AuthCheck::Record.refuse());
+    }
+    match exchanged.seq.cmp(&record.seq) {
+        std::cmp::Ordering::Greater => Ok(exchanged),
+        std::cmp::Ordering::Less => Ok(record),
+        std::cmp::Ordering::Equal => Err(AuthCheck::Record.refuse()),
+    }
 }
 
 fn check_gate(gate: Option<&super::manager::messages::ProofGate>) -> Result<(), CoreError> {

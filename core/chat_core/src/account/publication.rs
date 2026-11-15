@@ -342,45 +342,62 @@ impl RecordState {
             self.state = PublicationState::LocalBlocked;
         }
     }
+    /// `found` has the authority of my record `base` as this device holds it (Rulings R28, R30,
+    /// R35): see `same_shape`, with the devices this device revoked left out of `base`.
+    pub(crate) fn same_shape(&self, found: &SignedRecord, base: &SignedRecord) -> bool {
+        same_shape(found, base, &self.tombstones)
+    }
     /// Another of my devices renewed the accepted record: nothing of mine is pending, no
-    /// conflict is held, and `found` is current, newer than anything observed, of the same
-    /// generation, and lists exactly the accepted devices this device has not revoked. The same
-    /// rule whether it came with that device's authentication or from a lookup (M7 final fix D:
-    /// a lookup used to hold it as a list conflict).
+    /// conflict is held, and `found` is current, newer than anything observed, and of the
+    /// accepted shape (`same_shape`). The same rule whether it came with that device's
+    /// authentication or from a lookup (Ruling R28: a lookup used to hold it as a list conflict).
     pub(crate) fn is_renewal(&self, found: &SignedRecord, now: u64) -> bool {
-        let Some(previous) = &self.accepted else {
-            return false;
-        };
         self.pending.is_empty()
             && self.conflict.is_none()
             && found.seq > self.observed_seq
             && found.current(now)
-            && found.record.generation == previous.record.generation
-            && found.record.devices
-                == previous
-                    .record
-                    .devices
-                    .iter()
-                    .filter(|d| {
-                        !self.tombstones.iter().any(|t| {
-                            t.target_installation == d.installation_id
-                                || t.target_transport == d.transport_public_key
-                        })
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>()
+            && self
+                .accepted
+                .as_ref()
+                .is_some_and(|accepted| self.same_shape(found, accepted))
     }
     /// Ruling R30: another of my devices shows, as its authentication evidence, an older record
-    /// of exactly the accepted shape (same generation and devices, lower seq) — it has not
-    /// observed a renewal this device took already. Stale: ignored, never a conflict. Lookups
-    /// keep holding a lower seq (M3 5.1).
+    /// of the accepted shape (`same_shape`, lower seq) — it has not observed a renewal this
+    /// device took already. Stale: ignored, never a conflict. Lookups keep holding a lower seq
+    /// (M3 5.1).
     pub(crate) fn is_stale_renewal(&self, found: &SignedRecord) -> bool {
         self.conflict.is_none()
-            && self.accepted.as_ref().is_some_and(|accepted| {
-                found.seq < accepted.seq
-                    && found.record.generation == accepted.record.generation
-                    && found.record.devices == accepted.record.devices
-            })
+            && self
+                .accepted
+                .as_ref()
+                .is_some_and(|accepted| found.seq < accepted.seq && self.same_shape(found, accepted))
+    }
+    /// Takes my own record `signed` as the accepted one when it is my exact pending packet or a
+    /// renewal (`is_renewal`), current and not older than anything observed; true when it did.
+    /// Never sets a conflict: the caller decides what any other record means.
+    pub(crate) fn accept_own(&mut self, signed: &SignedRecord, now: u64) -> bool {
+        let exact = self
+            .pending
+            .iter()
+            .position(|p| p.signed.hash == signed.hash && p.status == PacketStatus::Ready);
+        if !(self.conflict.is_none()
+            && signed.seq >= self.observed_seq
+            && (exact.is_some() || self.is_renewal(signed, now))
+            && signed.current(now))
+        {
+            return false;
+        }
+        self.observed_seq = signed.seq;
+        self.accepted = Some(signed.clone());
+        if let Some(index) = exact {
+            self.pending.remove(index);
+        }
+        self.state = if self.pending.is_empty() {
+            PublicationState::Observed
+        } else {
+            PublicationState::Pending
+        };
+        true
     }
     fn owns(&self, record: &IdentityRecord, local: &LocalAccount) -> bool {
         record.generation == self.generation
@@ -977,6 +994,27 @@ fn optional_bytes<const N: usize>(d: &mut Decoder<'_>) -> Result<Option<[u8; N]>
     } else {
         Ok(Some(wire::bytes(d)?))
     }
+}
+
+/// The one "same authority" rule for two signed packets of one account (Rulings R28, R30,
+/// R35): the same generation, and `found` lists exactly `base`'s devices less those revoked in
+/// `tombstones` (pass none for another account). Seq, issue and expiry times may differ; what
+/// a different seq means is for the caller.
+pub(crate) fn same_shape(found: &SignedRecord, base: &SignedRecord, tombstones: &[RevokeIntent]) -> bool {
+    found.record.generation == base.record.generation
+        && found.record.devices
+            == base
+                .record
+                .devices
+                .iter()
+                .filter(|d| {
+                    !tombstones.iter().any(|t| {
+                        t.target_installation == d.installation_id
+                            || t.target_transport == d.transport_public_key
+                    })
+                })
+                .cloned()
+                .collect::<Vec<_>>()
 }
 
 #[cfg(test)]

@@ -127,6 +127,8 @@ TLS binding은 pinned iroh 1.3.0의 `Connection::export_keying_material(output, 
 
 접속 권한은 검증한 record hash/generation/만료에 묶인다. 만료 시 연결을 **제한 상태**로 바꾸고 연락처/계정 데이터·변경 intent 송수신을 중단한다. 이때 공개 signed record 교환과 재인증 handshake만 허용하며, §5.1 갱신본을 검증한 뒤 새 nonce/proof가 성공해야 일반 기능을 재개한다. 같은 generation의 더 높은 record를 수용해도 재인증 전에는 기존 권한을 이어 쓰지 않는다. remote installation 제거/tombstone이면 즉시 해당 권한/연결을 종료한다. generation 변경/동일 seq 충돌은 해당 계정의 기존 권한을 모두 무효화하고, 충돌 해소 및 새 record 기반 재인증 전 데이터를 주고받지 않는다. 내 installation이 새 목록에서 빠졌으면 내 일반 계정 활동도 보류한다.
 
+**M7에서 고침 (2026-11-16, Ruling R35).** 내 기기끼리의 재인증은 갱신을 사이에 두고도 된다: 서로 보인 내 record가 **같은 generation·같은 기기 목록**(이 기기가 해제한 기기는 뺀 목록)이고 seq만 다르면 같은 권한으로 보고, 더 높은 seq의 record로 권한을 묶는다(낮은 쪽은 그 record를 받아들인다). **seq가 같은데 packet이 다르면** 위의 동일 seq 충돌이므로 거절한다. 연락처(다른 계정)와의 인증은 지금처럼 정확히 같은 record여야 한다.
+
 M2의 transport-connected 시각/500 ms 지표는 그대로 둔다. 추가 cert/record/proof 처리가 끝난 `account-auth-ready`를 별도 상태로 기록하며 이 늦은 시각으로 M2 측정 정의를 바꾸거나 기존 미달을 통과 처리하지 않는다.
 
 ## 6. 초대·연락처·안전번호 — 제안
