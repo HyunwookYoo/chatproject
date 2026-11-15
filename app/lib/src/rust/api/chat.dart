@@ -267,6 +267,10 @@ class NotifyItem {
   /// other unread ones. `None` when no text is known: show "새 메시지 N개" (N = `unread`).
   final String? preview;
 
+  /// With `new_messages == 0`: new texts that do not alert (a generic push notification
+  /// alerted for them, Ruling R13); shown also when no notification of the conversation is.
+  final bool silenced;
+
   const NotifyItem({
     required this.conversation,
     required this.peer,
@@ -274,6 +278,7 @@ class NotifyItem {
     required this.unread,
     required this.title,
     this.preview,
+    required this.silenced,
   });
 
   @override
@@ -283,7 +288,8 @@ class NotifyItem {
       newMessages.hashCode ^
       unread.hashCode ^
       title.hashCode ^
-      preview.hashCode;
+      preview.hashCode ^
+      silenced.hashCode;
 
   @override
   bool operator ==(Object other) =>
@@ -295,7 +301,8 @@ class NotifyItem {
           newMessages == other.newMessages &&
           unread == other.unread &&
           title == other.title &&
-          preview == other.preview;
+          preview == other.preview &&
+          silenced == other.silenced;
 }
 
 class PeerInfo {

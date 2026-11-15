@@ -616,7 +616,12 @@ pub(crate) fn execute(
         MessageDbOp::MlsGroupOp(id, op) => super::mls_group::group_op(c, identity, local, id, op, mls_fault!(fault)),
         MessageDbOp::Mailbox(op) => super::mailbox_store::mailbox_op(c, identity, op, mls_fault!(fault)),
         MessageDbOp::Push(op) => super::push_store::push_op(c, identity, local, op, mls_fault!(fault)),
-        MessageDbOp::NotifyItems(keys, read) => Ok(MessageDbReply::Notify(notify_items(c, &keys, &read)?)),
+        MessageDbOp::NotifyItems(keys, read) => {
+            let tx = c.transaction().map_err(sql_error)?;
+            let items = notify_items(&tx, &keys, &read)?;
+            commit(tx,#[cfg(all(feature="test-hooks",debug_assertions))] fault)?;
+            Ok(MessageDbReply::Notify(items))
+        }
         MessageDbOp::Messages(id, before, n) => {
             let take = limit(n)?;
             let (lamport, install, msg) = match before {
@@ -1333,51 +1338,63 @@ impl MessageDbOp {
 /// counted per conversation, with the conversation's peer and unread count. Each conversation of
 /// `read` (read on another own device) gets an item too, with no new message if none counted: the
 /// app clears or updates what it shows for it.
+///
+/// Ruling R13 (final review 1): the first text of the other account notified after a generic
+/// push notification ("새 메시지") of its conversation alerted takes that notification's place,
+/// in this transaction: silently (the generic one alerted for it, `silenced`), and ending it, so
+/// the next text alerts. One that came read already clears or updates what it shows.
 pub(super) fn notify_items(
-    c: &Connection,
+    tx: &Transaction<'_>,
     keys: &[MessageKey],
     read: &[ConversationId],
 ) -> R<Vec<crate::event::NotifyItem>> {
     let keys: std::collections::BTreeSet<MessageKey> = keys.iter().copied().collect();
     let mut counts: std::collections::BTreeMap<ConversationId, u32> =
         read.iter().map(|id| (*id, 0)).collect();
+    let mut received = std::collections::BTreeSet::new();
     for k in keys {
-        let unseen: bool = c
+        let seen: Option<bool> = tx
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM message WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4 AND outgoing=0 AND seen_local=0)",
+                "SELECT seen_local FROM message WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4 AND outgoing=0",
                 params![k.conversation.0.as_slice(), k.sender.0.as_slice(), k.installation.0.as_slice(), k.id.0.as_slice()],
                 |r| r.get(0),
             )
+            .optional()
             .map_err(sql_error)?;
-        if unseen {
-            *counts.entry(k.conversation).or_default() += 1;
+        match seen {
+            Some(false) => *counts.entry(k.conversation).or_default() += 1,
+            Some(true) => {}
+            None => continue,
+        }
+        received.insert(k.conversation);
+    }
+    let mut ended = std::collections::BTreeSet::new();
+    for conversation in received {
+        if super::push_store::end_generic(tx, conversation)? {
+            counts.entry(conversation).or_default();
+            ended.insert(conversation);
         }
     }
     counts
         .into_iter()
         .map(|(conversation, new_messages)| {
-            let (peer, unread) = c
+            let (peer, unread) = tx
                 .query_row(
                     "SELECT peer,unread FROM conversation WHERE id=?1",
                     params![conversation.0.as_slice()],
                     |r| Ok((bytes::<32>(r, 0)?, uint(r, 1)?)),
                 )
                 .map_err(sql_error)?;
-            // Ruling R13: after a generic push notification ("새 메시지") alerted, the
-            // conversation's new texts update it without alerting until it is read up.
-            let new_messages = if new_messages > 0 && super::push_store::generic_pending(c, conversation)? {
-                0
-            } else {
-                new_messages
-            };
+            let silenced = new_messages > 0 && ended.contains(&conversation);
             Ok(crate::event::NotifyItem {
                 conversation,
                 peer: PeerId(peer),
-                new_messages,
+                new_messages: if silenced { 0 } else { new_messages },
                 unread,
                 // The alias is the actor's (`publish_notify`); the store has no contacts.
                 title: String::new(),
-                preview: last_unread_preview(c, conversation, unread)?,
+                preview: last_unread_preview(tx, conversation, unread)?,
+                silenced,
             })
         })
         .collect()

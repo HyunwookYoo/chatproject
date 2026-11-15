@@ -207,6 +207,7 @@ async fn cipher_push_stores_and_notifies_with_alias_and_preview() {
             unread: 1,
             title: alias.clone(),
             preview: Some(preview),
+            silenced: false,
         }]
     );
 
@@ -394,9 +395,10 @@ async fn undecryptable_push_notifies_generic() {
         unread: 1,
         title: "remote".into(),
         preview: None,
+        silenced: false,
     };
-    // Ruling R13: the first alerts; until the conversation is read up, the next ones only
-    // update it.
+    // Ruling R13: the first alerts; the next ones are shown silently (also where the first was
+    // dismissed) until a text takes its place or the conversation is read up.
     for (n, ciphertext) in [broken, vec![0xff; 40], Vec::new()].into_iter().enumerate() {
         let before = notify_events(&b1).len();
         let push = ReceivedPush::Cipher {
@@ -413,14 +415,15 @@ async fn undecryptable_push_notifies_generic() {
             notified_since(&b1, before),
             [NotifyItem {
                 new_messages,
+                silenced: n > 0,
                 ..generic.clone()
             }]
         );
     }
     assert!(message(&b1, *key).await.is_none());
 
-    // B1's process ends and starts again; the text then comes directly: it updates the generic
-    // notification without alerting.
+    // B1's process ends and starts again; the text then comes directly: it takes the generic
+    // notification's place without alerting.
     let b1 = start_as(B, stop(b1), net.clone()).await;
     link(&b1, &a1).await;
     settle!([&a1, &b1], message(&b1, *key).await.is_some());
@@ -430,6 +433,7 @@ async fn undecryptable_push_notifies_generic() {
         [NotifyItem {
             new_messages: 0,
             preview: Some("cannot open".into()),
+            silenced: true,
             ..generic.clone()
         }]
     );
@@ -479,7 +483,7 @@ async fn wake_then_late_direct_text_updates_without_second_alert() {
     quiet(&[&a1, &b1]).await;
     assert_eq!(alerts(&b1, conv), 1);
     let last = notify_events(&b1).pop().unwrap();
-    assert_eq!((last.new_messages, last.unread), (0, 1));
+    assert_eq!((last.new_messages, last.unread, last.silenced), (0, 1, true));
     assert_eq!(last.preview, Some(preview_text(&body, 0)));
 }
 
@@ -512,6 +516,7 @@ async fn wake_fetches_from_sender_within_deadline_and_updates_notification() {
         unread: 1,
         title: "remote".into(),
         preview: None,
+        silenced: false,
     };
     assert_eq!(items[0], generic);
     assert_eq!(
@@ -519,6 +524,7 @@ async fn wake_fetches_from_sender_within_deadline_and_updates_notification() {
         &NotifyItem {
             new_messages: 0,
             preview: Some(preview_text(&body, 0)),
+            silenced: true,
             ..generic
         }
     );
@@ -557,6 +563,7 @@ async fn wake_without_reach_leaves_generic_notification() {
             unread: 1,
             title: "remote".into(),
             preview: None,
+            silenced: false,
         }]
     );
     assert_eq!(network_state(&b1).await, NetworkState::Stopped);
@@ -780,6 +787,7 @@ async fn generic_ends_when_its_text_comes_read_from_my_device() {
         unread: 0,
         title: "remote".into(),
         preview: None,
+        silenced: false,
     };
     settle!(
         [&a1, &a2, &a3, &b1],
@@ -821,6 +829,7 @@ async fn reading_here_updates_then_cancels_the_notification() {
         unread: 0,
         title: "remote".into(),
         preview: None,
+        silenced: false,
     };
 
     let before = notify_events(&a1).len();
@@ -885,6 +894,7 @@ async fn read_with_nothing_unread_ends_generic() {
             unread: 0,
             title: "remote".into(),
             preview: None,
+            silenced: false,
         }]
     );
     back_online(&b1, &[&a1]).await;
@@ -918,4 +928,188 @@ async fn network_started_by_the_app_meanwhile_stays_on() {
     network(&b1, NetworkOp::Start).await;
     assert_eq!(task.await.unwrap().unwrap(), PushOutcome::Notified);
     assert_eq!(network_state(&b1).await, NetworkState::Online);
+}
+
+/// Final review 1: the text a wake's generic notification stood for takes its place without
+/// alerting (`silenced`: Kotlin shows it also when the user dismissed the generic one), and ends
+/// it: the next text of the conversation alerts again.
+#[tokio::test]
+async fn generic_ends_when_its_text_takes_its_place() {
+    let (a1, b1, conv, _net, proxy) = offline_receiver().await;
+    let body = "늦게 온 ".repeat(1_200);
+    let sent = pushed(&a1, b1.peer, &proxy, &[body.as_str()]).await;
+    let (key, tag, kind) = &sent[0];
+    assert!(*kind == PushItemKind::Wake);
+    network(&a1, NetworkOp::Stop).await;
+    let push = ReceivedPush::Wake { tag: *tag };
+    assert_eq!(
+        b1.account
+            .push_received(push, Duration::from_secs(2))
+            .await
+            .unwrap(),
+        PushOutcome::Notified
+    );
+    online(&a1).await;
+    back_online(&b1, &[&a1]).await;
+    settle!([&a1, &b1], message(&b1, *key).await.is_some());
+    quiet(&[&a1, &b1]).await;
+    assert_eq!(alerts(&b1, conv), 1);
+    let last = notify_events(&b1).pop().unwrap();
+    assert_eq!((last.new_messages, last.unread, last.silenced), (0, 1, true));
+
+    let next = send_to(&a1, b1.peer, 2, "the next one").await;
+    settle!([&a1, &b1], message(&b1, next).await.is_some());
+    quiet(&[&a1, &b1]).await;
+    assert_eq!(alerts(&b1, conv), 2);
+    let last = notify_events(&b1).pop().unwrap();
+    assert_eq!((last.new_messages, last.unread, last.silenced), (1, 2, false));
+}
+
+/// Final review 1: A1 showed a generic notification; A2 then read only an older text, one A1
+/// has. That read does not end the generic notification: the text it stood for, when it comes,
+/// does not alert a second time.
+#[tokio::test]
+async fn own_read_of_an_older_text_keeps_generic() {
+    let (mut a, b1, net, conv) = accounts(&[A1, A2], &[B1]).await;
+    let a2 = a.pop().unwrap();
+    let a1 = a.pop().unwrap();
+    let _proxy = proxy(&net);
+    let a1_id = installation(&a1).await;
+    android(&a1, "token-a1").await;
+    settle!([&a1, &a2, &b1], own_tag_handle(&a1, conv).await.is_some());
+    let old = delivered(&b1, &a1, &[&a2], 1).await;
+    settle!(
+        [&a1, &a2, &b1],
+        message(&a2, old).await.is_some() && alerts(&a1, conv) == 1
+    );
+    let tag = own_tag(&a1, conv).await;
+    network(&a1, NetworkOp::Stop).await;
+    settle!(
+        [&a1, &a2, &b1],
+        !ready_with(&b1, a1_id) && !ready_with(&a2, a1_id)
+    );
+    let push = ReceivedPush::Cipher {
+        tag,
+        ciphertext: vec![0xff; 40],
+    };
+    assert_eq!(
+        a1.account.push_received(push, WAIT).await.unwrap(),
+        PushOutcome::Notified
+    );
+    assert_eq!(alerts(&a1, conv), 2);
+
+    a2.account
+        .messages()
+        .mark_read(conv, vec![old])
+        .await
+        .unwrap();
+    back_online(&a1, &[&a2]).await;
+    a1.account.mailbox_sync_now().await.unwrap();
+    settle!([&a1, &a2, &b1], unread(&a1, b1.peer).await == 0);
+    quiet(&[&a1, &a2, &b1]).await;
+
+    link(&a1, &b1).await;
+    let late = send_to(&b1, a1.peer, 2, "the generic's text").await;
+    settle!([&a1, &a2, &b1], message(&a1, late).await.is_some());
+    quiet(&[&a1, &a2, &b1]).await;
+    assert_eq!(alerts(&a1, conv), 2);
+    let last = notify_events(&a1).pop().unwrap();
+    assert_eq!(
+        (last.new_messages, last.unread, last.silenced, last.preview.as_deref()),
+        (0, 1, true, Some("the generic's text"))
+    );
+}
+
+/// Final review 1 (R21 minor): A1 took A2's read of a text before the text came; then an
+/// undecryptable push of it showed a generic notification. The text comes read: that ends the
+/// generic notification and cancels it, and the next text alerts.
+#[tokio::test]
+async fn generic_after_the_read_cancels_when_its_text_comes_read() {
+    let (mut a, b1, net, conv) = accounts(&[A1, A2, A3], &[B1]).await;
+    let a3 = a.pop().unwrap();
+    let a2 = a.pop().unwrap();
+    let a1 = a.pop().unwrap();
+    let _proxy = proxy(&net);
+    let a1_id = installation(&a1).await;
+    android(&a1, "token-a1").await;
+    settle!(
+        [&a1, &a2, &a3, &b1],
+        own_tag_handle(&a1, conv).await.is_some()
+    );
+    let tag = own_tag(&a1, conv).await;
+    network(&a1, NetworkOp::Stop).await;
+    settle!(
+        [&a1, &a2, &a3, &b1],
+        !ready_with(&b1, a1_id) && !ready_with(&a2, a1_id) && !ready_with(&a3, a1_id)
+    );
+    let key = send_to(&b1, a1.peer, 1, "read on the pc").await;
+    settle!(
+        [&a2, &a3, &b1],
+        message(&a2, key).await.is_some() && message(&a3, key).await.is_some()
+    );
+    a2.account
+        .messages()
+        .mark_read(conv, vec![key])
+        .await
+        .unwrap();
+    let a2_id = installation(&a2).await;
+    // The seq of A2's logged receipt.
+    let receipt = || async {
+        mailbox(&a2)
+            .await
+            .entries
+            .into_iter()
+            .rev()
+            .find(|e| e.sender_install == a2_id && e.kind == 1 && e.msg_id.is_none())
+            .map(|e| e.seq)
+    };
+    settle!([&a2, &a3, &b1], receipt().await.is_some());
+    a1.account
+        .storage_test_fixture()
+        .messages()
+        .await
+        .unwrap()
+        .mailbox_pulled(a2_id, receipt().await.unwrap())
+        .await
+        .unwrap();
+    // A3 answers `Busy` until A1 has taken the receipt and the push.
+    a3.account.mailbox_test_hold(true).await.unwrap();
+    back_online(&a1, &[&a2, &a3]).await;
+    a1.account.mailbox_sync_now().await.unwrap();
+    settle!(
+        [&a1, &a2, &a3, &b1],
+        caught_up(&a1, &a2).await && mailbox(&a1).await.status_ahead == 1
+    );
+    assert!(message(&a1, key).await.is_none());
+    let push = ReceivedPush::Cipher {
+        tag,
+        ciphertext: vec![0xff; 40],
+    };
+    assert_eq!(
+        a1.account.push_received(push, WAIT).await.unwrap(),
+        PushOutcome::Notified
+    );
+    assert_eq!(alerts(&a1, conv), 1);
+
+    let before = notify_events(&a1).len();
+    a3.account.mailbox_test_hold(false).await.unwrap();
+    settle!([&a1, &a2, &a3, &b1], message(&a1, key).await.is_some());
+    quiet(&[&a1, &a2, &a3, &b1]).await;
+    assert_eq!(unread(&a1, b1.peer).await, 0);
+    let cancel = NotifyItem {
+        conversation: conv,
+        peer: b1.peer,
+        new_messages: 0,
+        unread: 0,
+        title: "remote".into(),
+        preview: None,
+        silenced: false,
+    };
+    assert_eq!(notified_since(&a1, before), [cancel]);
+
+    link(&a1, &b1).await;
+    let next = send_to(&b1, a1.peer, 2, "the next one").await;
+    settle!([&a1, &a2, &a3, &b1], message(&a1, next).await.is_some());
+    quiet(&[&a1, &a2, &a3, &b1]).await;
+    assert_eq!(alerts(&a1, conv), 2);
 }

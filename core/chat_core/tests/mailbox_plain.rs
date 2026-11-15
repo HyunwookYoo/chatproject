@@ -107,6 +107,7 @@ async fn unopenable_entry_is_stored_from_plaintext() {
             unread: 1,
             title: "remote".into(),
             preview: Some("text 1".into()),
+            silenced: false,
         }]
     );
     assert_eq!(notify_count(&a1), 1, "one notification");

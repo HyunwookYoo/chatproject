@@ -127,6 +127,9 @@ pub struct NotifyItem {
     /// The notification body: the start of the last unread text, with " 외 N개" for the N
     /// other unread ones. `None` when no text is known: show "새 메시지 N개" (N = `unread`).
     pub preview: Option<String>,
+    /// With `new_messages == 0`: new texts that do not alert (a generic push notification
+    /// alerted for them, Ruling R13); shown also when no notification of the conversation is.
+    pub silenced: bool,
 }
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChatEvent {

@@ -20,14 +20,19 @@ import 'support/fake_push.dart';
 
 Uint8List _bytes(int value) => Uint8List.fromList(List.filled(32, value));
 
-r.NotifyItem _item(int conversation, int newMessages, int unread) =>
-    r.NotifyItem(
-      conversation: _bytes(conversation),
-      peer: _bytes(conversation + 100),
-      newMessages: newMessages,
-      unread: BigInt.from(unread),
-      title: '',
-    );
+r.NotifyItem _item(
+  int conversation,
+  int newMessages,
+  int unread, {
+  bool silenced = false,
+}) => r.NotifyItem(
+  conversation: _bytes(conversation),
+  peer: _bytes(conversation + 100),
+  newMessages: newMessages,
+  unread: BigInt.from(unread),
+  title: '',
+  silenced: silenced,
+);
 
 /// 0x01010101: the first 4 conversation bytes as a big-endian int32.
 const _id1 = 0x01010101;
@@ -90,6 +95,7 @@ void main() {
         unread: BigInt.from(2),
         title: 'Alice',
         preview: '안녕 외 1개',
+        silenced: false,
       ),
     ]);
     expect(platform.notifications.single.body, '안녕 외 1개');
@@ -120,6 +126,14 @@ void main() {
     ]);
     notify([_item(1, 2, 3)]);
     expect(platform.notifications.last.update, isFalse, reason: 'new messages');
+  });
+
+  test('silenced new texts are posted without alerting even when none is '
+      'shown (Ruling R13)', () {
+    notify([_item(1, 0, 1, silenced: true)]);
+    expect(platform.notifications.map((n) => (n.body, n.update)), [
+      ('새 메시지 1개', true),
+    ]);
   });
 
   test('the channel sends update with every notify', () async {
@@ -236,6 +250,7 @@ void main() {
       newMessages: 1,
       unread: BigInt.from(unread),
       title: '',
+      silenced: false,
     );
 
     messages.controller.add(r.ChatEvent.notify(items: [item(1, 1)]));
@@ -292,6 +307,7 @@ void main() {
       newMessages: 1,
       unread: BigInt.from(unread),
       title: '',
+      silenced: false,
     );
     messages.controller.add(r.ChatEvent.notify(items: [item(1, 1)]));
     await tester.pumpAndSettle();

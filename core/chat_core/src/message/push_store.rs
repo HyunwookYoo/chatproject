@@ -988,8 +988,9 @@ pub(super) fn drop_delivered(
     Ok(())
 }
 
-/// Ruling R13: a "새 메시지" notification alerted for a push of the conversation and it was not
-/// read up since; until it is, its new texts update that notification without alerting.
+/// Ruling R13: a "새 메시지" notification alerted for a push of the conversation, and no text
+/// has taken its place since (`end_generic`) nor was it read up; another generic one does not
+/// alert again.
 pub(super) fn generic_pending(c: &Connection, conversation: ConversationId) -> R<bool> {
     Ok(c.query_row(
         "SELECT generic FROM push_tag WHERE conversation=?1",
@@ -1001,11 +1002,24 @@ pub(super) fn generic_pending(c: &Connection, conversation: ConversationId) -> R
     .unwrap_or(false))
 }
 
-/// In the transaction of a read of the conversation (here, synced from another of my devices,
-/// or a text stored already read): once nothing is unread, a generic push notification no
-/// longer keeps its new texts from alerting (Ruling R13). Other frames never clear it: a wake's
-/// generic notification shows before its text is stored, while `unread` may still be 0.
-/// Whether it ended one (its notification is then cancelled, Ruling R21).
+/// Ruling R13 (final review 1): a text of the other account is notified after the
+/// conversation's generic push notification; it takes that notification's place and ends it.
+/// Whether one was pending.
+pub(super) fn end_generic(tx: &Transaction<'_>, conversation: ConversationId) -> R<bool> {
+    let ended = tx
+        .execute(
+            "UPDATE push_tag SET generic=0 WHERE conversation=?1 AND generic=1",
+            params![conversation.0.as_slice()],
+        )
+        .map_err(sql)?;
+    Ok(ended > 0)
+}
+
+/// In the transaction of a read of the conversation (here, or synced from another of my devices
+/// with a text not here yet, which may be the one the generic notification stood for): once
+/// nothing is unread, the generic push notification ends (Ruling R13). A wake's generic
+/// notification shows before its text is stored, while `unread` may still be 0. Whether it
+/// ended one (its notification is then cancelled, Ruling R21).
 pub(super) fn read_up(tx: &Transaction<'_>, conversation: ConversationId) -> R<bool> {
     let ended = tx
         .execute(

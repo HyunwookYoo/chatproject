@@ -2516,8 +2516,8 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   NotifyItem dco_decode_notify_item(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     final arr = raw as List<dynamic>;
-    if (arr.length != 6)
-      throw Exception('unexpected arr length: expect 6 but see ${arr.length}');
+    if (arr.length != 7)
+      throw Exception('unexpected arr length: expect 7 but see ${arr.length}');
     return NotifyItem(
       conversation: dco_decode_list_prim_u_8_strict(arr[0]),
       peer: dco_decode_list_prim_u_8_strict(arr[1]),
@@ -2525,6 +2525,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       unread: dco_decode_u_64(arr[3]),
       title: dco_decode_String(arr[4]),
       preview: dco_decode_opt_String(arr[5]),
+      silenced: dco_decode_bool(arr[6]),
     );
   }
 
@@ -3536,6 +3537,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var var_unread = sse_decode_u_64(deserializer);
     var var_title = sse_decode_String(deserializer);
     var var_preview = sse_decode_opt_String(deserializer);
+    var var_silenced = sse_decode_bool(deserializer);
     return NotifyItem(
       conversation: var_conversation,
       peer: var_peer,
@@ -3543,6 +3545,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       unread: var_unread,
       title: var_title,
       preview: var_preview,
+      silenced: var_silenced,
     );
   }
 
@@ -4593,6 +4596,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     sse_encode_u_64(self.unread, serializer);
     sse_encode_String(self.title, serializer);
     sse_encode_opt_String(self.preview, serializer);
+    sse_encode_bool(self.silenced, serializer);
   }
 
   @protected

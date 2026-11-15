@@ -390,8 +390,12 @@ pub struct NativeNotifyItem {
     pub title: String,
     /// The start of the last unread text (with " 외 N개"), or "새 메시지 N개".
     pub body: String,
-    /// Update the shown notification without alerting (no new message).
+    /// Update the shown notification without alerting (no new message); nothing when none is
+    /// shown (a dismissed one stays dismissed, M6 Ruling 31).
     pub update: bool,
+    /// New texts shown without alerting, also when no notification is shown: a generic push
+    /// notification alerted for them already (Ruling R13).
+    pub silent: bool,
     /// Remove the notification (nothing unread); `title` and `body` are empty.
     pub cancel: bool,
     pub conversation: Vec<u8>,
@@ -429,7 +433,8 @@ fn native_items(items: Vec<chat_core::NotifyItem>, open: Option<i32>) -> Vec<Nat
                 id,
                 title,
                 body,
-                update: !cancel && item.new_messages == 0,
+                update: !cancel && item.new_messages == 0 && !item.silenced,
+                silent: !cancel && item.silenced,
                 cancel,
                 conversation: item.conversation.0.to_vec(),
             })
@@ -721,6 +726,7 @@ mod tests {
             unread,
             title: title.into(),
             preview: preview.map(str::to_owned),
+            silenced: false,
         }
     }
     fn recording() -> (Forwarder, mpsc::Receiver<Vec<NativeNotifyItem>>) {
@@ -742,6 +748,7 @@ mod tests {
                 item([0x00, 0x00, 0x01, 0x02], 1, 1, "Alice", Some("hello")),
                 item([0xff, 0xff, 0xff, 0xfe], 0, 3, "", None),
                 item([0x80, 0x00, 0x00, 0x00], 0, 0, "Bob", None),
+                chat_core::NotifyItem { silenced: true, ..item([0x00, 0x00, 0x00, 0x07], 0, 2, "Carol", Some("late")) },
             ],
         }));
         let items = next(&received);
@@ -753,6 +760,7 @@ mod tests {
                     title: "Alice".into(),
                     body: "hello".into(),
                     update: false,
+                    silent: false,
                     cancel: false,
                     conversation: conversation([0, 0, 1, 2]).0.to_vec(),
                 },
@@ -761,6 +769,7 @@ mod tests {
                     title: "새 메시지".into(),
                     body: "새 메시지 3개".into(),
                     update: true,
+                    silent: false,
                     cancel: false,
                     conversation: conversation([0xff, 0xff, 0xff, 0xfe]).0.to_vec(),
                 },
@@ -769,8 +778,18 @@ mod tests {
                     title: String::new(),
                     body: String::new(),
                     update: false,
+                    silent: false,
                     cancel: true,
                     conversation: conversation([0x80, 0, 0, 0]).0.to_vec(),
+                },
+                NativeNotifyItem {
+                    id: 7,
+                    title: "Carol".into(),
+                    body: "late".into(),
+                    update: false,
+                    silent: true,
+                    cancel: false,
+                    conversation: conversation([0, 0, 0, 7]).0.to_vec(),
                 },
             ]
         );

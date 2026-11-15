@@ -38,8 +38,10 @@
 //!   cannot be opened alerts as "새 메시지". A `wake` alerts as "새 메시지" first, then dials the
 //!   sender's devices and syncs with my devices until the caller's deadline, or until a
 //!   notification of the conversation shows a text in the generic one's place. Ruling R13: once
-//!   a generic notification alerted, the conversation's texts (by any path, also after a
-//!   restart: the mark is `push_tag.generic`) update it without alerting until it is read up.
+//!   a generic notification alerted, the conversation's next text (by any path, also after a
+//!   restart: the mark is `push_tag.generic`) takes its place without alerting (`silenced`,
+//!   shown also where the generic one was dismissed) and ends it; so does a read here or a
+//!   synced read of a text not here yet, once nothing is unread.
 //!   A read clear syncs with my devices until the deadline. Both start the
 //!   network only if it was off, and stop only what they started; the waits happen in the
 //!   caller's task, never in an actor turn.
@@ -1344,7 +1346,14 @@ impl Manager {
         };
         match (seen, new) {
             // Read on another device already: no notification (M6 user decision, spec 5.3).
-            (Some(true), _) => Some(PushOutcome::Nothing),
+            // Stored just now, it still ends a generic notification of the conversation, which
+            // is then cleared or updated (Ruling R13).
+            (Some(true), new) => {
+                if new {
+                    self.push_notify(vec![key], Vec::new(), request).await;
+                }
+                Some(PushOutcome::Nothing)
+            }
             // Silent when a generic notification of the conversation alerted already (R13).
             (Some(false), true) => self
                 .push_notify(vec![key], Vec::new(), request)
@@ -1390,9 +1399,10 @@ impl Manager {
 
     /// The "새 메시지" notification of a push whose text cannot be shown: one new message more
     /// than the conversation's unread ones, without a preview. It alerts unless one alerted for
-    /// the conversation already and was not read up since; until it is, the conversation's new
-    /// texts update it without alerting (Ruling R13, marked in `push_tag`). Returns the unread
-    /// count it shows and whether it alerted.
+    /// the conversation already and has not ended since (then it is `silenced`: shown, also
+    /// where the user dismissed the first); the conversation's next text takes its place
+    /// without alerting (Ruling R13, marked in `push_tag`). Returns the unread count it shows
+    /// and whether it alerted.
     async fn push_generic(
         &mut self,
         conversation: ConversationId,
@@ -1414,6 +1424,7 @@ impl Manager {
             unread,
             title: String::new(),
             preview: None,
+            silenced: pending,
         }]);
         (unread, !pending)
     }

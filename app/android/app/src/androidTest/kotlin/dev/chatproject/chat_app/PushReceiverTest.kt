@@ -127,8 +127,8 @@ class PushReceiverTest {
         val conversation = random(32)
         // The conversation's first 4 bytes, big-endian (Dart's notificationId, Task 9).
         val id = ByteBuffer.wrap(conversation, 0, 4).int
-        fun item(body: String, update: Boolean = false, cancel: Boolean = false) =
-            NativeNotifyItem(id, if (cancel) "" else "앨리스", if (cancel) "" else body, update, cancel, conversation)
+        fun item(body: String, update: Boolean = false, silent: Boolean = false, cancel: Boolean = false) =
+            NativeNotifyItem(id, if (cancel) "" else "앨리스", if (cancel) "" else body, update, silent, cancel, conversation)
 
         // A count update of a notification that is not shown posts nothing (M6 Ruling 31).
         notifier.notify(listOf(item("안녕하세요", update = true)))
@@ -150,6 +150,14 @@ class PushReceiverTest {
         // Read on another of my devices: the core's cancel after a read clear (spec 7).
         notifier.notify(listOf(item("", cancel = true)))
         waitFor { if (message(id) == null) Unit else null }
+
+        // Final review 1: the text a dismissed generic notification alerted for is posted
+        // without alerting (Ruling R13), even though nothing is shown.
+        notifier.notify(listOf(item("늦게 온 글", silent = true)))
+        val silent = waitFor { message(id) }
+        assertEquals("늦게 온 글", text(silent, Notification.EXTRA_TEXT))
+        assertEquals(Notification.GROUP_ALERT_SUMMARY, silent.notification.groupAlertBehavior)
+        manager.cancelAll()
     }
 
     @Test fun pushTheCoreCannotTakeStillNotifies() {

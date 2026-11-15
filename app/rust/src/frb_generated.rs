@@ -2839,6 +2839,7 @@ impl SseDecode for crate::api::chat::NotifyItem {
         let mut var_unread = <u64>::sse_decode(deserializer);
         let mut var_title = <String>::sse_decode(deserializer);
         let mut var_preview = <Option<String>>::sse_decode(deserializer);
+        let mut var_silenced = <bool>::sse_decode(deserializer);
         return crate::api::chat::NotifyItem {
             conversation: var_conversation,
             peer: var_peer,
@@ -2846,6 +2847,7 @@ impl SseDecode for crate::api::chat::NotifyItem {
             unread: var_unread,
             title: var_title,
             preview: var_preview,
+            silenced: var_silenced,
         };
     }
 }
@@ -4079,6 +4081,7 @@ impl flutter_rust_bridge::IntoDart for crate::api::chat::NotifyItem {
             self.unread.into_into_dart().into_dart(),
             self.title.into_into_dart().into_dart(),
             self.preview.into_into_dart().into_dart(),
+            self.silenced.into_into_dart().into_dart(),
         ]
         .into_dart()
     }
@@ -5106,6 +5109,7 @@ impl SseEncode for crate::api::chat::NotifyItem {
         <u64>::sse_encode(self.unread, serializer);
         <String>::sse_encode(self.title, serializer);
         <Option<String>>::sse_encode(self.preview, serializer);
+        <bool>::sse_encode(self.silenced, serializer);
     }
 }
 

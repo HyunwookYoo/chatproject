@@ -153,6 +153,7 @@ impl From<chat_core::NotifyItem> for NotifyItem {
             unread: item.unread,
             title: item.title,
             preview: item.preview,
+            silenced: item.silenced,
         }
     }
 }
@@ -489,6 +490,7 @@ mod tests {
             unread,
             title: title.into(),
             preview: preview.map(str::to_owned),
+            silenced: n == 3,
         };
         assert_eq!(
             ChatEvent::from(chat_core::CoreEvent::Notify {
@@ -503,6 +505,7 @@ mod tests {
                         unread: 7,
                         title: "Alice".into(),
                         preview: Some("hi 외 6개".into()),
+                        silenced: false,
                     },
                     NotifyItem {
                         conversation: vec![3; 32],
@@ -511,6 +514,7 @@ mod tests {
                         unread: 0,
                         title: String::new(),
                         preview: None,
+                        silenced: true,
                     },
                 ],
             }

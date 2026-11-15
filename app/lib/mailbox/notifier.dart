@@ -75,8 +75,12 @@ class Notifier {
       unawaited(platform.cancelNotification(id));
       return;
     }
-    // No new messages: only the count of a shown notification changes.
-    if (item.newMessages == 0 && !_shown.containsKey(id)) return;
+    // No new messages: only the count of a shown notification changes. New
+    // texts a generic push notification alerted for (silenced, Ruling R13) are
+    // shown without alerting even when none is.
+    if (item.newMessages == 0 && !item.silenced && !_shown.containsKey(id)) {
+      return;
+    }
     if (_lifecycle() == AppLifecycleState.resumed &&
         listEquals(openPeer, item.peer)) {
       return;

@@ -56,6 +56,11 @@ pub struct NotifyItem {
     /// is known (nothing unread, or a push that could not be opened): the app shows
     /// "새 메시지 N개" as in M6.
     pub preview: Option<String>,
+    /// With `new_messages == 0`: new texts that do not alert, because a generic push
+    /// notification ("새 메시지") alerted for them already (Ruling R13). Unlike a count update,
+    /// the app shows it also when no notification of the conversation is shown (the user
+    /// dismissed the generic one).
+    pub silenced: bool,
 }
 
 /// Receives core events. Return `false` once the receiver is gone; the bus then drops it.

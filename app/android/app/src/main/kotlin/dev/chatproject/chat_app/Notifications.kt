@@ -27,7 +27,7 @@ class Notifications(context: Context) : NativeNotifier {
     override fun notify(items: List<NativeNotifyItem>) {
         for (item in items) {
             try {
-                if (item.cancel) cancel(item.id) else show(item.id, item.title, item.body, item.update)
+                if (item.cancel) cancel(item.id) else show(item.id, item.title, item.body, item.update, item.silent)
             } catch (error: RuntimeException) {
                 // The system refused this one (e.g. its rate limit); the next event shows the count.
                 Log.w(ChatApplication.LOG_TAG, "Notification not posted: ${error.javaClass.simpleName}")
@@ -36,11 +36,13 @@ class Notifications(context: Context) : NativeNotifier {
     }
 
     // update: a count change of the notification shown for `id`. It never alerts and never
-    // brings back one the user dismissed (M6 Ruling 31).
-    private fun show(id: Int, title: String, body: String, update: Boolean) {
+    // brings back one the user dismissed (M6 Ruling 31). silent: new texts a generic push
+    // notification alerted for already (Ruling R13): posted without alerting, also when the
+    // user dismissed that one, so a high-priority push still ends visible (spec 2).
+    private fun show(id: Int, title: String, body: String, update: Boolean, silent: Boolean) {
         if (!manager.areNotificationsEnabled()) return
         if (update && manager.activeNotifications.none { it.tag == TAG && it.id == id }) return
-        post(TAG, id, isolated(title), body, update, open(id))
+        post(TAG, id, isolated(title), body, update, open(id), silent)
     }
 
     private fun cancel(id: Int) {
@@ -70,14 +72,17 @@ class Notifications(context: Context) : NativeNotifier {
         PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
     )
 
-    private fun post(tag: String, id: Int, title: String, body: String?, update: Boolean, open: PendingIntent) {
+    private fun post(tag: String, id: Int, title: String, body: String?, update: Boolean, open: PendingIntent, silent: Boolean = false) {
         val notification = Notification.Builder(context, CHANNEL)
             .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle(title)
             .apply { if (body != null) setContentText(body) }
             .setContentIntent(open)
             .setAutoCancel(true)
-            .setOnlyAlertOnce(update)
+            .setOnlyAlertOnce(update || silent)
+            // What Builder.setSilent (API 31) does: a member of a group that alerts only for its
+            // summary, which is never posted, never alerts.
+            .apply { if (silent) setGroup(SILENT_GROUP).setGroupAlertBehavior(Notification.GROUP_ALERT_SUMMARY) }
             .setCategory(Notification.CATEGORY_MESSAGE)
             .build()
         manager.notify(tag, id, notification)
@@ -89,6 +94,7 @@ class Notifications(context: Context) : NativeNotifier {
         const val TAG = "message"
         const val GENERIC_TAG = "push"
         const val GENERIC_ID = 0
+        private const val SILENT_GROUP = "silent"
         const val EXTRA_CONVERSATION = "chat_conversation"
         // The core's title when a contact has no alias (Task 9 native_items).
         private const val GENERIC_TITLE = "새 메시지"

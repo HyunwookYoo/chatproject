@@ -1236,9 +1236,16 @@ data class NativeNotifyItem (
     var `body`: kotlin.String
     , 
     /**
-     * Update the shown notification without alerting (no new message).
+     * Update the shown notification without alerting (no new message); nothing when none is
+     * shown (a dismissed one stays dismissed, M6 Ruling 31).
      */
     var `update`: kotlin.Boolean
+    , 
+    /**
+     * New texts shown without alerting, also when no notification is shown: a generic push
+     * notification alerted for them already (Ruling R13).
+     */
+    var `silent`: kotlin.Boolean
     , 
     /**
      * Remove the notification (nothing unread); `title` and `body` are empty.
@@ -1267,6 +1274,7 @@ public object FfiConverterTypeNativeNotifyItem: FfiConverterRustBuffer<NativeNot
             FfiConverterString.read(buf),
             FfiConverterBoolean.read(buf),
             FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
             FfiConverterByteArray.read(buf),
         )
     }
@@ -1276,6 +1284,7 @@ public object FfiConverterTypeNativeNotifyItem: FfiConverterRustBuffer<NativeNot
             FfiConverterString.allocationSize(value.`title`) +
             FfiConverterString.allocationSize(value.`body`) +
             FfiConverterBoolean.allocationSize(value.`update`) +
+            FfiConverterBoolean.allocationSize(value.`silent`) +
             FfiConverterBoolean.allocationSize(value.`cancel`) +
             FfiConverterByteArray.allocationSize(value.`conversation`)
     )
@@ -1285,6 +1294,7 @@ public object FfiConverterTypeNativeNotifyItem: FfiConverterRustBuffer<NativeNot
             FfiConverterString.write(value.`title`, buf)
             FfiConverterString.write(value.`body`, buf)
             FfiConverterBoolean.write(value.`update`, buf)
+            FfiConverterBoolean.write(value.`silent`, buf)
             FfiConverterBoolean.write(value.`cancel`, buf)
             FfiConverterByteArray.write(value.`conversation`, buf)
     }

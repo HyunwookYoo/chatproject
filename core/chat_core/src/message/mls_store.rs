@@ -1093,6 +1093,7 @@ fn apply_own_read(
     now: i64,
 ) -> R<bool> {
     let mut read = Vec::new();
+    let mut absent = false;
     for id in targets {
         let found: Option<([u8; 32], bool)> = tx
             .query_row(
@@ -1103,6 +1104,7 @@ fn apply_own_read(
             .optional()
             .map_err(sql)?;
         let Some((installation, seen)) = found else {
+            absent = true;
             tx.execute(
                 "INSERT OR IGNORE INTO mailbox_status_ahead VALUES(?1,?2,?3,1,?4)",
                 params![
@@ -1154,8 +1156,10 @@ fn apply_own_read(
         )
         .map_err(sql)?;
     }
-    // A read on another of my devices (whether or not it lowered `unread` here, Ruling R13).
-    let ended = super::push_store::read_up(tx, conversation)?;
+    // Ruling R13 (final review 1): only a read of a text not here yet may be of the one a
+    // generic push notification stood for. A read of texts all here may be older than that
+    // notification and leaves it; its text ends it when it comes (`notify_items`).
+    let ended = absent && super::push_store::read_up(tx, conversation)?;
     Ok(!read.is_empty() || ended)
 }
 
@@ -1423,10 +1427,8 @@ fn store_text(
         ],
     )
     .map_err(sql)?;
-    if seen {
-        // Read on another of my devices before it came here (Ruling R13).
-        super::push_store::read_up(tx, conversation)?;
-    }
+    // A generic push notification of the conversation ends when this text is notified, also
+    // when it came read already (`notify_items`, Ruling R13).
     Ok(Stored::New)
 }
 
