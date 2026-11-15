@@ -31,10 +31,13 @@ test_file="$1"
 attempts="${APP_TEST_ATTEMPTS:-1}"
 reset="${APP_TEST_RESET:-}"
 if [ -n "$reset" ]; then
+  # The device shell expands the path, so only plain path characters pass, never "..", and only a
+  # folder below files/ or no_backup/ (never those folders themselves).
   case "$reset" in
+    *[!A-Za-z0-9._/-]*) echo "APP_TEST_RESET may only hold A-Z a-z 0-9 . _ / -" >&2; exit 2 ;;
     *..*) echo "APP_TEST_RESET must not contain .." >&2; exit 2 ;;
-    "/data/user/0/$package/"?*) ;;
-    *) echo "APP_TEST_RESET must be under /data/user/0/$package/" >&2; exit 2 ;;
+    "/data/user/0/$package/files/"[A-Za-z0-9_-]* | "/data/user/0/$package/no_backup/"[A-Za-z0-9_-]*) ;;
+    *) echo "APP_TEST_RESET must be a folder below /data/user/0/$package/files/ or no_backup/" >&2; exit 2 ;;
   esac
 fi
 
@@ -89,8 +92,13 @@ while :; do
     attempt=$((attempt + 1))
     echo "== a flutter tool failure: trying $test_file once more (attempt $attempt of $attempts)"
     if [ -n "$reset" ]; then
-      echo "== clearing the test's fixture first"
-      adb -s "$serial" shell run-as "$package" rm -rf "$reset" || true
+      echo "== stopping the app and clearing the test's fixture first"
+      # A hung app still holds the fixture's files open; stop it before they are removed.
+      if ! adb -s "$serial" shell am force-stop "$package" ||
+        ! adb -s "$serial" shell run-as "$package" rm -rf "$reset"; then
+        echo "::error::could not clear the test's fixture; not trying $test_file again"
+        exit "$code"
+      fi
     fi
     continue
   fi

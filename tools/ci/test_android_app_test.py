@@ -38,6 +38,7 @@ case "$*" in
   *"--pid="*) for i in $(seq 400); do echo "pid line $i"; done ;;
   *"ActivityManager"*) echo "I ActivityManager: Start proc 4242:dev.chatproject.chat_app"; echo "I ActivityManager: Start proc 1:other.app" ;;
   *logcat*) echo "E AndroidRuntime: FATAL EXCEPTION" ;;
+  *"rm -rf"*) exit "${ADB_RM_EXIT:-0}" ;;
 esac
 '''
 
@@ -136,10 +137,40 @@ class AndroidAppTestScript(unittest.TestCase):
             "FLUTTER_FIRST_EXIT": "0", "FLUTTER_FIRST_SLEEP": "30"})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.calls, 2)
-        self.assertIn("shell run-as dev.chatproject.chat_app rm -rf /data/user/0/dev.chatproject.chat_app/no_backup/ci-message-storage", queries)
+        clear = "shell run-as dev.chatproject.chat_app rm -rf /data/user/0/dev.chatproject.chat_app/no_backup/ci-message-storage"
+        self.assertIn(clear, queries)
+        # The hung app is stopped first, so no live process holds the fixture's files open.
+        stop = "shell am force-stop dev.chatproject.chat_app"
+        self.assertIn(stop, queries)
+        self.assertLess(queries.index(stop), queries.index(clear))
+
+    def test_a_clear_that_fails_ends_the_run_without_a_retry(self):
+        result, _ = self.run_script("integration_test/message_test.dart", "--no-uninstall", bound=1, extra={
+            "APP_TEST_ATTEMPTS": "2", "APP_TEST_RESET": "/data/user/0/dev.chatproject.chat_app/no_backup/ci-message-storage",
+            "FLUTTER_FIRST_EXIT": "0", "FLUTTER_FIRST_SLEEP": "30", "ADB_RM_EXIT": "1"})
+        self.assertEqual((result.returncode, self.calls), (124, 1), result.stdout + result.stderr)
+        self.assertIn("::error::", result.stdout)
+
+    def test_a_reset_below_files_or_no_backup_is_accepted(self):
+        for path in ("/data/user/0/dev.chatproject.chat_app/files/x", "/data/user/0/dev.chatproject.chat_app/no_backup/a-b_c.d/e"):
+            with self.subTest(path=path):
+                result, _ = self.run_script("integration_test/message_test.dart", extra={
+                    "APP_TEST_ATTEMPTS": "2", "APP_TEST_RESET": path})
+                self.assertEqual((result.returncode, self.calls), (0, 1), result.stdout + result.stderr)
 
     def test_a_reset_outside_the_app_data_is_refused(self):
-        for path in ("/sdcard/x", "relative", "/data/user/0/dev.chatproject.chat_app/../other", ""):
+        app = "/data/user/0/dev.chatproject.chat_app/"
+        refused = (
+            "/sdcard/x", "relative", app + "../other",
+            # the bare app folder, a folder other than files/ or no_backup/, and the bare
+            # files/ or no_backup/ folders themselves
+            app, app + "x", app + "cache/x", app + "files", app + "files/", app + "no_backup",
+            app + "no_backup/", app + "no_backup//", app + "no_backup/.",
+            # characters the device shell would expand or split on, and a .. inside a name
+            app + "no_backup/a;rm", app + "no_backup/a b", app + "no_backup/$(id)",
+            app + "no_backup/*", app + "no_backup/a..b", app + "no_backup/`id`",
+        )
+        for path in refused + ("",):
             with self.subTest(path=path):
                 result, queries = self.run_script("integration_test/message_test.dart", extra={
                     "APP_TEST_ATTEMPTS": "2", "APP_TEST_RESET": path})
