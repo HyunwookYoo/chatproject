@@ -265,6 +265,34 @@ NOTIFICATION MANAGER (dumpsys notification)
     }
   });
 
+  test('a notification left after a read push notes A1 fetches', () async {
+    final fixture = PushFixture()..fault = 'no_cancel';
+    await fixture.start();
+    failureFacts.clear();
+    try {
+      await expectLater(
+        fixture.run(),
+        throwsA(
+          isA<ScenarioDeadline>().having(
+            (e) => e.message,
+            'text',
+            'Push scenario deadline: read_cleared',
+          ),
+        ),
+      );
+      expect(failureFacts, {
+        'm7_fetch_all': 'f1',
+        'm7_fetch_online': 'o1',
+        'm7_fetch_done': 'd0',
+        'm7_fetch_network': 'Stopped',
+      });
+      expect(safeFacts(failureFacts, loadSafeFacts()), failureFacts);
+    } finally {
+      failureFacts.clear();
+      await fixture.close();
+    }
+  });
+
   test('a ticket deadline notes every side network state', () async {
     final fixture = PushFixture()..fault = 'no_start';
     await fixture.start();
@@ -394,6 +422,7 @@ class PushFixture {
   var lingering = 3;
   var readClears = 0;
   var readItems = 0;
+  var fetches = 0;
   var launches = 0;
   var lamport = 0;
   final conversation = List.filled(32, 5);
@@ -485,7 +514,9 @@ class PushFixture {
         storeOnPhone(latest);
         show();
       });
-    } else if (extras.containsKey('r') && fault != 'no_cancel') {
+    } else if (extras.containsKey('r')) {
+      fetches++;
+      if (fault == 'no_cancel') return;
       unread.clear();
       show();
     }
@@ -565,6 +596,9 @@ class PushFixture {
               : 0,
           'read_clears': readClears,
           'read_items': readItems,
+          'fetches': fetches,
+          'fetches_online': fetches,
+          'fetches_done': fault == 'no_cancel' ? 0 : fetches,
         };
       case 'network_start':
         if (name == 'android-1' && fault != 'no_start') {
@@ -572,7 +606,7 @@ class PushFixture {
         }
         return {'state': 'Online'};
       case 'network_info':
-        final off = name == 'android-1' && offAfterRelaunch;
+        final off = name == 'android-1' && (offAfterRelaunch || stopped);
         return {
           'state': off ? 'Stopped' : 'Online',
           'ticket': off ? null : 'ticket-$name',

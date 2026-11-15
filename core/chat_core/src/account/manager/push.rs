@@ -98,6 +98,10 @@ pub(super) struct Shared {
     config: ConfigSlot,
     /// The network as received pushes use it.
     network: tokio::sync::Mutex<NetworkLease>,
+    /// Each fetch of a received push (`wake`, read clear): whether the network was online in
+    /// time, and whether what it waited for came in time.
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    fetches: std::sync::Mutex<Vec<(bool, bool)>>,
 }
 
 /// Received pushes fetching now, and whether they started the network: the last of them to end
@@ -368,12 +372,22 @@ impl AccountHandle {
         until: tokio::time::Instant,
     ) -> bool {
         let lease = NetworkUse::acquire(self.shared.clone()).await;
-        if lease.online(until).await {
+        let online = lease.online(until).await;
+        if online {
             let _ = self
                 .send(|reply| Command::Push(PushCommand::Fetch { peer, reply }))
                 .await;
         }
         let fetched = matches!(tokio::time::timeout_at(until, done).await, Ok(Ok(())));
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        self.shared
+            .push
+            .fetches
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((online, fetched));
+        #[cfg(not(all(feature = "test-hooks", debug_assertions)))]
+        let _ = online;
         if fetched {
             let linger = tokio::time::Instant::now() + FETCH_LINGER;
             tokio::time::sleep_until(linger.min(until)).await;
@@ -394,6 +408,17 @@ impl AccountHandle {
     }
     pub async fn push_status(&self) -> Result<PushStatus, CoreError> {
         self.send(Command::PushStatus).await
+    }
+    /// Each fetch of a received push so far, in order: whether the network was online in time,
+    /// and whether what it waited for (the sync, the woken text) came in time.
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    pub fn push_test_fetches(&self) -> Vec<(bool, bool)> {
+        self.shared
+            .push
+            .fetches
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
     /// Issues the handles due at `now_ms` (wall time) and seals them for the peers; returns
     /// once that renewal ended (the background renewal of Android and iOS).

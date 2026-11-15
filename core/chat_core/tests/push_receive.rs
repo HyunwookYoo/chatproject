@@ -585,11 +585,25 @@ async fn read_clear_syncs_and_cancels_notification() {
         .unwrap();
 
     let before = notify_events(&a1).len();
+    // A deadline too short for the network and the sync: `Nothing`, nothing changes, and the
+    // network is given back (Android then goes on in its fetch worker, e2e m7 run 5).
+    let short = a1
+        .account
+        .push_received(ReceivedPush::ReadClear, Duration::from_millis(1))
+        .await
+        .unwrap();
+    assert_eq!(short, PushOutcome::Nothing);
+    assert_eq!(unread(&a1, b1.peer).await, 1);
+    assert_eq!(a1.account.push_test_fetches(), vec![(false, false)]);
     let account = a1.account.clone();
     let task =
         tokio::spawn(async move { account.push_received(ReceivedPush::ReadClear, WAIT).await });
     settle!([&a1, &a2, &b1], task.is_finished());
     assert_eq!(task.await.unwrap().unwrap(), PushOutcome::Updated);
+    assert_eq!(
+        a1.account.push_test_fetches(),
+        vec![(false, false), (true, true)]
+    );
     assert_eq!(unread(&a1, b1.peer).await, 0);
     let cleared = notified_since(&a1, before);
     assert!(cleared.iter().any(|i| i.conversation == conv

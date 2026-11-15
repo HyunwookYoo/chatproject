@@ -81,6 +81,12 @@ class PushService : FirebaseMessagingService() {
             if (wake && outcome == NativePushOutcome.NOTIFIED && elapsed >= RECEIVE_DEADLINE_MS - FETCH_LINGER_MS) {
                 PushWorkers.scheduleFetch(context, data)
             }
+            // A read clear whose sync with my devices did not end in time (a cold network start,
+            // a dial and a pull may not fit FCM's time, e2e m7 run 5): the rest goes on in the
+            // same worker, which syncs again within FETCH_DEADLINE_MS. It never schedules again.
+            if ("r" in data && outcome == NativePushOutcome.NOTHING) {
+                PushWorkers.scheduleFetch(context, data)
+            }
             return outcome
         }
 

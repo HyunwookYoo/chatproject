@@ -423,6 +423,43 @@ Future<void> runPushScenario(
     failureFacts['m7_read_items'] = bucket(map['read_items'], 'i', 1);
   }
 
+  // On a notification a push should have changed: A1's fetches for received pushes
+  // (`m7_fetch_*`: all, online in time, done in time) and its network now.
+  Future<void> noteFetches() async {
+    Object? value;
+    Object? info;
+    try {
+      value = await a1.call(
+        'push_local_test_counts',
+        const {},
+        timeout: const Duration(seconds: 5),
+        failOnTimeout: false,
+      );
+      info = await a1.call(
+        'network_info',
+        const {},
+        timeout: const Duration(seconds: 5),
+        failOnTimeout: false,
+      );
+    } catch (_) {
+      /* What could not be read stays unknown. */
+    }
+    final map = value is Map ? value : const {};
+    String bucket(Object? n, String prefix, int top) => n is! int
+        ? 'unknown'
+        : n >= top
+        ? '$prefix${top}plus'
+        : '$prefix$n';
+    failureFacts['m7_fetch_all'] = bucket(map['fetches'], 'f', 2);
+    failureFacts['m7_fetch_online'] = bucket(map['fetches_online'], 'o', 2);
+    failureFacts['m7_fetch_done'] = bucket(map['fetches_done'], 'd', 2);
+    final state = info is Map ? info['state'] : null;
+    failureFacts['m7_fetch_network'] =
+        const {'Stopped', 'Starting', 'Online', 'Failed'}.contains(state)
+        ? state as String
+        : 'unknown';
+  }
+
   Future<Object?> ticket(Participant p) async {
     try {
       return (await until(
@@ -749,7 +786,12 @@ Future<void> runPushScenario(
     await noteReadClear();
     rethrow;
   }
-  await until(shown, (n) => n.isEmpty, 'read_cleared', within: timeout * 2);
+  try {
+    await until(shown, (n) => n.isEmpty, 'read_cleared', within: timeout * 2);
+  } on ScenarioDeadline {
+    await noteFetches();
+    rethrow;
+  }
   evidence?.call('read_cleared', {'notifications': 0});
 
   // 4. Too large for a push: `wake`, then the fetched text replaces it.

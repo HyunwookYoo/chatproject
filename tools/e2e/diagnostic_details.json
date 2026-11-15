@@ -730,6 +730,31 @@
       "i0",
       "i1plus",
       "unknown"
+    ],
+    "m7_fetch_all": [
+      "f0",
+      "f1",
+      "f2plus",
+      "unknown"
+    ],
+    "m7_fetch_online": [
+      "o0",
+      "o1",
+      "o2plus",
+      "unknown"
+    ],
+    "m7_fetch_done": [
+      "d0",
+      "d1",
+      "d2plus",
+      "unknown"
+    ],
+    "m7_fetch_network": [
+      "Stopped",
+      "Starting",
+      "Online",
+      "Failed",
+      "unknown"
     ]
   },
   "wait_kinds": [

@@ -104,6 +104,7 @@ pub async fn execute(
             let own = fixture.push_state().await?;
             let peers = fixture.push_peer_state().await?;
             let clears = handle.push_test_read_clears().await?;
+            let fetches = handle.push_test_fetches();
             let usize_count = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
             json!({
                 // Handles of this device: per conversation, and the one for my other devices.
@@ -120,6 +121,10 @@ pub async fn execute(
                 "own_sessions": usize_count(handle.mailbox_test_own_sessions().await?.len()),
                 "read_clears": usize_count(clears.len()),
                 "read_items": clears.iter().map(|(_, items)| u64::from(*items)).sum::<u64>(),
+                // Fetches of received pushes (wake, read clear): all, online in time, done in time.
+                "fetches": usize_count(fetches.len()),
+                "fetches_online": usize_count(fetches.iter().filter(|(online, _)| *online).count()),
+                "fetches_done": usize_count(fetches.iter().filter(|(_, done)| *done).count()),
             })
         }
     })
