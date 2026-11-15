@@ -512,3 +512,79 @@ async fn sql_commit_precedes_pair_disclosure() {
         }
     }
 }
+
+/// The app's storage fixture (`test_storage_start`): offline record services with a frozen
+/// fake clock, the core the Android `message_test.dart` phases run.
+async fn open_fixture(root: &std::path::Path) -> (Arc<CoreSlot>, AccountHandle) {
+    let slot = Arc::new(CoreSlot::new());
+    slot.start(
+        CoreConfig {
+            data_dir: root.into(),
+        },
+        &EventBus::new(),
+    )
+    .unwrap();
+    slot.network().unwrap().configure_local(None).await.unwrap();
+    let owned = slot.clone();
+    let account = tokio::task::spawn_blocking(move || {
+        owned.open_account_with_services(
+            support::protector(),
+            chat_core::account::AccountServices::offline_for_test(),
+        )
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    settled(&account).await;
+    (slot, account)
+}
+
+/// `message_test.dart`: 55 queued texts to an unknown peer in one process, then a second
+/// process on the same folder reads them back. The reopened core must answer within a bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reopened_account_with_queued_texts_answers_in_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let peer = chat_core::account::PeerId([253; 32]);
+    let (slot, account) = open_fixture(dir.path()).await;
+    let display = account.begin_create().await.unwrap();
+    let answers = display
+        .positions
+        .map(|p| display.words[usize::from(p - 1)].clone());
+    account.confirm_create(display.flow, answers).await.unwrap();
+    let service = account.messages();
+    for i in 0..55u8 {
+        service
+            .send_text(peer, chat_core::MessageId([i; 16]), format!("fixture {i}"))
+            .await
+            .unwrap();
+    }
+    let before = account.snapshot().await.unwrap();
+    drop(service);
+    drop(account);
+    drop(slot);
+    // The read process starts later: the first attempts' retries (1 s) are due when it opens.
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+
+    let (_slot, account) = open_fixture(dir.path()).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let after = account.snapshot().await.unwrap();
+        assert_eq!(after.installation, before.installation);
+        let service = account.messages();
+        let conversation = service.open_dm(peer).await.unwrap();
+        let page = service.load_messages(conversation.id, None, 50).await.unwrap();
+        assert_eq!(page.items.len(), 50);
+        let older = service
+            .load_messages(conversation.id, page.next, 50)
+            .await
+            .unwrap();
+        assert_eq!(older.items.len(), 5);
+        // Commands keep being answered while the due texts are polled (every 100 ms).
+        for _ in 0..20 {
+            account.snapshot().await.unwrap();
+            service.load_messages(conversation.id, None, 50).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the reopened core answers within 10 s");
+}
