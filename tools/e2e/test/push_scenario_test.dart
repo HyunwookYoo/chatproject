@@ -265,33 +265,45 @@ NOTIFICATION MANAGER (dumpsys notification)
     }
   });
 
-  test('a notification left after a read push notes A1 fetches', () async {
-    final fixture = PushFixture()..fault = 'no_cancel';
-    await fixture.start();
-    failureFacts.clear();
-    try {
-      await expectLater(
-        fixture.run(),
-        throwsA(
-          isA<ScenarioDeadline>().having(
-            (e) => e.message,
-            'text',
-            'Push scenario deadline: read_cleared',
-          ),
-        ),
-      );
-      expect(failureFacts, {
-        'm7_fetch_all': 'f1',
-        'm7_fetch_online': 'o1',
-        'm7_fetch_done': 'd0',
-        'm7_fetch_network': 'Stopped',
-      });
-      expect(safeFacts(failureFacts, loadSafeFacts()), failureFacts);
-    } finally {
+  test(
+    'a notification left after a read push notes A1 fetches and own-device sessions',
+    () async {
+      final fixture = PushFixture()..fault = 'no_cancel';
+      await fixture.start();
       failureFacts.clear();
-      await fixture.close();
-    }
-  });
+      try {
+        await expectLater(
+          fixture.run(),
+          throwsA(
+            isA<ScenarioDeadline>().having(
+              (e) => e.message,
+              'text',
+              'Push scenario deadline: read_cleared',
+            ),
+          ),
+        );
+        expect(failureFacts, {
+          'm7_fetch_all': 'f1',
+          'm7_fetch_online': 'o1',
+          'm7_fetch_done': 'd0',
+          'm7_fetch_dials_ok': 'k1',
+          'm7_fetch_dials_failed': 'x0',
+          'm7_fetch_dial_error': 'none',
+          'm7_fetch_pulls': 'p1',
+          'm7_fetch_pulls_failed': 'pf1',
+          'm7_fetch_pulls_stopped': 'ps0',
+          'm7_mailbox_accepts_ok': 'a2',
+          'm7_mailbox_accepts_failed': 'r0',
+          'm7_mailbox_accept_error': 'none',
+          'm7_fetch_network': 'Stopped',
+        });
+        expect(safeFacts(failureFacts, loadSafeFacts()), failureFacts);
+      } finally {
+        failureFacts.clear();
+        await fixture.close();
+      }
+    },
+  );
 
   test('a ticket deadline notes every side network state', () async {
     final fixture = PushFixture()..fault = 'no_start';
@@ -599,6 +611,22 @@ class PushFixture {
           'fetches': fetches,
           'fetches_online': fetches,
           'fetches_done': fault == 'no_cancel' ? 0 : fetches,
+          // A1 dialed A2 for each read clear and A2 took it (and A1's setup dial); with
+          // `no_cancel` each pull failed.
+          'own_dials_ok': name == 'android-1' ? fetches : 0,
+          'own_dials_failed': 0,
+          'own_dial_error': 'none',
+          'own_accepts_ok': name == 'mailbox' ? 1 + fetches : 0,
+          'own_accepts_failed': 0,
+          'own_accept_error': 'none',
+          'pulls': name == 'android-1' ? fetches : 0,
+          'pulls_done': name == 'android-1' && fault != 'no_cancel'
+              ? fetches
+              : 0,
+          'pulls_failed': name == 'android-1' && fault == 'no_cancel'
+              ? fetches
+              : 0,
+          'pulls_stopped': 0,
         };
       case 'network_start':
         if (name == 'android-1' && fault != 'no_start') {

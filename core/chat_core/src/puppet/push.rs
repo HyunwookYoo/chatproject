@@ -105,6 +105,19 @@ pub async fn execute(
             let peers = fixture.push_peer_state().await?;
             let clears = handle.push_test_read_clears().await?;
             let fetches = handle.push_test_fetches();
+            let sync = handle.mailbox_test_sync_trace().await?;
+            // Only a few fixed failure kinds are named (e2e m7 facts); any other is "other".
+            let code = |code: Option<ErrorCode>| match code {
+                None => "none",
+                Some(ErrorCode::NetworkTimeout) => "NetworkTimeout",
+                Some(ErrorCode::TransportFailed) => "TransportFailed",
+                Some(ErrorCode::AuthFailed) => "AuthFailed",
+                Some(ErrorCode::Busy) => "Busy",
+                Some(ErrorCode::StorageLocked) => "StorageLocked",
+                Some(ErrorCode::AccountRestricted) => "AccountRestricted",
+                Some(ErrorCode::NetworkNotStarted) => "NetworkNotStarted",
+                Some(_) => "other",
+            };
             let usize_count = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
             json!({
                 // Handles of this device: per conversation, and the one for my other devices.
@@ -125,6 +138,19 @@ pub async fn execute(
                 "fetches": usize_count(fetches.len()),
                 "fetches_online": usize_count(fetches.iter().filter(|(online, _)| *online).count()),
                 "fetches_done": usize_count(fetches.iter().filter(|(_, done)| *done).count()),
+                // Sessions with my other devices since this core started: dials that came back
+                // installed or failed, connections from them accepted or refused (with the last
+                // failure's kind), and pulls started and how they ended.
+                "own_dials_ok": sync.dials_ok,
+                "own_dials_failed": sync.dials_failed,
+                "own_dial_error": code(sync.dial_error),
+                "own_accepts_ok": sync.accepts_ok,
+                "own_accepts_failed": sync.accepts_failed,
+                "own_accept_error": code(sync.accept_error),
+                "pulls": sync.pulls,
+                "pulls_done": sync.pulls_done,
+                "pulls_failed": sync.pulls_failed,
+                "pulls_stopped": sync.pulls_stopped,
             })
         }
     })

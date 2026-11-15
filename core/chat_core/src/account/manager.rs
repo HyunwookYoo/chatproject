@@ -3220,6 +3220,7 @@ impl Manager {
                 #[cfg(all(feature = "test-hooks", debug_assertions))]
                 {
                     self.messages.mls.settled += 1;
+                    self.trace_own_accept(&conn, &result);
                 }
             }
             Input::Control {

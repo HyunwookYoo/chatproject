@@ -179,6 +179,9 @@ pub(crate) struct Runtime {
     /// Page requests still to fail as timed out, without being sent.
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     fail_pulls: u32,
+    /// How sessions with my other devices came about and how pulls ended (e2e m7).
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    trace: SyncTrace,
 }
 
 impl Runtime {
@@ -431,6 +434,7 @@ pub(crate) enum MailboxTest {
     HandoffSends,
     Announces,
     SyncDials,
+    SyncTrace,
 }
 #[cfg(all(feature = "test-hooks", debug_assertions))]
 pub(crate) enum MailboxTestReply {
@@ -442,6 +446,25 @@ pub(crate) enum MailboxTestReply {
     Sessions(Vec<InstallationId>),
     ReadClears(Vec<(u32, u32)>),
     Dials(Vec<InstallationId>),
+    Trace(SyncTrace),
+}
+
+/// Since this core started (e2e m7 `read_cleared`): dials of my other devices that came back
+/// installed or failed, connections from them accepted or refused (each with the last failure's
+/// code), and pulls started and how they ended.
+#[cfg(all(feature = "test-hooks", debug_assertions))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SyncTrace {
+    pub dials_ok: u64,
+    pub dials_failed: u64,
+    pub dial_error: Option<ErrorCode>,
+    pub accepts_ok: u64,
+    pub accepts_failed: u64,
+    pub accept_error: Option<ErrorCode>,
+    pub pulls: u64,
+    pub pulls_done: u64,
+    pub pulls_failed: u64,
+    pub pulls_stopped: u64,
 }
 
 /// What own-device sync counted since this core started (for the M6 results).
@@ -516,6 +539,14 @@ impl AccountHandle {
     pub async fn push_test_read_clears(&self) -> Result<Vec<(u32, u32)>, CoreError> {
         match self.mailbox_test(MailboxTest::ReadClears).await? {
             MailboxTestReply::ReadClears(clears) => Ok(clears),
+            _ => unreachable!(),
+        }
+    }
+    /// How sessions with my other devices came about and how pulls ended, since this core
+    /// started.
+    pub async fn mailbox_test_sync_trace(&self) -> Result<SyncTrace, CoreError> {
+        match self.mailbox_test(MailboxTest::SyncTrace).await? {
+            MailboxTestReply::Trace(trace) => Ok(trace),
             _ => unreachable!(),
         }
     }
@@ -597,6 +628,7 @@ impl Manager {
                 self.messages.mailbox.fail_pulls = requests;
                 MailboxTestReply::Done
             }
+            MailboxTest::SyncTrace => MailboxTestReply::Trace(self.messages.mailbox.trace),
             MailboxTest::Counters => MailboxTestReply::Counters(MailboxCounters {
                 missing: self.messages.mailbox.missing,
                 notifications: self.messages.mailbox.alerts,
@@ -643,6 +675,55 @@ impl Manager {
             .into_iter()
             .filter(|s| s.grant.peer == own)
             .collect()
+    }
+
+    /// e2e m7: a dial of `peer`'s device came back, installed or not; counted for my devices.
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    pub(super) fn trace_own_dial(&mut self, peer: PeerId, result: &Result<(), CoreError>) {
+        if self.local().map(|local| local.keys.peer_id()).ok() != Some(peer) {
+            return;
+        }
+        let trace = &mut self.messages.mailbox.trace;
+        match result {
+            Ok(()) => trace.dials_ok += 1,
+            Err(error) => {
+                trace.dials_failed += 1;
+                trace.dial_error = Some(error.code);
+            }
+        }
+    }
+
+    /// e2e m7: a connection that came in was installed or refused; counted when its endpoint is
+    /// one of my other devices.
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    pub(super) fn trace_own_accept(
+        &mut self,
+        conn: &iroh::endpoint::Connection,
+        result: &Result<(), CoreError>,
+    ) {
+        let remote = *conn.remote_id().as_bytes();
+        let own = self
+            .local()
+            .ok()
+            .and_then(|local| local.records.accepted.as_ref())
+            .is_some_and(|record| {
+                record
+                    .record
+                    .devices
+                    .iter()
+                    .any(|d| d.transport_public_key == remote)
+            });
+        if !own {
+            return;
+        }
+        let trace = &mut self.messages.mailbox.trace;
+        match result {
+            Ok(()) => trace.accepts_ok += 1,
+            Err(error) => {
+                trace.accepts_failed += 1;
+                trace.accept_error = Some(error.code);
+            }
+        }
     }
 
     /// A session became ready (`install_grant`): with another own device, this device pulls its
@@ -1417,6 +1498,10 @@ impl Manager {
         else {
             return Err(unavailable(ErrorCode::InvalidMessage));
         };
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        {
+            self.messages.mailbox.trace.pulls += 1;
+        }
         self.messages.mailbox.pulls.insert(
             installation,
             Pull {
@@ -1897,6 +1982,12 @@ impl Manager {
         let now = self.schedule_now();
         let mailbox = &mut self.messages.mailbox;
         let done = matches!(ended, Ended::Done);
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        match ended {
+            Ended::Done => mailbox.trace.pulls_done += 1,
+            Ended::Failed => mailbox.trace.pulls_failed += 1,
+            Ended::Stopped => mailbox.trace.pulls_stopped += 1,
+        }
         match ended {
             Ended::Done => {
                 mailbox.retry.remove(&holder);

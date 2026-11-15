@@ -585,6 +585,8 @@ async fn read_clear_syncs_and_cancels_notification() {
         .unwrap();
 
     let before = notify_events(&a1).len();
+    let a1_was = a1.account.mailbox_test_sync_trace().await.unwrap();
+    let a2_was = a2.account.mailbox_test_sync_trace().await.unwrap();
     // A deadline too short for the network and the sync: `Nothing`, nothing changes, and the
     // network is given back (Android then goes on in its fetch worker, e2e m7 run 5).
     let short = a1
@@ -604,6 +606,15 @@ async fn read_clear_syncs_and_cancels_notification() {
         a1.account.push_test_fetches(),
         vec![(false, false), (true, true)]
     );
+    // The e2e m7 facts of that sync: A1's dial of A2 was installed and accepted, nothing
+    // failed, and a pull from A2 ended at the end of its log.
+    let a1_sync = a1.account.mailbox_test_sync_trace().await.unwrap();
+    let a2_sync = a2.account.mailbox_test_sync_trace().await.unwrap();
+    assert_eq!(a1_sync.dials_ok, a1_was.dials_ok + 1, "{a1_sync:?}");
+    assert_eq!(a1_sync.dials_failed, a1_was.dials_failed, "{a1_sync:?}");
+    assert!(a1_sync.pulls_done > a1_was.pulls_done, "{a1_sync:?}");
+    assert_eq!(a2_sync.accepts_ok, a2_was.accepts_ok + 1, "{a2_sync:?}");
+    assert_eq!(a2_sync.accepts_failed, a2_was.accepts_failed, "{a2_sync:?}");
     assert_eq!(unread(&a1, b1.peer).await, 0);
     let cleared = notified_since(&a1, before);
     assert!(cleared.iter().any(|i| i.conversation == conv

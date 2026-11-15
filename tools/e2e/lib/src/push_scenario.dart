@@ -424,10 +424,23 @@ Future<void> runPushScenario(
   }
 
   // On a notification a push should have changed: A1's fetches for received pushes
-  // (`m7_fetch_*`: all, online in time, done in time) and its network now.
+  // (`m7_fetch_*`: all, online in time, done in time) and its network now; how A1's sessions
+  // with A2 came about since it opened again (dials installed or failed, the last failure's
+  // kind) and how its pulls ended; and what A2 did with connections from A1 (`m7_mailbox_*`).
   Future<void> noteFetches() async {
     Object? value;
     Object? info;
+    Object? mailbox;
+    try {
+      mailbox = await a2.call(
+        'push_local_test_counts',
+        const {},
+        timeout: const Duration(seconds: 5),
+        failOnTimeout: false,
+      );
+    } catch (_) {
+      /* What could not be read stays unknown. */
+    }
     try {
       value = await a1.call(
         'push_local_test_counts',
@@ -453,6 +466,50 @@ Future<void> runPushScenario(
     failureFacts['m7_fetch_all'] = bucket(map['fetches'], 'f', 2);
     failureFacts['m7_fetch_online'] = bucket(map['fetches_online'], 'o', 2);
     failureFacts['m7_fetch_done'] = bucket(map['fetches_done'], 'd', 2);
+    const errors = {
+      'none',
+      'NetworkTimeout',
+      'TransportFailed',
+      'AuthFailed',
+      'Busy',
+      'StorageLocked',
+      'AccountRestricted',
+      'NetworkNotStarted',
+      'other',
+    };
+    String error(Object? code) =>
+        errors.contains(code) ? code as String : 'unknown';
+    failureFacts['m7_fetch_dials_ok'] = bucket(map['own_dials_ok'], 'k', 2);
+    failureFacts['m7_fetch_dials_failed'] = bucket(
+      map['own_dials_failed'],
+      'x',
+      2,
+    );
+    failureFacts['m7_fetch_dial_error'] = error(map['own_dial_error']);
+    failureFacts['m7_fetch_pulls'] = bucket(map['pulls'], 'p', 2);
+    failureFacts['m7_fetch_pulls_failed'] = bucket(
+      map['pulls_failed'],
+      'pf',
+      2,
+    );
+    failureFacts['m7_fetch_pulls_stopped'] = bucket(
+      map['pulls_stopped'],
+      'ps',
+      1,
+    );
+    final held = mailbox is Map ? mailbox : const {};
+    // A2 took A1's dial once in setup already.
+    failureFacts['m7_mailbox_accepts_ok'] = bucket(
+      held['own_accepts_ok'],
+      'a',
+      3,
+    );
+    failureFacts['m7_mailbox_accepts_failed'] = bucket(
+      held['own_accepts_failed'],
+      'r',
+      2,
+    );
+    failureFacts['m7_mailbox_accept_error'] = error(held['own_accept_error']);
     final state = info is Map ? info['state'] : null;
     failureFacts['m7_fetch_network'] =
         const {'Stopped', 'Starting', 'Online', 'Failed'}.contains(state)

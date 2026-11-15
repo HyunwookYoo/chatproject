@@ -1893,15 +1893,21 @@ impl Manager {
     /// `connect_account`).
     async fn dialed(
         &mut self,
+        peer: PeerId,
         dialed: Result<(iroh::endpoint::Connection, auth::AuthGrant), CoreError>,
     ) {
         #[cfg(all(feature = "test-hooks", debug_assertions))]
         {
             self.messages.mls.settled += 1;
         }
-        if let Ok((conn, grant)) = dialed {
-            let _ = self.install_grant(conn, grant, None).await;
-        }
+        let installed = match dialed {
+            Ok((conn, grant)) => self.install_grant(conn, grant, None).await,
+            Err(error) => Err(error),
+        };
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        self.trace_own_dial(peer, &installed);
+        #[cfg(not(all(feature = "test-hooks", debug_assertions)))]
+        let _ = (peer, installed);
     }
 
     /// The account to dial `recipient` under: this one if its record lists the device (none if
@@ -2108,7 +2114,7 @@ impl Manager {
             (Task::Lookup { peer }, Answer::Lookup(lookup)) => {
                 self.looked_up(peer, lookup, request).await
             }
-            (_, Answer::Dial(dialed)) => self.dialed(dialed).await,
+            (_, Answer::Dial(dialed)) => self.dialed(answered, dialed).await,
             (task, Answer::Reply(result)) => {
                 let _ = self.mls_answer(task, result, request).await;
             }

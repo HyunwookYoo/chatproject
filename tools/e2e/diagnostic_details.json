@@ -755,6 +755,72 @@
       "Online",
       "Failed",
       "unknown"
+    ],
+    "m7_fetch_dials_ok": [
+      "k0",
+      "k1",
+      "k2plus",
+      "unknown"
+    ],
+    "m7_fetch_dials_failed": [
+      "x0",
+      "x1",
+      "x2plus",
+      "unknown"
+    ],
+    "m7_fetch_dial_error": [
+      "none",
+      "NetworkTimeout",
+      "TransportFailed",
+      "AuthFailed",
+      "Busy",
+      "StorageLocked",
+      "AccountRestricted",
+      "NetworkNotStarted",
+      "other",
+      "unknown"
+    ],
+    "m7_fetch_pulls": [
+      "p0",
+      "p1",
+      "p2plus",
+      "unknown"
+    ],
+    "m7_fetch_pulls_failed": [
+      "pf0",
+      "pf1",
+      "pf2plus",
+      "unknown"
+    ],
+    "m7_fetch_pulls_stopped": [
+      "ps0",
+      "ps1plus",
+      "unknown"
+    ],
+    "m7_mailbox_accepts_ok": [
+      "a0",
+      "a1",
+      "a2",
+      "a3plus",
+      "unknown"
+    ],
+    "m7_mailbox_accepts_failed": [
+      "r0",
+      "r1",
+      "r2plus",
+      "unknown"
+    ],
+    "m7_mailbox_accept_error": [
+      "none",
+      "NetworkTimeout",
+      "TransportFailed",
+      "AuthFailed",
+      "Busy",
+      "StorageLocked",
+      "AccountRestricted",
+      "NetworkNotStarted",
+      "other",
+      "unknown"
     ]
   },
   "wait_kinds": [
