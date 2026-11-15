@@ -406,15 +406,23 @@ async fn read_while_android_connected() -> (
     (a1, a2, b1, conv, proxy, a1_handle)
 }
 
-/// A1 goes off and A2 sees its session gone.
-async fn android_gone(a1: Fixture, a2: &Fixture, b1: &Fixture) -> tempfile::TempDir {
+/// A1 goes off and A2 sees its session gone. Waited for in real time with the clocks still: the
+/// connection ends by its QUIC idle timeout (about 30 s here), and moving A2's clock a second per
+/// round meanwhile would carry it past the read clear's 10-minute recheck window (CI run
+/// 43719155810).
+async fn android_gone(a1: Fixture, a2: &Fixture, _b1: &Fixture) -> tempfile::TempDir {
     let a1_id = installation(&a1).await;
     let dir = stop(a1);
-    settle!([a2, b1], !ready_with(a2, a1_id));
-    settle!(
-        [a2, b1],
-        a2.account.mailbox_test_own_sessions().await.unwrap().is_empty()
-    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    while ready_with(a2, a1_id)
+        || !a2.account.mailbox_test_own_sessions().await.unwrap().is_empty()
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "A2 never saw its session with A1 go"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     dir
 }
 
