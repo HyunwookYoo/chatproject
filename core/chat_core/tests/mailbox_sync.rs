@@ -469,3 +469,66 @@ async fn mailbox_entry_failure_sends_no_decrypt_failed_to_sender() {
     assert!(since > seq, "the unopened entry is passed");
     assert_eq!(a1.account.mailbox_test_counters().await.unwrap().missing, 1);
 }
+
+/// Final fix D (e2e m7 diagnostic run 43707727053): A1 renews the account record (same
+/// generation and devices at a higher seq; the app does so when its DHT lookup comes back empty,
+/// or after 23 h), and A2 finds that renewal by its own lookup. A2 takes it, as it does when the
+/// renewal comes with A1's authentication, stays Active, and accepts A1's sessions again. Before,
+/// A2 held it as a list conflict and refused every own device with `AccountRestricted`.
+#[tokio::test]
+async fn own_device_renewal_found_by_lookup_keeps_the_account_active() {
+    use chat_core::account::{AccountPhase, PublicationState};
+    let (mut a, _b1, net, _conv) = accounts(&[A1, A2], &[B1]).await;
+    let a2 = a.pop().unwrap();
+    let a1 = a.pop().unwrap();
+    for f in [&a1, &a2] {
+        f.clock.advance_seconds(23 * 3600 + 60);
+    }
+    let published = net.publishes.lock().unwrap().len();
+    a1.account.refresh_record(a1.peer).await.unwrap();
+    assert_eq!(net.publishes.lock().unwrap().len(), published + 1, "A1 renewed");
+    // A1 observes its own renewal; A2 finds the same one.
+    a1.account.refresh_record(a1.peer).await.unwrap();
+    a2.account.refresh_record(a2.peer).await.unwrap();
+    let (v1, v2) = (a1.view().await, a2.view().await);
+    assert_eq!(v2.phase, AccountPhase::Active);
+    assert_eq!(v2.publication.state, PublicationState::Observed);
+    assert!(v2.publication.conflict.is_none());
+    assert_eq!(v2.publication.accepted_hash, v1.publication.accepted_hash);
+    assert_eq!(v2.publication.accepted, v1.publication.accepted);
+
+    // The sessions bound to the old record end; the next ones between A1 and A2 are made and
+    // accepted, whichever side dials.
+    let (was1, was2) = (
+        a1.account.mailbox_test_sync_trace().await.unwrap(),
+        a2.account.mailbox_test_sync_trace().await.unwrap(),
+    );
+    let before = attempts(&a1).await + attempts(&a2).await;
+    a1.account.mailbox_sync_now().await.unwrap();
+    settle!([&a1, &a2], {
+        let now = attempts(&a1).await + attempts(&a2).await;
+        if now == before {
+            let _ = a1.account.mailbox_sync_now().await;
+        }
+        now > before && own_session(&a1, &a2).await
+    });
+    let (t1, t2) = (
+        a1.account.mailbox_test_sync_trace().await.unwrap(),
+        a2.account.mailbox_test_sync_trace().await.unwrap(),
+    );
+    assert_eq!((t1.dials_failed, t1.accepts_failed), (was1.dials_failed, was1.accepts_failed), "{t1:?}");
+    assert_eq!((t2.dials_failed, t2.accepts_failed), (was2.dials_failed, was2.accepts_failed), "{t2:?}");
+    assert_eq!(a2.view().await.phase, AccountPhase::Active);
+
+    // A newer record with other devices is still a list change for the user to confirm.
+    let issued = NOW + 23 * 3600 + 120;
+    publish(&net, A, &packet(A, &[A2], A, issued, issued + 600, issued * 1_000_000));
+    let changed = a2.account.refresh_record(a2.peer).await.unwrap_err();
+    assert_eq!(changed.code, ErrorCode::RecordConflict);
+}
+
+/// Own-device dials and accepts `f` made so far, failed or not.
+async fn attempts(f: &Fixture) -> u64 {
+    let t = f.account.mailbox_test_sync_trace().await.unwrap();
+    t.dials_ok + t.dials_failed + t.accepts_ok + t.accepts_failed
+}

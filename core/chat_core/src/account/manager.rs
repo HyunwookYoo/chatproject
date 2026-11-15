@@ -3284,23 +3284,7 @@ impl Manager {
             .pending
             .iter()
             .position(|p| p.signed.hash == signed.hash && p.status == PacketStatus::Ready);
-        let renewal = records.pending.is_empty()
-            && signed.seq > records.observed_seq
-            && current
-            && signed.record.generation == previous.record.generation
-            && signed.record.devices
-                == previous
-                    .record
-                    .devices
-                    .iter()
-                    .filter(|d| {
-                        !records.tombstones.iter().any(|t| {
-                            t.target_installation == d.installation_id
-                                || t.target_transport == d.transport_public_key
-                        })
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>();
+        let renewal = records.is_renewal(signed, self.services.clock.unix_seconds());
         let result = if records.conflict.is_none() && signed.hash == previous.hash {
             Ok(())
         } else if records.conflict.is_none()

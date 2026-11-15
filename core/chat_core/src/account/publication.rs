@@ -338,6 +338,34 @@ impl RecordState {
             self.state = PublicationState::LocalBlocked;
         }
     }
+    /// Another of my devices renewed the accepted record: nothing of mine is pending, no
+    /// conflict is held, and `found` is current, newer than anything observed, of the same
+    /// generation, and lists exactly the accepted devices this device has not revoked. The same
+    /// rule whether it came with that device's authentication or from a lookup (M7 final fix D:
+    /// a lookup used to hold it as a list conflict).
+    pub(crate) fn is_renewal(&self, found: &SignedRecord, now: u64) -> bool {
+        let Some(previous) = &self.accepted else {
+            return false;
+        };
+        self.pending.is_empty()
+            && self.conflict.is_none()
+            && found.seq > self.observed_seq
+            && found.current(now)
+            && found.record.generation == previous.record.generation
+            && found.record.devices
+                == previous
+                    .record
+                    .devices
+                    .iter()
+                    .filter(|d| {
+                        !self.tombstones.iter().any(|t| {
+                            t.target_installation == d.installation_id
+                                || t.target_transport == d.transport_public_key
+                        })
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+    }
     fn owns(&self, record: &IdentityRecord, local: &LocalAccount) -> bool {
         record.generation == self.generation
             && record.devices.iter().any(|d| {
@@ -572,6 +600,10 @@ impl RecordState {
                 self.state = PublicationState::Observed;
             } else if self.accepted.as_ref().is_some_and(|a| a.hash == found.hash) {
                 self.observed_seq = self.observed_seq.max(found.seq);
+            } else if self.is_renewal(&found, now) {
+                self.observed_seq = found.seq;
+                self.accepted = Some(found);
+                self.state = PublicationState::Observed;
             } else if self.accepted.is_none()
                 && self.pending.is_empty()
                 && local.intent == PublishIntent::Replacement
