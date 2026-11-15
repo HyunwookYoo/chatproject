@@ -1127,6 +1127,8 @@ class _OwnedChildFailure extends StateError {
               : 'owned_chat_node_exit',
         'emulator' || 'emulator.exe' => 'owned_emulator_exit',
         'chat_app' || 'chat_app.exe' => 'owned_windows_exit',
+        // The app's own logcat (`adb logcat --pid`, a non-account scenario's log).
+        'adb' || 'adb.exe' => 'owned_adb_exit',
         _ => 'owned_child_exit',
       },
       super('Owned child exited ($code)');

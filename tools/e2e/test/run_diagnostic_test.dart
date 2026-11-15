@@ -409,6 +409,8 @@ void main() {
     ('chat_node', ['PRIVATE_TOKEN', 'relay'], 'owned_chat_node_exit', 1),
     ('emulator', ['PRIVATE_TOKEN'], 'owned_emulator_exit', 1),
     ('chat_app', ['PRIVATE_TOKEN'], 'owned_windows_exit', 1),
+    // E2E 43747301926 m2: the app's logcat (`adb logcat --pid`) exited 255.
+    ('adb', ['logcat', 'PRIVATE_TOKEN'], 'owned_adb_exit', 1),
     ('chat_relay', ['PRIVATE_TOKEN'], 'owned_child_exit', 1),
     ('dart', [], 'owned_child_exit', 0),
   ]) {

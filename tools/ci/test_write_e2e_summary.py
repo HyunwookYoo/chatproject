@@ -74,7 +74,7 @@ class SummaryTests(unittest.TestCase):
     def test_closed_avd_and_owned_failure_kinds_require_exact_exit_pairing(self):
         exit_kinds = ('command_exit avd_list_exit avd_create_exit avd_devices_exit '
                       'avd_console_exit avd_snapshot_exit owned_relay_exit owned_emulator_exit '
-                      'owned_chat_node_exit owned_windows_exit owned_child_exit').split()
+                      'owned_chat_node_exit owned_windows_exit owned_adb_exit owned_child_exit').split()
         state_kinds = ('avd_console_invalid avd_serial_conflict avd_config_missing '
                        'avd_config_mismatch avd_snapshot_missing').split()
         cases = [(kind, code, True) for kind in exit_kinds for code in (-9, 0, 17)]

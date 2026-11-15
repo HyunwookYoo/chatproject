@@ -18,7 +18,7 @@ FAILURE_KINDS = set('cleanup command_exit timeout cancelled socket filesystem pr
                     'avd_devices_exit avd_console_exit avd_console_invalid avd_serial_conflict '
                     'avd_config_missing avd_config_mismatch avd_snapshot_exit avd_snapshot_missing '
                     'owned_relay_exit owned_emulator_exit owned_chat_node_exit owned_windows_exit '
-                    'owned_child_exit timeout_network_start timeout_network_info timeout_connect_peer '
+                    'owned_adb_exit owned_child_exit timeout_network_start timeout_network_info timeout_connect_peer '
                     'timeout_send_probe_text timeout_set_offline timeout_disconnect_peer '
                     'timeout_network_stop timeout_state_event timeout_probe_event timeout_offline_event'.split())
 SCENARIOS = {'m2', 'm3', 'm3-auth', 'm4', 'm6', 'm7', 'm7-fcm'}
@@ -173,7 +173,7 @@ def _push(value):
 
 EXIT_KINDS = set('command_exit avd_list_exit avd_create_exit avd_devices_exit avd_console_exit '
                  'avd_snapshot_exit owned_relay_exit owned_emulator_exit owned_chat_node_exit '
-                 'owned_windows_exit owned_child_exit'.split())
+                 'owned_windows_exit owned_adb_exit owned_child_exit'.split())
 
 
 def main():
