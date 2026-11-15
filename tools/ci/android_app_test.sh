@@ -9,6 +9,12 @@
 # takes under 70 s), and a failed or timed-out run prints the app's state: its pid, its process
 # record (state, frozen), the resumed activity and a capped, filtered logcat. The app logs no
 # tokens, handles, tags, payloads or bodies (M7 Global Constraints); nothing here prints more.
+#
+# With APP_TEST_ATTEMPTS=2 a flutter tool failure is tried once more: the run passed its bound,
+# or the tool lost the app's VM service or never started its development service. The app was
+# alive and idle in those runs (a4c2b7a, 0a1bf23, dad7c17 account_privacy_test, a9216d3
+# push_ios_test, whose tests all skip on Android); the cause is still not explained (R22, R23).
+# A failing test is never tried again, and a phase that keeps state between runs leaves it unset.
 set -uo pipefail
 
 serial="${ANDROID_SERIAL:-emulator-5554}"
@@ -20,16 +26,11 @@ if [ "$#" -lt 1 ]; then
 fi
 test_file="$1"
 
-cd "$(dirname "$0")/../../app" || exit 1
-timeout --kill-after=30 "$bound" flutter test "$@" -d "$serial"
-code=$?
-[ "$code" -eq 0 ] && exit 0
+attempts="${APP_TEST_ATTEMPTS:-1}"
 
-if [ "$code" -eq 124 ] || [ "$code" -eq 137 ]; then
-  echo "::error::$test_file did not finish within ${bound} s (exit $code); app state follows"
-else
-  echo "::error::$test_file failed (exit $code); app state follows"
-fi
+cd "$(dirname "$0")/../../app" || exit 1
+
+app_state() {
 pid="$(adb -s "$serial" shell pidof "$package" 2>/dev/null | tr -d '\r')"
 echo "== pid: ${pid:-none}"
 if [ -n "$pid" ]; then
@@ -48,4 +49,36 @@ echo "== logcat crash and app tags (last 200 lines)"
 adb -s "$serial" logcat -d -v threadtime -s AndroidRuntime:E DEBUG:F libc:F flutter:I ChatProject:I DartVM:I Choreographer:I 2>/dev/null | tail -n 200 || true
 echo "== logcat ActivityManager lines of $package (last 60 lines)"
 adb -s "$serial" logcat -d -v threadtime -s ActivityManager:I ActivityTaskManager:I 2>/dev/null | grep -F "$package" | tail -n 60 || true
-exit "$code"
+}
+
+output="$(mktemp)"
+trap 'rm -f "$output"' EXIT
+attempt=1
+while :; do
+  timeout --kill-after=30 "$bound" flutter test "$@" -d "$serial" 2>&1 | tee "$output"
+  code=${PIPESTATUS[0]}
+  [ "$code" -eq 0 ] && exit 0
+  timed_out=""
+  if [ "$code" -eq 124 ] || [ "$code" -eq 137 ]; then timed_out=1; fi
+  tool=""
+  if [ -n "$timed_out" ] || grep -Eq "VmServiceDisappearedException|Failed to start Dart Development Service" "$output"; then
+    tool=1
+  fi
+  if [ -n "$tool" ] && [ "$attempt" -lt "$attempts" ]; then
+    level="warning"
+  else
+    level="error"
+  fi
+  if [ -n "$timed_out" ]; then
+    echo "::$level::$test_file did not finish within ${bound} s (exit $code); app state follows"
+  else
+    echo "::$level::$test_file failed (exit $code); app state follows"
+  fi
+  app_state
+  if [ "$level" = "warning" ]; then
+    attempt=$((attempt + 1))
+    echo "== a flutter tool failure: trying $test_file once more (attempt $attempt of $attempts)"
+    continue
+  fi
+  exit "$code"
+done
