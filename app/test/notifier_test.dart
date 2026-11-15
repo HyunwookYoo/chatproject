@@ -128,8 +128,8 @@ void main() {
     expect(platform.notifications.last.update, isFalse, reason: 'new messages');
   });
 
-  test('silenced new texts are posted without alerting even when none is '
-      'shown (Ruling R13)', () {
+  test('silenced new texts reach the platform as an update even when none '
+      'is shown (Ruling R13)', () {
     notify([_item(1, 0, 1, silenced: true)]);
     expect(platform.notifications.map((n) => (n.body, n.update)), [
       ('새 메시지 1개', true),

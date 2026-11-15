@@ -76,8 +76,10 @@ class Notifier {
       return;
     }
     // No new messages: only the count of a shown notification changes. New
-    // texts a generic push notification alerted for (silenced, Ruling R13) are
-    // shown without alerting even when none is.
+    // texts a generic push notification alerted for (silenced, Ruling R13) go
+    // to the platform as an update even when this run showed none (Windows
+    // shows an update only in the balloon on screen; it receives no pushes, so
+    // it never gets one).
     if (item.newMessages == 0 && !item.silenced && !_shown.containsKey(id)) {
       return;
     }

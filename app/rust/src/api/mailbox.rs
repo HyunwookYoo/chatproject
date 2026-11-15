@@ -30,11 +30,14 @@ pub async fn mark_first_link_shown() -> Result<(), CoreError> {
 }
 /// The app came to the foreground with an active account (also a launch on screen): the network
 /// starts, so a push's use of it leaves it running (M7 final review, user decision 2026-11-15),
-/// and my other devices sync now. Launches in the background never call this: the FCM receiver
-/// and the WorkManager jobs run no Dart, and Dart calls it only once the app is resumed.
+/// and my other devices sync now (also when the start failed: the sync then reports what it can,
+/// and the start's error is returned after it). Launches in the background never call this: the
+/// FCM receiver and the WorkManager jobs run no Dart, and Dart calls it only once the app is
+/// resumed.
 pub async fn mailbox_foreground() -> Result<(), CoreError> {
-    super::chat::network_start().await?;
-    handle()?.mailbox_sync_now().await.map_err(Into::into)
+    let started = super::chat::network_start().await.map(|_| ());
+    handle()?.mailbox_sync_now().await.map_err(CoreError::from)?;
+    started
 }
 /// The app goes to the background or exits: hand undelivered messages to my mailboxes.
 /// Returns how many were handed over.
