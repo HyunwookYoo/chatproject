@@ -14,7 +14,9 @@
 # or the tool lost the app's VM service or never started its development service. The app was
 # alive and idle in those runs (a4c2b7a, 0a1bf23, dad7c17 account_privacy_test, a9216d3
 # push_ios_test, whose tests all skip on Android); the cause is still not explained (R22, R23).
-# A failing test is never tried again, and a phase that keeps state between runs leaves it unset.
+# A failing test is never tried again, and a phase that keeps state between runs leaves it unset
+# unless APP_TEST_RESET names the fixture directory (under the app's data) to clear before the
+# retry (message_test.dart's write phase needs a fresh one; CI 43747825697 hung there).
 set -uo pipefail
 
 serial="${ANDROID_SERIAL:-emulator-5554}"
@@ -27,6 +29,14 @@ fi
 test_file="$1"
 
 attempts="${APP_TEST_ATTEMPTS:-1}"
+reset="${APP_TEST_RESET:-}"
+if [ -n "$reset" ]; then
+  case "$reset" in
+    *..*) echo "APP_TEST_RESET must not contain .." >&2; exit 2 ;;
+    "/data/user/0/$package/"?*) ;;
+    *) echo "APP_TEST_RESET must be under /data/user/0/$package/" >&2; exit 2 ;;
+  esac
+fi
 
 cd "$(dirname "$0")/../../app" || exit 1
 
@@ -78,6 +88,10 @@ while :; do
   if [ "$level" = "warning" ]; then
     attempt=$((attempt + 1))
     echo "== a flutter tool failure: trying $test_file once more (attempt $attempt of $attempts)"
+    if [ -n "$reset" ]; then
+      echo "== clearing the test's fixture first"
+      adb -s "$serial" shell run-as "$package" rm -rf "$reset" || true
+    fi
     continue
   fi
   exit "$code"

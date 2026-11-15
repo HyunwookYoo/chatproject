@@ -128,6 +128,27 @@ class AndroidAppTestScript(unittest.TestCase):
         self.assertEqual((result.returncode, self.calls), (124, 2), result.stdout)
         self.assertIn("::error::integration_test/core_test.dart did not finish", result.stdout)
 
+    # CI 43747825697: message_test.dart's write phase hung the same way; it needs a fresh fixture,
+    # so its retry clears the fixture directory first (APP_TEST_RESET, only under the app's data).
+    def test_a_retry_clears_the_named_fixture_first(self):
+        result, queries = self.run_script("integration_test/message_test.dart", "--no-uninstall", bound=1, extra={
+            "APP_TEST_ATTEMPTS": "2", "APP_TEST_RESET": "/data/user/0/dev.chatproject.chat_app/no_backup/ci-message-storage",
+            "FLUTTER_FIRST_EXIT": "0", "FLUTTER_FIRST_SLEEP": "30"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.calls, 2)
+        self.assertIn("shell run-as dev.chatproject.chat_app rm -rf /data/user/0/dev.chatproject.chat_app/no_backup/ci-message-storage", queries)
+
+    def test_a_reset_outside_the_app_data_is_refused(self):
+        for path in ("/sdcard/x", "relative", "/data/user/0/dev.chatproject.chat_app/../other", ""):
+            with self.subTest(path=path):
+                result, queries = self.run_script("integration_test/message_test.dart", extra={
+                    "APP_TEST_ATTEMPTS": "2", "APP_TEST_RESET": path})
+                if path == "":
+                    self.assertEqual(result.returncode, 0, result.stdout)
+                    continue
+                self.assertEqual((result.returncode, self.calls), (2, 0), result.stdout + result.stderr)
+                self.assertNotIn("rm -rf", queries)
+
     def test_without_attempts_a_timed_out_run_is_not_tried_again(self):
         result, _ = self.run_script("integration_test/message_test.dart", flutter_sleep=30, bound=1)
         self.assertEqual((result.returncode, self.calls), (124, 1), result.stdout)
