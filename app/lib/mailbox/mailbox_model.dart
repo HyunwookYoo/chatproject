@@ -10,9 +10,15 @@ import 'mailbox_platform.dart';
 /// This device's mailbox setting (M6 spec 4, 8) and the app's foreground and
 /// background hooks into the core.
 class MailboxModel extends ChangeNotifier {
-  MailboxModel(this.client, this.platform);
+  MailboxModel(
+    this.client,
+    this.platform, {
+    AppLifecycleState? Function()? lifecycle,
+  }) : _lifecycle =
+           lifecycle ?? (() => WidgetsBinding.instance.lifecycleState);
   final MailboxClient client;
   final MailboxPlatform platform;
+  final AppLifecycleState? Function() _lifecycle;
 
   bool loaded = false;
   bool enabled = false;
@@ -40,9 +46,17 @@ class MailboxModel extends ChangeNotifier {
   /// Windows shows the first-link screen once (spec 8.1).
   bool get firstLinkDue => windows && loaded && !firstLinkShown;
 
-  /// The account is Active: load the setting once and tell the platform.
+  /// The account is Active: load the setting once and tell the platform. On
+  /// screen the core comes to the foreground at once (the network starts,
+  /// user decision 2026-11-15); a launch in the background waits until the app
+  /// is resumed.
   Future<void> accountActive() {
-    _active = true;
+    if (!_active) {
+      _active = true;
+      if (_lifecycle() == AppLifecycleState.resumed) {
+        unawaited(_core(client.mailboxForeground));
+      }
+    }
     return _loading ??= _load();
   }
 

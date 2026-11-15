@@ -8,7 +8,8 @@ abstract interface class MailboxClient {
   Future<void> setMailbox(bool enabled);
   Future<void> markFirstLinkShown();
 
-  /// The app came to the foreground: sync with my other devices.
+  /// The app came to the foreground with an Active account: the network
+  /// starts and my other devices sync.
   Future<void> mailboxForeground();
 
   /// The app goes to the background or exits: hand undelivered messages to my mailboxes.

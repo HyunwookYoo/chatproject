@@ -151,7 +151,11 @@ void main() {
     debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
     addTearDown(() => debugDefaultTargetPlatformOverride = null);
     final client = FakeMailboxClient();
-    final model = MailboxModel(client, FakeMailboxPlatform());
+    final model = MailboxModel(
+      client,
+      FakeMailboxPlatform(),
+      lifecycle: () => AppLifecycleState.hidden,
+    );
     addTearDown(model.dispose);
     model.lifecycle(AppLifecycleState.hidden);
     await pumpEventQueue();
@@ -171,6 +175,41 @@ void main() {
     await pumpEventQueue();
     expect(client.foregrounds, 2);
     expect(client.backgrounds, 2);
+  });
+
+  // Final review, user decision 2026-11-15: an Active account on screen
+  // starts the network (the core's foreground call); a launch in the
+  // background (no Dart in FCM, WorkManager; an iOS background refresh may
+  // start the engine) waits until the app comes to the foreground.
+  test('an Active account on screen comes to the foreground at once, a '
+      'background launch only when it is resumed', () async {
+    final client = FakeMailboxClient();
+    final model = MailboxModel(
+      client,
+      FakeMailboxPlatform(),
+      lifecycle: () => AppLifecycleState.resumed,
+    );
+    addTearDown(model.dispose);
+    await model.accountActive();
+    await model.accountActive();
+    await pumpEventQueue();
+    expect(client.foregrounds, 1);
+
+    for (final launched in [null, AppLifecycleState.hidden]) {
+      final background = FakeMailboxClient();
+      final model = MailboxModel(
+        background,
+        FakeMailboxPlatform(),
+        lifecycle: () => launched,
+      );
+      addTearDown(model.dispose);
+      await model.accountActive();
+      await pumpEventQueue();
+      expect(background.foregrounds, 0, reason: 'launched $launched');
+      model.lifecycle(AppLifecycleState.resumed);
+      await pumpEventQueue();
+      expect(background.foregrounds, 1);
+    }
   });
 
   testWidgets(
