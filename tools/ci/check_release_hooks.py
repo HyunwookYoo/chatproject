@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Reject controller code in every native member of a Release artifact, and the debug-only test
-push receiver in a Release APK's code and manifest."""
+"""Reject controller code in every native member of a Release artifact, the debug-only test push
+receiver in a Release APK's code and manifest, and anything a Release APK's merged manifest would
+start at boot (M7 final review: WorkManager's boot receiver is removed from the merge)."""
 import pathlib
 import sys
 import zipfile
@@ -12,6 +13,12 @@ MARKERS = (MARKER, b"account_local_", b"message_local_", b"Local record fixture 
 APP_MARKERS = tuple(
     text.encode(encoding)
     for text in ("TestPushReceiver", "dev.chatproject.chat_app.TEST_PUSH")
+    for encoding in ("utf-8", "utf-16-le")
+)
+# The merged manifest only: the dex keeps WorkManager's code, which names these too.
+BOOT_MARKERS = tuple(
+    text.encode(encoding)
+    for text in ("BOOT_COMPLETED", "systemalarm.RescheduleReceiver")
     for encoding in ("utf-8", "utf-16-le")
 )
 MACHO = {bytes.fromhex(value) for value in (
@@ -44,6 +51,9 @@ def check(artifact):
                 elif member.filename.lower().endswith(".dex") or member.filename == "AndroidManifest.xml":
                     with archive.open(member) as stream:
                         scan(stream, APP_MARKERS, "release APK contains the debug test push receiver")
+                    if member.filename == "AndroidManifest.xml":
+                        with archive.open(member) as stream:
+                            scan(stream, BOOT_MARKERS, "release APK manifest starts something at boot")
     elif artifact.is_dir():
         apple = artifact.suffix.lower() == ".app"
         files = sorted(artifact.rglob("*"))
