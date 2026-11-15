@@ -410,6 +410,12 @@ class SecretPlacementTest(unittest.TestCase):
                 doc = ordinary({"uses": "./.github/workflows/shared.yml", "secrets": secrets})
                 self.assertTrue(secret_problems(doc), check(ORDINARY, doc))
 
+    def test_secrets_context_is_matched_case_insensitively(self):
+        for value in ("${{ Secrets.SOME_TOKEN }}", "${{ SECRETS['SOME_TOKEN'] }}"):
+            with self.subTest(value=value):
+                doc = ordinary({"environment": "release", "env": {"TOKEN": value}, "steps": []})
+                self.assertTrue(secret_problems(doc), check(ORDINARY, doc))
+
     def test_environment_name_must_be_literal(self):
         doc = ordinary({"environment": "${{ inputs.target }}", "steps": []})
         self.assertTrue(any("literal" in p for p in check(ORDINARY, doc)))
@@ -442,6 +448,13 @@ class TestflightEnvironmentTest(unittest.TestCase):
                 doc["jobs"]["testflight"]["steps"].append(
                     {"uses": "actions/upload-artifact@0123456789012345678901234567890123456789"})
                 self.assertTrue(any("upload-artifact" in p for p in check(pathlib.Path("release.yml"), doc)))
+
+    def test_environment_name_is_matched_case_insensitively(self):
+        for environment in ("TestFlight", {"name": "TESTFLIGHT"}):
+            with self.subTest(environment=environment):
+                doc = self.release(environment)
+                doc["jobs"]["testflight"]["steps"].pop(0)
+                self.assertTrue(any("Refuse re-runs" in p for p in check(pathlib.Path("release.yml"), doc)))
 
     def test_trigger_rules_apply_in_any_file(self):
         doc = self.release(on={"push": {"branches": ["main"]}})
@@ -505,6 +518,20 @@ class PushE2eEnvironmentTest(unittest.TestCase):
         # An action writes wherever it likes; push-e2e secrets go through a run step that the checker can read.
         doc = self.nightly({"uses": "owner/action@" + "a" * 40, "with": {"key": "${{ secrets.FCM_SERVICE_ACCOUNT_JSON }}"}})
         self.assertTrue(any("push-e2e" in p for p in check(self.path, doc)))
+
+    def test_secret_env_on_an_action_step_is_rejected(self):
+        doc = self.nightly({"uses": "owner/action@" + "a" * 40,
+                            "env": {"FCM_JSON": "${{ secrets.FCM_SERVICE_ACCOUNT_JSON }}"}})
+        self.assertTrue(any("push-e2e secrets go in a run step" in p for p in check(self.path, doc)))
+        doc["jobs"]["android-fcm"]["steps"][-1]["env"] = {"FCM_SET": "${{ secrets.FCM_SERVICE_ACCOUNT_JSON != '' }}"}
+        self.assertEqual(check(self.path, doc), [])
+
+    def test_environment_name_is_matched_case_insensitively(self):
+        for environment in ("Push-E2E", {"name": "PUSH-E2E"}):
+            with self.subTest(environment=environment):
+                doc = self.nightly({"uses": "actions/upload-artifact@0123456789012345678901234567890123456789"})
+                doc["jobs"]["android-fcm"]["environment"] = environment
+                self.assertTrue(any("upload-artifact" in p for p in check(self.path, doc)))
 
     def test_the_rules_follow_the_environment_not_the_file(self):
         doc = self.nightly({"uses": "actions/upload-artifact@0123456789012345678901234567890123456789"})

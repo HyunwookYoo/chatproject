@@ -24,10 +24,11 @@ def triggers(doc):
 
 
 EXPRESSION = re.compile(r"\$\{\{(.*?)\}\}", re.S)
-SECRETS = re.compile(r"\bsecrets\b")
+SECRETS = re.compile(r"\bsecrets\b", re.I)
 # `${{ secrets.NAME != '' }}` yields true or false: the step learns whether the secret is set, never its value.
-PRESENCE = re.compile(r"^\$\{\{\s*secrets\.\w+\s*[!=]=\s*''\s*\}\}$")
+PRESENCE = re.compile(r"^\$\{\{\s*secrets\.\w+\s*[!=]=\s*''\s*\}\}$", re.I)
 # Shell output redirections (`>`, `>>`, `&>`, `2>`; not `>&2`) and `tee [-a]`, with their target word.
+# Limits: cp/mv/dd/install, a program writing a file itself, `>|`, and later copies of the file are not seen.
 WRITE = re.compile(r"""(?:&?>>?|\btee(?:\s+-a)?)[ \t]*(?!&)((?:"[^"]*"|'[^']*'|[^\s;|&)<>"'])+)""")
 TEMP_FILE = re.compile(r"^\$(?:RUNNER_TEMP|\{RUNNER_TEMP\})/(?!(?:.*/)?\.\.(?:/|$))")
 
@@ -57,7 +58,7 @@ def environment(job):
     value = job.get("environment") if isinstance(job, dict) else None
     if isinstance(value, dict):
         value = value.get("name")
-    return value if isinstance(value, str) else None
+    return value.lower() if isinstance(value, str) else None
 
 
 def location(path):
@@ -96,6 +97,9 @@ def check_push_e2e(name, job_id, job):
         holds_secret = any(references_secret(value) and not PRESENCE.match(value.strip())
                            for _, value in strings(step.get("env") or {}))
         if not holds_secret:
+            continue
+        if step.get("uses"):
+            problems.append(f"{name}: {job_id} step {index}: push-e2e secrets go in a run step's env, not an action's env")
             continue
         for target in WRITE.findall(step.get("run", "")):
             target = target.replace('"', "").replace("'", "")
