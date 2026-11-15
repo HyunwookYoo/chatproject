@@ -390,9 +390,16 @@ async fn read_on_pc_sends_one_read_clear_to_offline_android() {
         .unwrap();
     quiet(&[&a1, &a2, &b1]).await;
     assert!(read_pushes(&proxy).is_empty());
+    // The decision is on record: one own device with a ready session, nothing pushed.
+    assert_eq!(a2.account.push_test_read_clears().await.unwrap(), vec![(1, 0)]);
+    assert_eq!(a2.account.mailbox_test_own_sessions().await.unwrap(), vec![a1_id]);
 
     let _a1 = stop(a1);
     settle!([&a2, &b1], !ready_with(&a2, a1_id));
+    settle!(
+        [&a2, &b1],
+        a2.account.mailbox_test_own_sessions().await.unwrap().is_empty()
+    );
     let mut keys = Vec::new();
     for n in 2..5 {
         keys.push(send_to(&b1, a2.peer, n, &format!("unread {n}")).await);
@@ -419,6 +426,10 @@ async fn read_on_pc_sends_one_read_clear_to_offline_android() {
     assert_eq!(reads[0].items.len(), 1);
     assert_eq!(reads[0].items[0].handle, b64(&a1_handle));
     assert!(text_pushes(&proxy).is_empty());
+    assert_eq!(
+        a2.account.push_test_read_clears().await.unwrap(),
+        vec![(1, 0), (0, 1)]
+    );
 }
 
 #[tokio::test]

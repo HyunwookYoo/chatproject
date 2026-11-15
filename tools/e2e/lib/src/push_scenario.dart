@@ -398,6 +398,31 @@ Future<void> runPushScenario(
     }
   }
 
+  // On a missing `read` push: what A2 decided (`m7_read_*`, fixed buckets).
+  Future<void> noteReadClear() async {
+    Object? value;
+    try {
+      value = await a2.call(
+        'push_local_test_counts',
+        const {},
+        timeout: const Duration(seconds: 5),
+        failOnTimeout: false,
+      );
+    } catch (_) {
+      value = null;
+    }
+    final map = value is Map ? value : const {};
+    String bucket(Object? n, String prefix, int top) => n is! int
+        ? 'unknown'
+        : n >= top
+        ? '$prefix${top}plus'
+        : '$prefix$n';
+    failureFacts['m7_read_own_handles'] = bucket(map['own_handles'], 'h', 1);
+    failureFacts['m7_read_sessions'] = bucket(map['own_sessions'], 's', 1);
+    failureFacts['m7_read_clears'] = bucket(map['read_clears'], 'c', 2);
+    failureFacts['m7_read_items'] = bucket(map['read_items'], 'i', 1);
+  }
+
   Future<Object?> ticket(Participant p) async {
     try {
       return (await until(
@@ -707,11 +732,23 @@ Future<void> runPushScenario(
     (items) => idsFrom(items, bPeer).length >= 3,
     'mailbox_texts',
   );
+  // A read clear goes only to my devices without a ready session (spec 7). A1's network is
+  // stopped, but A2 may hold its account session until it sees it close: wait for that.
+  await until(
+    () => counts(a2),
+    (v) => v['own_sessions'] == 0,
+    'mailbox_session_gone',
+  );
   await call(a2, 'message_local_mark_read', {
     'conversation': conversation,
     'keys': [keyOf(kept, 1), keyOf(kept, 2)],
   });
-  await relay('read');
+  try {
+    await relay('read');
+  } on ScenarioDeadline {
+    await noteReadClear();
+    rethrow;
+  }
   await until(shown, (n) => n.isEmpty, 'read_cleared', within: timeout * 2);
   evidence?.call('read_cleared', {'notifications': 0});
 

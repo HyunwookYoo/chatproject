@@ -94,6 +94,7 @@ mod commands {
             json!({
                 "handles":0,"announced":0,"own_handle":false,"peer_handles":0,
                 "peer_withdrawn":0,"own_handles":0,"deliveries":0,
+                "own_sessions":0,"read_clears":0,"read_items":0,
             })
         );
         let renewed = call(&mut socket, 4, "push_local_renew_due", json!({})).await;

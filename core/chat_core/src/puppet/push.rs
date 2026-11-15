@@ -103,6 +103,7 @@ pub async fn execute(
             let fixture = handle.storage_test_fixture();
             let own = fixture.push_state().await?;
             let peers = fixture.push_peer_state().await?;
+            let clears = handle.push_test_read_clears().await?;
             let usize_count = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
             json!({
                 // Handles of this device: per conversation, and the one for my other devices.
@@ -114,6 +115,11 @@ pub async fn execute(
                 "peer_withdrawn": usize_count(peers.peers.iter().filter(|p| p.handle.is_none()).count()),
                 "own_handles": usize_count(own.own.len()),
                 "deliveries": usize_count(own.deliveries.len()),
+                // Read clearing (spec 7): my other devices with a ready session now, read
+                // clears decided, and the `read` items they pushed.
+                "own_sessions": usize_count(handle.mailbox_test_own_sessions().await?.len()),
+                "read_clears": usize_count(clears.len()),
+                "read_items": clears.iter().map(|(_, items)| u64::from(*items)).sum::<u64>(),
             })
         }
     })

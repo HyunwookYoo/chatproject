@@ -124,6 +124,7 @@
     "Push scenario deadline: initial_account",
     "Push scenario deadline: isolated_mailbox",
     "Push scenario deadline: isolated_sender",
+    "Push scenario deadline: mailbox_session_gone",
     "Push scenario deadline: mailbox_texts",
     "Push scenario deadline: new_device",
     "Push scenario deadline: offline_notification",
@@ -707,6 +708,27 @@
       "Starting",
       "Online",
       "Failed",
+      "unknown"
+    ],
+    "m7_read_own_handles": [
+      "h0",
+      "h1plus",
+      "unknown"
+    ],
+    "m7_read_sessions": [
+      "s0",
+      "s1plus",
+      "unknown"
+    ],
+    "m7_read_clears": [
+      "c0",
+      "c1",
+      "c2plus",
+      "unknown"
+    ],
+    "m7_read_items": [
+      "i0",
+      "i1plus",
       "unknown"
     ]
   },

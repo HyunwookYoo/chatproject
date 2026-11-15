@@ -178,6 +178,9 @@ pub(crate) struct Runtime {
     /// `push_messages_deleted`: once the network is up, my devices are synced with and every
     /// contact's devices dialed.
     full_sync: bool,
+    /// Each read clear decided: my other devices with a ready session, `read` items pushed.
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    pub(super) read_clear_log: Vec<(u32, u32)>,
     /// The network is being looked at for `full_sync`, and when it is looked at next.
     probing: bool,
     probe_at: u64,
@@ -464,6 +467,11 @@ impl Manager {
         self.messages.push.own_handle.clone()
     }
 
+    /// `push_local` was read, so `push_own_handle` is what is stored.
+    pub(super) fn push_loaded(&self) -> bool {
+        self.messages.push.loaded
+    }
+
     /// Reads `push_local` again. A changed own-device handle reaches my other devices with the
     /// next poll's `Announce` (own-device sync tells each one until it took what holds now).
     async fn push_reload(&mut self, request: Request) -> Result<(), CoreError> {
@@ -625,10 +633,19 @@ impl Manager {
             .into_iter()
             .filter(|i| *i != me && !connected.contains(i))
             .collect();
-        if let Ok(PushDbReply::Batch(Some(batch))) = self
-            .push_db(PushDbOp::ReadClear { offline }, request)
-            .await
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        let sessions = u32::try_from(connected.len()).unwrap_or(u32::MAX);
+        let reply = self.push_db(PushDbOp::ReadClear { offline }, request).await;
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
         {
+            let items = match &reply {
+                Ok(PushDbReply::Batch(Some(batch))) => batch.targets.len(),
+                _ => 0,
+            };
+            let items = u32::try_from(items).unwrap_or(u32::MAX);
+            self.messages.push.read_clear_log.push((sessions, items));
+        }
+        if let Ok(PushDbReply::Batch(Some(batch))) = reply {
             self.push_send(batch, request.ticket);
         }
     }

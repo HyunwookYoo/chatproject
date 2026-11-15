@@ -423,6 +423,11 @@ pub(crate) enum MailboxTest {
     /// The next this many page requests of pulls fail as timed out, without being sent.
     FailPulls(u32),
     Counters,
+    /// My other devices with a ready session now.
+    OwnSessions,
+    /// Each read clear decided (M7 spec 7): my other devices with a ready session then, and the
+    /// `read` items pushed.
+    ReadClears,
     HandoffSends,
     Announces,
     SyncDials,
@@ -434,6 +439,8 @@ pub(crate) enum MailboxTestReply {
     Counters(MailboxCounters),
     Sends(Vec<(u64, [u8; 32])>),
     Announces(Vec<(InstallationId, bool)>),
+    Sessions(Vec<InstallationId>),
+    ReadClears(Vec<(u32, u32)>),
     Dials(Vec<InstallationId>),
 }
 
@@ -496,6 +503,21 @@ impl AccountHandle {
     /// `Busy`), or resumes it.
     pub async fn mailbox_test_hold(&self, hold: bool) -> Result<(), CoreError> {
         self.mailbox_test(MailboxTest::Hold(hold)).await.map(|_| ())
+    }
+    /// My other devices this core has a ready session with now.
+    pub async fn mailbox_test_own_sessions(&self) -> Result<Vec<InstallationId>, CoreError> {
+        match self.mailbox_test(MailboxTest::OwnSessions).await? {
+            MailboxTestReply::Sessions(sessions) => Ok(sessions),
+            _ => unreachable!(),
+        }
+    }
+    /// Each read clear this core decided, in order: my other devices with a ready session at
+    /// that moment, and the `read` items it pushed (M7 spec 7).
+    pub async fn push_test_read_clears(&self) -> Result<Vec<(u32, u32)>, CoreError> {
+        match self.mailbox_test(MailboxTest::ReadClears).await? {
+            MailboxTestReply::ReadClears(clears) => Ok(clears),
+            _ => unreachable!(),
+        }
     }
     /// The next `requests` page requests of this core's pulls fail as a timeout would, without
     /// being sent.
@@ -582,6 +604,15 @@ impl Manager {
             }),
             MailboxTest::HandoffSends => {
                 MailboxTestReply::Sends(self.messages.mailbox.handoff_sends.clone())
+            }
+            MailboxTest::OwnSessions => MailboxTestReply::Sessions(
+                self.own_sessions()
+                    .iter()
+                    .map(|s| s.grant.installation)
+                    .collect(),
+            ),
+            MailboxTest::ReadClears => {
+                MailboxTestReply::ReadClears(self.messages.push.read_clear_log.clone())
             }
             MailboxTest::Announces => {
                 MailboxTestReply::Announces(self.messages.mailbox.announces.clone())
@@ -1046,13 +1077,17 @@ impl Manager {
             .is_some_and(|m| usable.iter().any(|s| m.contains(&s.grant.installation)));
         let enabled = mailbox.enabled.unwrap_or(false);
         let want = (enabled, self.push_own_handle());
+        // Before `push_local` is read the own-device handle is not known: an `Announce` then
+        // would say "none" and my other device would drop the handle it keeps.
+        let loaded = self.push_loaded();
         let now_tell = self.schedule_now();
         let mailbox = &self.messages.mailbox;
         let announce: Vec<Session> = usable
             .iter()
             .filter(|s| {
                 let i = &s.grant.installation;
-                !mailbox.telling.contains(i)
+                loaded
+                    && !mailbox.telling.contains(i)
                     && mailbox.told.get(i) != Some(&want)
                     && mailbox
                         .tell_at

@@ -237,6 +237,34 @@ NOTIFICATION MANAGER (dumpsys notification)
     }
   });
 
+  test('a missing read push notes what the mailbox decided', () async {
+    final fixture = PushFixture()..fault = 'stale_session';
+    await fixture.start();
+    failureFacts.clear();
+    try {
+      await expectLater(
+        fixture.run(),
+        throwsA(
+          isA<ScenarioDeadline>().having(
+            (e) => e.message,
+            'text',
+            'Push scenario deadline: delivery_read',
+          ),
+        ),
+      );
+      expect(failureFacts, {
+        'm7_read_own_handles': 'h1plus',
+        'm7_read_sessions': 's0',
+        'm7_read_clears': 'c1',
+        'm7_read_items': 'i0',
+      });
+      expect(safeFacts(failureFacts, loadSafeFacts()), failureFacts);
+    } finally {
+      failureFacts.clear();
+      await fixture.close();
+    }
+  });
+
   test('a ticket deadline notes every side network state', () async {
     final fixture = PushFixture()..fault = 'no_start';
     await fixture.start();
@@ -293,6 +321,14 @@ NOTIFICATION MANAGER (dumpsys notification)
         (e) => e.message,
         'text',
         'Push scenario deadline: ticket',
+      ),
+    ),
+    (
+      'stale_session',
+      isA<ScenarioDeadline>().having(
+        (e) => e.message,
+        'text',
+        'Push scenario deadline: delivery_read',
       ),
     ),
     (
@@ -355,6 +391,9 @@ class PushFixture {
   var stopped = false;
   // The relaunched app's network is off until `network_start` (the core's `restore`).
   var offAfterRelaunch = false;
+  var lingering = 3;
+  var readClears = 0;
+  var readItems = 0;
   var launches = 0;
   var lamport = 0;
   final conversation = List.filled(32, 5);
@@ -520,6 +559,12 @@ class PushFixture {
           'peer_withdrawn': 0,
           'own_handles': token && name == 'mailbox' ? 1 : 0,
           'deliveries': 0,
+          // A2's session to A1 lingers for a few reads after A1 stops.
+          'own_sessions': name == 'mailbox' && (reachable || lingering-- > 0)
+              ? 1
+              : 0,
+          'read_clears': readClears,
+          'read_items': readItems,
         };
       case 'network_start':
         if (name == 'android-1' && fault != 'no_start') {
@@ -582,8 +627,15 @@ class PushFixture {
             unread.remove(idOf(key));
           }
           show();
-        } else if (!reachable) {
-          deliver('read');
+        } else {
+          // Spec 7: only with no session to A1.
+          final session =
+              reachable || lingering > 0 || fault == 'stale_session';
+          readClears++;
+          if (!session) {
+            readItems++;
+            deliver('read');
+          }
         }
       default:
         throw StateError('Unexpected fixture operation $op');
