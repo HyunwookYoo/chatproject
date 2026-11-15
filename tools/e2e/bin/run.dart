@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 
 import 'package:args/args.dart';
 import 'package:chat_e2e/src/android_probe.dart';
@@ -14,6 +15,7 @@ import 'package:chat_e2e/src/emulators.dart';
 import 'package:chat_e2e/src/owned_resources.dart';
 import 'package:chat_e2e/src/process_runner.dart';
 import 'package:chat_e2e/src/protocol.dart';
+import 'package:chat_e2e/src/push_scenario.dart';
 import 'package:chat_e2e/src/scenario.dart';
 import 'package:chat_e2e/src/transport_trace.dart';
 import 'package:path/path.dart' as p;
@@ -80,7 +82,7 @@ Future<void> main(List<String> arguments) async {
     ..addOption(
       'scenario',
       defaultsTo: 'm2',
-      allowed: ['m2', 'm3', 'm3-auth', 'm4', 'm6'],
+      allowed: ['m2', 'm3', 'm3-auth', 'm4', 'm6', 'm7', 'm7-fcm'],
     )
     ..addOption('repo-root', mandatory: true);
   late ArgResults options;
@@ -91,14 +93,17 @@ Future<void> main(List<String> arguments) async {
         (!Platform.isWindows && options['profile'] != 'android') ||
         // M6 needs an Android phone: a Windows app or a second emulator is
         // its mailbox.
-        (options['scenario'] == 'm6' && options['profile'] == 'windows')) {
+        (options['scenario'] == 'm6' && options['profile'] == 'windows') ||
+        // M7 drives one Android app and two nodes.
+        ((options['scenario'] as String).startsWith('m7') &&
+            options['profile'] != 'android')) {
       throw const FormatException(
         'Profile requires a supported host and absolute repo root',
       );
     }
   } on FormatException {
     stderr.writeln(
-      'Usage: dart run bin/run.dart --profile mixed|android|windows --scenario m2|m3|m3-auth|m4|m6 --repo-root <absolute>',
+      'Usage: dart run bin/run.dart --profile mixed|android|windows --scenario m2|m3|m3-auth|m4|m6|m7|m7-fcm --repo-root <absolute>',
     );
     exitCode = 64;
     return;
@@ -108,6 +113,10 @@ Future<void> main(List<String> arguments) async {
   final authOnly = options['scenario'] == 'm3-auth';
   final messageScenario = options['scenario'] == 'm4';
   final mailboxScenario = options['scenario'] == 'm6';
+  // m7: the local proxy's fake upstream hands pushes to the harness, which
+  // broadcasts them to the app's debug receiver. m7-fcm: real FCM (nightly).
+  final pushScenario = (options['scenario'] as String).startsWith('m7');
+  final realFcm = options['scenario'] == 'm7-fcm';
   final accountScenario = options['scenario'] != 'm2';
   final scenarioName = options['scenario'] as String;
   final logs = await Directory(
@@ -148,7 +157,7 @@ Future<void> main(List<String> arguments) async {
     if (!File(p.join(root, 'Cargo.toml')).existsSync()) {
       throw StateError('Invalid repository root');
     }
-    for (final port in [3340, 47000]) {
+    for (final port in [3340, 47000, if (pushScenario) _pushPort]) {
       final socket = await ServerSocket.bind(
         InternetAddress.loopbackIPv4,
         port,
@@ -182,10 +191,28 @@ Future<void> main(List<String> arguments) async {
       cwd: root,
       timeout: const Duration(minutes: 20),
     );
+    if (pushScenario) {
+      run.phase = _Phase.buildPushProxy;
+      await run.command(
+        'rustup',
+        [
+          'run',
+          '1.92.0',
+          'cargo',
+          'build',
+          '--locked',
+          '-p',
+          'push_proxy',
+          if (!realFcm) ...['--features', 'fake-upstream'],
+        ],
+        cwd: root,
+        timeout: const Duration(minutes: 20),
+      );
+    }
     final flutter = Platform.isWindows ? 'flutter.bat' : 'flutter';
     final androidCount = profile == 'windows'
         ? 0
-        : profile == 'android'
+        : profile == 'android' && !pushScenario
         ? 2
         : 1;
     final windowsCount = profile == 'android'
@@ -237,6 +264,13 @@ Future<void> main(List<String> arguments) async {
       );
     }, const Duration(seconds: 10));
     run.token.check();
+    FakeUpstreamReceiver? upstream;
+    if (pushScenario) {
+      run.phase = _Phase.pushProxyReady;
+      upstream = realFcm ? null : await FakeUpstreamReceiver.start();
+      if (upstream != null) run.owned.add('fake upstream', upstream.close);
+      await _startPushProxy(run, root, logs, upstream);
+    }
     run.phase = _Phase.controllerStart;
     controller = await Controller.start(
       logDir: logs,
@@ -250,6 +284,7 @@ Future<void> main(List<String> arguments) async {
     final appClocks = <String, Future<int> Function()>{};
     final appAirplane = <String, Future<void> Function(bool)>{};
     final appForeground = <String, Future<void> Function()>{};
+    PushPhone? pushPhone;
     for (var i = 1; i <= windowsCount; i++) {
       run.phase = _Phase.windowsStart;
       final name = 'windows-$i';
@@ -358,7 +393,7 @@ Future<void> main(List<String> arguments) async {
       for (var i = 0; i < specs.length; i++) {
         final spec = specs[i];
         run.phase = _Phase.adbReverse;
-        for (final port in [3340, 47000]) {
+        for (final port in [3340, 47000, if (pushScenario) _pushPort]) {
           await run.reverse(sdk, spec, port);
         }
         final name = 'android-${i + 1}';
@@ -413,6 +448,9 @@ Future<void> main(List<String> arguments) async {
         });
         var appPid = '';
         var restarting = false;
+        // m7: the owned process was killed on purpose; a push may start
+        // another one, which is not owned until the next launch.
+        var detached = false;
         var store = 0;
         // The slowest launch so far: `am start` until the app's control hello.
         int? launchMsMax;
@@ -441,7 +479,7 @@ Future<void> main(List<String> arguments) async {
         }) async {
           restarting = true;
           try {
-            if (old != null) {
+            if (old != null && !detached) {
               final current = await run.command(sdk.adb, [
                 ...adb,
                 'shell',
@@ -451,6 +489,8 @@ Future<void> main(List<String> arguments) async {
               if ((current.stdout as String).trim() != appPid) {
                 throw StateError('Owned Android process changed');
               }
+            }
+            if (old != null) {
               await run.command(sdk.adb, [
                 ...adb,
                 'shell',
@@ -486,11 +526,14 @@ Future<void> main(List<String> arguments) async {
               '--es',
               'chat_name',
               name,
-              if (accountScenario) ...[
+              // m7: the receiver's cold process starts the core at the
+              // default root, so the app uses it too.
+              if (accountScenario && !pushScenario) ...[
                 '--es',
                 'chat_data_dir',
                 '/data/user/0/$package/files/e2e/${p.basename(logs.parent.path)}/$name/store-$store',
               ],
+              if (pushScenario) ...['--es', 'chat_push_url', _pushUrl],
             ], requireSuccess: false);
             await _captureAndroidLaunch(
               launched,
@@ -515,6 +558,7 @@ Future<void> main(List<String> arguments) async {
               return RegExp(r'^\d+$').hasMatch(appPid);
             }, const Duration(seconds: 15));
             activity['pid'] = appPid;
+            detached = false;
             run.save();
             Participant? next;
             run.phase = _Phase.androidParticipant;
@@ -577,6 +621,58 @@ Future<void> main(List<String> arguments) async {
             '$package/.MainActivity',
           ], requireSuccess: false);
         };
+        if (pushScenario && i == 0) {
+          var latest = first;
+          Future<ProcessResult> shell(List<String> args) => run.command(
+            sdk.adb,
+            [...adb, 'shell', ...args],
+            requireSuccess: false,
+          );
+          pushPhone = PushPhone(
+            kill: () async {
+              detached = true;
+              await shell(['input', 'keyevent', 'KEYCODE_HOME']);
+              // `am kill` takes a process only once it is in the background.
+              await run.until(() async {
+                await shell(['am', 'kill', package]);
+                await Future<void>.delayed(const Duration(milliseconds: 500));
+                final left = await shell(['pidof', package]);
+                return (left.stdout as String).trim().isEmpty;
+              }, const Duration(seconds: 30));
+            },
+            relaunch: () async => latest = await launch(latest),
+            push: (extras) async {
+              final result = await shell([
+                'am',
+                'broadcast',
+                '--include-stopped-packages',
+                '-n',
+                '$package/.TestPushReceiver',
+                '-a',
+                'dev.chatproject.chat_app.TEST_PUSH',
+                for (final MapEntry(:key, :value) in extras.entries) ...[
+                  '--es',
+                  key,
+                  value,
+                ],
+              ]);
+              if (result.exitCode != 0 ||
+                  !(result.stdout as String).contains('Broadcast completed')) {
+                throw StateError('Push broadcast failed');
+              }
+            },
+            notifications: () async {
+              final dump = await run.command(sdk.adb, [
+                ...adb,
+                'shell',
+                'dumpsys',
+                'notification',
+                '--noredact',
+              ]);
+              return parseNotifications(dump.stdout as String, package);
+            },
+          );
+        }
         appClocks[name] = () async {
           final result = await run.command(sdk.adb, [
             ...adb,
@@ -611,7 +707,7 @@ Future<void> main(List<String> arguments) async {
                 run.token.cancelled,
               ]);
               if (watching.isCompleted || run.token.isCancelled) return;
-              if (restarting) {
+              if (restarting || detached) {
                 misses = 0;
                 continue;
               }
@@ -622,7 +718,7 @@ Future<void> main(List<String> arguments) async {
                 requireSuccess: false,
                 failurePhase: 'android_pid_monitor',
               );
-              if (restarting || appPid != observedPid) {
+              if (restarting || detached || appPid != observedPid) {
                 misses = 0;
                 continue;
               }
@@ -668,42 +764,63 @@ Future<void> main(List<String> arguments) async {
         participants.add(first);
       }
     }
-    OwnedProcess? nodeProcess;
-    Future<Participant> launchNode([Participant? old]) async {
+    final nodeProcesses = <String, OwnedProcess>{};
+    // `node`, or m7's second node `mailbox` (A's other device).
+    Future<Participant> launchNode([
+      Participant? old,
+      String nodeName = 'node',
+    ]) async {
       run.phase = _Phase.nodeStart;
       run.token.check();
-      final previous = nodeProcess;
+      final previous = nodeProcesses[nodeName];
       if (previous != null) await run.stop(previous);
       run.token.check();
-      nodeProcess = await run.start(node, [
+      nodeProcesses[nodeName] = await run.start(node, [
         'puppet',
         '--control-url',
         'ws://127.0.0.1:47000',
         '--name',
-        'node',
+        nodeName,
         '--data-dir',
-        p.join(logs.path, 'node'),
-        if (mailboxScenario) '--account',
+        p.join(logs.path, nodeName),
+        if (mailboxScenario || pushScenario) '--account',
       ], logDir: logs);
       Participant? next;
       run.phase = _Phase.nodeParticipant;
       await run.until(() async {
-        next = await control.waitParticipant('node');
+        next = await control.waitParticipant(nodeName);
         return old == null || next!.instance != old.instance;
       }, const Duration(seconds: 15));
       if (old != null) run.phase = _Phase.scenario;
       return next!;
     }
 
-    if (!accountScenario || mailboxScenario) {
+    if (!accountScenario || mailboxScenario || pushScenario) {
       participants.add(await launchNode());
     }
+    if (pushScenario) participants.add(await launchNode(null, 'mailbox'));
     run.phase = _Phase.scenario;
     Participant named(String name) =>
         participants.singleWhere((participant) => participant.name == name);
     await run.wait(
       _traceOnFailure(
-        mailboxScenario
+        pushScenario
+            ? runPushScenario(
+                control,
+                [named('android-1'), named('mailbox'), named('node')],
+                phone: pushPhone!,
+                proxyUrl: _pushUrl,
+                upstream: upstream,
+                evidence: (stage, data) =>
+                    File(
+                      p.join(logs.path, 'push-public-evidence.jsonl'),
+                    ).writeAsStringSync(
+                      '${jsonEncode({'stage': stage, ...data})}\n',
+                      mode: FileMode.append,
+                      flush: true,
+                    ),
+              )
+            : mailboxScenario
             ? runMailboxScenario(
                 control,
                 [
@@ -793,7 +910,13 @@ Future<void> main(List<String> arguments) async {
         () async =>
             run.transport ??= await collectTransport(control.participants),
       ),
-      timeout: Duration(minutes: accountScenario ? 8 : 4),
+      timeout: Duration(
+        minutes: pushScenario
+            ? 12
+            : accountScenario
+            ? 8
+            : 4,
+      ),
       failurePhase: 'scenario',
     );
     run.transport = await collectTransport(control.participants);
@@ -852,7 +975,11 @@ Future<void> main(List<String> arguments) async {
     if (userInterrupted && code == 0) code = 130;
     if (code == 0) {
       stdout.writeln(
-        mailboxScenario
+        pushScenario
+            ? realFcm
+                  ? '$profile M7 FCM PASS: a real FCM push into a killed app showed the alias and the text.'
+                  : '$profile M7 PASS: cold cipher push showed alias and text, read push cleared it, wake push fetched the large text.'
+            : mailboxScenario
             ? '$profile M6 PASS: phone in airplane mode, mailbox kept three texts, phone got them in order once with one notification.'
             : messageScenario
             ? '$profile M4 PASS: native retained message restart, durable ack and read.'
@@ -900,6 +1027,7 @@ Future<void> main(List<String> arguments) async {
             'android': run.android,
             'waits': run.waits(),
             'transport': run.transport,
+            'push': pushStats.toSafeJson(),
           }),
           flush: true,
         );
@@ -974,6 +1102,8 @@ enum _Phase {
   androidParticipant('android_participant'),
   nodeStart('node_start'),
   nodeParticipant('node_participant'),
+  buildPushProxy('build_push_proxy'),
+  pushProxyReady('push_proxy_ready'),
   scenario('scenario'),
   cleanup('cleanup'),
   complete('complete');
@@ -1486,7 +1616,7 @@ class _Managed implements OwnedProcess {
 }
 
 /// A fixed scenario op name (tools/ci/write_e2e_summary.py `RPC_OP`).
-final _rpcOp = RegExp(r'^(?:account|message|mailbox)_local_[a-z_]{1,48}$');
+final _rpcOp = RegExp(r'^(?:account|message|mailbox|push)_local_[a-z_]{1,48}$');
 
 /// The host's 1-minute load average times 100 (Linux), or null.
 int? _hostLoad() {
@@ -1543,4 +1673,63 @@ Future<void> _captureAndroidLaunch(
   if ((launch.stdout as String).contains('Activity not started')) {
     throw StateError('Android launch did not start the activity');
   }
+}
+
+/// The local push proxy (m7): loopback only, reached by the app through
+/// `adb reverse`, by the nodes directly.
+const _pushPort = 8787;
+const _pushUrl = 'http://127.0.0.1:$_pushPort';
+
+/// Starts `push_proxy` with a fresh handle key; with [upstream] it hands every
+/// delivery to the harness (`fake-upstream`), without it to real FCM (the
+/// service account file `E2E_FCM_SERVICE_ACCOUNT_FILE`, android-fcm job).
+Future<void> _startPushProxy(
+  _Run run,
+  String root,
+  Directory logs,
+  FakeUpstreamReceiver? upstream,
+) async {
+  final random = Random.secure();
+  final key = [
+    for (var i = 0; i < 32; i++)
+      random.nextInt(256).toRadixString(16).padLeft(2, '0'),
+  ].join();
+  final environment = {
+    'PUSH_LISTEN': '127.0.0.1:$_pushPort',
+    'PUSH_KEY': key,
+    'PUSH_KEY_ID': '1',
+  };
+  if (upstream == null) {
+    final file = Platform.environment['E2E_FCM_SERVICE_ACCOUNT_FILE'];
+    if (file == null || !File(file).existsSync()) {
+      throw StateError('FCM service account file missing');
+    }
+    environment['FCM_SERVICE_ACCOUNT_FILE'] = file;
+  }
+  await run.start(
+    p.join(
+      root,
+      'target',
+      'debug',
+      Platform.isWindows ? 'push_proxy.exe' : 'push_proxy',
+    ),
+    [
+      if (upstream != null) ...['--fake-upstream-url', upstream.url],
+    ],
+    logDir: logs,
+    environment: environment,
+  );
+  await run.until(() async {
+    try {
+      final socket = await Socket.connect(
+        InternetAddress.loopbackIPv4,
+        _pushPort,
+        timeout: const Duration(seconds: 1),
+      );
+      socket.destroy();
+      return true;
+    } on SocketException {
+      return false;
+    }
+  }, const Duration(seconds: 15));
 }

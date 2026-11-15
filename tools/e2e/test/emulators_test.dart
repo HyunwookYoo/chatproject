@@ -316,6 +316,16 @@ void main() {
     connection.destroy();
   });
 
+  test('E2E_AVD_PROFILE picks the image on CI (the real-FCM job needs Google Play)', () {
+    expect(AvdConfig.load(environment: {'CI': 'true'}).flavor, 'google_apis');
+    expect(AvdConfig.load(environment: {}).flavor, 'google_apis_playstore');
+    expect(AvdConfig.load(environment: {'CI': 'true', 'E2E_AVD_PROFILE': 'local'}).flavor,
+        'google_apis_playstore');
+    expect(AvdConfig.load(environment: {'E2E_AVD_PROFILE': 'ci'}).flavor, 'google_apis');
+    expect(AvdConfig.load(ci: true, environment: {'E2E_AVD_PROFILE': 'local'}).flavor, 'google_apis');
+    expect(() => AvdConfig.load(environment: {'E2E_AVD_PROFILE': 'other'}), throwsStateError);
+  });
+
   test('CI image selection is consumed by AVD creation and validation', () async {
     final home = await Directory.systemTemp.createTemp('avd_home_');
     addTearDown(() => home.delete(recursive: true));

@@ -169,7 +169,9 @@ void noteWait(String name, int ms) {
   if (ms > (waitMs[name] ?? -1)) waitMs[name] = ms;
 }
 
-final _scenarioOp = RegExp(r'^(?:account|message|mailbox)_local_[a-z_]{1,48}$');
+final _scenarioOp = RegExp(
+  r'^(?:account|message|mailbox|push)_local_[a-z_]{1,48}$',
+);
 
 /// The [waitsLimit] slowest waits whose name is a listed failure text, a listed
 /// m2 kind or a scenario op, slowest first; null when none is left.

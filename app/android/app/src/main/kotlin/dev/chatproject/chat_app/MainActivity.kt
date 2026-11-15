@@ -80,11 +80,16 @@ class MainActivity : FlutterActivity() {
             val name = intent.getStringExtra("chat_name")
             val requestedDir = intent.getStringExtra("chat_data_dir")
             val dataDir = requestedDir?.let { ownedTestDataDir(filesDir, it) }
-            if (controlUrl != null || name != null || dataDir != null) {
+            // The e2e push proxy (M7). Dart's push_configure replaces the whole configuration,
+            // so Dart gets it too, not only the core Kotlin starts in this process.
+            val pushUrl = intent.getStringExtra("chat_push_url")
+            if (pushUrl != null) NativeCore.debugPushUrl = pushUrl
+            if (controlUrl != null || name != null || dataDir != null || pushUrl != null) {
                 return (args ?: emptyList()) + buildList {
                     if (controlUrl != null) addAll(listOf("--control-url", controlUrl))
                     if (name != null) addAll(listOf("--name", name))
                     if (dataDir != null) addAll(listOf("--data-dir", dataDir))
+                    if (pushUrl != null) addAll(listOf("--push-url", pushUrl))
                 }
             }
         }

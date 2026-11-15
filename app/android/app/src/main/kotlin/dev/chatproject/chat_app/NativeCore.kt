@@ -14,6 +14,11 @@ import uniffi.chat_ffi.nativeStart
 object NativeCore {
     private var info: NativeInfo? = null
 
+    // Debug builds: the push proxy MainActivity got as the `chat_push_url` extra (e2e), passed
+    // to native_start in place of the build's address. A receiver-started process has none.
+    @Volatile
+    var debugPushUrl: String? = null
+
     // Dart's root: accountStorageRoot(getApplicationSupportDirectory()/core) in core_client.dart.
     fun storageRoot(context: Context): String {
         val app = context.applicationContext
@@ -25,7 +30,7 @@ object NativeCore {
     fun ensureStarted(context: Context): NativeInfo {
         info?.let { return it }
         val started = try {
-            nativeStart(storageRoot(context), null)
+            nativeStart(storageRoot(context), debugPushUrl)
         } catch (error: NativeException.Core) {
             // Debug runs may start Dart's core in another folder (--data-dir): use that one.
             val running = nativeInstanceId()

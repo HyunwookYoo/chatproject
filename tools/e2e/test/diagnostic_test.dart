@@ -247,6 +247,7 @@ void main() {
       'account_scenario': ('Account scenario: ', null),
       'message_scenario': ('Message scenario: ', 'Message scenario deadline: '),
       'mailbox_scenario': ('Mailbox scenario: ', 'Mailbox scenario deadline: '),
+      'push_scenario': ('Push scenario: ', 'Push scenario deadline: '),
     };
     for (final MapEntry(key: file, value: (code, deadline))
         in prefixes.entries) {

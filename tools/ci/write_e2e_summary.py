@@ -11,7 +11,8 @@ PHASES = set('preflight build_node build_windows build_android gradle_stop relay
              'android_participant node_start node_participant scenario cleanup complete '
              'scenario_app1 scenario_app2 scenario_node scenario_app1_to_app2 '
              'scenario_app1_to_node scenario_app2_to_app1 scenario_app2_to_node '
-             'scenario_node_to_app1 scenario_node_to_app2 android_pid_monitor'.split())
+             'scenario_node_to_app1 scenario_node_to_app2 android_pid_monitor '
+             'build_push_proxy push_proxy_ready'.split())
 FAILURE_KINDS = set('cleanup command_exit timeout cancelled socket filesystem process_spawn '
                     'state argument unsupported format other avd_list_exit avd_create_exit '
                     'avd_devices_exit avd_console_exit avd_console_invalid avd_serial_conflict '
@@ -20,7 +21,7 @@ FAILURE_KINDS = set('cleanup command_exit timeout cancelled socket filesystem pr
                     'owned_child_exit timeout_network_start timeout_network_info timeout_connect_peer '
                     'timeout_send_probe_text timeout_set_offline timeout_disconnect_peer '
                     'timeout_network_stop timeout_state_event timeout_probe_event timeout_offline_event'.split())
-SCENARIOS = {'m2', 'm3', 'm3-auth', 'm4', 'm6'}
+SCENARIOS = {'m2', 'm3', 'm3-auth', 'm4', 'm6', 'm7', 'm7-fcm'}
 # Fixed public failure texts, shared with tools/e2e/lib/src/diagnostic.dart.
 SHARED = json.loads(
     (pathlib.Path(__file__).resolve().parents[1] / 'e2e' / 'diagnostic_details.json')
@@ -85,7 +86,7 @@ PROBE = {
     'cpus': _int(1, 1024),
 }
 # The command an RPC failed on: a fixed scenario op name, never its arguments.
-RPC_OP = re.compile(r'(?:account|message|mailbox)_local_[a-z_]{1,48}')
+RPC_OP = re.compile(r'(?:account|message|mailbox|push)_local_[a-z_]{1,48}')
 
 
 # m2's own waits, named by their timeout kind.
@@ -151,6 +152,25 @@ def _transport(value):
         and len({t['name'] for t in value}) == len(value))
 
 
+# m7's push counts (tools/e2e/lib/src/push_scenario.dart PushStats): fixed keys, counts only,
+# never a body, token, tag or handle.
+PUSH_KINDS = ('cipher', 'wake', 'read')
+
+
+def _push(value):
+    count = _int(0, 1_000_000)
+    return value is None or (
+        isinstance(value, dict)
+        and set(value) == {'push_items', 'push_results', 'broadcasts', 'notifications'}
+        and isinstance(value['push_items'], dict) and set(value['push_items']) == set(PUSH_KINDS)
+        and all(count(n) and n is not None for n in value['push_items'].values())
+        and isinstance(value['push_results'], dict)
+        and set(value['push_results']) == {'sent', 'failed'}
+        and all(count(n) and n is not None for n in value['push_results'].values())
+        and count(value['broadcasts']) and value['broadcasts'] is not None
+        and _int(0, 1000)(value['notifications']))
+
+
 EXIT_KINDS = set('command_exit avd_list_exit avd_create_exit avd_devices_exit avd_console_exit '
                  'avd_snapshot_exit owned_relay_exit owned_emulator_exit owned_chat_node_exit '
                  'owned_windows_exit owned_child_exit'.split())
@@ -177,14 +197,14 @@ def main():
     safe = {'phase': None, 'failure_kind': None, 'command_exit_code': None,
             'detail': None, 'scenario': None, 'android_crash': None,
             'last_view': None, 'participant': None, 'rpc_op': None, 'facts': None,
-            'android': None, 'waits': None, 'transport': None}
+            'android': None, 'waits': None, 'transport': None, 'push': None}
     if args.diagnostic_file and args.diagnostic_file.is_file():
         try:
             diagnostic = json.loads(args.diagnostic_file.read_text(encoding='utf-8'))
             if not isinstance(diagnostic, dict) or set(diagnostic) != set(safe):
                 raise ValueError()
             (phase, kind, code, detail, scenario, crash, view, participant, op, facts,
-             android, waits, transport) = (diagnostic[key] for key in safe)
+             android, waits, transport, push) = (diagnostic[key] for key in safe)
             if not isinstance(phase, str) or phase not in PHASES:
                 raise ValueError()
             if kind is not None and (not isinstance(kind, str) or kind not in FAILURE_KINDS):
@@ -216,15 +236,17 @@ def main():
                 raise ValueError()
             if not _transport(transport):
                 raise ValueError()
+            if not _push(push):
+                raise ValueError()
             safe = {'phase': phase, 'failure_kind': kind, 'command_exit_code': code,
                     'detail': detail, 'scenario': scenario, 'android_crash': crash,
                     'last_view': view, 'participant': participant, 'rpc_op': op,
                     'facts': facts, 'android': android, 'waits': waits,
-                    'transport': transport}
+                    'transport': transport, 'push': push}
         except (OSError, ValueError):
             parser.error('Invalid safe diagnostic')
     # Reconstruct only fixed keys and validated values; never copy log/error text.
-    value = {'schema_version': 10, 'profile': args.profile, 'stage': args.stage,
+    value = {'schema_version': 11, 'profile': args.profile, 'stage': args.stage,
              'outcome': args.outcome, 'exitCode': args.exit_code, 'peak_rss_kib': peak,
              **safe}
     args.output.write_text(json.dumps(value, indent=2) + '\n', encoding='utf-8')

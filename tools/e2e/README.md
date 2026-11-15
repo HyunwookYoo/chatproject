@@ -55,6 +55,15 @@ building, before AVD launch. It measures memory before changing heap settings.
 The downloadable failure artifact contains only the fixed-schema sanitized
 summary; full private diagnostics are retained only on the runner.
 
+`--profile android --scenario m7` (M7 push) uses one emulator and two nodes
+(`node` = B1, `mailbox` = A's second device). It builds `push_proxy` with the
+debug-only `fake-upstream` feature and runs it on 127.0.0.1:8787 (reversed to
+the emulator); the proxy hands each push to the harness, which broadcasts it to
+the debug app's `TestPushReceiver`, and notifications are read with `dumpsys
+notification`. `--scenario m7-fcm` sends through real FCM instead: it needs
+`E2E_FCM_SERVICE_ACCOUNT_FILE`, an app built with `google-services.json`, and a
+Google Play image (`E2E_AVD_PROFILE=local`); the `android-fcm` job runs it.
+
 Ports 3340/47000 must be free. Existing AVDs and reverse mappings are preserved;
 an already running target test AVD fails before install/launch. Only emulators
 newly launched by this run receive the test APK. Handled Ctrl+C, stage failure,

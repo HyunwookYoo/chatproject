@@ -32,10 +32,17 @@ class AndroidSdk {
 class AvdConfig {
   AvdConfig({required this.api, required this.flavor, required this.abi});
 
-  factory AvdConfig.load({bool? ci}) {
+  /// `ci` picks the image; without it `E2E_AVD_PROFILE` (`ci` or `local`: the nightly
+  /// real-FCM job needs the Google Play image on CI), else `CI=true`.
+  factory AvdConfig.load({bool? ci, Map<String, String>? environment}) {
     final source = Isolate.resolvePackageUriSync(Uri.parse('package:chat_e2e/src/android_sdk.dart'))!;
     final file = File.fromUri(source.resolve('../../avd_config.json'));
-    final profile = (ci ?? Platform.environment['CI'] == 'true') ? 'ci' : 'local';
+    final env = environment ?? Platform.environment;
+    final chosen = env['E2E_AVD_PROFILE'];
+    if (ci == null && chosen != null && chosen != 'ci' && chosen != 'local') {
+      throw StateError('E2E_AVD_PROFILE must be ci or local');
+    }
+    final profile = ci != null ? (ci ? 'ci' : 'local') : chosen ?? (env['CI'] == 'true' ? 'ci' : 'local');
     final data = (jsonDecode(file.readAsStringSync()) as Map<String, dynamic>)[profile] as Map<String, dynamic>;
     return AvdConfig(api: data['api'] as int, flavor: data['flavor'] as String, abi: data['abi'] as String);
   }
