@@ -365,8 +365,18 @@ async fn gone_drops_peer_handle() {
 
 /// Spec 7: A1 (Android) announced its own-device handle to A2 (Windows). Reads on A2 while A1
 /// has a session push nothing; with A1 off, three reads within a second push one `read`.
-#[tokio::test]
-async fn read_on_pc_sends_one_read_clear_to_offline_android() {
+/// A1 (Android, push on) and A2 (push on, no platform) of one account, and B1; A2 holds A1's
+/// own-device handle, and A1 has a session with A2. Then B1's text 1 is delivered to A2 and A1
+/// and A2 reads it while that session is ready: nothing is pushed (spec 7). Returns A1, A2, B1,
+/// the conversation, the proxy and A1's handle.
+async fn read_while_android_connected() -> (
+    Fixture,
+    Fixture,
+    Fixture,
+    ConversationId,
+    Arc<FakePushProxy>,
+    Vec<u8>,
+) {
     let (mut a, b1, net, conv) = accounts(&[A1, A2], &[B1]).await;
     let a2 = a.pop().unwrap();
     let a1 = a.pop().unwrap();
@@ -393,13 +403,27 @@ async fn read_on_pc_sends_one_read_clear_to_offline_android() {
     // The decision is on record: one own device with a ready session, nothing pushed.
     assert_eq!(a2.account.push_test_read_clears().await.unwrap(), vec![(1, 0)]);
     assert_eq!(a2.account.mailbox_test_own_sessions().await.unwrap(), vec![a1_id]);
+    (a1, a2, b1, conv, proxy, a1_handle)
+}
 
-    let _a1 = stop(a1);
-    settle!([&a2, &b1], !ready_with(&a2, a1_id));
+/// A1 goes off and A2 sees its session gone.
+async fn android_gone(a1: Fixture, a2: &Fixture, b1: &Fixture) -> tempfile::TempDir {
+    let a1_id = installation(&a1).await;
+    let dir = stop(a1);
+    settle!([a2, b1], !ready_with(a2, a1_id));
     settle!(
-        [&a2, &b1],
+        [a2, b1],
         a2.account.mailbox_test_own_sessions().await.unwrap().is_empty()
     );
+    dir
+}
+
+#[tokio::test]
+async fn read_on_pc_sends_one_read_clear_to_offline_android() {
+    let (a1, a2, b1, conv, proxy, a1_handle) = read_while_android_connected().await;
+    let _a1 = android_gone(a1, &a2, &b1).await;
+    // Spec 7 (amended): the session went soon after the read; A1 gets that read clear now.
+    settle!([&a2, &b1], read_pushes(&proxy).len() == 1);
     let mut keys = Vec::new();
     for n in 2..5 {
         keys.push(send_to(&b1, a2.peer, n, &format!("unread {n}")).await);
@@ -419,17 +443,55 @@ async fn read_on_pc_sends_one_read_clear_to_offline_android() {
             .await
             .unwrap();
     }
+    settle!([&a2, &b1], read_pushes(&proxy).len() == 2);
+    quiet(&[&a2, &b1]).await;
+    let reads = read_pushes(&proxy);
+    assert_eq!(reads.len(), 2);
+    for read in &reads {
+        assert_eq!(read.items.len(), 1);
+        assert_eq!(read.items[0].handle, b64(&a1_handle));
+    }
+    assert!(text_pushes(&proxy).is_empty());
+    assert_eq!(
+        a2.account.push_test_read_clears().await.unwrap(),
+        vec![(1, 0), (0, 1), (0, 1)]
+    );
+}
+
+/// Spec 7 (amended, user decision 2026-11-15): a read clear skipped A1 for its session, and that
+/// session went within `READ_RECHECK_MS` of the read: A1 gets the `read` then, once.
+#[tokio::test]
+async fn read_clear_follows_a_session_that_drops_soon_after() {
+    let (a1, a2, b1, _conv, proxy, a1_handle) = read_while_android_connected().await;
+    let _a1 = android_gone(a1, &a2, &b1).await;
     settle!([&a2, &b1], !read_pushes(&proxy).is_empty());
     quiet(&[&a2, &b1]).await;
     let reads = read_pushes(&proxy);
     assert_eq!(reads.len(), 1);
     assert_eq!(reads[0].items.len(), 1);
     assert_eq!(reads[0].items[0].handle, b64(&a1_handle));
-    assert!(text_pushes(&proxy).is_empty());
     assert_eq!(
         a2.account.push_test_read_clears().await.unwrap(),
         vec![(1, 0), (0, 1)]
     );
+}
+
+/// The session goes later than 10 minutes after the read, or with push off: nothing is pushed
+/// (the notification is cleared at A1's next sync, as before).
+#[tokio::test]
+async fn late_or_push_off_session_drop_sends_no_read_clear() {
+    for push_off in [false, true] {
+        let (a1, a2, b1, _conv, proxy, _) = read_while_android_connected().await;
+        if push_off {
+            a2.account.push_set_enabled(false).await.unwrap();
+        } else {
+            a2.clock.advance_monotonic_ms(600_000);
+            quiet(&[&a2]).await;
+        }
+        let _a1 = android_gone(a1, &a2, &b1).await;
+        quiet(&[&a2, &b1]).await;
+        assert!(read_pushes(&proxy).is_empty(), "push off {push_off}");
+    }
 }
 
 #[tokio::test]

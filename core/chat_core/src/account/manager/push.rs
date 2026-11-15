@@ -29,7 +29,8 @@
 //!   retries, mailbox handoffs, receipts, Commits and PushHandles never push. A `/push` runs in a
 //!   spawned task, bounded by `PUSH_TIMEOUT`; only its `gone` results come back, withdrawing
 //!   those handles. Read clearing (spec 7): reads here push one `read`, `READ_CLEAR_MS` after the
-//!   first of them, to my devices with an own-device handle and no session.
+//!   first of them, to my devices with an own-device handle and no session. A device it skipped
+//!   for its session gets that `read` once if the session goes within `READ_RECHECK_MS`.
 //! * Receiving (spec 5.3, 5.4, 7): a push's tag names the conversation of one of this device's
 //!   current handles; an unknown one shows nothing. A `cipher` gets its group id back and is
 //!   opened like a received frame (`Via::Push`: no answer is sent), so a copy that also comes
@@ -83,6 +84,9 @@ const DIAL_CHECK_MS: u64 = 1_000;
 const PUSH_TIMEOUT: Duration = Duration::from_secs(20);
 /// Reads within this long of the first one clear notifications with one push (spec 7).
 const READ_CLEAR_MS: u64 = 1_000;
+/// A device a read clear skipped for its ready session gets the `read` if that session goes
+/// within this long of the decision (spec 7, amended 2026-11-15).
+const READ_RECHECK_MS: u64 = 600_000;
 /// While a fetch for a received push waits for the network to come up, it looks this often.
 const NETWORK_LOOK: Duration = Duration::from_millis(50);
 /// A fetch that got what it waited for keeps the network this much longer: the answer to the
@@ -175,6 +179,9 @@ pub(crate) struct Runtime {
     fingerprint: Option<[u8; 32]>,
     /// Scheduler time the pending read clear is sent at.
     read_clear_at: Option<u64>,
+    /// My devices the latest read clear skipped for their ready session, with the scheduler
+    /// time until which that session going still sends them the `read` (one entry each).
+    read_recheck: BTreeMap<InstallationId, u64>,
     /// Wake pushes fetching now, per conversation, with the unread count their generic
     /// notification showed: told when a notification of the conversation shows a text in its
     /// place. One whose caller stopped waiting (closed) is over.
@@ -535,8 +542,12 @@ impl Manager {
         if self.messages.push.seal_due {
             self.push_seal(request).await;
         }
-        if self.messages.push.read_clear_at.is_some_and(|at| now >= at) {
-            self.push_read_clears(request).await;
+        match self.messages.push.read_clear_at {
+            Some(at) if now >= at => self.push_read_clears(request).await,
+            None if !self.messages.push.read_recheck.is_empty() => {
+                self.push_read_recheck(now, request).await;
+            }
+            _ => {}
         }
         self.push_probe(now, request);
         self.push_deliver(now, request).await;
@@ -642,12 +653,34 @@ impl Manager {
     }
 
     /// One `read` for each of my other current devices without a session now that announced an
-    /// own-device handle (only Android devices do).
+    /// own-device handle (only Android devices do). Those with a session are kept for
+    /// `push_read_recheck`.
     async fn push_read_clears(&mut self, request: Request) {
         self.messages.push.read_clear_at = None;
-        let Ok(local) = self.local() else {
+        let Some((current, connected)) = self.own_devices() else {
             return;
         };
+        let (offline, skipped): (Vec<_>, Vec<_>) =
+            current.into_iter().partition(|i| !connected.contains(i));
+        // Spec 7 (amended): the devices skipped now get this read if their session goes soon;
+        // the latest decision is the one that counts.
+        let until = self.schedule_now().saturating_add(READ_RECHECK_MS);
+        self.messages.push.read_recheck = skipped.into_iter().map(|i| (i, until)).collect();
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        let sessions = u32::try_from(connected.len()).unwrap_or(u32::MAX);
+        self.push_read_items(
+            offline,
+            #[cfg(all(feature = "test-hooks", debug_assertions))]
+            sessions,
+            request,
+        )
+        .await;
+    }
+
+    /// My other current devices, and those of them with a ready session; `None` without an
+    /// account.
+    fn own_devices(&self) -> Option<(Vec<InstallationId>, Vec<InstallationId>)> {
+        let local = self.local().ok()?;
         let (me, own) = (local.device.installation_id(), local.keys.peer_id());
         let connected: Vec<InstallationId> = self
             .mls_sessions()
@@ -655,13 +688,49 @@ impl Manager {
             .filter(|s| s.grant.peer == own)
             .map(|s| s.grant.installation)
             .collect();
-        let offline = self
+        let current = self
             .current_installations(own)
             .into_iter()
-            .filter(|i| *i != me && !connected.contains(i))
+            .filter(|i| *i != me)
             .collect();
-        #[cfg(all(feature = "test-hooks", debug_assertions))]
-        let sessions = u32::try_from(connected.len()).unwrap_or(u32::MAX);
+        Some((current, connected))
+    }
+
+    /// Spec 7 (amended): a device the latest read clear skipped for its session, whose session
+    /// went before `READ_RECHECK_MS` passed, gets that read clear now, once. While another read
+    /// clear is pending it decides for them all (`poll_push` comes here only without one).
+    async fn push_read_recheck(&mut self, now: u64, request: Request) {
+        let Some((current, connected)) = self.own_devices() else {
+            return;
+        };
+        let recheck = &mut self.messages.push.read_recheck;
+        recheck.retain(|i, until| now < *until && current.contains(i));
+        let gone: Vec<InstallationId> = recheck
+            .keys()
+            .filter(|i| !connected.contains(i))
+            .copied()
+            .collect();
+        if gone.is_empty() {
+            return;
+        }
+        recheck.retain(|i, _| !gone.contains(i));
+        self.push_read_items(
+            gone,
+            #[cfg(all(feature = "test-hooks", debug_assertions))]
+            0,
+            request,
+        )
+        .await;
+    }
+
+    /// One `read` for each of `offline` that announced an own-device handle (none with push
+    /// off), pushed in a spawned task.
+    async fn push_read_items(
+        &mut self,
+        offline: Vec<InstallationId>,
+        #[cfg(all(feature = "test-hooks", debug_assertions))] sessions: u32,
+        request: Request,
+    ) {
         let reply = self.push_db(PushDbOp::ReadClear { offline }, request).await;
         #[cfg(all(feature = "test-hooks", debug_assertions))]
         {
