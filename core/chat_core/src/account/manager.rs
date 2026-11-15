@@ -3184,6 +3184,8 @@ impl Manager {
             Input::Mailbox(event)=>self.mailbox_event(event).await,
             Input::Push(event)=>self.push_event(event).await,
             Input::Incoming(conn) => {
+                // Ruling R30: my device that showed an older record of the accepted shape.
+                let mut stale_own = None;
                 let result = async {
                     let request = self.ready()?;
                     if !self.local_authorized() {
@@ -3193,6 +3195,7 @@ impl Manager {
                         .service(request, Box::pin(super::auth::receive_preface(&conn)))
                         .await?;
                     let peer = preface.hello.peer;
+                    let installation = preface.hello.cert.installation_id;
                     let record = self.remote_record(peer).await?;
                     let mut evidence = None;
                     let result = self
@@ -3209,6 +3212,10 @@ impl Manager {
                         )
                         .await;
                     if let Some(signed) = evidence {
+                        let local = self.local()?;
+                        if local.keys.peer_id() == peer && local.records.is_stale_renewal(&signed) {
+                            stale_own = Some((peer, installation, request));
+                        }
                         self.observe_auth_record(peer, signed, request).await?;
                     }
                     self.install_grant(conn.clone(), result?, None).await
@@ -3216,6 +3223,11 @@ impl Manager {
                 .await;
                 if result.is_err() {
                     conn.close(0u32.into(), b"account authentication failed");
+                    // The close loses the newer record this side sent; dialing that device
+                    // hands it over in the record exchange, and its next session is accepted.
+                    if let Some((peer, installation, request)) = stale_own {
+                        self.start_dial(peer, installation, request);
+                    }
                 }
                 #[cfg(all(feature = "test-hooks", debug_assertions))]
                 {
@@ -3285,7 +3297,9 @@ impl Manager {
             .iter()
             .position(|p| p.signed.hash == signed.hash && p.status == PacketStatus::Ready);
         let renewal = records.is_renewal(signed, self.services.clock.unix_seconds());
-        let result = if records.conflict.is_none() && signed.hash == previous.hash {
+        let result = if records.conflict.is_none() && signed.hash == previous.hash
+            || records.is_stale_renewal(signed)
+        {
             Ok(())
         } else if records.conflict.is_none()
             && signed.seq >= records.observed_seq

@@ -527,6 +527,51 @@ async fn own_device_renewal_found_by_lookup_keeps_the_account_active() {
     assert_eq!(changed.code, ErrorCode::RecordConflict);
 }
 
+/// Ruling R30 (re-review of final fix D): A1 renews (its lookup came back empty) and has not
+/// observed its renewal yet, so it still holds the old record; A2 takes the renewal by lookup
+/// while they have no session. When they authenticate next, A1 shows the old record: same
+/// generation and devices, lower seq. A2 ignores it as stale and stays Active (before: a list
+/// conflict, and every own device refused), and a session comes up, whichever side dials.
+#[tokio::test]
+async fn older_own_record_shown_at_auth_after_a_renewal_is_ignored() {
+    use chat_core::account::{AccountPhase, PublicationState};
+    for a2_dials in [false, true] {
+        let (mut a, _b1, net, _conv) = accounts(&[A1, A2], &[B1]).await;
+        let a2 = a.pop().unwrap();
+        let a1 = a.pop().unwrap();
+        let old = a1.view().await.publication.accepted_hash;
+        net.packets.lock().unwrap().remove(&peer_of(A));
+        a1.account.refresh_record(a1.peer).await.unwrap();
+        let v1 = a1.view().await;
+        assert_eq!(v1.publication.state, PublicationState::Pending, "A1 renewed, unobserved");
+        assert_eq!(v1.publication.accepted_hash, old);
+        // A1's network is off (m7 step 3), so A2 cannot hand it the renewal it finds.
+        a1.slot.network().unwrap().execute(NetworkOp::Stop).await.unwrap();
+        settle!([&a1, &a2], !own_session(&a2, &a1).await);
+        a2.account.refresh_record(a2.peer).await.unwrap();
+        let renewed = a2.view().await.publication.accepted_hash;
+        assert_ne!(renewed, old, "A2 took the renewal");
+        assert_eq!(a1.view().await.publication.accepted_hash, old, "A1 still holds the old one");
+        online(&a1).await;
+        link(&a1, &a2).await;
+
+        let started = tokio::time::Instant::now();
+        let dialer = if a2_dials { &a2 } else { &a1 };
+        settle!([&a1, &a2], {
+            let _ = dialer.account.mailbox_sync_now().await;
+            let view = a2.view().await;
+            assert_eq!(view.phase, AccountPhase::Active, "A2 dials {a2_dials}");
+            assert!(view.publication.conflict.is_none(), "A2 dials {a2_dials}");
+            own_session(&a1, &a2).await && own_session(&a2, &a1).await
+        });
+        assert!(started.elapsed() < Duration::from_secs(20), "A2 dials {a2_dials}: {:?}", started.elapsed());
+        let (v1, v2) = (a1.view().await, a2.view().await);
+        assert_eq!(v2.publication.accepted_hash, renewed);
+        assert_eq!(v1.publication.accepted_hash, renewed, "A1 observed its renewal");
+        assert_eq!(v1.phase, AccountPhase::Active);
+    }
+}
+
 /// Own-device dials and accepts `f` made so far, failed or not.
 async fn attempts(f: &Fixture) -> u64 {
     let t = f.account.mailbox_test_sync_trace().await.unwrap();
