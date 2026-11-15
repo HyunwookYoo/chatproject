@@ -14,7 +14,7 @@ class FakeMailboxClient implements MailboxClient {
   r.ErrorCode? failure;
   Completer<void>? backgroundWait;
   final sets = <bool>[];
-  int states = 0, marks = 0, foregrounds = 0, backgrounds = 0;
+  int states = 0, marks = 0, foregrounds = 0, backgrounds = 0, starts = 0;
 
   void _check() {
     if (failure != null) {
@@ -50,6 +50,12 @@ class FakeMailboxClient implements MailboxClient {
   @override
   Future<void> mailboxForeground() async {
     foregrounds++;
+    _check();
+  }
+
+  @override
+  Future<void> startNetwork() async {
+    starts++;
     _check();
   }
 

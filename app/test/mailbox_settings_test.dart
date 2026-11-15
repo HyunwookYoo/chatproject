@@ -178,10 +178,12 @@ void main() {
   });
 
   // Final review, user decision 2026-11-15: an Active account on screen
-  // starts the network (the core's foreground call); a launch in the
-  // background (no Dart in FCM, WorkManager; an iOS background refresh may
-  // start the engine) waits until the app comes to the foreground.
-  test('an Active account on screen comes to the foreground at once, a '
+  // starts the network; a launch in the background (no Dart in FCM,
+  // WorkManager; an iOS background refresh may start the engine) waits until
+  // the app comes to the foreground. Becoming Active syncs nothing by itself
+  // (e2e m6 run 43719156130: an own-device sync at that moment kept the new
+  // mailbox from its phone's log); every resume does, as before.
+  test('an Active account on screen starts the network at once, a '
       'background launch only when it is resumed', () async {
     final client = FakeMailboxClient();
     final model = MailboxModel(
@@ -193,7 +195,7 @@ void main() {
     await model.accountActive();
     await model.accountActive();
     await pumpEventQueue();
-    expect(client.foregrounds, 1);
+    expect((client.starts, client.foregrounds), (1, 0));
 
     for (final launched in [null, AppLifecycleState.hidden]) {
       final background = FakeMailboxClient();
@@ -205,7 +207,11 @@ void main() {
       addTearDown(model.dispose);
       await model.accountActive();
       await pumpEventQueue();
-      expect(background.foregrounds, 0, reason: 'launched $launched');
+      expect(
+        (background.starts, background.foregrounds),
+        (0, 0),
+        reason: 'launched $launched',
+      );
       model.lifecycle(AppLifecycleState.resumed);
       await pumpEventQueue();
       expect(background.foregrounds, 1);

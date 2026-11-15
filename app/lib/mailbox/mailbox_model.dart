@@ -14,8 +14,7 @@ class MailboxModel extends ChangeNotifier {
     this.client,
     this.platform, {
     AppLifecycleState? Function()? lifecycle,
-  }) : _lifecycle =
-           lifecycle ?? (() => WidgetsBinding.instance.lifecycleState);
+  }) : _lifecycle = lifecycle ?? (() => WidgetsBinding.instance.lifecycleState);
   final MailboxClient client;
   final MailboxPlatform platform;
   final AppLifecycleState? Function() _lifecycle;
@@ -47,14 +46,15 @@ class MailboxModel extends ChangeNotifier {
   bool get firstLinkDue => windows && loaded && !firstLinkShown;
 
   /// The account is Active: load the setting once and tell the platform. On
-  /// screen the core comes to the foreground at once (the network starts,
-  /// user decision 2026-11-15); a launch in the background waits until the app
-  /// is resumed.
+  /// screen the network starts at once (user decision 2026-11-15); a launch in
+  /// the background waits until the app is resumed. Becoming Active syncs
+  /// nothing by itself: an own-device sync right as a device joins could find
+  /// its other device not ready yet (e2e m6 run 43719156130); resumes sync.
   Future<void> accountActive() {
     if (!_active) {
       _active = true;
       if (_lifecycle() == AppLifecycleState.resumed) {
-        unawaited(_core(client.mailboxForeground));
+        unawaited(_core(client.startNetwork));
       }
     }
     return _loading ??= _load();
