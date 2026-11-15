@@ -599,9 +599,14 @@ Future<void> runPushScenario(
     (v) => (v['peer_handles'] as int) >= 1,
     'handle_at_sender',
   );
-  await call(a1, 'mailbox_local_sync_now');
+  // The own-device handle rides A1's Announce over its session with A2 (sent again until A2
+  // takes it); every few seconds A1 dials its own devices in case that session is not up.
+  var reads = 0;
   final a2Counts = await until(
-    () => counts(a2),
+    () async {
+      if (reads++ % 20 == 0) await call(a1, 'mailbox_local_sync_now');
+      return counts(a2);
+    },
     (v) => (v['own_handles'] as int) >= 1,
     'own_handle_at_mailbox',
   );
