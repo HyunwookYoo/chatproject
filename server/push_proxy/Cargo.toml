@@ -4,6 +4,16 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+[features]
+default = []
+# Debug builds only (a compile error otherwise; Ruling R6): `--fake-upstream-url <url>` hands
+# every delivery to the m7 end-to-end harness on this machine instead of FCM or APNs.
+fake-upstream = ["tokio/io-util"]
+
+[[test]]
+name = "fake_upstream"
+required-features = ["fake-upstream"]
+
 [dependencies]
 push_wire = { path = "../../core/push_wire" }
 axum = { version = "=0.8.9", default-features = false, features = ["http1", "tokio"] }

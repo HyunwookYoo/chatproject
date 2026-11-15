@@ -6,6 +6,8 @@ mod apns;
 mod app;
 mod config;
 mod fcm;
+#[cfg(feature = "fake-upstream")]
+mod harness;
 mod jwt;
 mod limit;
 mod log;
@@ -16,6 +18,8 @@ pub use apns::{APNS_PRODUCTION, APNS_SANDBOX, ApnsUpstream};
 pub use app::{AppState, router};
 pub use config::{ApnsConfig, ApnsEnv, Config, ConfigError};
 pub use fcm::{FCM_ENDPOINT, FcmUpstream, GOOGLE_TOKEN_URL};
+#[cfg(feature = "fake-upstream")]
+pub use harness::HarnessUpstream;
 pub use limit::Limits;
 pub use log::{LogSink, stderr_sink};
 pub use reqwest::Url;

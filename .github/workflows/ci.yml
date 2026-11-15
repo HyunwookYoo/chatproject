@@ -78,7 +78,7 @@ jobs:
   # 30 minutes on a cold cache.
   push-proxy:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -86,8 +86,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master 2026-10-01
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo build --locked -p push_proxy --release
+      # The e2e harness upstream (Ruling R6) is a debug-only feature: tested and linted here,
+      # never in the release binary above.
+      - run: cargo test --locked -p push_proxy --features fake-upstream --test fake_upstream
+      - run: cargo clippy --locked -p push_proxy --features fake-upstream --all-targets -- -D warnings
+      - name: Release binary has no harness upstream
+        run: |
+          if grep -q 'fake-upstream-url' target/release/push_proxy; then
+            echo 'release push_proxy contains the fake upstream'
+            exit 1
+          fi
 
   bindings:
     strategy:
