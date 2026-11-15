@@ -835,6 +835,62 @@
       "Observed",
       "Conflict",
       "unknown"
+    ],
+    "m6_own_sessions_phone": [
+      "s0",
+      "s1plus",
+      "unknown"
+    ],
+    "m6_pulls_phone": [
+      "p0",
+      "p1",
+      "p2plus",
+      "unknown"
+    ],
+    "m6_pulls_done_phone": [
+      "d0",
+      "d1",
+      "d2plus",
+      "unknown"
+    ],
+    "m6_pulls_failed_phone": [
+      "pf0",
+      "pf1",
+      "pf2plus",
+      "unknown"
+    ],
+    "m6_pulls_stopped_phone": [
+      "ps0",
+      "ps1plus",
+      "unknown"
+    ],
+    "m6_own_sessions_mailbox": [
+      "s0",
+      "s1plus",
+      "unknown"
+    ],
+    "m6_pulls_mailbox": [
+      "p0",
+      "p1",
+      "p2plus",
+      "unknown"
+    ],
+    "m6_pulls_done_mailbox": [
+      "d0",
+      "d1",
+      "d2plus",
+      "unknown"
+    ],
+    "m6_pulls_failed_mailbox": [
+      "pf0",
+      "pf1",
+      "pf2plus",
+      "unknown"
+    ],
+    "m6_pulls_stopped_mailbox": [
+      "ps0",
+      "ps1plus",
+      "unknown"
     ]
   },
   "wait_kinds": [

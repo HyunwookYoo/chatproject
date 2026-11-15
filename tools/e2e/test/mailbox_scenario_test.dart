@@ -245,7 +245,18 @@ void main() {
         'm6_deliveries_mailbox': 'd0',
         'm6_holds_mailbox': 'h0',
         'm6_attempted_mailbox': 'r0',
+        'm6_own_sessions_phone': 's1plus',
+        'm6_pulls_phone': 'p1',
+        'm6_pulls_done_phone': 'd1',
+        'm6_pulls_failed_phone': 'pf0',
+        'm6_pulls_stopped_phone': 'ps0',
+        'm6_own_sessions_mailbox': 's1plus',
+        'm6_pulls_mailbox': 'p1',
+        'm6_pulls_done_mailbox': 'd0',
+        'm6_pulls_failed_mailbox': 'pf0',
+        'm6_pulls_stopped_mailbox': 'ps1plus',
       });
+      expect(safeFacts(failureFacts, loadSafeFacts()), failureFacts);
     } finally {
       failureFacts.clear();
       await fixture.close();
@@ -459,6 +470,15 @@ class MailboxFixture {
         };
       case 'message_local_load_messages':
         return {'revision': 1, 'items': texts[name], 'next': null};
+      case 'push_local_test_counts':
+        // `mailbox_missing`: the mailbox's one pull ended stopped.
+        return {
+          'own_sessions': 1,
+          'pulls': 1,
+          'pulls_done': name == 'mailbox' ? 0 : 1,
+          'pulls_failed': 0,
+          'pulls_stopped': name == 'mailbox' ? 1 : 0,
+        };
       default:
         throw StateError('Unexpected fixture operation $op');
     }

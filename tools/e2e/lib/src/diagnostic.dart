@@ -128,6 +128,30 @@ String _bucket(Object? value, String prefix, int top) => value is! int
     ? '$prefix${top}plus'
     : '$prefix$value';
 
+/// Notes one m6 A side's own-device sync as buckets (`push_local_test_counts`):
+/// `m6_own_sessions_<side>` (ready sessions with my other devices now),
+/// `m6_pulls_<side>` (pulls started since the core started) and how they
+/// ended (`_done`, `_failed`, `_stopped`: a `Refused` or out-of-order page ends
+/// syncing over that session). `unknown` when it could not be read.
+Future<void> noteOwnSync(String side, Future<Object?> Function() facts) async {
+  Object? value;
+  try {
+    value = await facts();
+  } catch (_) {
+    value = null;
+  }
+  final map = value is Map ? value : const {};
+  failureFacts['m6_own_sessions_$side'] = _bucket(map['own_sessions'], 's', 1);
+  failureFacts['m6_pulls_$side'] = _bucket(map['pulls'], 'p', 2);
+  failureFacts['m6_pulls_done_$side'] = _bucket(map['pulls_done'], 'd', 2);
+  failureFacts['m6_pulls_failed_$side'] = _bucket(map['pulls_failed'], 'pf', 2);
+  failureFacts['m6_pulls_stopped_$side'] = _bucket(
+    map['pulls_stopped'],
+    'ps',
+    1,
+  );
+}
+
 /// Notes one m6 side's MLS group for the conversation as buckets
 /// (`message_local_test_group_facts`): `m6_group_<side>` (members or `none`),
 /// `m6_epoch_<side>`, `m6_received_<side>` (MLS ciphertexts processed),

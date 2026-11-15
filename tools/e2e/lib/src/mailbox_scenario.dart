@@ -297,6 +297,17 @@ Future<void> runMailboxScenario(
           ),
         );
       }
+      for (final (side, p) in [('phone', phone), ('mailbox', mailbox)]) {
+        await noteOwnSync(
+          side,
+          () => p.call(
+            'push_local_test_counts',
+            const {},
+            timeout: const Duration(seconds: 5),
+            failOnTimeout: false,
+          ),
+        );
+      }
       rethrow;
     }
   }

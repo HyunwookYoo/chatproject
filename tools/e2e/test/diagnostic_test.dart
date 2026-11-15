@@ -200,6 +200,38 @@ void main() {
     failureFacts.clear();
   });
 
+  test('an m6 deadline notes each A side own-device sync as buckets', () async {
+    failureFacts.clear();
+    await noteOwnSync(
+      'mailbox',
+      () async => {
+        'own_sessions': 1,
+        'own_dials_ok': 1,
+        'own_accepts_ok': 0,
+        'pulls': 2,
+        'pulls_done': 1,
+        'pulls_failed': 0,
+        'pulls_stopped': 1,
+        'PRIVATE': 'PRIVATE_TOKEN',
+      },
+    );
+    await noteOwnSync('phone', () async => throw StateError('PRIVATE'));
+    expect(failureFacts, {
+      'm6_own_sessions_mailbox': 's1plus',
+      'm6_pulls_mailbox': 'p2plus',
+      'm6_pulls_done_mailbox': 'd1',
+      'm6_pulls_failed_mailbox': 'pf0',
+      'm6_pulls_stopped_mailbox': 'ps1plus',
+      'm6_own_sessions_phone': 'unknown',
+      'm6_pulls_phone': 'unknown',
+      'm6_pulls_done_phone': 'unknown',
+      'm6_pulls_failed_phone': 'unknown',
+      'm6_pulls_stopped_phone': 'unknown',
+    });
+    expect(safeFacts(failureFacts, loadSafeFacts()), failureFacts);
+    failureFacts.clear();
+  });
+
   test('the slowest waits keep listed names only, slowest first', () {
     waitMs.clear();
     noteWait('account_local_pair_scan', 9800);
