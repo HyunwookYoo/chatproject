@@ -1,5 +1,6 @@
 // iOS only (CI job `ios`): the App Group folder the notification extension shares with the app
-// (M7 spec 5.6, Task 11).
+// (M7 spec 5.6, Task 11). Other platforms have no `chat_app/push` channel and skip these tests;
+// the Android and Windows jobs run every integration file, so this one passes there skipped.
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
@@ -40,7 +41,7 @@ void main() {
     } finally {
       file.deleteSync();
     }
-  });
+  }, skip: !Platform.isIOS);
 
   // What the extension appends is taken by the ingest the app runs at launch and on every
   // return to the foreground (Task 12 calls it there), and the inbox is gone afterwards.
@@ -66,5 +67,5 @@ void main() {
     expect(inbox.existsSync(), false);
     expect(File('${dir.path}/inbox.taken.jsonl').existsSync(), false);
     await model.close();
-  });
+  }, skip: !Platform.isIOS);
 }
