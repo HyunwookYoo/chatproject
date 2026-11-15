@@ -212,6 +212,9 @@ void main() {
         'pulls_done': 1,
         'pulls_failed': 0,
         'pulls_stopped': 1,
+        'pull_failure': 'session_gone',
+        'own_closes': 3,
+        'own_close': 'peer_simultaneous_dial',
         'PRIVATE': 'PRIVATE_TOKEN',
       },
     );
@@ -222,11 +225,17 @@ void main() {
       'm6_pulls_done_mailbox': 'd1',
       'm6_pulls_failed_mailbox': 'pf0',
       'm6_pulls_stopped_mailbox': 'ps1plus',
+      'm6_pull_failure_mailbox': 'session_gone',
+      'm6_own_closes_mailbox': 'c2plus',
+      'm6_own_close_mailbox': 'peer_simultaneous_dial',
       'm6_own_sessions_phone': 'unknown',
       'm6_pulls_phone': 'unknown',
       'm6_pulls_done_phone': 'unknown',
       'm6_pulls_failed_phone': 'unknown',
       'm6_pulls_stopped_phone': 'unknown',
+      'm6_pull_failure_phone': 'unknown',
+      'm6_own_closes_phone': 'unknown',
+      'm6_own_close_phone': 'unknown',
     });
     expect(safeFacts(failureFacts, loadSafeFacts()), failureFacts);
     failureFacts.clear();

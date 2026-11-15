@@ -98,7 +98,7 @@ mod commands {
                 "fetches":0,"fetches_online":0,"fetches_done":0,
                 "own_dials_ok":0,"own_dials_failed":0,"own_dial_error":"none","own_dial_check":"none",
                 "own_accepts_ok":0,"own_accepts_failed":0,"own_accept_error":"none","own_accept_check":"none",
-                "pulls":0,"pulls_done":0,"pulls_failed":0,"pulls_stopped":0,
+                "pulls":0,"pulls_done":0,"pulls_failed":0,"pulls_stopped":0,"pull_failure":"none","own_closes":0,"own_close":"none",
             })
         );
         let renewed = call(&mut socket, 4, "push_local_renew_due", json!({})).await;

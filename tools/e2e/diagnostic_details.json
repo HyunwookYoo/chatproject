@@ -911,6 +911,70 @@
       "proof",
       "grant",
       "unknown"
+    ],
+    "m6_pull_failure_phone": [
+      "none",
+      "busy",
+      "request",
+      "entries",
+      "storage",
+      "session_gone",
+      "plain",
+      "unknown"
+    ],
+    "m6_own_closes_phone": [
+      "c0",
+      "c1",
+      "c2plus",
+      "unknown"
+    ],
+    "m6_own_close_phone": [
+      "none",
+      "open",
+      "local",
+      "timeout",
+      "reset",
+      "peer_simultaneous_dial",
+      "peer_new_proof",
+      "peer_restricted",
+      "peer_auth_failed",
+      "peer_record_changed",
+      "peer_stopped",
+      "peer_other",
+      "other",
+      "unknown"
+    ],
+    "m6_pull_failure_mailbox": [
+      "none",
+      "busy",
+      "request",
+      "entries",
+      "storage",
+      "session_gone",
+      "plain",
+      "unknown"
+    ],
+    "m6_own_closes_mailbox": [
+      "c0",
+      "c1",
+      "c2plus",
+      "unknown"
+    ],
+    "m6_own_close_mailbox": [
+      "none",
+      "open",
+      "local",
+      "timeout",
+      "reset",
+      "peer_simultaneous_dial",
+      "peer_new_proof",
+      "peer_restricted",
+      "peer_auth_failed",
+      "peer_record_changed",
+      "peer_stopped",
+      "peer_other",
+      "other",
+      "unknown"
     ]
   },
   "wait_kinds": [

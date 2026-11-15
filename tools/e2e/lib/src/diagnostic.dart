@@ -150,7 +150,40 @@ Future<void> noteOwnSync(String side, Future<Object?> Function() facts) async {
     'ps',
     1,
   );
+  failureFacts['m6_pull_failure_$side'] = _named(
+    map['pull_failure'],
+    _pullFailures,
+  );
+  failureFacts['m6_own_closes_$side'] = _bucket(map['own_closes'], 'c', 2);
+  failureFacts['m6_own_close_$side'] = _named(map['own_close'], _closes);
 }
+
+const _pullFailures = {
+  'none',
+  'busy',
+  'request',
+  'entries',
+  'storage',
+  'session_gone',
+  'plain',
+};
+const _closes = {
+  'none',
+  'open',
+  'local',
+  'timeout',
+  'reset',
+  'peer_simultaneous_dial',
+  'peer_new_proof',
+  'peer_restricted',
+  'peer_auth_failed',
+  'peer_record_changed',
+  'peer_stopped',
+  'peer_other',
+  'other',
+};
+String _named(Object? value, Set<String> names) =>
+    names.contains(value) ? value as String : 'unknown';
 
 /// Notes one m6 side's MLS group for the conversation as buckets
 /// (`message_local_test_group_facts`): `m6_group_<side>` (members or `none`),

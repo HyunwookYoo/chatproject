@@ -3250,7 +3250,12 @@ impl Manager {
             Input::Closed(id) => {
                 let mut sessions = self.auth.registry.0.lock().unwrap();
                 if let Some(at) = sessions.iter().position(|s| s.conn.stable_id() == id) {
-                    let closed = sessions.remove(at).grant;
+                    let removed = sessions.remove(at);
+                    #[cfg(all(feature = "test-hooks", debug_assertions))]
+                    if self.local().is_ok_and(|local| local.keys.peer_id() == removed.grant.peer) {
+                        self.messages.mailbox.note_own_close(&removed.conn);
+                    }
+                    let closed = removed.grant;
                     // After a simultaneous dial another session with the device may be left
                     // (`install_grant`): it stays ready.
                     if !sessions.iter().any(|s| {

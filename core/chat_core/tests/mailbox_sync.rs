@@ -331,6 +331,9 @@ async fn failed_or_busy_pull_is_retried_without_a_new_trigger() {
         texts_from(&a1, conv, b1.peer).await.is_empty(),
         "A2 was busy"
     );
+    // The e2e m6 fact of why: the failed request first, then A2's `Busy`.
+    let trace = a1.account.mailbox_test_sync_trace().await.unwrap();
+    assert_eq!(trace.pull_failure, Some("busy"), "{trace:?}");
     a2.account.mailbox_test_hold(false).await.unwrap();
     settle!(
         [&a1, &a2, &b1],

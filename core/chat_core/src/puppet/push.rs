@@ -153,6 +153,9 @@ pub async fn execute(
                 "pulls_done": sync.pulls_done,
                 "pulls_failed": sync.pulls_failed,
                 "pulls_stopped": sync.pulls_stopped,
+                "pull_failure": sync.pull_failure.unwrap_or("none"),
+                "own_closes": sync.own_closes,
+                "own_close": sync.own_close.unwrap_or("none"),
             })
         }
     })

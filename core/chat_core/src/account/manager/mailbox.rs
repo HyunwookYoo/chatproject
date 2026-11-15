@@ -197,6 +197,12 @@ pub(crate) struct Runtime {
 }
 
 impl Runtime {
+    /// e2e m6: a session with one of my other devices closed (`close_name`).
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    pub(super) fn note_own_close(&mut self, conn: &iroh::endpoint::Connection) {
+        self.trace.own_closes += 1;
+        self.trace.own_close = Some(close_name(conn));
+    }
     /// Pulls from `installation` at the next poll, or again once its running pull ends.
     fn schedule(&mut self, installation: InstallationId) {
         match self.pulls.get_mut(&installation) {
@@ -496,6 +502,38 @@ pub struct SyncTrace {
     pub pulls_done: u64,
     pub pulls_failed: u64,
     pub pulls_stopped: u64,
+    /// Why the last failed pull failed (`pull_failed`).
+    pub pull_failure: Option<&'static str>,
+    /// Sessions with my other devices that closed, and how the last one did (`close_name`).
+    pub own_closes: u64,
+    pub own_close: Option<&'static str>,
+}
+
+/// How a connection ended, as a fixed name (e2e facts): by this side (`local`), by the peer
+/// with one of this app's close reasons (`peer_*`) or another one (`peer_other`), an idle
+/// timeout, a reset, or something else.
+#[cfg(all(feature = "test-hooks", debug_assertions))]
+fn close_name(conn: &iroh::endpoint::Connection) -> &'static str {
+    use iroh::endpoint::ConnectionError as E;
+    const PEER: [(&[u8], &str); 6] = [
+        (b"simultaneous dial", "peer_simultaneous_dial"),
+        (b"new account proof", "peer_new_proof"),
+        (b"account restricted", "peer_restricted"),
+        (b"account authentication failed", "peer_auth_failed"),
+        (b"account record changed", "peer_record_changed"),
+        (b"account stopped", "peer_stopped"),
+    ];
+    match conn.close_reason() {
+        None => "open",
+        Some(E::LocallyClosed) => "local",
+        Some(E::TimedOut) => "timeout",
+        Some(E::Reset) => "reset",
+        Some(E::ApplicationClosed(close)) => PEER
+            .iter()
+            .find(|(reason, _)| close.reason.as_ref() == *reason)
+            .map_or("peer_other", |(_, name)| name),
+        Some(_) => "other",
+    }
 }
 
 /// What own-device sync counted since this core started (for the M6 results).
@@ -1656,8 +1694,12 @@ impl Manager {
                         (entries, next_seq, more)
                     }
                     // Not now: asked again after a back-off.
-                    Ok(MailboxReply::Busy) | Err(_) => {
-                        self.end_pull(holder, Ended::Failed, request).await;
+                    Ok(MailboxReply::Busy) => {
+                        self.pull_failed(holder, "busy", request).await;
+                        return;
+                    }
+                    Err(_) => {
+                        self.pull_failed(holder, "request", request).await;
                         return;
                     }
                     // `Refused`, or a page out of order: no syncing over this session for now.
@@ -1674,7 +1716,7 @@ impl Manager {
                     return;
                 }
                 let Ok(summary) = summary else {
-                    self.end_pull(holder, Ended::Failed, request).await;
+                    self.pull_failed(holder, "entries", request).await;
                     return;
                 };
                 if !summary.unopened.is_empty() {
@@ -1701,7 +1743,7 @@ impl Manager {
         };
         let pulled = MailboxDbOp::Pulled { holder, next_seq };
         if self.mailbox_db(pulled, request).await.is_err() {
-            self.end_pull(holder, Ended::Failed, request).await;
+            self.pull_failed(holder, "storage", request).await;
             return;
         }
         #[cfg(all(feature = "test-hooks", debug_assertions))]
@@ -1721,7 +1763,7 @@ impl Manager {
         match session {
             Some(session) if more => self.request_page(&session, next_seq, request),
             // The rest of the log over another session, if one comes.
-            None if more => self.end_pull(holder, Ended::Failed, request).await,
+            None if more => self.pull_failed(holder, "session_gone", request).await,
             _ => self.end_pull(holder, Ended::Done, request).await,
         }
     }
@@ -1867,7 +1909,7 @@ impl Manager {
             .find(|s| s.conn.stable_id() == conn)
         else {
             // The session is gone: the page is pulled again over the next one.
-            self.end_pull(holder, Ended::Failed, request).await;
+            self.pull_failed(holder, "session_gone", request).await;
             return;
         };
         let mailbox = self.auth.send.clone();
@@ -1917,7 +1959,7 @@ impl Manager {
                         return false;
                     }
                     if stored.is_err() {
-                        self.end_pull(holder, Ended::Failed, request).await;
+                        self.pull_failed(holder, "entries", request).await;
                         return false;
                     }
                 }
@@ -1928,8 +1970,12 @@ impl Manager {
                     }
                 }
                 // Not now: the page is pulled (and its entries asked for) again after a back-off.
-                Ok(MailboxReply::Busy) | Err(_) => {
-                    self.end_pull(holder, Ended::Failed, request).await;
+                Ok(MailboxReply::Busy) => {
+                    self.pull_failed(holder, "busy", request).await;
+                    return false;
+                }
+                Err(_) => {
+                    self.pull_failed(holder, "request", request).await;
                     return false;
                 }
                 Ok(_) => {
@@ -1941,7 +1987,7 @@ impl Manager {
             }
         }
         if !complete {
-            self.end_pull(holder, Ended::Failed, request).await;
+            self.pull_failed(holder, "plain", request).await;
         }
         complete
     }
@@ -2037,6 +2083,18 @@ impl Manager {
     /// elsewhere; also what a run that died before its pull ended stored (Ruling 35). A pull that
     /// failed is tried again after a back-off (final review I1: nothing else may come to pull
     /// again); one that got to the end of the log ends the back-off.
+    /// A pull from `holder` failed for now (`reason`, a fixed name the e2e m6 facts note:
+    /// busy, request, entries, storage, session_gone, plain); it is tried again after a back-off.
+    async fn pull_failed(&mut self, holder: InstallationId, reason: &'static str, request: Request) {
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        if self.messages.mailbox.pulls.contains_key(&holder) {
+            self.messages.mailbox.trace.pull_failure = Some(reason);
+        }
+        #[cfg(not(all(feature = "test-hooks", debug_assertions)))]
+        let _ = reason;
+        self.end_pull(holder, Ended::Failed, request).await;
+    }
+
     async fn end_pull(&mut self, holder: InstallationId, ended: Ended, request: Request) {
         let Some(pull) = self.messages.mailbox.pulls.remove(&holder) else {
             return;

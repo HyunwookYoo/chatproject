@@ -250,11 +250,17 @@ void main() {
         'm6_pulls_done_phone': 'd1',
         'm6_pulls_failed_phone': 'pf0',
         'm6_pulls_stopped_phone': 'ps0',
+        'm6_pull_failure_phone': 'none',
+        'm6_own_closes_phone': 'c0',
+        'm6_own_close_phone': 'none',
         'm6_own_sessions_mailbox': 's1plus',
         'm6_pulls_mailbox': 'p1',
         'm6_pulls_done_mailbox': 'd0',
         'm6_pulls_failed_mailbox': 'pf0',
         'm6_pulls_stopped_mailbox': 'ps1plus',
+        'm6_pull_failure_mailbox': 'none',
+        'm6_own_closes_mailbox': 'c0',
+        'm6_own_close_mailbox': 'none',
       });
       expect(safeFacts(failureFacts, loadSafeFacts()), failureFacts);
     } finally {
@@ -478,6 +484,9 @@ class MailboxFixture {
           'pulls_done': name == 'mailbox' ? 0 : 1,
           'pulls_failed': 0,
           'pulls_stopped': name == 'mailbox' ? 1 : 0,
+          'pull_failure': 'none',
+          'own_closes': 0,
+          'own_close': 'none',
         };
       default:
         throw StateError('Unexpected fixture operation $op');
