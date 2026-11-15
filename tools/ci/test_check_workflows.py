@@ -19,7 +19,8 @@ def testflight(**overrides):
             "environment": "testflight",
             "steps": [
                 {"name": "Refuse re-runs", "run": 'if [ "$GITHUB_RUN_ATTEMPT" != 1 ]; then exit 1; fi'},
-                {"name": "Install provisioning profiles", "run": "ProvisionedDevices application-groups aps-environment"},
+                {"name": "Install provisioning profiles", "env": {"APP_PROFILE_B64": "${{ secrets.APPSTORE_PROFILE_APP_BASE64 }}"},
+                 "run": "bash tools/ci/testflight_profile.sh"},
                 {"name": "Locate IPA and check its contents", "run": 'bash tools/ci/check_ios_app.sh --signed "$app_dir"'},
                 {"name": "Upload to TestFlight", "uses": PINNED},
             ],
@@ -168,14 +169,12 @@ class CheckTest(unittest.TestCase):
         del doc["jobs"]["testflight"]["steps"][1]
         self.assertTrue(any("validate the profiles" in p for p in check(self.path, doc)))
 
-    def test_each_profile_check_is_required(self):
-        for keyword in ("ProvisionedDevices", "application-groups", "aps-environment"):
-            with self.subTest(removed=keyword):
-                doc = testflight()
-                step = doc["jobs"]["testflight"]["steps"][1]
-                step["run"] = step["run"].replace(keyword, "")
-                problems = check(self.path, doc)
-                self.assertTrue(any("validate the profiles" in p for p in problems), problems)
+    def test_profile_step_must_run_the_tested_script(self):
+        # The checks themselves live in tools/ci/testflight_profile.sh (test_testflight_profile.py).
+        doc = testflight()
+        doc["jobs"]["testflight"]["steps"][1]["run"] = "ProvisionedDevices application-groups aps-environment"
+        problems = check(self.path, doc)
+        self.assertTrue(any("testflight_profile.sh" in p for p in problems), problems)
 
     def test_the_ipa_check_must_run_the_shared_script_on_the_signed_app(self):
         for body in ("echo ok", 'bash tools/ci/check_ios_app.sh "$app_dir"'):
@@ -357,6 +356,162 @@ class PolicyTest(unittest.TestCase):
                     self.assertEqual(len(output.getvalue().splitlines()), 1)
                     self.assertIn("broken.yaml:", output.getvalue())
                     self.assertNotIn("Traceback", output.getvalue())
+
+
+SECRET = "${{ secrets.SOME_TOKEN }}"
+ORDINARY = pathlib.Path("ordinary.yml")
+
+
+def ordinary(job, **overrides):
+    doc = {"on": "workflow_dispatch", "permissions": {"contents": "read"}, "jobs": {"test": job}}
+    doc.update(overrides)
+    return doc
+
+
+def secret_problems(doc, path=ORDINARY):
+    return [p for p in check(path, doc) if "secret" in p]
+
+
+class SecretPlacementTest(unittest.TestCase):
+    """Rule (a): a secret reaches only the step that needs it, in a job that declares an Environment."""
+
+    def test_step_env_and_action_inputs_of_an_environment_job_are_allowed(self):
+        for step in ({"env": {"TOKEN": SECRET}, "run": 'use "$TOKEN"'},
+                     {"env": {"TOKEN_SET": "${{ secrets.SOME_TOKEN != '' }}"}, "run": 'test "$TOKEN_SET" = true'},
+                     {"uses": "owner/action@" + "a" * 40, "with": {"token": SECRET}}):
+            for environment in ("release", {"name": "release", "url": "https://example.invalid"}):
+                with self.subTest(step=step, environment=environment):
+                    doc = ordinary({"environment": environment, "steps": [step]})
+                    self.assertEqual(check(ORDINARY, doc), [])
+
+    def test_the_word_secrets_outside_an_expression_is_not_a_reference(self):
+        doc = ordinary({"steps": [{"name": "Write secrets.json", "run": 'cp "$RUNNER_TEMP/secrets.json" out'}]})
+        self.assertEqual(check(ORDINARY, doc), [])
+
+    def test_secrets_elsewhere_are_rejected(self):
+        cases = {
+            "workflow env": ordinary({"environment": "release", "steps": []}, env={"TOKEN": SECRET}),
+            "job env": ordinary({"environment": "release", "env": {"TOKEN": SECRET}, "steps": []}),
+            "run text": ordinary({"environment": "release", "steps": [{"run": "use " + SECRET}]}),
+            "whole context": ordinary({"environment": "release", "steps": [{"run": "echo '${{ toJSON(secrets) }}'"}]}),
+            "step if": ordinary({"environment": "release", "steps": [{"if": "secrets.SOME_TOKEN != ''", "run": "true"}]}),
+            "no environment": ordinary({"steps": [{"env": {"TOKEN": SECRET}, "run": 'use "$TOKEN"'}]}),
+            "no environment, action": ordinary({"steps": [{"uses": "owner/action@" + "a" * 40, "with": {"token": SECRET}}]}),
+            "service credentials": ordinary({"environment": "release", "services": {"db": {
+                "image": "db", "credentials": {"password": SECRET}}}, "steps": []}),
+        }
+        for label, doc in cases.items():
+            with self.subTest(case=label):
+                self.assertTrue(secret_problems(doc), check(ORDINARY, doc))
+
+    def test_reusable_workflow_secrets_are_rejected(self):
+        for secrets in ("inherit", {"token": SECRET}):
+            with self.subTest(secrets=secrets):
+                doc = ordinary({"uses": "./.github/workflows/shared.yml", "secrets": secrets})
+                self.assertTrue(secret_problems(doc), check(ORDINARY, doc))
+
+    def test_environment_name_must_be_literal(self):
+        doc = ordinary({"environment": "${{ inputs.target }}", "steps": []})
+        self.assertTrue(any("literal" in p for p in check(ORDINARY, doc)))
+
+    def test_the_committed_workflows_pass(self):
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(main(), 0, output.getvalue())
+
+
+class TestflightEnvironmentTest(unittest.TestCase):
+    """Rule (b): the TestFlight rules follow `environment: testflight`, not the file name."""
+
+    def release(self, environment="testflight", **overrides):
+        doc = testflight(**overrides)
+        doc["jobs"]["testflight"]["environment"] = environment
+        return doc
+
+    def test_a_good_testflight_job_passes_in_any_file(self):
+        for environment in ("testflight", {"name": "testflight"}):
+            with self.subTest(environment=environment):
+                self.assertEqual(check(pathlib.Path("release.yml"), self.release(environment)), [])
+
+    def test_job_rules_apply_in_any_file(self):
+        for environment in ("testflight", {"name": "testflight"}):
+            with self.subTest(environment=environment):
+                doc = self.release(environment)
+                doc["jobs"]["testflight"]["steps"].pop(0)
+                self.assertTrue(any("Refuse re-runs" in p for p in check(pathlib.Path("release.yml"), doc)))
+                doc = self.release(environment)
+                doc["jobs"]["testflight"]["steps"].append(
+                    {"uses": "actions/upload-artifact@0123456789012345678901234567890123456789"})
+                self.assertTrue(any("upload-artifact" in p for p in check(pathlib.Path("release.yml"), doc)))
+
+    def test_trigger_rules_apply_in_any_file(self):
+        doc = self.release(on={"push": {"branches": ["main"]}})
+        self.assertTrue(any("push may only be for tags" in p for p in check(pathlib.Path("release.yml"), doc)))
+
+    def test_jobs_with_other_environments_are_not_testflight_jobs(self):
+        doc = ordinary({"environment": "release", "steps": []})
+        self.assertEqual(check(ORDINARY, doc), [])
+
+    def test_build_ipa_step_holds_no_secret(self):
+        # cargokit's build_pod.sh runs `env`, so a failed build would print the secret.
+        doc = testflight()
+        doc["jobs"]["testflight"]["steps"].insert(2, {"name": "Build IPA", "env": {"KEY": SECRET}, "run": "flutter build ipa"})
+        self.assertTrue(any("Build IPA" in p for p in check(CheckTest.path, doc)))
+        del doc["jobs"]["testflight"]["steps"][2]["env"]
+        self.assertEqual(check(CheckTest.path, doc), [])
+
+
+class PushE2eEnvironmentTest(unittest.TestCase):
+    """Rule (c): a `push-e2e` job uploads no artifact and writes its secret files under $RUNNER_TEMP only."""
+
+    path = pathlib.Path("e2e.yml")
+
+    def nightly(self, *steps):
+        return {
+            "on": {"schedule": [{"cron": "0 18 * * *"}], "workflow_dispatch": None},
+            "permissions": {"contents": "read"},
+            "env": {"RUST_TOOLCHAIN": "1.92.0", "FLUTTER_VERSION": "3.44.6"},
+            "jobs": {"android-fcm": {"environment": "push-e2e", "steps": [
+                {"name": "FCM secret present", "id": "secret",
+                 "env": {"FCM_SET": "${{ secrets.FCM_SERVICE_ACCOUNT_JSON != '' }}"},
+                 "run": 'if [ "$FCM_SET" != true ]; then echo "skipped: no FCM secret" >> "$GITHUB_STEP_SUMMARY"; fi\n'
+                        'echo "present=$FCM_SET" >> "$GITHUB_OUTPUT"'},
+                {"name": "Write the service account",
+                 "env": {"FCM_JSON": "${{ secrets.FCM_SERVICE_ACCOUNT_JSON }}"},
+                 "run": 'umask 077\nprintf \'%s\' "$FCM_JSON" > "$RUNNER_TEMP/fcm.json"\n'
+                        'printf \'%s\' "$FCM_JSON" | tee -a "${RUNNER_TEMP}/fcm-copy.json" >/dev/null 2>&1\n'
+                        'printf \'%s\' "$FCM_JSON" >"$RUNNER_TEMP"/fcm-quoted.json\n'
+                        'test -s "$RUNNER_TEMP/fcm.json" >&2'},
+                *steps,
+            ]}},
+        }
+
+    def test_a_good_push_e2e_job_passes(self):
+        self.assertEqual(check(self.path, self.nightly()), [])
+
+    def test_artifact_upload_is_rejected(self):
+        doc = self.nightly({"uses": "actions/upload-artifact@0123456789012345678901234567890123456789"})
+        self.assertTrue(any("upload-artifact" in p for p in check(self.path, doc)))
+
+    def test_secret_files_outside_runner_temp_are_rejected(self):
+        for write in ('> fcm.json', '> "$HOME/fcm.json"', '>> "$GITHUB_ENV"', '> "$GITHUB_STEP_SUMMARY"',
+                      '| tee fcm.json', '| tee -a "$GITHUB_OUTPUT"', '> "$RUNNER_TEMP/../fcm.json"',
+                      '> /tmp/fcm.json', '&> out.log', '> "$RUNNER_TEMP_X/fcm.json"'):
+            with self.subTest(write=write):
+                doc = self.nightly({"env": {"FCM_JSON": "${{ secrets.FCM_SERVICE_ACCOUNT_JSON }}"},
+                                    "run": 'printf \'%s\' "$FCM_JSON" ' + write})
+                self.assertTrue(any("RUNNER_TEMP" in p for p in check(self.path, doc)), write)
+
+    def test_secret_action_inputs_are_rejected(self):
+        # An action writes wherever it likes; push-e2e secrets go through a run step that the checker can read.
+        doc = self.nightly({"uses": "owner/action@" + "a" * 40, "with": {"key": "${{ secrets.FCM_SERVICE_ACCOUNT_JSON }}"}})
+        self.assertTrue(any("push-e2e" in p for p in check(self.path, doc)))
+
+    def test_the_rules_follow_the_environment_not_the_file(self):
+        doc = self.nightly({"uses": "actions/upload-artifact@0123456789012345678901234567890123456789"})
+        doc["on"] = "workflow_dispatch"
+        self.assertTrue(any("upload-artifact" in p for p in check(ORDINARY, doc)))
+        doc["jobs"]["android-fcm"]["environment"] = {"name": "push-e2e"}
+        self.assertTrue(any("upload-artifact" in p for p in check(ORDINARY, doc)))
 
 
 if __name__ == "__main__":

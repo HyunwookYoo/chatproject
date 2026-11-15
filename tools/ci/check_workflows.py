@@ -23,6 +23,88 @@ def triggers(doc):
     return on or {}
 
 
+EXPRESSION = re.compile(r"\$\{\{(.*?)\}\}", re.S)
+SECRETS = re.compile(r"\bsecrets\b")
+# `${{ secrets.NAME != '' }}` yields true or false: the step learns whether the secret is set, never its value.
+PRESENCE = re.compile(r"^\$\{\{\s*secrets\.\w+\s*[!=]=\s*''\s*\}\}$")
+# Shell output redirections (`>`, `>>`, `&>`, `2>`; not `>&2`) and `tee [-a]`, with their target word.
+WRITE = re.compile(r"""(?:&?>>?|\btee(?:\s+-a)?)[ \t]*(?!&)((?:"[^"]*"|'[^']*'|[^\s;|&)<>"'])+)""")
+TEMP_FILE = re.compile(r"^\$(?:RUNNER_TEMP|\{RUNNER_TEMP\})/(?!(?:.*/)?\.\.(?:/|$))")
+
+
+def references_secret(value, implicit_expression=False):
+    """True when a workflow string reads the secrets context (an `if:` is an expression without ${{ }})."""
+    if not isinstance(value, str):
+        return False
+    expressions = [value] if implicit_expression else EXPRESSION.findall(value)
+    return any(SECRETS.search(expression) for expression in expressions)
+
+
+def strings(node, path=()):
+    """Every string in a workflow document, with its key path."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            yield from strings(value, path + (str(key),))
+    elif isinstance(node, list):
+        for index, value in enumerate(node):
+            yield from strings(value, path + (index,))
+    elif isinstance(node, str):
+        yield path, node
+
+
+def environment(job):
+    """The Environment a job declares (`environment: name` or `environment: {name: ...}`), or None."""
+    value = job.get("environment") if isinstance(job, dict) else None
+    if isinstance(value, dict):
+        value = value.get("name")
+    return value if isinstance(value, str) else None
+
+
+def location(path):
+    return "".join(f"[{part}]" if isinstance(part, int) else ("." if index else "") + part
+                   for index, part in enumerate(path))
+
+
+def check_secrets(name, doc):
+    """Rule (a): a secret appears only in a step's env (or an action step's with) of a job that has an Environment."""
+    problems = []
+    jobs = doc.get("jobs") or {}
+    for path, value in strings(doc):
+        if not references_secret(value, implicit_expression=path[-1:] == ("if",)):
+            continue
+        job = jobs.get(path[1]) if len(path) > 1 and path[0] == "jobs" else None
+        step_input = len(path) == 6 and path[2] == "steps" and path[4] in ("env", "with")
+        if not (step_input and environment(job)):
+            problems.append(f"{name}: {location(path)}: secrets may only appear in a step's env or with, "
+                            "in a job that declares environment:")
+    for job_id, job in jobs.items():
+        if isinstance(job, dict) and "secrets" in job:
+            problems.append(f"{name}: job {job_id} must not pass secrets to a reusable workflow")
+        if "${{" in (environment(job) or ""):
+            problems.append(f"{name}: job {job_id}: environment must be a literal name")
+    return problems
+
+
+def check_push_e2e(name, job_id, job):
+    """Rule (c): no artifacts, and a step holding a push-e2e secret writes files only under $RUNNER_TEMP."""
+    problems = []
+    for index, step in enumerate(job.get("steps") or []):
+        if "upload-artifact" in step.get("uses", ""):
+            problems.append(f"{name}: job {job_id} must not upload-artifact (push-e2e)")
+        if any(references_secret(value) for _, value in strings(step.get("with") or {})):
+            problems.append(f"{name}: {job_id} step {index}: push-e2e secrets go in a run step's env, not an action's with")
+        holds_secret = any(references_secret(value) and not PRESENCE.match(value.strip())
+                           for _, value in strings(step.get("env") or {}))
+        if not holds_secret:
+            continue
+        for target in WRITE.findall(step.get("run", "")):
+            target = target.replace('"', "").replace("'", "")
+            if target != "/dev/null" and not TEMP_FILE.match(target):
+                problems.append(f"{name}: {job_id} step {index}: a step holding a secret may write only under "
+                                f"$RUNNER_TEMP, not {target}")
+    return problems
+
+
 def steps(doc):
     for job_id, job in (doc.get("jobs") or {}).items():
         for index, step in enumerate(job.get("steps") or []):
@@ -78,8 +160,14 @@ def check(path, doc):
                 problems.append(f"{name}: job {job_id}: SQL build prerequisites must be checked in the native job")
     if path.stem.lower() == "ci":
         problems += check_ci(name, doc)
-    if path.stem.lower() == "testflight":  # GitHub runs testflight.yaml too
-        problems += check_testflight(name, doc)
+    problems += check_secrets(name, doc)
+    jobs = doc.get("jobs") or {}
+    # GitHub runs testflight.yaml too. The job rules follow the Environment that holds the signing secrets.
+    if path.stem.lower() == "testflight" or any(environment(job) == "testflight" for job in jobs.values()):
+        problems += check_testflight(name, doc, every_job=path.stem.lower() == "testflight")
+    for job_id, job in jobs.items():
+        if environment(job) == "push-e2e":
+            problems += check_push_e2e(name, job_id, job)
     return problems
 
 
@@ -171,8 +259,10 @@ def check_ci(name, doc):
     return problems
 
 
-def check_testflight(name, doc):
-    """The release job holds the App Store signing secrets (Review Focus 5)."""
+def check_testflight(name, doc, every_job):
+    """A job in the testflight Environment holds the App Store signing secrets (Review Focus 5).
+
+    In testflight.yml every job must be one; in any other file the job rules apply to the jobs that are."""
     problems = []
     trig = triggers(doc)
     if set(trig) - {"workflow_dispatch", "push"}:
@@ -181,8 +271,10 @@ def check_testflight(name, doc):
     if "push" in trig and trig["push"] != {"tags": ["testflight-*"]}:
         problems.append(f"{name}: push may only be for tags testflight-*")
     for job_id, job in (doc.get("jobs") or {}).items():
-        if job.get("environment") != "testflight":
-            problems.append(f"{name}: job {job_id} must use environment: testflight")
+        if environment(job) != "testflight":
+            if every_job:
+                problems.append(f"{name}: job {job_id} must use environment: testflight")
+            continue
         step_list = job.get("steps") or []
         names = [step.get("name", "") for step in step_list]
         if not names or names[0] != "Refuse re-runs":
@@ -190,10 +282,15 @@ def check_testflight(name, doc):
         guard = next((s for s in step_list if s.get("name") == "Refuse re-runs"), None)
         if guard is not None and not all(k in guard.get("run", "") for k in ("GITHUB_RUN_ATTEMPT", "exit 1")):
             problems.append(f"{name}: job {job_id}: the 'Refuse re-runs' step must test GITHUB_RUN_ATTEMPT and exit 1")
+        # The profile checks live in a script that test_testflight_profile.py runs with fake tools.
         profiles = next((s for s in step_list if s.get("name") == "Install provisioning profiles"), None)
-        if profiles is None or not all(k in profiles.get("run", "") for k in
-                                        ("ProvisionedDevices", "application-groups", "aps-environment")):
-            problems.append(f"{name}: job {job_id} must validate the profiles before signing")
+        if profiles is None or "tools/ci/testflight_profile.sh" not in profiles.get("run", ""):
+            problems.append(f"{name}: job {job_id} must validate the profiles before signing "
+                            "(run tools/ci/testflight_profile.sh)")
+        # cargokit's build_pod.sh runs `env`, so a failed build prints every variable the step has.
+        for step in step_list:
+            if step.get("name") == "Build IPA" and any(references_secret(v) for _, v in strings(step)):
+                problems.append(f"{name}: job {job_id}: the Build IPA step must not hold a secret")
         # The IPA check is the last guard before the upload: it must exist, check the signed entitlements
         # too, and come first.
         ipa = next((i for i, s in enumerate(step_list) if s.get("name") == "Locate IPA and check its contents"), None)
