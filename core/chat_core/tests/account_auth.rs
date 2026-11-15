@@ -1446,14 +1446,16 @@ async fn different_accounts_exchange_expired_public_records_durably_before_fresh
     a.account.refresh_record(a.peer).await.unwrap();
     a.account.refresh_record(a.peer).await.unwrap();
     let renewed_a = backend.packets.lock().unwrap()[&a.peer].clone();
-    tokio::time::timeout(Duration::from_secs(3), async {
+    // Polled every 20 ms within 10 s: a busy loop over durable snapshots can starve the
+    // actors on a loaded CI runner (CI run 43724728893 timed out at 3 s).
+    tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if durable_remote(&b, a.peer).await
                 .is_some_and(|(bytes, _)| bytes.as_slice() == renewed_a.as_bytes().as_ref())
             {
                 break;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
@@ -1461,14 +1463,16 @@ async fn different_accounts_exchange_expired_public_records_durably_before_fresh
     b.account.refresh_record(b.peer).await.unwrap();
     b.account.refresh_record(b.peer).await.unwrap();
     let renewed_b = backend.packets.lock().unwrap()[&b.peer].clone();
-    tokio::time::timeout(Duration::from_secs(3), async {
+    // Polled every 20 ms within 10 s: a busy loop over durable snapshots can starve the
+    // actors on a loaded CI runner (CI run 43724728893 timed out at 3 s).
+    tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if durable_remote(&a, b.peer).await
                 .is_some_and(|(bytes, _)| bytes.as_slice() == renewed_b.as_bytes().as_ref())
             {
                 break;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
