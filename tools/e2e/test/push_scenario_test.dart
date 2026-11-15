@@ -296,6 +296,8 @@ NOTIFICATION MANAGER (dumpsys notification)
           'm7_mailbox_accepts_failed': 'r0',
           'm7_mailbox_accept_error': 'none',
           'm7_fetch_network': 'Stopped',
+          'm7_mailbox_record': 'Observed',
+          'm7_phone_record': 'Observed',
         });
         expect(safeFacts(failureFacts, loadSafeFacts()), failureFacts);
       } finally {

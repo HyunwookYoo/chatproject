@@ -426,11 +426,30 @@ Future<void> runPushScenario(
   // On a notification a push should have changed: A1's fetches for received pushes
   // (`m7_fetch_*`: all, online in time, done in time) and its network now; how A1's sessions
   // with A2 came about since it opened again (dials installed or failed, the last failure's
-  // kind) and how its pulls ended; and what A2 did with connections from A1 (`m7_mailbox_*`).
+  // kind) and how its pulls ended; what A2 did with connections from A1 (`m7_mailbox_*`);
+  // and the account record state each holds (`m7_*_record`: a list conflict restricts it).
   Future<void> noteFetches() async {
     Object? value;
     Object? info;
     Object? mailbox;
+    final records = <String, Object?>{};
+    for (final (name, p) in [
+      ('m7_mailbox_record', a2),
+      ('m7_phone_record', a1),
+    ]) {
+      try {
+        final view = await p.call(
+          'account_local_snapshot',
+          const {},
+          timeout: const Duration(seconds: 5),
+          failOnTimeout: false,
+        );
+        final publication = view is Map ? view['publication'] : null;
+        records[name] = publication is Map ? publication['state'] : null;
+      } catch (_) {
+        /* What could not be read stays unknown. */
+      }
+    }
     try {
       mailbox = await a2.call(
         'push_local_test_counts',
@@ -515,6 +534,18 @@ Future<void> runPushScenario(
         const {'Stopped', 'Starting', 'Online', 'Failed'}.contains(state)
         ? state as String
         : 'unknown';
+    for (final name in ['m7_mailbox_record', 'm7_phone_record']) {
+      final record = records[name];
+      failureFacts[name] =
+          const {
+            'LocalBlocked',
+            'Pending',
+            'Observed',
+            'Conflict',
+          }.contains(record)
+          ? record as String
+          : 'unknown';
+    }
   }
 
   Future<Object?> ticket(Participant p) async {

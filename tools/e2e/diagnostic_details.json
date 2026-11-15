@@ -821,6 +821,20 @@
       "NetworkNotStarted",
       "other",
       "unknown"
+    ],
+    "m7_mailbox_record": [
+      "LocalBlocked",
+      "Pending",
+      "Observed",
+      "Conflict",
+      "unknown"
+    ],
+    "m7_phone_record": [
+      "LocalBlocked",
+      "Pending",
+      "Observed",
+      "Conflict",
+      "unknown"
     ]
   },
   "wait_kinds": [
