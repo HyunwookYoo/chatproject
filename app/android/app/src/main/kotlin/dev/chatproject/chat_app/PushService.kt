@@ -82,22 +82,24 @@ class PushService : FirebaseMessagingService() {
                 PushWorkers.scheduleFetch(context, data)
             }
             // A read clear whose sync with my devices did not end in time (a cold network start,
-            // a dial and a pull may not fit FCM's time, e2e m7 run 5): the rest goes on in the
-            // same worker, which syncs again within FETCH_DEADLINE_MS. It never schedules again.
+            // a dial and a pull may not fit FCM's time, e2e m7 run 5): the rest goes on in its
+            // own push_read_fetch worker, which syncs again within FETCH_DEADLINE_MS. It never
+            // schedules again.
             if ("r" in data && outcome == NativePushOutcome.NOTHING) {
                 PushWorkers.scheduleFetch(context, data)
             }
             return outcome
         }
 
-        // The push_fetch worker: the rest of a wake's fetch, within FETCH_MAX_MS. Its generic
-        // notification shows already; this one only changes it silently.
+        // The push_fetch and push_read_fetch workers, within FETCH_MAX_MS: the rest of a wake's
+        // fetch (its generic notification shows already; this only changes it silently), or of
+        // a read clear's sync with my devices (this clears or updates what it read).
         fun fetch(context: Context, data: Map<String, String>) {
             try {
                 NativeCore.ensureStarted(context)
                 nativePushReceived(data, PushWorkers.FETCH_DEADLINE_MS.toUInt())
             } catch (error: Exception) {
-                refused("Wake fetch", error)
+                refused("Push fetch", error)
             }
         }
 

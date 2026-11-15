@@ -80,7 +80,8 @@ class CheckTest(unittest.TestCase):
 
     def test_push_instrumentation_requires_its_class_and_only_the_cold_assumption(self):
         methods = ('unknownTagPostsNothing', 'storageRootSameFromNativeAndFlutter', 'brokenBindingFailsEnsureInitialized',
-                   'notifierPostsUpdatesAndCancels', 'pushTheCoreCannotTakeStillNotifies', 'coldPushShowedNotification')
+                   'notifierPostsUpdatesAndCancels', 'pushTheCoreCannotTakeStillNotifies', 'readClearFetchHasItsOwnWorkName',
+                   'coldPushShowedNotification')
         output = self.push_output(methods, skipped=('coldPushShowedNotification',))
         self.assertEqual(check_workflows.check_android_instrumentation(output, 'push'), [])
         self.assertTrue(check_workflows.check_android_instrumentation(output.replace('unknownTagPostsNothing', 'other'), 'push'))

@@ -191,7 +191,7 @@ INSTRUMENTATION_PHASES = {
     'read': (_ACCOUNT_TEST, {'restartPersistence'}, None),
     'push': (_PUSH_TEST, {
         'unknownTagPostsNothing', 'storageRootSameFromNativeAndFlutter', 'brokenBindingFailsEnsureInitialized',
-        'notifierPostsUpdatesAndCancels', 'pushTheCoreCannotTakeStillNotifies',
+        'notifierPostsUpdatesAndCancels', 'pushTheCoreCannotTakeStillNotifies', 'readClearFetchHasItsOwnWorkName',
     }, 'coldPushShowedNotification'),
     'cold': (_PUSH_TEST, {'coldPushShowedNotification'}, None),
 }

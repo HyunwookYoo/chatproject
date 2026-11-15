@@ -22,7 +22,8 @@ import uniffi.chat_ffi.nativePushRenew
 object PushWorkers {
     const val RENEW = "push_renew"
     const val FETCH = "push_fetch"
-    // FETCH_MAX_MS (chat_core::push): the longest a wake's fetch keeps the network on.
+    const val READ_FETCH = "push_read_fetch"
+    // FETCH_MAX_MS (chat_core::push): the longest a received push's fetch keeps the network on.
     const val FETCH_DEADLINE_MS = 20_000
     private const val RENEW_HOURS = 24L
 
@@ -38,10 +39,12 @@ object PushWorkers {
         WorkManager.getInstance(context).enqueueUniquePeriodicWork(RENEW, ExistingPeriodicWorkPolicy.KEEP, request)
     }
 
-    // The rest of a wake push's fetch after FCM's processing time. Expedited from Android 12,
-    // where it runs as an expedited job. Before that WorkManager would run expedited work as a
-    // foreground service with a notification, so there it is ordinary work. A fetch already
-    // pending or running is kept: it reaches the same sender and my devices.
+    // The rest of a wake push's fetch, or of a read clear's sync with my devices, after FCM's
+    // processing time. Expedited from Android 12, where it runs as an expedited job. Before that
+    // WorkManager would run expedited work as a foreground service with a notification, so there
+    // it is ordinary work. Each kind has its own unique name, so a read clear never gives way to
+    // a pending wake fetch (or the other way); one of the same kind already pending or running
+    // is kept: it reaches the same devices.
     fun scheduleFetch(context: Context, data: Map<String, String>) {
         val builder = OneTimeWorkRequestBuilder<PushFetchWorker>()
             .setConstraints(network)
@@ -49,8 +52,11 @@ object PushWorkers {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             builder.setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
         }
-        WorkManager.getInstance(context).enqueueUniqueWork(FETCH, ExistingWorkPolicy.KEEP, builder.build())
+        WorkManager.getInstance(context).enqueueUniqueWork(fetchName(data), ExistingWorkPolicy.KEEP, builder.build())
     }
+
+    // A read clear's (`r`) or a wake's.
+    fun fetchName(data: Map<String, String>) = if ("r" in data) READ_FETCH else FETCH
 }
 
 class PushRenewWorker(context: Context, params: WorkerParameters) : Worker(context, params) {

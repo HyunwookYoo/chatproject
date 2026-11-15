@@ -160,6 +160,12 @@ class PushReceiverTest {
         manager.cancelAll()
     }
 
+    // A read clear's rest of the sync never waits behind a wake's fetch, nor the other way.
+    @Test fun readClearFetchHasItsOwnWorkName() {
+        assertEquals("push_read_fetch", PushWorkers.fetchName(mapOf("t" to "x", "r" to "1")))
+        assertEquals("push_fetch", PushWorkers.fetchName(mapOf("t" to "x", "w" to "1")))
+    }
+
     @Test fun pushTheCoreCannotTakeStillNotifies() {
         manager.cancelAll()
         // A high-priority push the core refuses still ends in a visible notification.
