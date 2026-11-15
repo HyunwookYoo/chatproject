@@ -345,6 +345,47 @@ async fn own_handle_rides_announce_and_m6_announce_still_decodes() {
     );
 }
 
+/// e2e m7 run 2: an own-device `Announce` my other device could not take (it answered `Busy`)
+/// was never sent again over that session, so that device never learned the own-device handle
+/// (and never sent the read clear push). It is sent again until that device takes it.
+#[tokio::test]
+async fn own_handle_reaches_my_device_that_was_busy_when_announced() {
+    let (mut a, b1, net, _conv) = accounts(&[A1, A2], &[B1]).await;
+    let a2 = a.pop().unwrap();
+    let a1 = a.pop().unwrap();
+    let _proxy = proxy(&net);
+    let a1_id = installation(&a1).await;
+    let before = a1.account.mailbox_test_announces().await.unwrap().len();
+    // A2 answers every own-device request `Busy` while A1 announces its new handle.
+    a2.account.mailbox_test_hold(true).await.unwrap();
+    android(&a1, "token-a1").await;
+    settle!([&a1, &b1], {
+        push_state(&a1).await.own_handle.is_some()
+            && a1.account.mailbox_test_announces().await.unwrap().len() > before
+    });
+    // The Busy answer is back before A2 takes requests again.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(push_state(&a2).await.own.is_empty());
+    a2.account.mailbox_test_hold(false).await.unwrap();
+    let own = push_state(&a1).await.own_handle.unwrap();
+    settle!(
+        [&a1, &a2, &b1],
+        push_state(&a2).await.own == vec![(a1_id, own.clone())]
+    );
+    // Taken: not sent again while nothing changes.
+    let told = a1.account.mailbox_test_announces().await.unwrap().len();
+    for _ in 0..10 {
+        for d in [&a1, &a2, &b1] {
+            d.clock.advance_monotonic_ms(10_000);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        a1.account.mailbox_test_announces().await.unwrap().len(),
+        told
+    );
+}
+
 /// Spec 5.2: what a device announced goes once it is revoked (M3) or no longer listed.
 #[tokio::test]
 async fn revoked_device_handles_are_dropped() {

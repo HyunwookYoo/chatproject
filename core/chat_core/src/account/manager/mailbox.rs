@@ -39,8 +39,8 @@
 //! drops the duplicate.
 //!
 //! The mailbox role (spec 8.4): a device set as a mailbox (`set_mailbox`) tells my other devices
-//! with `Announce`, when it changes and on every session with one that becomes ready, and never
-//! a contact. What they announce is recorded (`mailbox_device`): it is where handoffs go, which
+//! with `Announce`, when it changes and on every session with one that becomes ready, again
+//! until that device took it (one at a time per device), and never a contact. What they announce is recorded (`mailbox_device`): it is where handoffs go, which
 //! of my devices `mailbox_sync_now` dials first, and what `ConnectionSnapshot::mailbox_ok`
 //! reports. A mailbox takes handoffs only while it is one (what it took it tries until settled),
 //! and records its uptime every `UPTIME_EVERY_MS` (M6 records it, nothing judges it).
@@ -79,6 +79,8 @@ const PULL_RETRY_MAX_MS: u64 = 30_000;
 /// notified with the next pull from that device that ends, or this long after the start when no
 /// pull from it runs by then.
 const RESTART_NOTIFY_MS: u64 = 60_000;
+/// An `Announce` my other device did not take (`Busy`, no answer) is sent again this much later.
+const ANNOUNCE_RETRY_MS: u64 = 5_000;
 
 /// A handed-off ciphertext's row: the device that handed it over, conversation, message.
 type HandoffKey = (InstallationId, ConversationId, MessageId);
@@ -122,9 +124,15 @@ pub(crate) struct Runtime {
     enabled: Option<bool>,
     /// My devices recorded as mailboxes (`None`: read at the next poll).
     mailboxes: Option<BTreeSet<InstallationId>>,
-    /// Own devices whose session became ready: told at the next poll whether this one is a
-    /// mailbox.
-    announce_due: BTreeSet<InstallationId>,
+    /// What each of my other devices took from this one's last `Announce` (whether this one is
+    /// a mailbox, its own-device push handle), over its current session. A device whose entry
+    /// differs from what holds now is told at the next poll, one `Announce` at a time, until it
+    /// takes it: a lost or `Busy` answer is not the end (e2e m7 run 2).
+    told: BTreeMap<InstallationId, (bool, Option<Vec<u8>>)>,
+    /// Own devices an `Announce` is on its way to.
+    telling: BTreeSet<InstallationId>,
+    /// Own devices whose last `Announce` was not taken: told again at this scheduler time.
+    tell_at: BTreeMap<InstallationId, u64>,
     /// Scheduler time this device, while a mailbox, next records that it is up.
     uptime_at: u64,
     /// Each `Announce` sent: to which device, saying what.
@@ -236,6 +244,11 @@ enum Step {
     Plain {
         page: Resolving,
         answers: Vec<Result<MailboxReply, ErrorCode>>,
+    },
+    /// The answer of my other device (the event's `holder`) to an `Announce` saying `told`.
+    Announced {
+        told: (bool, Option<Vec<u8>>),
+        answer: Result<MailboxReply, ErrorCode>,
     },
     /// The peer's answer to one attempt of a handed-off ciphertext (`grant`: the session it
     /// went over; the event's `holder` is that session's device).
@@ -599,7 +612,9 @@ impl Manager {
             .notified
             .insert(grant.installation, (mailbox.head, now));
         mailbox.schedule(grant.installation);
-        mailbox.announce_due.insert(grant.installation);
+        // A new session: that device is told again whether this one is a mailbox.
+        mailbox.told.remove(&grant.installation);
+        mailbox.tell_at.remove(&grant.installation);
         mailbox.handoff_due = true;
     }
 
@@ -623,8 +638,8 @@ impl Manager {
         }
     }
 
-    /// Sets this device's mailbox role and tells my other devices with a ready session; one
-    /// without a session is told once its session is ready.
+    /// Sets this device's mailbox role; my other devices are told at the next poll (one
+    /// without a session once its session is ready).
     pub(super) async fn set_mailbox(&mut self, enabled: bool) -> Result<(), CoreError> {
         let request = self.ready()?;
         self.mailbox_db(MailboxDbOp::SetEnabled(enabled), request)
@@ -633,15 +648,6 @@ impl Manager {
         mailbox.enabled = Some(enabled);
         // Up from now on: recorded at the next poll.
         mailbox.uptime_at = 0;
-        let stopped = &self.messages.mailbox.stopped;
-        let sessions: Vec<Session> = self
-            .own_sessions()
-            .into_iter()
-            .filter(|s| !stopped.contains(&s.conn.stable_id()))
-            .collect();
-        for session in sessions {
-            self.announce(session, enabled);
-        }
         Ok(())
     }
 
@@ -652,34 +658,63 @@ impl Manager {
             .map(|_| ())
     }
 
-    /// Spec 8.4: tells another own device whether this one is a mailbox, in a spawned task (its
-    /// answer changes nothing). Never a contact: the role is for my devices to know.
-    fn announce(&mut self, session: Session, mailbox: bool) {
+    /// Spec 8.4: tells another own device whether this one is a mailbox, with the own-device
+    /// push handle (M7 spec 5.2), in a spawned task; its answer comes back as
+    /// `Step::Announced`. Never a contact: the role is for my devices to know.
+    fn announce(&mut self, session: Session, told: (bool, Option<Vec<u8>>), ticket: u64) {
         if self.local().map(|local| local.keys.peer_id()).ok() != Some(session.grant.peer) {
             return;
         }
+        let installation = session.grant.installation;
         #[cfg(all(feature = "test-hooks", debug_assertions))]
-        self.messages
-            .mailbox
-            .announces
-            .push((session.grant.installation, mailbox));
-        // M7 spec 5.2: an Android device's own-device push handle rides along.
-        let handle = self.push_own_handle();
-        let body = MailboxFrame::Announce { mailbox, handle }.encode();
+        self.messages.mailbox.announces.push((installation, told.0));
+        self.messages.mailbox.telling.insert(installation);
+        let body = MailboxFrame::Announce {
+            mailbox: told.0,
+            handle: told.1.clone(),
+        }
+        .encode();
+        let mailbox = self.auth.send.clone();
         tokio::spawn(async move {
-            let _ = exchange(&session, &body).await;
+            let answer = exchange(&session, &body).await;
+            let _ = mailbox
+                .send(Input::Mailbox(MailboxEvent {
+                    ticket,
+                    holder: installation,
+                    conn: session.conn.stable_id(),
+                    step: Step::Announced { told, answer },
+                }))
+                .await;
         });
     }
 
-    /// My other devices with a ready session are told again at the next poll (the own-device
-    /// push handle changed, M7 spec 5.2).
-    pub(super) fn announce_again(&mut self) {
-        let sessions: Vec<InstallationId> = self
-            .own_sessions()
-            .iter()
-            .map(|s| s.grant.installation)
-            .collect();
-        self.messages.mailbox.announce_due.extend(sessions);
+    /// My other device's answer to an `Announce`: taken (`Ok`, or `Refused`: an M6 device that
+    /// does not read the M7 form, or no longer mine; not sent again over this session until it
+    /// changes), otherwise told again `ANNOUNCE_RETRY_MS` later.
+    fn announce_answered(
+        &mut self,
+        ticket: u64,
+        installation: InstallationId,
+        told: (bool, Option<Vec<u8>>),
+        answer: Result<MailboxReply, ErrorCode>,
+    ) {
+        self.messages.mailbox.telling.remove(&installation);
+        if !self.ready().is_ok_and(|r| r.ticket == ticket) {
+            return;
+        }
+        let now = self.schedule_now();
+        let mailbox = &mut self.messages.mailbox;
+        match answer {
+            Ok(MailboxReply::Ok | MailboxReply::Refused) => {
+                mailbox.tell_at.remove(&installation);
+                mailbox.told.insert(installation, told);
+            }
+            _ => {
+                mailbox
+                    .tell_at
+                    .insert(installation, now.saturating_add(ANNOUNCE_RETRY_MS));
+            }
+        }
     }
 
     /// The app goes to the background or exits (spec 7): hands what this device has not
@@ -991,13 +1026,22 @@ impl Manager {
             .as_ref()
             .is_some_and(|m| usable.iter().any(|s| m.contains(&s.grant.installation)));
         let enabled = mailbox.enabled.unwrap_or(false);
-        let announce: Vec<Session> = std::mem::take(&mut mailbox.announce_due)
-            .into_iter()
-            .filter_map(|i| usable.iter().find(|s| s.grant.installation == i).cloned())
+        let want = (enabled, self.push_own_handle());
+        let now_tell = self.schedule_now();
+        let mailbox = &self.messages.mailbox;
+        let announce: Vec<Session> = usable
+            .iter()
+            .filter(|s| {
+                let i = &s.grant.installation;
+                !mailbox.telling.contains(i)
+                    && mailbox.told.get(i) != Some(&want)
+                    && mailbox.tell_at.get(i).is_none_or(|at| now_tell >= *at)
+            })
+            .cloned()
             .collect();
         self.bus.set_mailbox_ok(ok);
         for session in announce {
-            self.announce(session, enabled);
+            self.announce(session, want.clone(), request.ticket);
         }
         let mailbox = &mut self.messages.mailbox;
         // Failed pulls whose back-off is over are due again.
@@ -1369,6 +1413,10 @@ impl Manager {
             step,
         } = event;
         let step = match step {
+            Step::Announced { told, answer } => {
+                self.announce_answered(ticket, holder, told, answer);
+                return;
+            }
             Step::Handoff {
                 key,
                 ct_hash,
@@ -1446,7 +1494,7 @@ impl Manager {
                 }
                 (page.next_seq, page.more)
             }
-            Step::Handoff { .. } => unreachable!("taken above"),
+            Step::Handoff { .. } | Step::Announced { .. } => unreachable!("taken above"),
         };
         let pulled = MailboxDbOp::Pulled { holder, next_seq };
         if self.mailbox_db(pulled, request).await.is_err() {

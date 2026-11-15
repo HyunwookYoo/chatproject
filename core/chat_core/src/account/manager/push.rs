@@ -464,18 +464,15 @@ impl Manager {
         self.messages.push.own_handle.clone()
     }
 
-    /// Reads `push_local` again; my other devices are told when the own-device handle changed.
+    /// Reads `push_local` again. A changed own-device handle reaches my other devices with the
+    /// next poll's `Announce` (own-device sync tells each one until it took what holds now).
     async fn push_reload(&mut self, request: Request) -> Result<(), CoreError> {
         let PushDbReply::Local(local) = self.push_db(PushDbOp::Local, request).await? else {
             return Err(unavailable(ErrorCode::InvalidMessage));
         };
         let push = &mut self.messages.push;
-        let changed = push.loaded && push.own_handle != local.own_handle;
         push.own_handle = local.own_handle;
         push.loaded = true;
-        if changed {
-            self.announce_again();
-        }
         Ok(())
     }
 
