@@ -309,6 +309,51 @@ NOTIFICATION MANAGER (dumpsys notification)
     },
   );
 
+  // E2E 43747301926: the read clear's fetch left A1's network on, so B1 reached it directly
+  // and no wake was pushed. Step 4 takes A1 off line itself, as step 3 does.
+  test('step 4 takes the phone off line again before the wake', () async {
+    final fixture = PushFixture()..fault = 'online_after_read';
+    await fixture.start();
+    try {
+      await fixture.run();
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  test(
+    'a missing wake push notes what the sender and both A sides held',
+    () async {
+      final fixture = PushFixture()..fault = 'no_wake';
+      await fixture.start();
+      failureFacts.clear();
+      try {
+        await expectLater(
+          fixture.run(),
+          throwsA(
+            isA<ScenarioDeadline>().having(
+              (e) => e.message,
+              'text',
+              'Push scenario deadline: delivery_wake',
+            ),
+          ),
+        );
+        expect(failureFacts, {
+          'm7_wake_phone_network_before': 'Stopped',
+          'm7_wake_sender_attempted': 'r0',
+          'm7_wake_sender_handles': 'h1plus',
+          'm7_wake_phone_text': 'missing',
+          'm7_wake_mailbox_text': 'got',
+          'm7_wake_mailbox_sessions': 's0',
+        });
+        expect(safeFacts(failureFacts, loadSafeFacts()), failureFacts);
+      } finally {
+        failureFacts.clear();
+        await fixture.close();
+      }
+    },
+  );
+
   test('a ticket deadline notes every side network state', () async {
     final fixture = PushFixture()..fault = 'no_start';
     await fixture.start();
@@ -532,6 +577,8 @@ class PushFixture {
       });
     } else if (extras.containsKey('r')) {
       fetches++;
+      // The read clear's fetch leaves A1's network on (an app start meanwhile, M7 B1).
+      if (fault == 'online_after_read') stopped = false;
       if (fault == 'no_cancel') return;
       unread.clear();
       show();
@@ -684,12 +731,25 @@ class PushFixture {
           show();
         } else if (token) {
           if (utf8.encode(body).length > 2900) {
-            deliver('wake');
+            if (fault != 'no_wake') deliver('wake');
           } else {
             deliver('cipher', e: 'Y2lwaGVy');
           }
         }
         return text;
+      case 'message_local_test_group_facts':
+        return {
+          'group': true,
+          'epoch': 1,
+          'members': 3,
+          'processed_mls': 0,
+          'deliveries': 0,
+          'holds': 0,
+          'rejoins': 0,
+          'attempted': name == 'node' && args['key'] != null && reachable
+              ? 1
+              : 0,
+        };
       case 'message_local_load_messages':
         final items = texts[name]!.toList();
         if (fault == 'duplicate' && name == 'android-1' && launches > 1) {

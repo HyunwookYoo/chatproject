@@ -975,6 +975,39 @@
       "peer_other",
       "other",
       "unknown"
+    ],
+    "m7_wake_phone_network_before": [
+      "Stopped",
+      "Starting",
+      "Online",
+      "Failed",
+      "unknown"
+    ],
+    "m7_wake_sender_attempted": [
+      "r0",
+      "r1",
+      "r2plus",
+      "unknown"
+    ],
+    "m7_wake_sender_handles": [
+      "h0",
+      "h1plus",
+      "unknown"
+    ],
+    "m7_wake_phone_text": [
+      "got",
+      "missing",
+      "unknown"
+    ],
+    "m7_wake_mailbox_text": [
+      "got",
+      "missing",
+      "unknown"
+    ],
+    "m7_wake_mailbox_sessions": [
+      "s0",
+      "s1plus",
+      "unknown"
     ]
   },
   "wait_kinds": [

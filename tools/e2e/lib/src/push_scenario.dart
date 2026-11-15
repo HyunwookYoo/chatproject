@@ -398,6 +398,85 @@ Future<void> runPushScenario(
     }
   }
 
+  // On a missing `wake` push (`m7_wake_*`, fixed buckets): A1's network state before step 4
+  // took it off line; whether B1's first attempt reached a device of A (the text's attempted
+  // receivers) and whether it holds A1's handle; whether A1 and A2 have the text; A2's
+  // sessions with A1.
+  Future<void> noteWake(
+    Object? phoneBefore,
+    Object? key,
+    Object? conversation,
+    List<int> textId,
+  ) async {
+    Future<Object?> read(
+      Participant p,
+      String op,
+      Map<String, Object?> args,
+    ) async {
+      try {
+        return await p.call(
+          op,
+          args,
+          timeout: const Duration(seconds: 5),
+          failOnTimeout: false,
+        );
+      } catch (_) {
+        return null;
+      }
+    }
+
+    String bucket(Object? n, String prefix, int top) => n is! int
+        ? 'unknown'
+        : n >= top
+        ? '$prefix${top}plus'
+        : '$prefix$n';
+    Future<String> has(Participant p) async {
+      final page = await read(p, 'message_local_load_messages', {
+        'conversation': conversation,
+        'before': null,
+        'limit': 50,
+      });
+      final items = page is Map ? page['items'] : null;
+      if (items is! List) return 'unknown';
+      return items.any(
+            (m) =>
+                m is Map &&
+                m['key'] is Map &&
+                same((m['key'] as Map)['id'], textId),
+          )
+          ? 'got'
+          : 'missing';
+    }
+
+    failureFacts['m7_wake_phone_network_before'] =
+        const {'Stopped', 'Starting', 'Online', 'Failed'}.contains(phoneBefore)
+        ? phoneBefore as String
+        : 'unknown';
+    final group = await read(b1, 'message_local_test_group_facts', {
+      'conversation': conversation,
+      'key': key,
+    });
+    failureFacts['m7_wake_sender_attempted'] = bucket(
+      group is Map ? group['attempted'] : null,
+      'r',
+      2,
+    );
+    final sender = await read(b1, 'push_local_test_counts', const {});
+    failureFacts['m7_wake_sender_handles'] = bucket(
+      sender is Map ? sender['peer_handles'] : null,
+      'h',
+      1,
+    );
+    failureFacts['m7_wake_phone_text'] = await has(a1);
+    failureFacts['m7_wake_mailbox_text'] = await has(a2);
+    final mailbox = await read(a2, 'push_local_test_counts', const {});
+    failureFacts['m7_wake_mailbox_sessions'] = bucket(
+      mailbox is Map ? mailbox['own_sessions'] : null,
+      's',
+      1,
+    );
+  }
+
   // On a missing `read` push: what A2 decided (`m7_read_*`, fixed buckets).
   Future<void> noteReadClear() async {
     Object? value;
@@ -896,15 +975,27 @@ Future<void> runPushScenario(
   }
   evidence?.call('read_cleared', {'notifications': 0});
 
-  // 4. Too large for a push: `wake`, then the fetched text replaces it.
+  // 4. Too large for a push: `wake`, then the fetched text replaces it. The read clear's
+  // fetch may leave A1's network on (with the app on screen, a start the app made meanwhile
+  // keeps it: M7 B1; E2E 43747301926 reached A1 directly and pushed nothing), so A1 is taken
+  // off line again as in step 3.
+  final phoneBefore = (await network(a1))['state'];
+  await call(a1, 'network_stop');
   await isolated(endpoint);
   final large = 'm7 wake text '.padRight(16384, 'w');
-  await call(b1, 'message_local_send_text', {
-    'peer': aPeer,
-    'id': id(3),
-    'body': large,
-  });
-  await relay('wake');
+  final wakeKey = object(
+    await call(b1, 'message_local_send_text', {
+      'peer': aPeer,
+      'id': id(3),
+      'body': large,
+    }),
+  )['key'];
+  try {
+    await relay('wake');
+  } on ScenarioDeadline {
+    await noteWake(phoneBefore, wakeKey, conversation, id(3));
+    rethrow;
+  }
   var generic = false;
   final woken = await until(
     () async {
