@@ -663,11 +663,13 @@ impl Manager {
             MessageDbReply::Messages(v) => A::Messages(v),
             MessageDbReply::Message(v) => A::Message(v),
             MessageDbReply::Done => A::Done,
-            // `MarkRead`: how many messages were read just now (M7 spec 7).
-            MessageDbReply::Count(read) => {
+            // `MarkRead`: how many messages were read just now (M7 spec 7), and the
+            // notification of the conversation it changed (Ruling R21).
+            MessageDbReply::Read(read, notify) => {
                 if read > 0 {
                     self.push_read_clear();
                 }
+                self.publish_notify(notify);
                 A::Done
             }
             _ => unreachable!(),

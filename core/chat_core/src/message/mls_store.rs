@@ -982,7 +982,7 @@ pub(super) fn open_app(
                 targets,
             } if own => {
                 if let Some(peer) = conversation_peer(&tx, conversation)? {
-                    read = !apply_own_read(&tx, conversation, peer, targets, now)?.is_empty();
+                    read = apply_own_read(&tx, conversation, peer, targets, now)?;
                 }
                 Stored::Yes
             }
@@ -1083,14 +1083,15 @@ fn conversation_peer(tx: &Transaction<'_>, conversation: ConversationId) -> R<Op
 /// of the conversation's `peer`) there. Each one here becomes seen and leaves `unread`, and its
 /// receipt jobs and sealed receipts go (the peer has my other device's receipt; nothing is sent
 /// from here). A target not here yet is kept in `mailbox_status_ahead` (kind 1) for when it
-/// comes. Returns the messages that became read just now.
+/// comes. Returns whether that changed what this device shows of the conversation: messages
+/// became read just now, or its generic push notification ended (Ruling R21).
 fn apply_own_read(
     tx: &Transaction<'_>,
     conversation: ConversationId,
     peer: PeerId,
     targets: &[MessageId],
     now: i64,
-) -> R<Vec<MessageKey>> {
+) -> R<bool> {
     let mut read = Vec::new();
     for id in targets {
         let found: Option<([u8; 32], bool)> = tx
@@ -1154,8 +1155,8 @@ fn apply_own_read(
         .map_err(sql)?;
     }
     // A read on another of my devices (whether or not it lowered `unread` here, Ruling R13).
-    super::push_store::read_up(tx, conversation)?;
-    Ok(read)
+    let ended = super::push_store::read_up(tx, conversation)?;
+    Ok(!read.is_empty() || ended)
 }
 
 /// `processed_ct` codec of a received MLS ciphertext whose text was refused (2 is one that was

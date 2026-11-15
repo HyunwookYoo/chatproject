@@ -255,17 +255,28 @@ async fn sync_killed_after_a_page_notifies_its_texts_after_restart() {
         texts_from(&a1, conv, b1.peer).await.len() == 5 && caught_up(&a1, &a2).await
     );
     quiet(&[&a1, &a2, &b1]).await;
-    assert_eq!(notify_count(&a1), 1, "one notification");
+    // The read first updated what is shown, without alerting (Ruling R21); one notification
+    // alerts after.
+    assert_eq!(notify_count(&a1), 2);
+    let item = NotifyItem {
+        conversation: conv,
+        peer: b1.peer,
+        new_messages: 4,
+        unread: 4,
+        title: "remote".into(),
+        preview: Some("text 5 외 3개".into()),
+    };
     assert_eq!(
         notify_events(&a1),
-        vec![NotifyItem {
-            conversation: conv,
-            peer: b1.peer,
-            new_messages: 4,
-            unread: 4,
-            title: "remote".into(),
-            preview: Some("text 5 외 3개".into()),
-        }]
+        vec![
+            NotifyItem {
+                new_messages: 0,
+                unread: 2,
+                preview: Some("text 3 외 1개".into()),
+                ..item.clone()
+            },
+            item
+        ]
     );
 }
 

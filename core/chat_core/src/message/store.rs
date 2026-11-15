@@ -1157,7 +1157,8 @@ pub(crate) enum MessageDbReply {
     /// when the text came from the other account and was stored just now.
     OpenedText(crate::mls::wire::MlsReply, MessageKey, bool),
     /// The reply for my `Read` receipt from another of my devices that made messages of the
-    /// conversation read here just now (M6, spec 6.4).
+    /// conversation read here just now (M6, spec 6.4), or ended its generic push notification
+    /// (Ruling R21).
     OpenedRead(crate::mls::wire::MlsReply, ConversationId),
     /// The reply for a `PushHandle` of the other account's device `installation` (its MLS
     /// leaf) that just changed what `push_peer` holds for it in `conversation` (M7 spec 5.2).
@@ -1179,6 +1180,9 @@ pub(crate) enum MessageDbReply {
     Mailbox(super::mailbox_store::MailboxDbReply),
     Push(super::push_store::PushDbReply),
     Notify(Vec<crate::event::NotifyItem>),
+    /// `MarkRead`: how many messages were read just now, and the conversation's notification
+    /// item when the read changed what it shows (none otherwise; Ruling R21).
+    Read(u64, Vec<crate::event::NotifyItem>),
     Conversation(ConversationView),
     Message(MessageView),
     Messages(MessagePage),
@@ -2483,12 +2487,19 @@ fn mark_read(
         .map_err(sql_error)?;
     }
     // The user read the conversation here (also when nothing was unread, Ruling R13).
-    super::push_store::read_up(&tx, id)?;
+    let ended = super::push_store::read_up(&tx, id)?;
+    // Ruling R21: what the notification shows follows the read (cancelled once nothing is
+    // unread, else updated without alerting); a read that changed nothing leaves it.
+    let notify = if changed > 0 || ended {
+        notify_items(&tx, &[], &[id])?
+    } else {
+        Vec::new()
+    };
     commit(
         tx,
         #[cfg(all(feature = "test-hooks", debug_assertions))]
         fault,
     )?;
     // How many were read just now (M7: only those clear notifications on my other devices).
-    Ok(MessageDbReply::Count(changed as u64))
+    Ok(MessageDbReply::Read(changed as u64, notify))
 }

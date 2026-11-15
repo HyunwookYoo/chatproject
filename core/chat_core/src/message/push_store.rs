@@ -1005,13 +1005,15 @@ pub(super) fn generic_pending(c: &Connection, conversation: ConversationId) -> R
 /// or a text stored already read): once nothing is unread, a generic push notification no
 /// longer keeps its new texts from alerting (Ruling R13). Other frames never clear it: a wake's
 /// generic notification shows before its text is stored, while `unread` may still be 0.
-pub(super) fn read_up(tx: &Transaction<'_>, conversation: ConversationId) -> R<()> {
-    tx.execute(
-        "UPDATE push_tag SET generic=0 WHERE conversation=?1 AND generic=1 AND (SELECT unread FROM conversation WHERE id=?1)=0",
-        params![conversation.0.as_slice()],
-    )
-    .map_err(sql)?;
-    Ok(())
+/// Whether it ended one (its notification is then cancelled, Ruling R21).
+pub(super) fn read_up(tx: &Transaction<'_>, conversation: ConversationId) -> R<bool> {
+    let ended = tx
+        .execute(
+            "UPDATE push_tag SET generic=0 WHERE conversation=?1 AND generic=1 AND (SELECT unread FROM conversation WHERE id=?1)=0",
+            params![conversation.0.as_slice()],
+        )
+        .map_err(sql)?;
+    Ok(ended > 0)
 }
 
 /// What the iOS state files (`push::ios_state`) read: a tag names a conversation exactly as

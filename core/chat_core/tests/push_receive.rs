@@ -747,6 +747,19 @@ async fn generic_ends_when_its_text_comes_read_from_my_device() {
         caught_up(&a1, &a2).await && mailbox(&a1).await.status_ahead == 1
     );
     assert!(message(&a1, key).await.is_none());
+    // Ruling R21: that read ended the generic notification here before its text came.
+    let cancel = NotifyItem {
+        conversation: conv,
+        peer: b1.peer,
+        new_messages: 0,
+        unread: 0,
+        title: "remote".into(),
+        preview: None,
+    };
+    settle!(
+        [&a1, &a2, &a3, &b1],
+        notify_events(&a1).last() == Some(&cancel)
+    );
     a3.account.mailbox_test_hold(false).await.unwrap();
     settle!(
         [&a1, &a2, &a3, &b1],
@@ -759,6 +772,62 @@ async fn generic_ends_when_its_text_comes_read_from_my_device() {
     let next = send_to(&b1, a1.peer, 2, "the next one").await;
     settle!([&a1, &a2, &a3, &b1], message(&a1, next).await.is_some());
     quiet(&[&a1, &a2, &a3, &b1]).await;
+    assert_eq!(alerts(&a1, conv), 2);
+}
+
+/// Ruling R21: reading in the app updates the conversation's notification without alerting
+/// (a read of some: what is still unread; a read of all: cancelled); a read that changes
+/// nothing publishes nothing.
+#[tokio::test]
+async fn reading_here_updates_then_cancels_the_notification() {
+    let (mut a, b1, _net, conv) = accounts(&[A1], &[B1]).await;
+    let a1 = a.pop().unwrap();
+    let first = delivered(&b1, &a1, &[], 1).await;
+    let second = delivered(&b1, &a1, &[], 2).await;
+    settle!(
+        [&a1, &b1],
+        unread(&a1, b1.peer).await == 2 && alerts(&a1, conv) == 2
+    );
+    quiet(&[&a1, &b1]).await;
+    let item = NotifyItem {
+        conversation: conv,
+        peer: b1.peer,
+        new_messages: 0,
+        unread: 0,
+        title: "remote".into(),
+        preview: None,
+    };
+
+    let before = notify_events(&a1).len();
+    a1.account
+        .messages()
+        .mark_read(conv, vec![first])
+        .await
+        .unwrap();
+    assert_eq!(
+        notified_since(&a1, before),
+        [NotifyItem {
+            unread: 1,
+            preview: Some("text 2".into()),
+            ..item.clone()
+        }]
+    );
+
+    let before = notify_events(&a1).len();
+    a1.account
+        .messages()
+        .mark_read(conv, vec![first, second])
+        .await
+        .unwrap();
+    assert_eq!(notified_since(&a1, before), [item]);
+
+    // Read already: nothing to change.
+    let before = notify_events(&a1).len();
+    for keys in [vec![first, second], Vec::new()] {
+        a1.account.messages().mark_read(conv, keys).await.unwrap();
+    }
+    quiet(&[&a1, &b1]).await;
+    assert!(notified_since(&a1, before).is_empty());
     assert_eq!(alerts(&a1, conv), 2);
 }
 
@@ -775,11 +844,24 @@ async fn read_with_nothing_unread_ends_generic() {
         b1.account.push_received(push, WAIT).await.unwrap(),
         PushOutcome::Notified
     );
+    let before = notify_events(&b1).len();
     b1.account
         .messages()
         .mark_read(conv, Vec::new())
         .await
         .unwrap();
+    // Ruling R21: the generic notification is cancelled with it.
+    assert_eq!(
+        notified_since(&b1, before),
+        [NotifyItem {
+            conversation: conv,
+            peer: a1.peer,
+            new_messages: 0,
+            unread: 0,
+            title: "remote".into(),
+            preview: None,
+        }]
+    );
     back_online(&b1, &[&a1]).await;
     let key = send_to(&a1, b1.peer, 1, "alerts again").await;
     settle!([&a1, &b1], message(&b1, key).await.is_some());
