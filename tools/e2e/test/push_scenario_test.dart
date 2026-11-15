@@ -237,6 +237,39 @@ NOTIFICATION MANAGER (dumpsys notification)
     }
   });
 
+  test('a ticket deadline notes every side network state', () async {
+    final fixture = PushFixture()..fault = 'no_start';
+    await fixture.start();
+    failureFacts.clear();
+    try {
+      await expectLater(
+        fixture.run(),
+        throwsA(
+          isA<ScenarioDeadline>()
+              .having(
+                (e) => e.message,
+                'text',
+                'Push scenario deadline: ticket',
+              )
+              .having((e) => e.participant, 'participant', 'android-1'),
+        ),
+      );
+      expect(failureFacts, {
+        'm7_network_phone': 'Stopped',
+        'm7_network_mailbox': 'Online',
+        'm7_network_node': 'Online',
+      });
+      expect(
+        safeFacts(failureFacts, loadSafeFacts()),
+        failureFacts,
+        reason: 'every m7 network fact is allowlisted',
+      );
+    } finally {
+      failureFacts.clear();
+      await fixture.close();
+    }
+  });
+
   for (final (fault, failure) in [
     (
       'wrong_title',
@@ -252,6 +285,14 @@ NOTIFICATION MANAGER (dumpsys notification)
         (e) => e.message,
         'text',
         'Push scenario: cold_text_once',
+      ),
+    ),
+    (
+      'no_start',
+      isA<ScenarioDeadline>().having(
+        (e) => e.message,
+        'text',
+        'Push scenario deadline: ticket',
       ),
     ),
     (
@@ -312,6 +353,8 @@ class PushFixture {
   var token = false;
   var killed = false;
   var stopped = false;
+  // The relaunched app's network is off until `network_start` (the core's `restore`).
+  var offAfterRelaunch = false;
   var launches = 0;
   var lamport = 0;
   final conversation = List.filled(32, 5);
@@ -338,6 +381,7 @@ class PushFixture {
             actions.add('relaunch');
             killed = false;
             stopped = false;
+            offAfterRelaunch = true;
             return join('android-1');
           },
           push: (extras) async {
@@ -477,9 +521,16 @@ class PushFixture {
           'own_handles': token && name == 'mailbox' ? 1 : 0,
           'deliveries': 0,
         };
+      case 'network_start':
+        if (name == 'android-1' && fault != 'no_start') {
+          offAfterRelaunch = false;
+        }
+        return {'state': 'Online'};
       case 'network_info':
+        final off = name == 'android-1' && offAfterRelaunch;
         return {
-          'ticket': 'ticket-$name',
+          'state': off ? 'Stopped' : 'Online',
+          'ticket': off ? null : 'ticket-$name',
           'endpoint_id': 'endpoint-$name',
           'peers': [
             if (name != 'android-1')

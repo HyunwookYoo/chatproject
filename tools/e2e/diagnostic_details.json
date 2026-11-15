@@ -687,6 +687,27 @@
       "r2",
       "r3plus",
       "unknown"
+    ],
+    "m7_network_phone": [
+      "Stopped",
+      "Starting",
+      "Online",
+      "Failed",
+      "unknown"
+    ],
+    "m7_network_mailbox": [
+      "Stopped",
+      "Starting",
+      "Online",
+      "Failed",
+      "unknown"
+    ],
+    "m7_network_node": [
+      "Stopped",
+      "Starting",
+      "Online",
+      "Failed",
+      "unknown"
     ]
   },
   "wait_kinds": [

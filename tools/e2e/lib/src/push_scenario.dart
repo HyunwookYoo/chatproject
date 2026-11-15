@@ -375,11 +375,41 @@ Future<void> runPushScenario(
 
   Future<Map<String, Object?>> network(Participant p) async =>
       object(await call(p, 'network_info'));
-  Future<Object?> ticket(Participant p) async => (await until(
-    () => network(p),
-    (v) => v['ticket'] is String,
-    'ticket',
-  ))['ticket'];
+  // On a ticket deadline: every side's network state (`m7_network_<side>`), so the summary
+  // names which one was not online and how.
+  Future<void> noteNetworks() async {
+    for (final (side, p) in [('phone', a1), ('mailbox', a2), ('node', b1)]) {
+      Object? state;
+      try {
+        final info = await p.call(
+          'network_info',
+          const {},
+          timeout: const Duration(seconds: 5),
+          failOnTimeout: false,
+        );
+        state = info is Map ? info['state'] : null;
+      } catch (_) {
+        state = null;
+      }
+      failureFacts['m7_network_$side'] =
+          const {'Stopped', 'Starting', 'Online', 'Failed'}.contains(state)
+          ? state as String
+          : 'unknown';
+    }
+  }
+
+  Future<Object?> ticket(Participant p) async {
+    try {
+      return (await until(
+        () => network(p),
+        (v) => v['ticket'] is String,
+        'ticket',
+      ))['ticket'];
+    } on ScenarioDeadline {
+      await noteNetworks();
+      rethrow;
+    }
+  }
 
   // A1's account shows the code; A2 joins it (M3).
   Future<void> link() async {
@@ -639,6 +669,9 @@ Future<void> runPushScenario(
   );
   evidence?.call('cold_notification', {'notifications': cold.length});
   a1 = await phone.relaunch();
+  // An account opened again keeps its network off until something starts it (the core's
+  // `restore` installs the key without a start; the m3/m4 restarts do the same).
+  await call(a1, 'network_start');
   await routes([a1]);
   for (final p in [a2, b1]) {
     await call(a1, 'account_local_route', {'ticket': await ticket(p)});
