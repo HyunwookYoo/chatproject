@@ -891,6 +891,26 @@
       "ps0",
       "ps1plus",
       "unknown"
+    ],
+    "m7_fetch_dial_check": [
+      "none",
+      "identity",
+      "certificate",
+      "record",
+      "device",
+      "proof",
+      "grant",
+      "unknown"
+    ],
+    "m7_mailbox_accept_check": [
+      "none",
+      "identity",
+      "certificate",
+      "record",
+      "device",
+      "proof",
+      "grant",
+      "unknown"
     ]
   },
   "wait_kinds": [

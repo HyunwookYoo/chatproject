@@ -295,6 +295,8 @@ NOTIFICATION MANAGER (dumpsys notification)
           'm7_mailbox_accepts_ok': 'a2',
           'm7_mailbox_accepts_failed': 'r0',
           'm7_mailbox_accept_error': 'none',
+          'm7_fetch_dial_check': 'record',
+          'm7_mailbox_accept_check': 'none',
           'm7_fetch_network': 'Stopped',
           'm7_mailbox_record': 'Observed',
           'm7_phone_record': 'Observed',
@@ -618,9 +620,11 @@ class PushFixture {
           'own_dials_ok': name == 'android-1' ? fetches : 0,
           'own_dials_failed': 0,
           'own_dial_error': 'none',
+          'own_dial_check': fault == 'no_cancel' ? 'record' : 'none',
           'own_accepts_ok': name == 'mailbox' ? 1 + fetches : 0,
           'own_accepts_failed': 0,
           'own_accept_error': 'none',
+          'own_accept_check': 'none',
           'pulls': name == 'android-1' ? fetches : 0,
           'pulls_done': name == 'android-1' && fault != 'no_cancel'
               ? fetches

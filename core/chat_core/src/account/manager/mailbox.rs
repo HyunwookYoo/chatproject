@@ -451,16 +451,19 @@ pub(crate) enum MailboxTestReply {
 
 /// Since this core started (e2e m7 `read_cleared`): dials of my other devices that came back
 /// installed or failed, connections from them accepted or refused (each with the last failure's
-/// code), and pulls started and how they ended.
+/// code and, for an authentication refusal, the check that refused it: `auth::AuthCheck::name`),
+/// and pulls started and how they ended.
 #[cfg(all(feature = "test-hooks", debug_assertions))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SyncTrace {
     pub dials_ok: u64,
     pub dials_failed: u64,
     pub dial_error: Option<ErrorCode>,
+    pub dial_check: Option<&'static str>,
     pub accepts_ok: u64,
     pub accepts_failed: u64,
     pub accept_error: Option<ErrorCode>,
+    pub accept_check: Option<&'static str>,
     pub pulls: u64,
     pub pulls_done: u64,
     pub pulls_failed: u64,
@@ -689,6 +692,7 @@ impl Manager {
             Err(error) => {
                 trace.dials_failed += 1;
                 trace.dial_error = Some(error.code);
+                trace.dial_check = auth::AuthCheck::of(error).map(auth::AuthCheck::name);
             }
         }
     }
@@ -722,6 +726,7 @@ impl Manager {
             Err(error) => {
                 trace.accepts_failed += 1;
                 trace.accept_error = Some(error.code);
+                trace.accept_check = auth::AuthCheck::of(error).map(auth::AuthCheck::name);
             }
         }
     }

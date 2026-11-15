@@ -554,6 +554,10 @@ async fn older_own_record_shown_at_auth_after_a_renewal_is_ignored() {
         assert_eq!(a1.view().await.publication.accepted_hash, old, "A1 still holds the old one");
         online(&a1).await;
         link(&a1, &a2).await;
+        let (was1, was2) = (
+            a1.account.mailbox_test_sync_trace().await.unwrap(),
+            a2.account.mailbox_test_sync_trace().await.unwrap(),
+        );
 
         let started = tokio::time::Instant::now();
         let dialer = if a2_dials { &a2 } else { &a1 };
@@ -569,6 +573,17 @@ async fn older_own_record_shown_at_auth_after_a_renewal_is_ignored() {
         assert_eq!(v2.publication.accepted_hash, renewed);
         assert_eq!(v1.publication.accepted_hash, renewed, "A1 observed its renewal");
         assert_eq!(v1.phase, AccountPhase::Active);
+        // E2E 43728038578: the first authentication between them already succeeds, whichever
+        // side holds the newer record; nothing waits for a refused attempt's aftermath.
+        let (t1, t2) = (
+            a1.account.mailbox_test_sync_trace().await.unwrap(),
+            a2.account.mailbox_test_sync_trace().await.unwrap(),
+        );
+        assert_eq!(
+            (t1.dials_failed, t1.accepts_failed, t2.dials_failed, t2.accepts_failed),
+            (was1.dials_failed, was1.accepts_failed, was2.dials_failed, was2.accepts_failed),
+            "A2 dials {a2_dials}: {t1:?} {t2:?}"
+        );
     }
 }
 

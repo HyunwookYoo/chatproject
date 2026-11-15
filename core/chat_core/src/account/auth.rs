@@ -86,6 +86,65 @@ use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use iroh::endpoint::{Connection, RecvStream, SendStream, Side};
 pub(crate) const ALPN: &[u8] = b"chatproject/account/1";
 pub(crate) type LocalIdentity = LocalAccount;
+
+/// Which check refused an account authentication, as the `AuthFailed` detail (fixed texts:
+/// nothing of the peer, its record or keys). e2e m7 notes it (`check_of`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthCheck {
+    /// ALPN, the expected account, or the certificate's transport key against the connection.
+    Identity,
+    /// The installation certificate's signature.
+    Certificate,
+    /// The record the peer showed is not the one this device holds for its account.
+    Record,
+    /// The peer's installation is not in that record.
+    Device,
+    /// The installation proof's signature.
+    Proof,
+    /// The grant is not valid (expired record, removed device).
+    Grant,
+}
+impl AuthCheck {
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    const ALL: [Self; 6] = [
+        Self::Identity,
+        Self::Certificate,
+        Self::Record,
+        Self::Device,
+        Self::Proof,
+        Self::Grant,
+    ];
+    fn detail(self) -> &'static str {
+        match self {
+            Self::Identity => "account auth refused: identity",
+            Self::Certificate => "account auth refused: certificate",
+            Self::Record => "account auth refused: record",
+            Self::Device => "account auth refused: device",
+            Self::Proof => "account auth refused: proof",
+            Self::Grant => "account auth refused: grant",
+        }
+    }
+    fn refuse(self) -> CoreError {
+        CoreError::new(crate::ErrorCode::AuthFailed, self.detail())
+    }
+    /// A fixed short name (e2e facts).
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Identity => "identity",
+            Self::Certificate => "certificate",
+            Self::Record => "record",
+            Self::Device => "device",
+            Self::Proof => "proof",
+            Self::Grant => "grant",
+        }
+    }
+    /// The check an `AuthFailed` error of `finish` names; `None` for any other error.
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    pub fn of(error: &CoreError) -> Option<Self> {
+        Self::ALL.into_iter().find(|c| error.detail == c.detail())
+    }
+}
 #[derive(Clone)]
 pub(crate) struct AuthGrant {
     pub(crate) peer: PeerId,
@@ -323,9 +382,9 @@ async fn finish(
         || remote.peer != expected
         || remote.cert.transport_public_key != *conn.remote_id().as_bytes()
     {
-        return Err(wire::invalid());
+        return Err(AuthCheck::Identity.refuse());
     }
-    verify_cert(&remote.cert, expected)?;
+    verify_cert(&remote.cert, expected).map_err(|_| AuthCheck::Certificate.refuse())?;
     let own_record = local.records.accepted.as_ref().ok_or_else(wire::invalid)?;
     write_auth_frame(
         &mut send,
@@ -339,15 +398,30 @@ async fn finish(
     // Identity-signature/canonical evidence survives a denied installation proof.
     *evidence = Some(exchanged.clone());
     super::parse_record(&exchanged.packet, expected, clock.unix_seconds())?;
-    if exchanged.hash != record.hash || remote.generation != record.record.generation {
-        return Err(wire::invalid());
+    // Ruling R31 (e2e m7 run 43728038578): my other device may hold a renewal of my record that
+    // this one has not taken yet, or the reverse (each renews on its own, R28/R30). The same
+    // generation and devices at another seq is the same authority: the session is granted on the
+    // newer of the two, which the caller takes from the evidence (or keeps) right after. Any
+    // other difference, and any difference for another account, is refused as before.
+    let record = if exchanged.hash == record.hash {
+        record
+    } else if expected == local.keys.peer_id()
+        && exchanged.record.generation == record.record.generation
+        && exchanged.record.devices == record.record.devices
+    {
+        if exchanged.seq > record.seq { &exchanged } else { record }
+    } else {
+        return Err(AuthCheck::Record.refuse());
+    };
+    if remote.generation != record.record.generation {
+        return Err(AuthCheck::Record.refuse());
     }
     if !record.record.devices.iter().any(|d| {
         d.installation_id == remote.cert.installation_id
             && d.transport_public_key == remote.cert.transport_public_key
             && d.kind == remote.cert.kind
     }) {
-        return Err(wire::invalid());
+        return Err(AuthCheck::Device.refuse());
     }
     let grant = AuthGrant {
         peer: expected,
@@ -358,7 +432,7 @@ async fn finish(
         expires_at: record.record.expires_at,
     };
     if !grant.valid(record, &[], clock.unix_seconds()) {
-        return Err(wire::invalid());
+        return Err(AuthCheck::Grant.refuse());
     }
     let context = if conn.side() == Side::Client {
         context(&own, &remote)
@@ -385,9 +459,9 @@ async fn finish(
     VerifyingKey::from_bytes(&remote.cert.installation_id.0)
         .map_err(|_| wire::invalid())?
         .verify_strict(&message, &Signature::from_bytes(&sig))
-        .map_err(|_| wire::invalid())?;
+        .map_err(|_| AuthCheck::Proof.refuse())?;
     if !grant.valid(record, &[], clock.unix_seconds()) {
-        return Err(wire::invalid());
+        return Err(AuthCheck::Grant.refuse());
     }
     send.finish().map_err(|_| io_error(gate.is_some()))?;
     Ok(grant)

@@ -505,6 +505,19 @@ Future<void> runPushScenario(
       2,
     );
     failureFacts['m7_fetch_dial_error'] = error(map['own_dial_error']);
+    // Which authentication check refused it (`auth::AuthCheck::name`).
+    const checks = {
+      'none',
+      'identity',
+      'certificate',
+      'record',
+      'device',
+      'proof',
+      'grant',
+    };
+    String check(Object? name) =>
+        checks.contains(name) ? name as String : 'unknown';
+    failureFacts['m7_fetch_dial_check'] = check(map['own_dial_check']);
     failureFacts['m7_fetch_pulls'] = bucket(map['pulls'], 'p', 2);
     failureFacts['m7_fetch_pulls_failed'] = bucket(
       map['pulls_failed'],
@@ -529,6 +542,7 @@ Future<void> runPushScenario(
       2,
     );
     failureFacts['m7_mailbox_accept_error'] = error(held['own_accept_error']);
+    failureFacts['m7_mailbox_accept_check'] = check(held['own_accept_check']);
     final state = info is Map ? info['state'] : null;
     failureFacts['m7_fetch_network'] =
         const {'Stopped', 'Starting', 'Online', 'Failed'}.contains(state)

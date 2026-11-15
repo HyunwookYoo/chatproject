@@ -96,8 +96,8 @@ mod commands {
                 "peer_withdrawn":0,"own_handles":0,"deliveries":0,
                 "own_sessions":0,"read_clears":0,"read_items":0,
                 "fetches":0,"fetches_online":0,"fetches_done":0,
-                "own_dials_ok":0,"own_dials_failed":0,"own_dial_error":"none",
-                "own_accepts_ok":0,"own_accepts_failed":0,"own_accept_error":"none",
+                "own_dials_ok":0,"own_dials_failed":0,"own_dial_error":"none","own_dial_check":"none",
+                "own_accepts_ok":0,"own_accepts_failed":0,"own_accept_error":"none","own_accept_check":"none",
                 "pulls":0,"pulls_done":0,"pulls_failed":0,"pulls_stopped":0,
             })
         );

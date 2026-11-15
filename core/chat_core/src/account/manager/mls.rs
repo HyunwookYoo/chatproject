@@ -260,11 +260,19 @@ enum Task {
     Dial,
 }
 
+/// A dial of another device that authenticated, ready to be installed.
+type DialedAccount = (
+    iroh::endpoint::Connection,
+    auth::AuthGrant,
+    Option<Box<crate::account::publication::SignedRecord>>,
+);
 enum Answer {
     Reply(Result<MlsReply, ErrorCode>),
     Lookup(Result<Lookup, CoreError>),
     /// A dial run outside the actor (`dial_unreachable`): the connection and its proof.
-    Dial(Result<(iroh::endpoint::Connection, auth::AuthGrant), CoreError>),
+    /// The connection and grant, with my own record the grant was made on when my other device
+    /// showed a renewal of it this device has not taken yet (Ruling R31).
+    Dial(Result<DialedAccount, CoreError>),
 }
 
 /// Who made a received kind 17 request: the account and installation that sent it (its MLS
@@ -1835,7 +1843,9 @@ impl Manager {
                 }
                 // A device presenting another record than this one fails the handshake. The
                 // record it showed is not observed here: record changes belong to the lookup
-                // and record-review flows (a lagging device must not raise a conflict).
+                // and record-review flows (a lagging device must not raise a conflict). One
+                // exception (Ruling R31): my other device's renewal of my record, which the
+                // grant was made on; the actor takes it only as a renewal (`dialed`).
                 let mut evidence = None;
                 let grant = auth::authenticate(
                     connected.clone(),
@@ -1847,7 +1857,10 @@ impl Manager {
                     None,
                 )
                 .await?;
-                Ok((connected, grant))
+                let renewal = evidence
+                    .filter(|e| grant.record_hash != record.hash && e.hash == grant.record_hash)
+                    .map(Box::new);
+                Ok((connected, grant, renewal))
             };
             let result = tokio::select! {biased;
                 _ = cancel.cancelled() => Err(unavailable(ErrorCode::StorageLocked)),
@@ -1891,23 +1904,45 @@ impl Manager {
 
     /// A spawned dial came back: the session is installed (checked again here, as for
     /// `connect_account`).
-    async fn dialed(
-        &mut self,
-        peer: PeerId,
-        dialed: Result<(iroh::endpoint::Connection, auth::AuthGrant), CoreError>,
-    ) {
+    async fn dialed(&mut self, peer: PeerId, dialed: Result<DialedAccount, CoreError>) {
         #[cfg(all(feature = "test-hooks", debug_assertions))]
         {
             self.messages.mls.settled += 1;
         }
         let installed = match dialed {
-            Ok((conn, grant)) => self.install_grant(conn, grant, None).await,
+            Ok((conn, grant, renewal)) => {
+                // Ruling R31: the grant is on my other device's renewal of my record. Taken
+                // here only if it is one (my exact pending packet, or `is_renewal`); anything
+                // else is left to the lookup flows and the grant then fails as before.
+                if let Some(signed) = renewal {
+                    self.take_own_renewal(&signed).await;
+                }
+                self.install_grant(conn, grant, None).await
+            }
             Err(error) => Err(error),
         };
         #[cfg(all(feature = "test-hooks", debug_assertions))]
         self.trace_own_dial(peer, &installed);
         #[cfg(not(all(feature = "test-hooks", debug_assertions)))]
         let _ = (peer, installed);
+    }
+
+    /// Takes my own record `signed` that my other device showed while this one dialed it, when
+    /// it is my exact pending packet or a renewal of what this device holds (never a conflict).
+    async fn take_own_renewal(&mut self, signed: &crate::account::publication::SignedRecord) {
+        let (Ok(request), Ok(local)) = (self.ready(), self.local()) else {
+            return;
+        };
+        let records = &local.records;
+        let exact = records.pending.iter().any(|p| {
+            p.signed.hash == signed.hash
+                && p.status == crate::account::publication::PacketStatus::Ready
+        });
+        if (exact && records.conflict.is_none())
+            || records.is_renewal(signed, self.services.clock.unix_seconds())
+        {
+            let _ = self.apply_record_change(signed, request).await;
+        }
     }
 
     /// The account to dial `recipient` under: this one if its record lists the device (none if
