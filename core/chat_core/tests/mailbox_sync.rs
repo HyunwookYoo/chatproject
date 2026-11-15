@@ -650,17 +650,38 @@ async fn own_records_with_equal_seq_and_another_hash_never_authenticate() {
             online(f).await;
         }
         link(&a1, &a2).await;
-        let dialer = if a2_dials { &a2 } else { &a1 };
+        let (dialer, acceptor) = if a2_dials { (&a2, &a1) } else { (&a1, &a2) };
+        // Counted from here: the sessions of the setup are gone with the records' divergence.
+        let (was_d, was_a) = (
+            dialer.account.mailbox_test_sync_trace().await.unwrap(),
+            acceptor.account.mailbox_test_sync_trace().await.unwrap(),
+        );
         settle!([&a1, &a2], {
             let _ = dialer.account.mailbox_sync_now().await;
-            dialer.account.mailbox_test_sync_trace().await.unwrap().dials_failed > 0
+            dialer.account.mailbox_test_sync_trace().await.unwrap().dials_failed > was_d.dials_failed
         });
         quiet(&[&a1, &a2]).await;
-        let trace = dialer.account.mailbox_test_sync_trace().await.unwrap();
-        assert_eq!(trace.dial_check, Some("record"), "A2 dials {a2_dials}: {trace:?}");
+        let (d, acc) = (
+            dialer.account.mailbox_test_sync_trace().await.unwrap(),
+            acceptor.account.mailbox_test_sync_trace().await.unwrap(),
+        );
+        assert_eq!(
+            (d.dials_ok, d.accepts_ok, acc.dials_ok, acc.accepts_ok),
+            (was_d.dials_ok, was_d.accepts_ok, was_a.dials_ok, was_a.accepts_ok),
+            "A2 dials {a2_dials}: no authentication succeeded: {d:?} {acc:?}"
+        );
         assert!(
             !own_session(&a1, &a2).await && !own_session(&a2, &a1).await,
             "A2 dials {a2_dials}: a session came up"
+        );
+        // Whichever side read the other's record first refused it on the record check and closed
+        // (the other then fails unnamed, CI 43742955782), and a side that took the equal-seq
+        // packet as evidence holds it as a conflict (M3 5.2), refusing what follows early.
+        let held = acceptor.view().await.publication.conflict.is_some()
+            || dialer.view().await.publication.conflict.is_some();
+        assert!(
+            d.dial_check == Some("record") || acc.accept_check == Some("record") || held,
+            "A2 dials {a2_dials}: {d:?} {acc:?}"
         );
     }
 }
