@@ -391,7 +391,8 @@ jobs:
 
   ios:
     runs-on: macos-26
-    timeout-minutes: 50
+    # Successful runs take 40-45 min; the account/privacy step alone varies 11-25 min by runner.
+    timeout-minutes: 70
     env:
       # One Rust slice (arm64) for the simulator instead of arm64 + x86_64.
       FLUTTER_XCODE_ARCHS: arm64
