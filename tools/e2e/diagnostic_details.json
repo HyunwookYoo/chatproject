@@ -1009,6 +1009,9 @@
       "s0",
       "s1plus",
       "unknown"
+    ],
+    "logcat_lost": [
+      "lost"
     ]
   },
   "wait_kinds": [

@@ -687,13 +687,13 @@ Future<void> main(List<String> arguments) async {
           return int.parse(value);
         };
         if (!accountScenario) {
-          await run.start(sdk.adb, [
+          await run.startDiagnosticLog(sdk.adb, [
             ...adb,
             'logcat',
             '--pid=$appPid',
             '-v',
             'threadtime',
-          ], logDir: logs);
+          ]);
         }
         final watching = Completer<void>();
         run.monitorStops.add(watching);
@@ -1127,8 +1127,6 @@ class _OwnedChildFailure extends StateError {
               : 'owned_chat_node_exit',
         'emulator' || 'emulator.exe' => 'owned_emulator_exit',
         'chat_app' || 'chat_app.exe' => 'owned_windows_exit',
-        // The app's own logcat (`adb logcat --pid`, a non-account scenario's log).
-        'adb' || 'adb.exe' => 'owned_adb_exit',
         _ => 'owned_child_exit',
       },
       super('Owned child exited ($code)');
@@ -1322,6 +1320,7 @@ class _Run extends IoProcessRunner {
     bool cleanup = false,
     bool retainOutput = false,
     Map<String, String>? environment,
+    bool diagnostic = false,
   }) {
     if (!cleanup) {
       token.check();
@@ -1336,6 +1335,7 @@ class _Run extends IoProcessRunner {
       cleanup: cleanup,
       retainOutput: retainOutput,
       environment: environment,
+      diagnostic: diagnostic,
     );
     acquisitions.add(acquisition);
     unawaited(
@@ -1360,6 +1360,7 @@ class _Run extends IoProcessRunner {
     required bool cleanup,
     bool retainOutput = false,
     Map<String, String>? environment,
+    bool diagnostic = false,
   }) async {
     File(p.join(logs.path, 'commands.jsonl')).writeAsStringSync(
       '${jsonEncode({'at': DateTime.now().toUtc().toIso8601String(), 'executable': executable, 'args': args, 'cwd': cwd})}\n',
@@ -1398,14 +1399,21 @@ class _Run extends IoProcessRunner {
       unawaited(
         process.exitCode.then(
           (code) {
-            if (!stopping.contains(process)) {
-              fail(
-                _OwnedChildFailure(code, executable, args),
-                StackTrace.current,
-              );
+            if (stopping.contains(process)) return;
+            if (diagnostic) {
+              _diagnosticLost();
+              return;
             }
+            fail(
+              _OwnedChildFailure(code, executable, args),
+              StackTrace.current,
+            );
           },
           onError: (Object error, StackTrace stack) {
+            if (diagnostic) {
+              _diagnosticLost();
+              return;
+            }
             fail(error, stack);
           },
         ),
@@ -1436,6 +1444,21 @@ class _Run extends IoProcessRunner {
     }
     Error.throwWithStackTrace(failure.primary, failure.primaryStack);
   }
+
+  /// The app's own logcat reader (`adb logcat --pid`): diagnostics only, the
+  /// scenario never depends on it. Its exit is noted as the fact `logcat_lost`
+  /// and does not fail the run; the scenario's own outcome decides (user
+  /// decision (g), 2026-11-18). Every other persistent child, adb included,
+  /// still fails the run when it exits.
+  Future<OwnedProcess> startDiagnosticLog(
+    String executable,
+    List<String> arguments,
+  ) async => _Managed(
+    await acquire(executable, arguments, persistent: true, diagnostic: true),
+    this,
+  );
+
+  void _diagnosticLost() => failureFacts['logcat_lost'] = 'lost';
 
   @override
   Future<OwnedProcess> start(
