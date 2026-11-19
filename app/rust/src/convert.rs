@@ -151,6 +151,9 @@ impl From<chat_core::NotifyItem> for NotifyItem {
             peer: item.peer.0.to_vec(),
             new_messages: item.new_messages,
             unread: item.unread,
+            title: item.title,
+            preview: item.preview,
+            silenced: item.silenced,
         }
     }
 }
@@ -480,18 +483,39 @@ mod tests {
 
     #[test]
     fn notify_keeps_every_conversation_item() {
-        let item = |n: u8, new_messages, unread| chat_core::NotifyItem {
+        let item = |n: u8, new_messages, unread, title: &str, preview: Option<&str>| chat_core::NotifyItem {
             conversation: chat_core::ConversationId([n; 32]),
             peer: chat_core::account::PeerId([n + 1; 32]),
             new_messages,
             unread,
+            title: title.into(),
+            preview: preview.map(str::to_owned),
+            silenced: n == 3,
         };
         assert_eq!(
-            ChatEvent::from(chat_core::CoreEvent::Notify { items: vec![item(1, 5, 7), item(3, 0, 0)] }),
+            ChatEvent::from(chat_core::CoreEvent::Notify {
+                items: vec![item(1, 5, 7, "Alice", Some("hi 외 6개")), item(3, 0, 0, "", None)],
+            }),
             ChatEvent::Notify {
                 items: vec![
-                    NotifyItem { conversation: vec![1; 32], peer: vec![2; 32], new_messages: 5, unread: 7 },
-                    NotifyItem { conversation: vec![3; 32], peer: vec![4; 32], new_messages: 0, unread: 0 },
+                    NotifyItem {
+                        conversation: vec![1; 32],
+                        peer: vec![2; 32],
+                        new_messages: 5,
+                        unread: 7,
+                        title: "Alice".into(),
+                        preview: Some("hi 외 6개".into()),
+                        silenced: false,
+                    },
+                    NotifyItem {
+                        conversation: vec![3; 32],
+                        peer: vec![4; 32],
+                        new_messages: 0,
+                        unread: 0,
+                        title: String::new(),
+                        preview: None,
+                        silenced: true,
+                    },
                 ],
             }
         );

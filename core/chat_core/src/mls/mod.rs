@@ -8,9 +8,14 @@ pub(crate) mod group;
 pub(crate) mod identity;
 pub(crate) mod kv;
 pub(crate) mod membership;
+// The app writes the extension's snapshots (`push::ios_state`); only the extension's build
+// makes the module public.
 #[cfg(feature = "nse")]
 pub mod nse;
+#[cfg(not(feature = "nse"))]
+pub(crate) mod nse;
 pub(crate) mod payload;
+pub(crate) mod push_ct;
 pub(crate) mod wire;
 
 use openmls_rust_crypto::RustCrypto;

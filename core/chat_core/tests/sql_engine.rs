@@ -137,6 +137,11 @@ fn schema_enforces_version_one_bounds() {
             "mls_receipt",
             "outbox",
             "processed_ct",
+            "push_delivery",
+            "push_local",
+            "push_own",
+            "push_peer",
+            "push_tag",
             "receipt_job",
             "sqlite_sequence",
             "storage_meta"
@@ -146,7 +151,7 @@ fn schema_enforces_version_one_bounds() {
         .query_row("SELECT count(*) FROM account_state", [], |r| r.get(0))
         .unwrap();
     assert_eq!(unconfigured, 0);
-    conn.execute_batch("INSERT INTO storage_meta VALUES (1,3,zeroblob(16),x'01',NULL,0,0)")
+    conn.execute_batch("INSERT INTO storage_meta VALUES (1,4,zeroblob(16),x'01',NULL,0,0)")
         .unwrap();
     for update in [
         "singleton=2",
@@ -154,6 +159,7 @@ fn schema_enforces_version_one_bounds() {
         "schema_version=NULL",
         "schema_version=1",
         "schema_version=2",
+        "schema_version=3",
         "db_id=NULL",
         "db_id=zeroblob(15)",
         "binding=NULL",

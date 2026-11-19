@@ -167,7 +167,7 @@ fn load_outgoing(tx: &Transaction<'_>, key: MessageKey) -> R<Outgoing> {
 /// Seals `message`, remembers the ciphertext hash (so this device recognises it if it comes
 /// back) and returns the hash and the complete kind 17 frame.
 #[allow(clippy::too_many_arguments)]
-fn seal_one(
+pub(super) fn seal_one(
     tx: &Transaction<'_>,
     provider: &MlsProvider,
     signer: &SignatureKeyPair,
@@ -708,13 +708,15 @@ pub(super) fn reseal_receipt(
 
 /// The synchronous `Ack` of a sent `App` frame: the recipient stored the message (spec: the
 /// same meaning as an M4 `Receipt`), so it is `Delivered` and leaves the outbox. The recipient
-/// must be one this message was prepared for. Never undoes `Read`.
+/// must be one this message was prepared for. Never undoes `Read`. `first`: its first attempt,
+/// whose push is decided on in this transaction before the outbox row goes (M7 spec 6.1).
 pub(super) fn acked(
     c: &mut Connection,
     identity: Identity,
     key: MessageKey,
     recipient: InstallationId,
     now: u64,
+    first: Option<&mut super::push_store::FirstAttempt>,
     fault: Fault,
 ) -> R<MessageDbReply> {
     check_own(identity, key)?;
@@ -729,6 +731,9 @@ pub(super) fn acked(
         .map_err(sql)?;
     if !message.outgoing || !super::store::receivers(&raw)?.contains(&recipient) {
         return Err(invalid());
+    }
+    if let Some(first) = first {
+        first.decide(&tx, key)?;
     }
     let changed = tx
         .execute(
@@ -842,6 +847,10 @@ fn decrypt_failed(class: u8, epoch: u64) -> MessageDbReply {
 /// * a `Read` receipt another device of this account sent means the user read those messages
 ///   there (spec 6.4): they are read here too, and no receipt goes from here. Its `Delivered`
 ///   receipt says nothing to this device and is dropped.
+/// * a `PushHandle` (M7 spec 5.2) is no message: from the other account it becomes (or, empty,
+///   withdraws) the `push_peer` row of the leaf that sealed it, unless that row is from a frame
+///   sent no earlier (Ruling R10); another device of this account's is only taken. Neither is
+///   stored, counted unread or notified.
 pub(super) fn open_app(
     c: &mut Connection,
     identity: Identity,
@@ -853,7 +862,7 @@ pub(super) fn open_app(
 ) -> R<MessageDbReply> {
     let ct_hash: [u8; 32] = Sha256::digest(&ciphertext).into();
     let ack = MessageDbReply::Opened(MlsReply::Ack { ct_hash });
-    if from.transport == identity.installation {
+    if from.transport == Some(identity.installation) {
         return Ok(ack);
     }
     let sender_peer = from.peer;
@@ -946,6 +955,7 @@ pub(super) fn open_app(
     let mut stored = Stored::Yes;
     let mut text = None;
     let mut read = false;
+    let mut peer_handle = false;
     if let Some(message) = message {
         if matches!(message.content, Content::Text { .. }) {
             text = Some(MessageKey {
@@ -972,13 +982,26 @@ pub(super) fn open_app(
                 targets,
             } if own => {
                 if let Some(peer) = conversation_peer(&tx, conversation)? {
-                    read = !apply_own_read(&tx, conversation, peer, targets, now)?.is_empty();
+                    read = apply_own_read(&tx, conversation, peer, targets, now)?;
                 }
                 Stored::Yes
             }
             Content::Receipt { .. } if own => Stored::Yes,
             Content::Receipt { kind, targets } => {
                 apply_receipt(&tx, identity, conversation, *kind, targets, now)?;
+                Stored::Yes
+            }
+            Content::PushHandle { handle } => {
+                if !own {
+                    peer_handle = super::push_store::store_peer_handle(
+                        &tx,
+                        conversation,
+                        sender_install,
+                        handle,
+                        message.sent_at_ms,
+                        now,
+                    )?;
+                }
                 Stored::Yes
             }
             // Content this version does not know is dropped (spec 5.1 `Custom` fallback).
@@ -1035,6 +1058,11 @@ pub(super) fn open_app(
         (Stored::Yes | Stored::New, None) if read => {
             MessageDbReply::OpenedRead(MlsReply::Ack { ct_hash }, conversation)
         }
+        (Stored::Yes | Stored::New, None) if peer_handle => MessageDbReply::OpenedPushHandle {
+            reply: MlsReply::Ack { ct_hash },
+            conversation,
+            installation: sender_install,
+        },
         (Stored::Yes | Stored::New, None) => ack,
     })
 }
@@ -1055,15 +1083,17 @@ fn conversation_peer(tx: &Transaction<'_>, conversation: ConversationId) -> R<Op
 /// of the conversation's `peer`) there. Each one here becomes seen and leaves `unread`, and its
 /// receipt jobs and sealed receipts go (the peer has my other device's receipt; nothing is sent
 /// from here). A target not here yet is kept in `mailbox_status_ahead` (kind 1) for when it
-/// comes. Returns the messages that became read just now.
+/// comes. Returns whether that changed what this device shows of the conversation: messages
+/// became read just now, or its generic push notification ended (Ruling R21).
 fn apply_own_read(
     tx: &Transaction<'_>,
     conversation: ConversationId,
     peer: PeerId,
     targets: &[MessageId],
     now: i64,
-) -> R<Vec<MessageKey>> {
+) -> R<bool> {
     let mut read = Vec::new();
+    let mut absent = false;
     for id in targets {
         let found: Option<([u8; 32], bool)> = tx
             .query_row(
@@ -1074,6 +1104,7 @@ fn apply_own_read(
             .optional()
             .map_err(sql)?;
         let Some((installation, seen)) = found else {
+            absent = true;
             tx.execute(
                 "INSERT OR IGNORE INTO mailbox_status_ahead VALUES(?1,?2,?3,1,?4)",
                 params![
@@ -1125,7 +1156,11 @@ fn apply_own_read(
         )
         .map_err(sql)?;
     }
-    Ok(read)
+    // Ruling R13 (final review 1): only a read of a text not here yet may be of the one a
+    // generic push notification stood for. A read of texts all here may be older than that
+    // notification and leaves it; its text ends it when it comes (`notify_items`).
+    let ended = absent && super::push_store::read_up(tx, conversation)?;
+    Ok(!read.is_empty() || ended)
 }
 
 /// `processed_ct` codec of a received MLS ciphertext whose text was refused (2 is one that was
@@ -1392,6 +1427,8 @@ fn store_text(
         ],
     )
     .map_err(sql)?;
+    // A generic push notification of the conversation ends when this text is notified, also
+    // when it came read already (`notify_items`, Ruling R13).
     Ok(Stored::New)
 }
 
@@ -1474,6 +1511,9 @@ pub struct MlsOutbox {
     pub reencrypts: u64,
     pub waiting_peer_update: bool,
     pub dispatch_state: u64,
+    pub attempts: u64,
+    /// `outbox.pushed`: the push decision of its first attempt is made (M7).
+    pub pushed: bool,
 }
 /// MLS state of one conversation, for fixture assertions.
 #[cfg(all(feature = "test-hooks", debug_assertions))]
@@ -1525,7 +1565,7 @@ pub(super) fn fixture_promote(c: &Connection, key: MessageKey) -> R<()> {
 pub(super) fn fixture_outbox(c: &Connection, key: MessageKey) -> R<MlsOutbox> {
     let row = c
         .query_row(
-            "SELECT codec,wire,reencrypts,waiting_peer_update,dispatch_state FROM outbox WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",
+            "SELECT codec,wire,reencrypts,waiting_peer_update,dispatch_state,attempts,pushed FROM outbox WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4",
             params![key.conversation.0.as_slice(), key.sender.0.as_slice(), key.installation.0.as_slice(), key.id.0.as_slice()],
             |r| Ok(MlsOutbox {
                 codec: Some(r.get(0)?),
@@ -1533,6 +1573,8 @@ pub(super) fn fixture_outbox(c: &Connection, key: MessageKey) -> R<MlsOutbox> {
                 reencrypts: uint(r, 2)?,
                 waiting_peer_update: r.get(3)?,
                 dispatch_state: uint(r, 4)?,
+                attempts: uint(r, 5)?,
+                pushed: r.get(6)?,
             }),
         )
         .optional()
@@ -1543,6 +1585,8 @@ pub(super) fn fixture_outbox(c: &Connection, key: MessageKey) -> R<MlsOutbox> {
         reencrypts: 0,
         waiting_peer_update: false,
         dispatch_state: 0,
+        attempts: 0,
+        pushed: false,
     }))
 }
 
@@ -1648,6 +1692,29 @@ pub(super) fn fixture_state(c: &Connection, conversation: ConversationId) -> R<M
     })
 }
 
+/// Test-only: seals a `PushHandle` of this device in the conversation's group and returns the
+/// MLS ciphertext. Only the ratchet changes (no frame is queued or logged).
+#[cfg(all(feature = "test-hooks", debug_assertions))]
+pub(super) fn fixture_seal_push_handle(
+    c: &mut Connection,
+    identity: Identity,
+    local: &LocalAccount,
+    conversation: ConversationId,
+    handle: Vec<u8>,
+    issued_at_ms: u64,
+) -> R<MessageDbReply> {
+    let tx = c.transaction().map_err(sql)?;
+    let group = group_row(&tx, conversation)?.ok_or_else(missing)?;
+    let provider = MlsProvider::new(KvStore::load_scope(&tx, conversation.0)?);
+    let (signer, _) = signer_of(local);
+    let message =
+        crate::mls::payload::push_handle_message(identity.installation, issued_at_ms, handle);
+    let ciphertext = group::seal(&provider, &signer, &group.group_id, &message)?;
+    provider.storage().flush(&tx, conversation.0)?;
+    finish(tx, NO_FAULT)?;
+    Ok(MessageDbReply::Ciphertext(ciphertext))
+}
+
 /// Test-only: lets the next own Commit be made although the last one is unacknowledged.
 #[cfg(all(feature = "test-hooks", debug_assertions))]
 pub(super) fn fixture_clear_commit_flag(c: &Connection, conversation: ConversationId) -> R<()> {
@@ -1684,6 +1751,140 @@ mod tests {
     }
     fn count(c: &Connection, sql: &str) -> i64 {
         c.query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    /// M7 spec 5.2: a `PushHandle` sealed by another device of this account is taken like any
+    /// frame (processed, in the device log, acknowledged) but is no peer handle; one from the
+    /// other account goes into `push_peer` under the leaf that sealed it.
+    #[test]
+    fn own_push_handle_is_not_stored_as_peer() {
+        let device = |seed: u8| derive_device(Secret32::from([seed; 32])).unwrap();
+        let (a1, b1, b2) = (device(1), device(2), device(3));
+        let (a_peer, b_peer) = (PeerId([1; 32]), PeerId([2; 32]));
+        let conversation = conversation_id(b_peer, a_peer).unwrap();
+        let party = |peer: PeerId, device: &crate::account::DeviceKeys, c: &Connection| {
+            (
+                MlsProvider::new(KvStore::load(c, conversation.0).unwrap()),
+                mls_signer(device),
+                MlsCredential::issue(peer, device),
+            )
+        };
+        let any = |_: &[u8], _: &[u8]| -> R<()> { Ok(()) };
+        let (a_connection, mut b1_connection, b2_connection) = (database(), database(), database());
+        let a = party(a_peer, &a1, &a_connection);
+        let b = party(b_peer, &b1, &b1_connection);
+        let b_other = party(b_peer, &b2, &b2_connection);
+        let key_packages = [&b, &b_other]
+            .map(|(p, signer, credential)| group::new_key_package(p, signer, credential).unwrap());
+        let created =
+            group::create_group(&a.0, &a.1, &a.2, conversation, &key_packages, &any).unwrap();
+        let joined = group::join(&b.0, &created.welcome, &any).unwrap();
+        group::join(&b_other.0, &created.welcome, &any).unwrap();
+        {
+            let tx = b1_connection.transaction().unwrap();
+            tx.execute(
+                "INSERT INTO conversation VALUES(?1,?2,0,?3,0,0)",
+                params![
+                    conversation.0.as_slice(),
+                    a_peer.0.as_slice(),
+                    [0u8; 32].as_slice()
+                ],
+            )
+            .unwrap();
+            b.0.storage().flush(&tx, conversation.0).unwrap();
+            tx.execute(
+                "INSERT INTO mls_conversation(conversation,group_id,first_commit_hash,epoch,own_commit_unacked,rejoin_count,rejoin_after_ms,peer_mls) VALUES(?1,?2,?3,?4,0,0,0,1)",
+                params![
+                    conversation.0.as_slice(),
+                    joined.group_id,
+                    created.first_commit_hash.as_slice(),
+                    joined.epoch as i64
+                ],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        let identity = Identity {
+            peer: b_peer,
+            installation: b1.installation_id(),
+        };
+        let open = |c: &mut Connection, from: OpenFrom, ciphertext: Vec<u8>| {
+            open_app(c, identity, &from, conversation, ciphertext, 7, NO_FAULT).unwrap()
+        };
+        let handle = vec![0x42; 100];
+
+        // From B2, a device of this account.
+        let message =
+            crate::mls::payload::push_handle_message(b2.installation_id(), 1, handle.clone());
+        let ciphertext = group::seal(&b_other.0, &b_other.1, &created.group_id, &message).unwrap();
+        let hash: [u8; 32] = Sha256::digest(&ciphertext).into();
+        let own = OpenFrom {
+            peer: b_peer,
+            transport: Some(b2.installation_id()),
+            allowed: vec![b1.installation_id(), b2.installation_id()],
+            pull: None,
+        };
+        let reply = open(&mut b1_connection, own, ciphertext);
+        assert!(matches!(
+            reply,
+            MessageDbReply::Opened(MlsReply::Ack { ct_hash }) if ct_hash == hash
+        ));
+        assert_eq!(count(&b1_connection, "SELECT count(*) FROM push_peer"), 0);
+        assert_eq!(count(&b1_connection, "SELECT count(*) FROM message"), 0);
+        assert_eq!(
+            count(
+                &b1_connection,
+                "SELECT count(*) FROM processed_ct WHERE codec=2"
+            ),
+            1
+        );
+        assert_eq!(
+            count(&b1_connection, "SELECT count(*) FROM mailbox_store"),
+            1
+        );
+
+        // From A1, the other account: kept for A1's leaf.
+        let message =
+            crate::mls::payload::push_handle_message(a1.installation_id(), 1, handle.clone());
+        let ciphertext = group::seal(&a.0, &a.1, &created.group_id, &message).unwrap();
+        let hash: [u8; 32] = Sha256::digest(&ciphertext).into();
+        let peer = OpenFrom {
+            peer: a_peer,
+            transport: Some(a1.installation_id()),
+            allowed: vec![a1.installation_id()],
+            pull: None,
+        };
+        let reply = open(&mut b1_connection, peer, ciphertext);
+        assert!(matches!(
+            reply,
+            MessageDbReply::OpenedPushHandle {
+                reply: MlsReply::Ack { ct_hash },
+                conversation: c,
+                installation,
+            } if ct_hash == hash && c == conversation && installation == a1.installation_id()
+        ));
+        let stored: (Vec<u8>, Vec<u8>, Option<Vec<u8>>, i64, i64) = b1_connection
+            .query_row(
+                "SELECT conversation,installation,handle,sent_at_ms,received_at_ms FROM push_peer",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            stored,
+            (
+                conversation.0.to_vec(),
+                a1.installation_id().0.to_vec(),
+                Some(handle),
+                1,
+                7
+            )
+        );
+        assert_eq!(count(&b1_connection, "SELECT count(*) FROM message"), 0);
+        assert_eq!(
+            count(&b1_connection, "SELECT count(*) FROM mailbox_store"),
+            2
+        );
     }
 
     /// An authenticated application message whose plaintext is not a `ChatMessage` (Ruling 8):
@@ -1766,7 +1967,7 @@ mod tests {
                 identity,
                 &OpenFrom {
                     peer: a_peer,
-                    transport: a_device.installation_id(),
+                    transport: Some(a_device.installation_id()),
                     allowed: vec![a_device.installation_id()],
                     pull: None,
                 },

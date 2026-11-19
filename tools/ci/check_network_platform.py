@@ -42,15 +42,25 @@ def check(root=ROOT):
         if "android.permission." + permission not in permissions:
             errors.append(f"Main manifest must declare {permission}")
 
-    activity = source(android / "src/main/kotlin/dev/chatproject/chat_app/MainActivity.kt")
-    create = block(activity, r"override fun onCreate\([^)]*\)")
-    load = create.find('System.loadLibrary("chat_ffi")')
-    initialize = create.find("check(initializeNetworkContext(applicationContext))")
-    flutter = create.find("super.onCreate(")
-    if not (0 <= load < initialize < flutter):
-        errors.append("Load and checked applicationContext initialization must occur before super.onCreate")
-    if not re.search(r"private external fun initializeNetworkContext\(context: Context\): Boolean", activity):
-        errors.append("JNI initialization must be an instance Context method")
+    # Every component (activity, push receiver, workers) starts after Application.onCreate.
+    kotlin = android / "src/main/kotlin/dev/chatproject/chat_app"
+    app = manifest.find("application")
+    if app is None or app.get(name) != ".ChatApplication":
+        errors.append("Main manifest must start ChatApplication, which initializes the native library")
+    application = source(kotlin / "ChatApplication.kt")
+    create = block(application, r"override fun onCreate\(\)")
+    order = [create.find(s) for s in ('System.loadLibrary("chat_ffi")', "NativeInit.initialize(this)",
+                                      "uniffiEnsureInitialized()", "nativeSetNotifier(", "super.onCreate(")]
+    if any(i < 0 for i in order) or order != sorted(order):
+        errors.append("Library load, JNI initialization, binding check and notifier must occur in order before super.onCreate")
+    native_init = block(source(kotlin / "NativeInit.kt"), r"\bobject NativeInit\b")
+    if not re.search(r"private external fun initializeNetworkContext\(context: Context\): Boolean", native_init):
+        errors.append("JNI initialization must be an instance Context method of object NativeInit")
+    if "check(initializeNetworkContext(context.applicationContext))" not in block(native_init, r"fun initialize\(context: Context\)"):
+        errors.append("NativeInit must check its initialization with the applicationContext")
+    activity = source(kotlin / "MainActivity.kt")
+    if re.search(r"\bexternal\s+fun\b", activity):
+        errors.append("MainActivity must not declare JNI methods; NativeInit owns them")
     configure = block(activity, r"override fun configureFlutterEngine\([^)]*\)")
     channels = configure.count('"chat_app/native_core"')
     if channels != 1 or sum(b.count('"chat_app/native_core"') for b in debug_blocks(configure)) != channels:
@@ -64,8 +74,8 @@ def check(root=ROOT):
         errors.append("Debug intent contract must map chat_control_url and chat_name to Dart flags")
 
     keep = re.sub(r"#[^\n]*", "", (android / "proguard-rules.pro").read_text(encoding="utf-8"))
-    if not re.search(r"-keepclasseswithmembernames\s+class\s+dev\.chatproject\.chat_app\.MainActivity\s*\{\s*native\s+<methods>;\s*\}", keep):
-        errors.append("R8 must keep MainActivity native method names")
+    if not re.search(r"-keepclasseswithmembernames\s+class\s+dev\.chatproject\.chat_app\.NativeInit\s*\{\s*native\s+<methods>;\s*\}", keep):
+        errors.append("R8 must keep NativeInit native method names")
 
     rust = root / "app/rust/src"
     lib = source(rust / "lib.rs")
@@ -76,7 +86,7 @@ def check(root=ROOT):
     onload = block(jni, r"fn JNI_OnLoad\([^)]*\)[^{]*")
     if not onload or "reserved" in onload or "install_android_jni_context" in onload or "JNI_VERSION_1_6" not in onload:
         errors.append("JNI_OnLoad must store only VM/version and leave reserved unused")
-    export = r"fn Java_dev_chatproject_chat_1app_MainActivity_initializeNetworkContext\(([^)]*)\)"
+    export = r"fn Java_dev_chatproject_chat_1app_NativeInit_initializeNetworkContext\(([^)]*)\)"
     signature = re.search(export, jni)
     if not signature or not re.search(r"_this:\s*JObject", signature[1]) or "JClass" in signature[1]:
         errors.append("Exported JNI initialization requires instance JObject receiver")

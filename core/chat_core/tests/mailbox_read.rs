@@ -69,7 +69,10 @@ async fn read_on_a1_marks_a2_read_without_notification_or_receipt() {
             conversation: conv,
             peer: b1.peer,
             new_messages: 0,
-            unread: 0
+            unread: 0,
+            title: "remote".into(),
+            preview: None,
+            silenced: false,
         }]
     );
     // The user opens the conversation on A2 as well: nothing to send from here.
@@ -121,7 +124,10 @@ async fn read_reaches_my_devices_while_contact_is_off() {
             conversation: conv,
             peer: b_peer,
             new_messages: 0,
-            unread: 0
+            unread: 0,
+            title: "remote".into(),
+            preview: None,
+            silenced: false,
         }]
     );
 

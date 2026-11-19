@@ -547,14 +547,28 @@ async fn garbage_commit_does_not_force_rejoin() {
 
     // Tampered copies of the real Commit, claiming an old, the current and the next epoch;
     // some of them hash below the Commit B1 is on, so they reach the fork comparison.
-    let mut below = 0;
-    for i in 1..=24 {
+    let tamper = |i: usize, mask: u8| {
         let mut bad = commit.clone();
         let at = bad.len() - i;
-        bad[at] ^= 0x5a;
-        if digest(&bad) < digest(&commit) {
-            below += 1;
-        }
+        bad[at] ^= mask;
+        bad
+    };
+    let real = digest(&commit);
+    let mut copies: Vec<Vec<u8>> = (1..=24).map(|i| tamper(i, 0x5a)).collect();
+    // When the real Commit's digest is low, no copy of those 24 hashes below it (about 1 run
+    // in 25). Then look on, over the same last 24 bytes with other masks, for one copy that
+    // does; only that one is applied as well. 4,096 more tries leave about 1 run in 4,000.
+    if !copies.iter().any(|bad| digest(bad) < real) {
+        let more = (1..=u8::MAX)
+            .filter(|&mask| mask != 0x5a)
+            .flat_map(|mask| (1..=24).map(move |i| (i, mask)))
+            .take(4096)
+            .map(|(i, mask)| tamper(i, mask))
+            .find(|bad| digest(bad) < real);
+        copies.extend(more);
+    }
+    let below = copies.iter().filter(|bad| digest(bad) < real).count();
+    for bad in copies {
         for claim in [0, 2, 3] {
             let outcome = mb
                 .mls_apply_commit(conv, a1.peer, a1.peer, claim, bad.clone(), now)

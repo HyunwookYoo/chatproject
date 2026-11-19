@@ -374,6 +374,7 @@ Future<Map<String, dynamic>?> _runSmokeOnce({
       }
       final ready =
           state.current &&
+          (platform != 'android' || _androidNativeOk(state.output)) &&
           (contractNonce == null
               ? state.text.contains('내 계정 시작하기') &&
                     state.text.contains('새 계정 만들기') &&
@@ -415,6 +416,17 @@ Future<Map<String, dynamic>?> _runSmokeOnce({
     }
   }
   return proof;
+}
+
+/// `ChatApplication` logs this one line once Kotlin reached the Release build's Rust core
+/// (M1a carry-forward 1); a second one in the owned process's log means it ran twice.
+bool _androidNativeOk(String output) {
+  final lines = RegExp(
+    r'ChatProject native ok [0-9A-Za-z.+-]+\s*$',
+    multiLine: true,
+  ).allMatches(output).length;
+  if (lines > 1) throw StateError('Duplicate Android native readiness line');
+  return lines == 1;
 }
 
 Map<String, dynamic>? _contractProof(

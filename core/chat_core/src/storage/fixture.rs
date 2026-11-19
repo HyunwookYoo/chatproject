@@ -254,12 +254,28 @@ impl Messages {
         ciphertext: Vec<u8>,
         now: u64,
     ) -> Result<crate::mls::wire::MlsReply, CoreError> {
-        let from = crate::message::store::OpenFrom { peer: sender, transport, allowed, pull: None };
+        self.mls_open_app_via(sender, transport, allowed, None, conversation, ciphertext, now)
+            .await
+    }
+    /// `mls_open_app_from`, brought by a pull from mailbox `pull` when that is given.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn mls_open_app_via(
+        &self,
+        sender: crate::account::PeerId,
+        transport: crate::account::InstallationId,
+        allowed: Vec<crate::account::InstallationId>,
+        pull: Option<crate::account::InstallationId>,
+        conversation: ConversationId,
+        ciphertext: Vec<u8>,
+        now: u64,
+    ) -> Result<crate::mls::wire::MlsReply, CoreError> {
+        let from = crate::message::store::OpenFrom { peer: sender, transport: Some(transport), allowed, pull };
         let op = MessageDbOp::OpenApp(from, conversation, ciphertext, now);
         match self.mls(op).await? {
             MessageDbReply::Opened(reply)
             | MessageDbReply::OpenedText(reply, ..)
-            | MessageDbReply::OpenedRead(reply, _) => Ok(reply),
+            | MessageDbReply::OpenedRead(reply, _)
+            | MessageDbReply::OpenedPushHandle { reply, .. } => Ok(reply),
             // Without the actor no new epoch is made: the sender is told it is out of order.
             MessageDbReply::FarAhead { epoch } => Ok(crate::mls::wire::MlsReply::DecryptFailed {
                 class: crate::mls::group::CLASS_OUT_OF_ORDER,
@@ -269,6 +285,19 @@ impl Messages {
             MessageDbReply::Rejected => Err(CoreError::new(ErrorCode::InvalidMessage, "mls_text_rejected")),
             // Refused for its leaf, as the actor does on a direct session.
             MessageDbReply::NotCurrent => Err(CoreError::new(ErrorCode::InvalidMessage, "mls_leaf_not_current")),
+            _ => unreachable!(),
+        }
+    }
+    /// The MLS ciphertext of a `PushHandle` this device seals in the conversation's group for
+    /// `handle` issued at `issued_at_ms` (nothing is queued or logged).
+    pub async fn mls_seal_push_handle(
+        &self,
+        conversation: ConversationId,
+        handle: Vec<u8>,
+        issued_at_ms: u64,
+    ) -> Result<Vec<u8>, CoreError> {
+        match self.mls(MessageDbOp::SealPushHandle(conversation, handle, issued_at_ms)).await? {
+            MessageDbReply::Ciphertext(ciphertext) => Ok(ciphertext),
             _ => unreachable!(),
         }
     }
@@ -289,7 +318,7 @@ impl Messages {
     /// The user saw these received messages (queues their `Read` receipt jobs).
     pub async fn mark_read(&self, conversation: ConversationId, keys: Vec<MessageKey>, now: u64) -> Result<(), CoreError> {
         match self.mls(MessageDbOp::MarkRead(conversation, keys, now, now)).await? {
-            MessageDbReply::Done => Ok(()),
+            MessageDbReply::Read(..) => Ok(()),
             _ => unreachable!(),
         }
     }
@@ -478,10 +507,23 @@ pub struct DbProbe {
     pub message_rows: Vec<u8>,
     pub outbox: Vec<OutboxProbe>,
     /// Canonical dump of every table that exists in v2 (all columns, row order), keyed by name.
-    /// `storage_meta` omits `schema_version`, the one column a later upgrade rewrites.
+    /// Omits the columns a later upgrade rewrites or adds: `storage_meta.schema_version` and
+    /// `outbox.pushed`.
     pub v2_rows: Vec<(String, Vec<u8>)>,
     /// `mailbox_local` rows as (singleton, enabled, first_link_shown); empty before v3.
     pub mailbox_local: Vec<(i64, i64, i64)>,
+    /// `push_local` rows; empty before v4.
+    pub push_local: Vec<PushLocalProbe>,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushLocalProbe {
+    pub id: i64,
+    pub enabled: i64,
+    pub platform: Option<i64>,
+    pub token: Option<String>,
+    pub own_tag: Vec<u8>,
+    pub own_handle: Option<Vec<u8>>,
+    pub own_issued_at_ms: Option<i64>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboxProbe {
@@ -495,6 +537,8 @@ pub struct OutboxProbe {
     /// `None` on a v1 table, which has no such column.
     pub reencrypts: Option<i64>,
     pub waiting_peer_update: Option<i64>,
+    /// `None` before v4, which has no such column.
+    pub pushed: Option<i64>,
 }
 const V1_DOWNGRADE: &str = "
 DROP TABLE mls_kv;
@@ -562,6 +606,27 @@ INSERT INTO storage_meta_v2
 DROP TABLE storage_meta;
 ALTER TABLE storage_meta_v2 RENAME TO storage_meta;
 ";
+const V3_DOWNGRADE: &str = "
+DROP TABLE push_local;
+DROP TABLE push_tag;
+DROP TABLE push_peer;
+DROP TABLE push_own;
+DROP TABLE push_delivery;
+ALTER TABLE outbox DROP COLUMN pushed;
+CREATE TABLE storage_meta_v3 (
+    singleton INTEGER PRIMARY KEY NOT NULL CHECK(singleton = 1),
+    schema_version INTEGER NOT NULL CHECK(schema_version = 3),
+    db_id BLOB NOT NULL CHECK(length(db_id) = 16),
+    binding BLOB NOT NULL,
+    legacy_hash BLOB CHECK(legacy_hash IS NULL OR length(legacy_hash) = 32),
+    migration_ready INTEGER NOT NULL CHECK(migration_ready IN (0, 1)),
+    message_revision INTEGER NOT NULL CHECK(message_revision BETWEEN 0 AND 9223372036854775807)
+) STRICT;
+INSERT INTO storage_meta_v3
+    SELECT singleton,3,db_id,binding,legacy_hash,migration_ready,message_revision FROM storage_meta;
+DROP TABLE storage_meta;
+ALTER TABLE storage_meta_v3 RENAME TO storage_meta;
+";
 fn probe_error(_: rusqlite::Error) -> CoreError {
     CoreError::new(ErrorCode::StorageCorrupt, "fixture_probe_failed")
 }
@@ -598,16 +663,18 @@ fn probe(c: &rusqlite::Connection) -> Result<DbProbe, CoreError> {
     )?;
     let mut v2_rows = Vec::new();
     for table in &tables {
-        if table.starts_with("mailbox_") || table == "sqlite_sequence" {
+        if table.starts_with("mailbox_") || table.starts_with("push_") || table == "sqlite_sequence" {
             continue;
         }
-        let sql = if table == "storage_meta" {
-            "SELECT singleton,db_id,binding,legacy_hash,migration_ready,message_revision \
-             FROM storage_meta ORDER BY rowid"
-                .to_string()
-        } else {
-            format!("SELECT * FROM {table} ORDER BY rowid")
+        let later = |column: &String| {
+            (table == "storage_meta" && column == "schema_version")
+                || (table == "outbox" && column == "pushed")
         };
+        let columns: Vec<String> = names(&format!("SELECT name FROM pragma_table_info('{table}') ORDER BY cid"))?
+            .into_iter()
+            .filter(|column| !later(column))
+            .collect();
+        let sql = format!("SELECT {} FROM {table} ORDER BY rowid", columns.join(","));
         v2_rows.push((table.clone(), dump_rows(c, &sql)?.0));
     }
     let mailbox_local = if tables.iter().any(|t| t == "mailbox_local") {
@@ -628,10 +695,38 @@ fn probe(c: &rusqlite::Connection) -> Result<DbProbe, CoreError> {
         )
         .map_err(probe_error)?
         == 1;
-    let columns = if has_v2_columns {
-        "reencrypts,waiting_peer_update"
+    let has_v4_columns = c
+        .query_row(
+            "SELECT count(*) FROM pragma_table_info('outbox') WHERE name='pushed'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map_err(probe_error)?
+        == 1;
+    let columns = match (has_v2_columns, has_v4_columns) {
+        (true, true) => "reencrypts,waiting_peer_update,pushed",
+        (true, false) => "reencrypts,waiting_peer_update,NULL",
+        _ => "NULL,NULL,NULL",
+    };
+    let push_local = if tables.iter().any(|t| t == "push_local") {
+        c.prepare("SELECT id,enabled,platform,token,own_tag,own_handle,own_issued_at_ms FROM push_local ORDER BY id")
+            .map_err(probe_error)?
+            .query_map([], |r| {
+                Ok(PushLocalProbe {
+                    id: r.get(0)?,
+                    enabled: r.get(1)?,
+                    platform: r.get(2)?,
+                    token: r.get(3)?,
+                    own_tag: r.get(4)?,
+                    own_handle: r.get(5)?,
+                    own_issued_at_ms: r.get(6)?,
+                })
+            })
+            .map_err(probe_error)?
+            .collect::<Result<_, _>>()
+            .map_err(probe_error)?
     } else {
-        "NULL,NULL"
+        Vec::new()
     };
     let outbox = c
         .prepare(&format!(
@@ -650,6 +745,7 @@ fn probe(c: &rusqlite::Connection) -> Result<DbProbe, CoreError> {
                 dispatch_state: r.get(6)?,
                 reencrypts: r.get(7)?,
                 waiting_peer_update: r.get(8)?,
+                pushed: r.get(9)?,
             })
         })
         .map_err(probe_error)?
@@ -665,6 +761,7 @@ fn probe(c: &rusqlite::Connection) -> Result<DbProbe, CoreError> {
         outbox,
         v2_rows,
         mailbox_local,
+        push_local,
     })
 }
 /// Canonical, type-tagged dump of every row `sql` returns, and the row count.
@@ -911,6 +1008,18 @@ impl Fixture {
         self.handle.0.test(TestOp::Message(FixtureOp::MlsPlantRow(conversation, key, value, tx))).await;
         rx.await.unwrap()
     }
+    /// The `push_peer` rows and the `mailbox_notify` count.
+    pub async fn push_peer_state(&self) -> Result<PushPeerState, CoreError> {
+        let (tx, rx) = oneshot::channel();
+        self.handle.0.test(TestOp::Message(FixtureOp::PushPeerState(tx))).await;
+        rx.await.unwrap()
+    }
+    /// This device's push setting, handles and their queued deliveries.
+    pub async fn push_state(&self) -> Result<PushState, CoreError> {
+        let (tx, rx) = oneshot::channel();
+        self.handle.0.test(TestOp::Message(FixtureOp::PushState(tx))).await;
+        rx.await.unwrap()
+    }
     /// The device log, cursors and pulls, and counts of the other per-device tables.
     pub async fn mailbox_state(&self) -> Result<MailboxState, CoreError> {
         let (tx, rx) = oneshot::channel();
@@ -1029,8 +1138,8 @@ impl Fixture {
             })
         })
     }
-    /// Rewrite a closed, migrated store into the exact M4 (schema v1) shape: the mailbox and MLS tables
-    /// and the v2 outbox columns go away, `user_version` and `schema_version` return to 1, and
+    /// Rewrite a closed, migrated store into the exact M4 (schema v1) shape: the push, mailbox and MLS
+    /// tables and the v2/v4 outbox columns go away, `user_version` and `schema_version` return to 1, and
     /// every queued row becomes the M4 plaintext job (codec 1) with the canonical text frame an
     /// M4 app would have queued for it. Only valid while no row is sealed (codec 2).
     pub fn downgrade_to_v1(root: &Path, p: Arc<dyn KeyProtector>) -> Result<(), CoreError> {
@@ -1072,19 +1181,31 @@ impl Fixture {
                 )
                 .map_err(probe_error)?;
             }
+            tx.execute_batch(V3_DOWNGRADE).map_err(probe_error)?;
             tx.execute_batch(V2_DOWNGRADE).map_err(probe_error)?;
             tx.execute_batch(V1_DOWNGRADE).map_err(probe_error)?;
             tx.pragma_update(None, "user_version", 1).map_err(probe_error)?;
             tx.commit().map_err(probe_error)
         })
     }
-    /// Rewrite a closed, migrated store into the exact M5 (schema v2) shape: the mailbox tables
-    /// go away and `user_version` and `schema_version` return to 2.
+    /// Rewrite a closed, migrated store into the exact M5 (schema v2) shape: the push and mailbox
+    /// tables and `outbox.pushed` go away and `user_version` and `schema_version` return to 2.
     pub fn downgrade_to_v2(root: &Path, p: Arc<dyn KeyProtector>) -> Result<(), CoreError> {
         crate::storage::migration::with_raw_connection(root, &*p, |c| {
             let tx = c.transaction().map_err(probe_error)?;
+            tx.execute_batch(V3_DOWNGRADE).map_err(probe_error)?;
             tx.execute_batch(V2_DOWNGRADE).map_err(probe_error)?;
             tx.pragma_update(None, "user_version", 2).map_err(probe_error)?;
+            tx.commit().map_err(probe_error)
+        })
+    }
+    /// Rewrite a closed, migrated store into the exact M6 (schema v3) shape: the push tables and
+    /// `outbox.pushed` go away and `user_version` and `schema_version` return to 3.
+    pub fn downgrade_to_v3(root: &Path, p: Arc<dyn KeyProtector>) -> Result<(), CoreError> {
+        crate::storage::migration::with_raw_connection(root, &*p, |c| {
+            let tx = c.transaction().map_err(probe_error)?;
+            tx.execute_batch(V3_DOWNGRADE).map_err(probe_error)?;
+            tx.pragma_update(None, "user_version", 3).map_err(probe_error)?;
             tx.commit().map_err(probe_error)
         })
     }
@@ -1154,6 +1275,12 @@ impl Fixture {
     pub fn v2_reader_check(root: &Path, p: Arc<dyn KeyProtector>) -> Result<(), CoreError> {
         crate::storage::migration::with_raw_connection(root, &*p, |c| {
             crate::storage::migration::ready_v2(c)
+        })
+    }
+    /// Run the M6 (v3) reader's version check against a closed store.
+    pub fn v3_reader_check(root: &Path, p: Arc<dyn KeyProtector>) -> Result<(), CoreError> {
+        crate::storage::migration::with_raw_connection(root, &*p, |c| {
+            crate::storage::migration::ready_v3(c)
         })
     }
     /// The next schema upgrade of the store under `root` fails after its DDL, before commit.
@@ -1262,9 +1389,21 @@ impl Fixture {
 pub use crate::message::wire::{decode as decode_message, Frame as MessageFrame};
 pub use crate::account::MessageMutation;
 pub use crate::mls::wire::{MlsFrame, MlsReply};
+pub use crate::mls::push_ct::{PushCtError, restore_group_id, strip_group_id};
+pub use crate::message::push_store::{
+    PushDeliveryRow, PushPeerRow, PushPeerState, PushState, PushTagRow,
+};
 pub use crate::mailbox::wire::{
     EntryBody, HandoffEntry, LogEntry, MailboxFrame, MailboxReply, PlainRecord,
 };
+/// The notification extension's decrypt of one pushed ciphertext against an iOS state file
+/// (`push::ios_state`): the text's preview, or `None` for what the extension cannot show.
+pub fn nse_preview(state_file: &[u8], ciphertext: &[u8]) -> Option<String> {
+    let state = crate::push::ios_state::decode_state(state_file)?;
+    crate::mls::nse::decrypt_readonly(state.snapshot, ciphertext)
+        .ok()
+        .map(|preview| preview.preview)
+}
 pub const MAILBOX_MAX_ENTRY_BODY: usize = crate::mailbox::wire::MAX_ENTRY_BODY;
 pub fn mailbox_page(entries: impl Iterator<Item = LogEntry>) -> (Vec<LogEntry>, bool) {
     crate::mailbox::wire::page(entries)

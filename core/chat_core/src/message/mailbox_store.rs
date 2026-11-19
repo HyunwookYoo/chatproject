@@ -301,11 +301,13 @@ pub(crate) enum MailboxDbOp {
     SetEnabled(bool),
     /// The first-link screen (spec 8.1) was shown.
     FirstLinkShown,
-    /// Own device `installation` announced at `at` whether it is a mailbox. `Count(1)` when that
-    /// changed what is recorded (a device not recorded counts as not a mailbox).
+    /// Own device `installation` announced at `at` whether it is a mailbox, and its own-device
+    /// push handle (M7 spec 5.2; `None`: it has none). `Count(1)` when the mailbox role changed
+    /// what is recorded (a device not recorded counts as not a mailbox).
     Announced {
         installation: InstallationId,
         mailbox: bool,
+        handle: Option<Vec<u8>>,
         at: u64,
     },
     /// This device is up as a mailbox at `now` (wall time): the last period goes on if it ended
@@ -623,6 +625,7 @@ pub(super) fn mailbox_op(
         MailboxDbOp::Announced {
             installation,
             mailbox,
+            handle,
             at,
         } => {
             let tx = c.transaction().map_err(sql)?;
@@ -638,6 +641,7 @@ pub(super) fn mailbox_op(
                 params![installation.0.as_slice(), mailbox, integer(at)?],
             )
             .map_err(sql)?;
+            super::push_store::store_own_handle(&tx, installation, handle.as_deref())?;
             finish(tx, fault)?;
             MailboxDbReply::Count(u64::from(before != mailbox))
         }
@@ -1065,6 +1069,10 @@ fn apply_note(tx: &Transaction, identity: Identity, entry: &LogEntry, now: u64) 
         _ => return Ok(0),
     };
     drop_handoff(tx, entry.sender_install, entry.conversation, msg_id)?;
+    // This device's `PushHandle` frame (M7), handed over and delivered: no longer queued.
+    if entry.sender_install == identity.installation {
+        super::push_store::drop_delivered(tx, entry.conversation, msg_id)?;
+    }
     let key = params![
         entry.conversation.0.as_slice(),
         entry.sender_peer.0.as_slice(),

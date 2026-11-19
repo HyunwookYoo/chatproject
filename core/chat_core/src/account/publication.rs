@@ -11,12 +11,16 @@ use super::{
 use crate::{CoreError, ErrorCode};
 use minicbor::{Decoder, Encoder, data::Type};
 use pkarr::SignedPacket;
-use std::{cmp::Ordering, sync::Arc};
+use std::sync::Arc;
+#[cfg(any(test, all(feature = "test-hooks", debug_assertions)))]
+use std::cmp::Ordering;
 
 pub struct AccountServices {
     pub(crate) backend: Option<Arc<dyn RecordBackend>>,
     pub(crate) clock: Arc<dyn Clock>,
     pub(crate) notifier: Option<Arc<dyn RevocationNotifier>>,
+    /// The push proxy used for any configured address instead of `HttpPushProxy` (tests).
+    pub(crate) push: Option<Arc<dyn crate::push::PushProxy>>,
 }
 impl AccountServices {
     /// Local bridge/storage fixture only. It never constructs a production backend.
@@ -40,6 +44,7 @@ impl AccountServices {
             backend: Some(backend),
             clock,
             notifier: None,
+            push: None,
         }
     }
     #[cfg(all(feature = "test-hooks", debug_assertions))]
@@ -47,11 +52,18 @@ impl AccountServices {
         self.notifier = Some(notifier);
         self
     }
+    /// The push proxy every configured proxy address reaches (a test's in-memory proxy).
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    pub fn with_push_proxy(mut self, proxy: Arc<dyn crate::push::PushProxy>) -> Self {
+        self.push = Some(proxy);
+        self
+    }
     pub(crate) fn production() -> Self {
         Self {
             backend: None,
             clock: Arc::new(SystemClock::default()),
             notifier: None,
+            push: None,
         }
     }
     pub(crate) fn backend(&mut self) -> Result<Arc<dyn RecordBackend>, CoreError> {
@@ -177,6 +189,8 @@ pub(crate) struct RecordState {
     pub(crate) pending: Vec<PacketIntent>,
     pub(crate) state: PublicationState,
 }
+/// Why a lookup was held (stderr, tests and harness builds only: never in a release).
+#[cfg(any(test, all(feature = "test-hooks", debug_assertions)))]
 struct OwnRecordComparison {
     retained_before: bool,
     accepted_present: bool,
@@ -328,6 +342,63 @@ impl RecordState {
             self.state = PublicationState::LocalBlocked;
         }
     }
+    /// `found` has the authority of my record `base` as this device holds it (Rulings R28, R30,
+    /// R35): see `same_shape`, with the devices this device revoked left out of `base`.
+    pub(crate) fn same_shape(&self, found: &SignedRecord, base: &SignedRecord) -> bool {
+        same_shape(found, base, &self.tombstones)
+    }
+    /// Another of my devices renewed the accepted record: nothing of mine is pending, no
+    /// conflict is held, and `found` is current, newer than anything observed, and of the
+    /// accepted shape (`same_shape`). The same rule whether it came with that device's
+    /// authentication or from a lookup (Ruling R28: a lookup used to hold it as a list conflict).
+    pub(crate) fn is_renewal(&self, found: &SignedRecord, now: u64) -> bool {
+        self.pending.is_empty()
+            && self.conflict.is_none()
+            && found.seq > self.observed_seq
+            && found.current(now)
+            && self
+                .accepted
+                .as_ref()
+                .is_some_and(|accepted| self.same_shape(found, accepted))
+    }
+    /// Ruling R30: another of my devices shows, as its authentication evidence, an older record
+    /// of the accepted shape (`same_shape`, lower seq) — it has not observed a renewal this
+    /// device took already. Stale: ignored, never a conflict. Lookups keep holding a lower seq
+    /// (M3 5.1).
+    pub(crate) fn is_stale_renewal(&self, found: &SignedRecord) -> bool {
+        self.conflict.is_none()
+            && self
+                .accepted
+                .as_ref()
+                .is_some_and(|accepted| found.seq < accepted.seq && self.same_shape(found, accepted))
+    }
+    /// Takes my own record `signed` as the accepted one when it is my exact pending packet or a
+    /// renewal (`is_renewal`), current and not older than anything observed; true when it did.
+    /// Never sets a conflict: the caller decides what any other record means.
+    pub(crate) fn accept_own(&mut self, signed: &SignedRecord, now: u64) -> bool {
+        let exact = self
+            .pending
+            .iter()
+            .position(|p| p.signed.hash == signed.hash && p.status == PacketStatus::Ready);
+        if !(self.conflict.is_none()
+            && signed.seq >= self.observed_seq
+            && (exact.is_some() || self.is_renewal(signed, now))
+            && signed.current(now))
+        {
+            return false;
+        }
+        self.observed_seq = signed.seq;
+        self.accepted = Some(signed.clone());
+        if let Some(index) = exact {
+            self.pending.remove(index);
+        }
+        self.state = if self.pending.is_empty() {
+            PublicationState::Observed
+        } else {
+            PublicationState::Pending
+        };
+        true
+    }
     fn owns(&self, record: &IdentityRecord, local: &LocalAccount) -> bool {
         record.generation == self.generation
             && record.devices.iter().any(|d| {
@@ -337,44 +408,49 @@ impl RecordState {
             && !self.removed(local)
     }
     fn hold(&mut self, found: SignedRecord, now: u64) -> CoreError {
-        use std::io::Write;
-        // Hold-entry facts: the future guard in reconcile may already have
-        // raised observed_seq. This is not a pre-reconcile snapshot.
-        let comparison = OwnRecordComparison {
-            retained_before: self.conflict.is_some(),
-            accepted_present: self.accepted.is_some(),
-            accepted_hash_equal: self.accepted.as_ref().is_some_and(|a| a.hash == found.hash),
-            seq_vs_observed_at_hold: found.seq.cmp(&self.observed_seq),
-            seq_vs_allocated_at_hold: found.seq.cmp(&self.allocated_seq),
-            generation_equal: found.record.generation == self.generation,
-            devices_equal_to_accepted: self.accepted.as_ref().is_some_and(|a| a.record.devices == found.record.devices),
-            pending_hash_match: self.pending.iter().any(|p| p.signed.hash == found.hash),
-            pending_ready_hash_match: self.pending.iter().any(|p| p.signed.hash == found.hash && p.status == PacketStatus::Ready),
-            time_valid: found.current(now),
-            expired: found.record.is_expired(now),
-        };
-        let _ = writeln!(
-            std::io::stderr().lock(),
-            "own_publication hold retained_before={} accepted_present={} accepted_hash_equal={} seq_vs_observed_at_hold={:?} seq_vs_allocated_at_hold={:?} generation_equal={} devices_equal_to_accepted={} pending_hash_match={} pending_ready_hash_match={} time_valid={} expired={}",
-            comparison.retained_before, comparison.accepted_present, comparison.accepted_hash_equal,
-            comparison.seq_vs_observed_at_hold, comparison.seq_vs_allocated_at_hold,
-            comparison.generation_equal, comparison.devices_equal_to_accepted,
-            comparison.pending_hash_match, comparison.pending_ready_hash_match,
-            comparison.time_valid, comparison.expired,
-        );
-        let _ = writeln!(
-            std::io::stderr().lock(),
-            "own_publication retained_context accepted_meets_observed_floor={} accepted_meets_allocated_floor={} retained_older_than_accepted={} retained_membership_equal_accepted={} accepted_current_unexpired={} accepted_generation_equal_local={} pending_empty={}",
-            self.accepted.as_ref().is_some_and(|a| a.seq >= self.observed_seq),
-            self.accepted.as_ref().is_some_and(|a| a.seq >= self.allocated_seq),
-            self.conflict.as_ref().zip(self.accepted.as_ref()).is_some_and(|(c, a)| c.seq < a.seq),
-            self.conflict.as_ref().zip(self.accepted.as_ref()).is_some_and(|(c, a)| {
-                c.record.generation == a.record.generation && c.record.devices == a.record.devices
-            }),
-            self.accepted.as_ref().is_some_and(|a| a.current(now) && !a.record.is_expired(now)),
-            self.accepted.as_ref().is_some_and(|a| a.record.generation == self.generation),
-            self.pending.is_empty(),
-        );
+        // Only the diagnostic below reads the time.
+        let _ = now;
+        #[cfg(any(test, all(feature = "test-hooks", debug_assertions)))]
+        {
+            use std::io::Write;
+            // Hold-entry facts: the future guard in reconcile may already have
+            // raised observed_seq. This is not a pre-reconcile snapshot.
+            let comparison = OwnRecordComparison {
+                retained_before: self.conflict.is_some(),
+                accepted_present: self.accepted.is_some(),
+                accepted_hash_equal: self.accepted.as_ref().is_some_and(|a| a.hash == found.hash),
+                seq_vs_observed_at_hold: found.seq.cmp(&self.observed_seq),
+                seq_vs_allocated_at_hold: found.seq.cmp(&self.allocated_seq),
+                generation_equal: found.record.generation == self.generation,
+                devices_equal_to_accepted: self.accepted.as_ref().is_some_and(|a| a.record.devices == found.record.devices),
+                pending_hash_match: self.pending.iter().any(|p| p.signed.hash == found.hash),
+                pending_ready_hash_match: self.pending.iter().any(|p| p.signed.hash == found.hash && p.status == PacketStatus::Ready),
+                time_valid: found.current(now),
+                expired: found.record.is_expired(now),
+            };
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "own_publication hold retained_before={} accepted_present={} accepted_hash_equal={} seq_vs_observed_at_hold={:?} seq_vs_allocated_at_hold={:?} generation_equal={} devices_equal_to_accepted={} pending_hash_match={} pending_ready_hash_match={} time_valid={} expired={}",
+                comparison.retained_before, comparison.accepted_present, comparison.accepted_hash_equal,
+                comparison.seq_vs_observed_at_hold, comparison.seq_vs_allocated_at_hold,
+                comparison.generation_equal, comparison.devices_equal_to_accepted,
+                comparison.pending_hash_match, comparison.pending_ready_hash_match,
+                comparison.time_valid, comparison.expired,
+            );
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "own_publication retained_context accepted_meets_observed_floor={} accepted_meets_allocated_floor={} retained_older_than_accepted={} retained_membership_equal_accepted={} accepted_current_unexpired={} accepted_generation_equal_local={} pending_empty={}",
+                self.accepted.as_ref().is_some_and(|a| a.seq >= self.observed_seq),
+                self.accepted.as_ref().is_some_and(|a| a.seq >= self.allocated_seq),
+                self.conflict.as_ref().zip(self.accepted.as_ref()).is_some_and(|(c, a)| c.seq < a.seq),
+                self.conflict.as_ref().zip(self.accepted.as_ref()).is_some_and(|(c, a)| {
+                    c.record.generation == a.record.generation && c.record.devices == a.record.devices
+                }),
+                self.accepted.as_ref().is_some_and(|a| a.current(now) && !a.record.is_expired(now)),
+                self.accepted.as_ref().is_some_and(|a| a.record.generation == self.generation),
+                self.pending.is_empty(),
+            );
+        }
         self.observed_seq = self.observed_seq.max(found.seq);
         if self.conflict.as_ref().is_none_or(|c| found.seq >= c.seq) {
             self.conflict = Some(found);
@@ -562,6 +638,10 @@ impl RecordState {
                 self.state = PublicationState::Observed;
             } else if self.accepted.as_ref().is_some_and(|a| a.hash == found.hash) {
                 self.observed_seq = self.observed_seq.max(found.seq);
+            } else if self.is_renewal(&found, now) {
+                self.observed_seq = found.seq;
+                self.accepted = Some(found);
+                self.state = PublicationState::Observed;
             } else if self.accepted.is_none()
                 && self.pending.is_empty()
                 && local.intent == PublishIntent::Replacement
@@ -572,8 +652,11 @@ impl RecordState {
                 return Err(self.hold(found, now));
             }
         } else if self.conflict.is_some() {
-            use std::io::Write;
-            let _ = writeln!(std::io::stderr().lock(), "own_publication hold lookup_present=false retained_before=true");
+            #[cfg(any(test, all(feature = "test-hooks", debug_assertions)))]
+            {
+                use std::io::Write;
+                let _ = writeln!(std::io::stderr().lock(), "own_publication hold lookup_present=false retained_before=true");
+            }
             return Err(conflict());
         }
 
@@ -911,6 +994,27 @@ fn optional_bytes<const N: usize>(d: &mut Decoder<'_>) -> Result<Option<[u8; N]>
     } else {
         Ok(Some(wire::bytes(d)?))
     }
+}
+
+/// The one "same authority" rule for two signed packets of one account (Rulings R28, R30,
+/// R35): the same generation, and `found` lists exactly `base`'s devices less those revoked in
+/// `tombstones` (pass none for another account). Seq, issue and expiry times may differ; what
+/// a different seq means is for the caller.
+pub(crate) fn same_shape(found: &SignedRecord, base: &SignedRecord, tombstones: &[RevokeIntent]) -> bool {
+    found.record.generation == base.record.generation
+        && found.record.devices
+            == base
+                .record
+                .devices
+                .iter()
+                .filter(|d| {
+                    !tombstones.iter().any(|t| {
+                        t.target_installation == d.installation_id
+                            || t.target_transport == d.transport_public_key
+                    })
+                })
+                .cloned()
+                .collect::<Vec<_>>()
 }
 
 #[cfg(test)]

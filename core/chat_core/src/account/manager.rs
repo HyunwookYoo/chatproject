@@ -93,6 +93,12 @@ enum Command {
     MailboxState(oneshot::Sender<Result<MailboxStateView,CoreError>>),
     SetMailbox(bool,oneshot::Sender<Result<(),CoreError>>),
     MailboxFirstLinkShown(oneshot::Sender<Result<(),CoreError>>),
+    PushSetToken(crate::push::Platform,String,oneshot::Sender<Result<(),CoreError>>),
+    PushSetEnabled(bool,oneshot::Sender<Result<(),CoreError>>),
+    PushStatus(oneshot::Sender<Result<crate::push::PushStatus,CoreError>>),
+    PushRenewDue(u64,oneshot::Sender<Result<crate::push::RenewSummary,CoreError>>),
+    /// A received push, and what processing one asks of the actor (M7).
+    Push(push::PushCommand),
     Retry(oneshot::Sender<Result<u64, CoreError>>),
     #[cfg(all(feature="test-hooks",debug_assertions))]
     PairTestStop(super::PairTestStop,oneshot::Sender<Result<(),CoreError>>),
@@ -169,6 +175,10 @@ impl Command {
             Self::MailboxState(reply)=>{let _=reply.send(Err(error));}
             Self::SetMailbox(_,reply)=>{let _=reply.send(Err(error));}
             Self::MailboxFirstLinkShown(reply)=>{let _=reply.send(Err(error));}
+            Self::PushSetToken(_,_,reply)|Self::PushSetEnabled(_,reply)=>{let _=reply.send(Err(error));}
+            Self::PushStatus(reply)=>{let _=reply.send(Err(error));}
+            Self::PushRenewDue(_,reply)=>{let _=reply.send(Err(error));}
+            Self::Push(command)=>command.reject(error),
             Self::Retry(reply) => { let _ = reply.send(Err(error)); }
             #[cfg(all(feature="test-hooks",debug_assertions))]
             Self::PairTestStop(_,reply)=>{let _=reply.send(Err(error));}
@@ -230,6 +240,9 @@ struct Shared {
     // ticket << 2 | 0 pending / 1 complete / 2 failed. Monotonic revisions
     // prevent an obsolete completion from reporting success for a newer request.
     status: AtomicU64,
+    /// The latest `push_configure`, taken by the actor at its next poll, and the network a
+    /// received push started (M7).
+    push: push::Shared,
 }
 #[derive(Clone)]
 pub struct AccountHandle {
@@ -292,6 +305,7 @@ impl AccountHandle {
             network,
             requests,
             status: AtomicU64::new(ticket << 2),
+            push: Default::default(),
         });
         let (commands, input) = mpsc::channel(32);
         let auth = super::connection::Runtime::default();
@@ -1264,6 +1278,11 @@ impl Manager {
                         Command::MailboxState(reply)=>{let result=self.mailbox_state().await;let _=reply.send(result);}
                         Command::SetMailbox(enabled,reply)=>{let result=self.set_mailbox(enabled).await;let _=reply.send(result);}
                         Command::MailboxFirstLinkShown(reply)=>{let result=self.mark_first_link_shown().await;let _=reply.send(result);}
+                        Command::PushSetToken(platform,token,reply)=>{let result=self.push_set_token(platform,token).await;let _=reply.send(result);}
+                        Command::PushSetEnabled(enabled,reply)=>{let result=self.push_set_enabled(enabled).await;let _=reply.send(result);}
+                        Command::PushStatus(reply)=>{let result=self.push_status().await;let _=reply.send(result);}
+                        Command::PushRenewDue(now,reply)=>{self.push_renew_due(now,reply).await;}
+                        Command::Push(command)=>{self.push_command(command).await;}
                         Command::Retry(reply) => { let result = self.retry_open(); let _ = reply.send(result); }
                         #[cfg(all(feature="test-hooks",debug_assertions))]
                         Command::PairTestStop(stop,reply)=>{self.pair.stop=Some(stop);self.pair.reached=None;let _=reply.send(Ok(()));}
@@ -2056,6 +2075,7 @@ mod tests {
             network: network.clone(),
             requests,
             status: AtomicU64::new((ticket << 2) | 1),
+            push: Default::default(),
         });
         let sink = Arc::new(BoundarySink {
             network,
@@ -2188,6 +2208,7 @@ mod tests {
             network: network.clone(),
             requests,
             status: AtomicU64::new(ticket << 2),
+            push: Default::default(),
         });
         let backend = Arc::new(Backend {
             absent: AtomicBool::new(false),
@@ -2299,6 +2320,7 @@ mod tests {
                     network: network.clone(),
                     requests,
                     status: AtomicU64::new(ticket << 2),
+                    push: Default::default(),
                 }),
                 services: offline_services(),
             };
@@ -2430,6 +2452,7 @@ mod tests {
             network: network.clone(),
             requests,
             status: AtomicU64::new(ticket << 2),
+            push: Default::default(),
         });
         let mut manager = Manager {
             messages: Default::default(),
@@ -2528,6 +2551,7 @@ mod tests {
             network: network.clone(),
             requests,
             status: AtomicU64::new(ticket << 2),
+            push: Default::default(),
         });
         let mut manager = Manager {
             messages: Default::default(),
@@ -2630,8 +2654,7 @@ impl Manager {
         now: u64,
     ) -> bool {
         candidate.seq < accepted.seq
-            && candidate.record.generation == accepted.record.generation
-            && candidate.record.devices == accepted.record.devices
+            && super::publication::same_shape(candidate, accepted, &[])
             && candidate.current(now)
             && !candidate.record.is_expired(now)
             && accepted.current(now)
@@ -3158,7 +3181,11 @@ impl Manager {
             Input::MessageProof(result)=>self.message_proof(result).await,
             Input::Mls(event)=>self.mls_event(event).await,
             Input::Mailbox(event)=>self.mailbox_event(event).await,
+            Input::Push(event)=>self.push_event(event).await,
             Input::Incoming(conn) => {
+                // My device that showed an older record of the accepted shape (Ruling R30), dialed
+                // back if its authentication still fails (Ruling R31).
+                let mut stale_own = None;
                 let result = async {
                     let request = self.ready()?;
                     if !self.local_authorized() {
@@ -3168,6 +3195,7 @@ impl Manager {
                         .service(request, Box::pin(super::auth::receive_preface(&conn)))
                         .await?;
                     let peer = preface.hello.peer;
+                    let installation = preface.hello.cert.installation_id;
                     let record = self.remote_record(peer).await?;
                     let mut evidence = None;
                     let result = self
@@ -3184,6 +3212,10 @@ impl Manager {
                         )
                         .await;
                     if let Some(signed) = evidence {
+                        let local = self.local()?;
+                        if local.keys.peer_id() == peer && local.records.is_stale_renewal(&signed) {
+                            stale_own = Some((peer, installation, request));
+                        }
                         self.observe_auth_record(peer, signed, request).await?;
                     }
                     self.install_grant(conn.clone(), result?, None).await
@@ -3191,10 +3223,16 @@ impl Manager {
                 .await;
                 if result.is_err() {
                     conn.close(0u32.into(), b"account authentication failed");
+                    // The close loses the newer record this side sent; dialing that device
+                    // hands it over in the record exchange, and its next session is accepted.
+                    if let Some((peer, installation, request)) = stale_own {
+                        self.start_dial(peer, installation, request);
+                    }
                 }
                 #[cfg(all(feature = "test-hooks", debug_assertions))]
                 {
                     self.messages.mls.settled += 1;
+                    self.trace_own_accept(&conn, &result);
                 }
             }
             Input::Control {
@@ -3212,7 +3250,12 @@ impl Manager {
             Input::Closed(id) => {
                 let mut sessions = self.auth.registry.0.lock().unwrap();
                 if let Some(at) = sessions.iter().position(|s| s.conn.stable_id() == id) {
-                    let closed = sessions.remove(at).grant;
+                    let removed = sessions.remove(at);
+                    #[cfg(all(feature = "test-hooks", debug_assertions))]
+                    if self.local().is_ok_and(|local| local.keys.peer_id() == removed.grant.peer) {
+                        self.messages.mailbox.note_own_close(&removed.conn);
+                    }
+                    let closed = removed.grant;
                     // After a simultaneous dial another session with the device may be left
                     // (`install_grant`): it stays ready.
                     if !sessions.iter().any(|s| {
@@ -3253,45 +3296,10 @@ impl Manager {
             .accepted
             .as_ref()
             .ok_or_else(|| unavailable(ErrorCode::AccountRestricted))?;
-        let current = signed.current(self.services.clock.unix_seconds());
-        let exact = records
-            .pending
-            .iter()
-            .position(|p| p.signed.hash == signed.hash && p.status == PacketStatus::Ready);
-        let renewal = records.pending.is_empty()
-            && signed.seq > records.observed_seq
-            && current
-            && signed.record.generation == previous.record.generation
-            && signed.record.devices
-                == previous
-                    .record
-                    .devices
-                    .iter()
-                    .filter(|d| {
-                        !records.tombstones.iter().any(|t| {
-                            t.target_installation == d.installation_id
-                                || t.target_transport == d.transport_public_key
-                        })
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>();
-        let result = if records.conflict.is_none() && signed.hash == previous.hash {
-            Ok(())
-        } else if records.conflict.is_none()
-            && signed.seq >= records.observed_seq
-            && (exact.is_some() || renewal)
-            && current
+        let result = if records.conflict.is_none() && signed.hash == previous.hash
+            || records.is_stale_renewal(signed)
+            || records.accept_own(signed, self.services.clock.unix_seconds())
         {
-            records.observed_seq = signed.seq;
-            records.accepted = Some(signed.clone());
-            if let Some(index) = exact {
-                records.pending.remove(index);
-            }
-            records.state = if records.pending.is_empty() {
-                PublicationState::Observed
-            } else {
-                PublicationState::Pending
-            };
             Ok(())
         } else {
             records.observed_seq = records.observed_seq.max(signed.seq);
@@ -3999,5 +4007,6 @@ pub use messages::{MessageMutation,MessagePause,MessagePoint};
 pub(super) mod mls;
 pub use mls::GroupState;
 pub(super) mod mailbox;
+pub(super) mod push;
 #[cfg(all(feature="test-hooks",debug_assertions))]
 pub use mailbox::MailboxCounters;

@@ -14,7 +14,7 @@ class FakeMailboxClient implements MailboxClient {
   r.ErrorCode? failure;
   Completer<void>? backgroundWait;
   final sets = <bool>[];
-  int states = 0, marks = 0, foregrounds = 0, backgrounds = 0;
+  int states = 0, marks = 0, foregrounds = 0, backgrounds = 0, starts = 0;
 
   void _check() {
     if (failure != null) {
@@ -54,6 +54,12 @@ class FakeMailboxClient implements MailboxClient {
   }
 
   @override
+  Future<void> startNetwork() async {
+    starts++;
+    _check();
+  }
+
+  @override
   Future<int> mailboxBackground() async {
     backgrounds++;
     await backgroundWait?.future;
@@ -67,7 +73,6 @@ class FakeMailboxPlatform implements MailboxPlatform {
   /// What `setMailbox(true)` answers (Android: false unless the app is on screen).
   bool mailboxResult = true;
   bool autostartValue = false;
-  bool permissionResult = true;
   final calls = <String>[];
   final notifications = <({int id, String title, String body, bool update})>[];
   final cancelled = <int>[];
@@ -105,12 +110,6 @@ class FakeMailboxPlatform implements MailboxPlatform {
   @override
   Future<void> requestBatteryExemption() async =>
       calls.add('requestBatteryExemption');
-
-  @override
-  Future<bool> requestNotificationPermission() async {
-    calls.add('requestNotificationPermission');
-    return permissionResult;
-  }
 
   @override
   Future<void> quit() async => calls.add('quit');

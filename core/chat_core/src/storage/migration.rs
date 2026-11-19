@@ -19,9 +19,9 @@ use std::{fs, path::Path};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 type R<T> = Result<T, CoreError>;
-/// Current SQL schema. v1 (M4) and v2 (M5) are upgraded in place by `upgrade_v1_to_v2` and
-/// `upgrade_v2_to_v3`; nothing else is accepted.
-const SCHEMA_VERSION: i64 = 3;
+/// Current SQL schema. v1 (M4), v2 (M5) and v3 (M6) are upgraded in place by `upgrade_v1_to_v2`,
+/// `upgrade_v2_to_v3` and `upgrade_v3_to_v4`; nothing else is accepted.
+const SCHEMA_VERSION: i64 = 4;
 const DB: &str = "db.sqlite3";
 const PREP: &str = "migration.prep";
 pub(crate) struct OpenedStore {
@@ -412,6 +412,7 @@ fn open_locked(root: &Path, protector: &dyn KeyProtector) -> R<(Connection, DbSe
             ],
         )
         .map_err(|_| corrupt())?;
+        seed_push_local(&tx)?;
         if let Some(s) = &legacy {
             tx.execute(
                 "INSERT INTO account_state VALUES(1,?1,?2)",
@@ -517,6 +518,24 @@ fn upgrade_if_old(conn: &mut Connection) -> R<()> {
     if version == 1 || version == 2 {
         upgrade_v2_to_v3(conn)?;
     }
+    if (1..=3).contains(&version) {
+        upgrade_v3_to_v4(conn)?;
+    }
+    Ok(())
+}
+/// The one `push_local` row every v4 database starts with (fresh or upgraded): push on, no
+/// platform, token or handle yet, and this database's own random 16-byte tag. Seeded here and
+/// not in SQL so the tag comes from the OS CSPRNG rather than SQLite's `randomblob`.
+fn seed_push_local(c: &Connection) -> R<()> {
+    let mut own_tag = [0u8; 16];
+    getrandom::fill(&mut own_tag).map_err(|_| {
+        CoreError::new(ErrorCode::NotAvailable, "secure_randomness_unavailable")
+    })?;
+    c.execute(
+        "INSERT INTO push_local VALUES(1,1,NULL,NULL,?1,NULL,NULL)",
+        [own_tag.as_slice()],
+    )
+    .map_err(upgrade_failed)?;
     Ok(())
 }
 /// One transaction: new MLS tables, `storage_meta`/`outbox` rebuilt as v2, `user_version = 2`.
@@ -581,6 +600,41 @@ pub(crate) fn upgrade_v2_to_v3(c: &mut Connection) -> R<()> {
         ));
     }
     tx.pragma_update(None, "user_version", 3)
+        .map_err(upgrade_failed)?;
+    tx.commit().map_err(|_| {
+        CoreError::new(ErrorCode::StorageUncertain, "schema_upgrade_commit_uncertain")
+    })
+}
+
+/// One transaction: the push tables, `outbox.pushed` (0 on every queued row), `storage_meta`
+/// rebuilt as v4, the `push_local` row, `user_version = 4`. Any failure rolls back to an intact
+/// v3 database. A v3 app opening the result rejects it as corrupt (version != 3).
+pub(crate) fn upgrade_v3_to_v4(c: &mut Connection) -> R<()> {
+    let tx = c.transaction().map_err(upgrade_failed)?;
+    let version: i64 = tx
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .map_err(|_| corrupt())?;
+    let schema: i64 = tx
+        .query_row(
+            "SELECT schema_version FROM storage_meta WHERE singleton=1",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|_| corrupt())?;
+    if version != 3 || schema != 3 {
+        return Err(corrupt());
+    }
+    tx.execute_batch(include_str!("upgrade_v3_to_v4.sql"))
+        .map_err(upgrade_failed)?;
+    seed_push_local(&tx)?;
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    if take_upgrade_fault(&tx) {
+        return Err(CoreError::new(
+            ErrorCode::StorageCorrupt,
+            "schema_upgrade_fixture_fault",
+        ));
+    }
+    tx.pragma_update(None, "user_version", 4)
         .map_err(upgrade_failed)?;
     tx.commit().map_err(|_| {
         CoreError::new(ErrorCode::StorageUncertain, "schema_upgrade_commit_uncertain")
@@ -655,6 +709,25 @@ pub(crate) fn ready_v2(conn: &Connection) -> R<()> {
         )
         .map_err(|_| corrupt())?;
     if version != 2 || schema != 2 {
+        return Err(corrupt());
+    }
+    Ok(())
+}
+
+/// Test-only copy of the M6 (v3) reader's version check, to prove v3 rejects a v4 database.
+#[cfg(all(feature = "test-hooks", debug_assertions))]
+pub(crate) fn ready_v3(conn: &Connection) -> R<()> {
+    let version: i64 = conn
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .map_err(|_| corrupt())?;
+    let schema: i64 = conn
+        .query_row(
+            "SELECT schema_version FROM storage_meta WHERE singleton=1",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|_| corrupt())?;
+    if version != 3 || schema != 3 {
         return Err(corrupt());
     }
     Ok(())

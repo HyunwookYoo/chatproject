@@ -6,25 +6,33 @@ import 'package:chat_app/mailbox/mailbox_platform.dart';
 import 'package:chat_app/mailbox/notifier.dart';
 import 'package:chat_app/main.dart';
 import 'package:chat_app/message/screens/conversation_screen.dart';
+import 'package:chat_app/push/push_platform.dart';
 import 'package:chat_app/src/rust/api/account.dart' as a;
 import 'package:chat_app/src/rust/api/chat.dart' as r;
 import 'package:flutter/services.dart';
-import 'package:flutter/widgets.dart';
+import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'support/fake_mailbox.dart';
 import 'support/fake_message_client.dart' as m;
 import 'support/fake_network_client.dart';
+import 'support/fake_push.dart';
 
 Uint8List _bytes(int value) => Uint8List.fromList(List.filled(32, value));
 
-r.NotifyItem _item(int conversation, int newMessages, int unread) =>
-    r.NotifyItem(
-      conversation: _bytes(conversation),
-      peer: _bytes(conversation + 100),
-      newMessages: newMessages,
-      unread: BigInt.from(unread),
-    );
+r.NotifyItem _item(
+  int conversation,
+  int newMessages,
+  int unread, {
+  bool silenced = false,
+}) => r.NotifyItem(
+  conversation: _bytes(conversation),
+  peer: _bytes(conversation + 100),
+  newMessages: newMessages,
+  unread: BigInt.from(unread),
+  title: '',
+  silenced: silenced,
+);
 
 /// 0x01010101: the first 4 conversation bytes as a big-endian int32.
 const _id1 = 0x01010101;
@@ -78,6 +86,21 @@ void main() {
     expect(platform.notifications.single.body, '새 메시지 1개');
   });
 
+  test("the body is the core's preview when it has one (Windows)", () {
+    notify([
+      r.NotifyItem(
+        conversation: _bytes(1),
+        peer: _bytes(101),
+        newMessages: 2,
+        unread: BigInt.from(2),
+        title: 'Alice',
+        preview: '안녕 외 1개',
+        silenced: false,
+      ),
+    ]);
+    expect(platform.notifications.single.body, '안녕 외 1개');
+  });
+
   test('unread 0 cancels the conversation notification', () {
     notify([_item(1, 3, 3)]);
     notify([_item(1, 0, 0)]);
@@ -103,6 +126,14 @@ void main() {
     ]);
     notify([_item(1, 2, 3)]);
     expect(platform.notifications.last.update, isFalse, reason: 'new messages');
+  });
+
+  test('silenced new texts reach the platform as an update even when none '
+      'is shown (Ruling R13)', () {
+    notify([_item(1, 0, 1, silenced: true)]);
+    expect(platform.notifications.map((n) => (n.body, n.update)), [
+      ('새 메시지 1개', true),
+    ]);
   });
 
   test('the channel sends update with every notify', () async {
@@ -218,6 +249,8 @@ void main() {
       peer: _bytes(conversation + 1),
       newMessages: 1,
       unread: BigInt.from(unread),
+      title: '',
+      silenced: false,
     );
 
     messages.controller.add(r.ChatEvent.notify(items: [item(1, 1)]));
@@ -243,5 +276,57 @@ void main() {
     await tester.pumpWidget(const SizedBox());
     accounts.dispose();
     await core.controller.close();
-  });
+  }, variant: TargetPlatformVariant.only(TargetPlatform.windows));
+
+  testWidgets('Android posts nothing from Dart (Kotlin does), still opens a '
+      'tapped conversation and reports the one on screen', (tester) async {
+    final core = FakeNetworkClient();
+    final messages = m.FakeMessageClient()
+      ..conversations = [m.conversation(5, revision: 2)];
+    final accounts = AccountModel(ActiveAccountClient());
+    await accounts.open();
+    final channel = FakeMailboxPlatform();
+    final host = FakePushHost()..state = NotificationPermission.granted;
+    await tester.pumpWidget(
+      ChatApp(
+        core: core,
+        network: core,
+        account: accounts,
+        messages: messages,
+        mailbox: FakeMailboxClient()..firstLinkShown = true,
+        mailboxPlatform: channel,
+        push: FakePushClient(),
+        pushHost: host,
+      ),
+    );
+    await tester.pumpAndSettle();
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+    r.NotifyItem item(int conversation, int unread) => r.NotifyItem(
+      conversation: _bytes(conversation),
+      peer: _bytes(conversation + 1),
+      newMessages: 1,
+      unread: BigInt.from(unread),
+      title: '',
+      silenced: false,
+    );
+    messages.controller.add(r.ChatEvent.notify(items: [item(1, 1)]));
+    await tester.pumpAndSettle();
+    expect(channel.notifications, isEmpty);
+    expect(channel.cancelled, isEmpty);
+
+    channel.onOpenConversation!(0x05050505);
+    await tester.pumpAndSettle();
+    expect(
+      tester.widget<ConversationScreen>(find.byType(ConversationScreen)).peer,
+      _bytes(6),
+    );
+    expect(host.calls, contains('setOpenConversation:${0x05050505}'));
+    tester.state<NavigatorState>(find.byType(Navigator).first).pop();
+    await tester.pumpAndSettle();
+    expect(host.calls.last, 'setOpenConversation:null');
+
+    await tester.pumpWidget(const SizedBox());
+    accounts.dispose();
+    await core.controller.close();
+  }, variant: TargetPlatformVariant.only(TargetPlatform.android));
 }

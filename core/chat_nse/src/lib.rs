@@ -1,17 +1,23 @@
-//! MLS decrypt for the iOS notification service extension (design 12.3, M5 design 10). MLS only.
+//! MLS decrypt for the iOS notification service extension (M7 spec 5.6, design 12.3). MLS only.
 //!
-//! A thin UniFFI wrapper: the state file is a `chat_core` snapshot, and `chat_core` does the
-//! decrypting. Nothing is written: OpenMLS's writes during decrypt (it re-saves the message
-//! secrets, spike B) land in an in-memory copy that is dropped on return.
+//! A thin UniFFI wrapper: the app writes one state file per conversation a push can name
+//! (`chat_core::push::ios_state`), and `chat_core` does the decrypting. Nothing is written:
+//! OpenMLS's writes during decrypt (it re-saves the message secrets, spike B) land in an
+//! in-memory copy that is dropped on return. This crate has no HTTP client and no network code
+//! (`chat_core` without its `push-http` feature).
 
 use std::fs::File;
 use std::io::Read as _;
-use std::time::Instant;
+use std::path::Path;
 
 use chat_core::mls::nse;
+use chat_core::push::ios_state::{decode_state, state_file_name};
+use push_wire::{BASE64URL_NOPAD, PUSH_CIPHER_MAX, Tag};
 
-// UniFFI turns a panic into a Swift error only if panics unwind. With `panic = "abort"` the
-// notification extension would die without an error, so the build refuses it.
+// `nse_open` catches a panic and returns the generic notice, so the extension still shows
+// "새 메시지" (its Swift binding cannot throw: UniFFI lifts it with `try!`). Catching needs
+// panics to unwind; with `panic = "abort"` the extension would die instead, so the build
+// refuses it.
 #[cfg(not(panic = "unwind"))]
 compile_error!("chat_nse needs panic = \"unwind\"; do not set panic = \"abort\" in a profile");
 
@@ -22,51 +28,49 @@ uniffi::setup_scaffolding!();
 /// 0.4 MB), so 8 MiB is a ceiling for a corrupt file, not a target.
 const MAX_STATE_FILE: u64 = 8 << 20;
 
-#[derive(Debug, uniffi::Record)]
-pub struct ProbeOutcome {
-    /// Bytes of the message text.
-    pub plaintext_len: u32,
-    /// Up to 48 bytes of the text, for the notification body.
-    pub preview: String,
-    /// Reading the state file.
-    pub load_micros: u64,
-    /// Decoding the snapshot, loading the group, TLS decode and `process_message`.
-    pub decrypt_micros: u64,
+/// What a notification shows when the text cannot be: the app's `NEW_MSG`.
+const GENERIC: &str = "새 메시지";
+
+/// What the notification of one push shows.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct NseNotice {
+    /// The contact's alias, or "새 메시지" without one. Empty with `body`: show nothing.
+    pub title: String,
+    /// The start of the text (at most 48 bytes, whole characters), or "새 메시지". Empty: the
+    /// tag names no conversation of this device (withdrawn, or the conversation is gone), and
+    /// nothing is shown.
+    pub body: String,
+    /// The body is the text.
+    pub decrypted: bool,
 }
 
-#[derive(Debug, thiserror::Error, uniffi::Error)]
-#[uniffi(flat_error)]
-pub enum NseError {
-    #[error("bad state: {0}")]
-    BadState(String),
-    #[error("group not in state")]
-    GroupNotFound,
-    #[error("bad ciphertext: {0}")]
-    BadCiphertext(String),
-    #[error("decrypt failed: {0}")]
-    Decrypt(String),
-    #[error("not an application message")]
-    NotApplication,
-}
-
-impl From<nse::NseError> for NseError {
-    fn from(error: nse::NseError) -> Self {
-        match error {
-            nse::NseError::BadState(why) => Self::BadState(why.to_owned()),
-            nse::NseError::GroupNotFound => Self::GroupNotFound,
-            nse::NseError::BadCiphertext => Self::BadCiphertext("not an MLS private message".to_owned()),
-            nse::NseError::Decrypt(class) => Self::Decrypt(format!("class {class}")),
-            // A Commit, a receipt or a payload that is no text: no notification text either way.
-            nse::NseError::NotApplication | nse::NseError::NoPreview => Self::NotApplication,
+impl NseNotice {
+    fn silent() -> Self {
+        Self {
+            title: String::new(),
+            body: String::new(),
+            decrypted: false,
         }
     }
+
+    fn generic(alias: &str) -> Self {
+        Self {
+            title: title_of(alias),
+            body: GENERIC.to_owned(),
+            decrypted: false,
+        }
+    }
+}
+
+fn title_of(alias: &str) -> String {
+    if alias.is_empty() { GENERIC } else { alias }.to_owned()
 }
 
 fn too_large() -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, "state file too large")
 }
 
-fn read_state(path: &str) -> std::io::Result<Vec<u8>> {
+fn read_state(path: &Path) -> std::io::Result<Vec<u8>> {
     let file = File::open(path)?;
     let size = file.metadata()?.len();
     if size > MAX_STATE_FILE {
@@ -81,101 +85,172 @@ fn read_state(path: &str) -> std::io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// Reads the state file (a `chat_core::mls::nse::export_snapshot` snapshot) and decrypts one
-/// `MlsMessageOut` wire encoding of a `PrivateMessage` against it.
+/// The notification of one push: `tag_b64` is its `t`, `stripped_b64` its `e` (empty for a
+/// wake push), both base64url without padding; `push_dir` is `<App Group>/push`.
+///
+/// * No state file for the tag: nothing is shown (`title` and `body` empty).
+/// * A bad tag, a state file that cannot be read (before the first unlock, for one) or
+///   decoded, no `e`, or a ciphertext that does not open against the state (the state is older
+///   than the message, or it is not a text): "새 메시지", with the alias as the title if the
+///   file has one.
+/// * Otherwise the alias and the start of the text.
+///
+/// Reads one file, writes nothing, and never fails: a panic inside is caught and shows the
+/// generic notice ("새 메시지").
 #[uniffi::export]
-pub fn probe_decrypt(state_path: String, ciphertext: Vec<u8>) -> Result<ProbeOutcome, NseError> {
-    let start = Instant::now();
-    let snapshot = read_state(&state_path).map_err(|e| NseError::BadState(e.to_string()))?;
-    let loaded = Instant::now();
-    let preview = nse::decrypt_readonly(&snapshot, &ciphertext)?;
-    let done = Instant::now();
-    Ok(ProbeOutcome {
-        plaintext_len: preview.plaintext_len,
-        preview: preview.preview,
-        load_micros: (loaded - start).as_micros() as u64,
-        decrypt_micros: (done - loaded).as_micros() as u64,
-    })
+pub fn nse_open(push_dir: String, tag_b64: String, stripped_b64: String) -> NseNotice {
+    guarded(|| open(&push_dir, &tag_b64, &stripped_b64))
+}
+
+/// `notice()`, or the generic notice if it panics: no panic crosses the FFI boundary.
+fn guarded(notice: impl FnOnce() -> NseNotice) -> NseNotice {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(notice))
+        .unwrap_or_else(|_| NseNotice::generic(""))
+}
+
+fn open(push_dir: &str, tag_b64: &str, stripped_b64: &str) -> NseNotice {
+    let Some(tag) = BASE64URL_NOPAD
+        .decode(tag_b64.as_bytes())
+        .ok()
+        .and_then(|tag| Tag::try_from(tag).ok())
+    else {
+        return NseNotice::generic("");
+    };
+    let bytes = match read_state(&Path::new(push_dir).join(state_file_name(&tag))) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return NseNotice::silent(),
+        Err(_) => return NseNotice::generic(""),
+    };
+    let Some(state) = decode_state(&bytes) else {
+        return NseNotice::generic("");
+    };
+    let ciphertext = match BASE64URL_NOPAD.decode(stripped_b64.as_bytes()) {
+        Ok(ciphertext) if !ciphertext.is_empty() && ciphertext.len() <= PUSH_CIPHER_MAX => {
+            ciphertext
+        }
+        _ => return NseNotice::generic(state.alias),
+    };
+    match nse::decrypt_readonly(state.snapshot, &ciphertext) {
+        Ok(preview) => NseNotice {
+            title: title_of(state.alias),
+            body: preview.preview,
+            decrypted: true,
+        },
+        Err(_) => NseNotice::generic(state.alias),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chat_core::mls::nse::fixture::{Fixture, build_full, stripped};
+    use chat_core::push::ios_state::encode_state;
 
-    fn write(dir: &tempfile::TempDir, bytes: &[u8]) -> String {
-        let path = dir.path().join("nse_state.bin");
-        std::fs::write(&path, bytes).unwrap();
-        path.to_string_lossy().into_owned()
+    const TAG: Tag = [3; 16];
+
+    fn b64(bytes: &[u8]) -> String {
+        BASE64URL_NOPAD.encode(bytes)
     }
 
-    /// `b"CNS2" | gid_len | gid | n` with no rows.
-    fn empty_state(group_id: &[u8]) -> Vec<u8> {
-        let mut bytes = b"CNS2".to_vec();
-        bytes.extend_from_slice(&(group_id.len() as u32).to_be_bytes());
-        bytes.extend_from_slice(group_id);
-        bytes.extend_from_slice(&0u32.to_be_bytes());
-        bytes
+    /// A push folder holding `bytes` as the state file of `TAG`.
+    fn folder(bytes: &[u8]) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(state_file_name(&TAG)), bytes).unwrap();
+        let path = dir.path().to_string_lossy().into_owned();
+        (dir, path)
+    }
+
+    fn fixture() -> Fixture {
+        build_full(3, 2, 0)
     }
 
     #[test]
-    fn missing_state_file_is_bad_state() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("missing.bin").to_string_lossy().into_owned();
-        let err = probe_decrypt(path, vec![1, 2, 3]).unwrap_err();
-        assert!(matches!(err, NseError::BadState(_)), "{err:?}");
-    }
-
-    #[test]
-    fn state_with_bad_magic_is_bad_state() {
-        let dir = tempfile::tempdir().unwrap();
-        let err = probe_decrypt(write(&dir, b"NOPE"), Vec::new()).unwrap_err();
-        assert!(matches!(err, NseError::BadState(_)), "{err:?}");
-        // The M1b format is not accepted any more.
-        let err = probe_decrypt(write(&dir, b"CNS1\0\0\0\0\0\0\0\0"), Vec::new()).unwrap_err();
-        assert!(matches!(err, NseError::BadState(_)), "{err:?}");
-    }
-
-    #[test]
-    fn a_well_formed_empty_state_is_not_bad_state() {
-        // The state parses; it is the (empty) ciphertext that is refused.
-        let dir = tempfile::tempdir().unwrap();
-        let err = probe_decrypt(write(&dir, &empty_state(b"gid")), Vec::new()).unwrap_err();
-        assert!(matches!(err, NseError::BadCiphertext(_)), "{err:?}");
-    }
-
-    #[test]
-    fn huge_length_claims_in_the_file_are_bad_state() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut group_id = b"CNS2".to_vec();
-        group_id.extend_from_slice(&u32::MAX.to_be_bytes());
-        let mut entries = empty_state(b"g");
-        let at = entries.len() - 4;
-        entries[at..].copy_from_slice(&u32::MAX.to_be_bytes());
-        let mut field = empty_state(b"g");
-        let at = field.len() - 4;
-        field[at..].copy_from_slice(&1u32.to_be_bytes());
-        field.extend_from_slice(&u32::MAX.to_be_bytes()); // key length
-        field.extend_from_slice(&u32::MAX.to_be_bytes()); // value length
-        for claim in [group_id, entries, field] {
-            // The state is checked before the ciphertext, so this malformed one is never reached.
-            let err = probe_decrypt(write(&dir, &claim), vec![1, 2, 3]).unwrap_err();
-            assert!(matches!(err, NseError::BadState(_)), "{err:?}");
+    fn state_file_opens_with_nse_open() {
+        let fixture = fixture();
+        let (_dir, push) = folder(&encode_state("앨리스", &fixture.snapshot));
+        for (seq, ciphertext) in fixture.ciphertexts.iter().enumerate() {
+            let notice = nse_open(push.clone(), b64(&TAG), b64(&stripped(ciphertext)));
+            assert!(notice.decrypted, "{notice:?}");
+            assert_eq!(notice.title, "앨리스");
+            assert!(notice.body.starts_with(&format!("M1b probe message {seq} ")));
+            assert_eq!(notice.body.len(), 48);
         }
+        // Without an alias the title is the generic one.
+        let (_dir, push) = folder(&encode_state("", &fixture.snapshot));
+        let notice = nse_open(push, b64(&TAG), b64(&stripped(&fixture.ciphertexts[0])));
+        assert!(notice.decrypted);
+        assert_eq!(notice.title, GENERIC);
+    }
+
+    #[test]
+    fn nse_open_without_state_is_silent() {
+        let dir = tempfile::tempdir().unwrap();
+        let push = dir.path().to_string_lossy().into_owned();
+        assert_eq!(nse_open(push.clone(), b64(&TAG), b64(b"anything")), NseNotice::silent());
+        assert_eq!(nse_open(push, b64(&TAG), String::new()), NseNotice::silent());
+        let missing = dir.path().join("no-such-folder").to_string_lossy().into_owned();
+        assert_eq!(nse_open(missing, b64(&TAG), String::new()), NseNotice::silent());
+    }
+
+    #[test]
+    fn nse_open_stale_state_is_generic() {
+        let fixture = fixture();
+        let (_dir, push) = folder(&encode_state("앨리스", &fixture.snapshot));
+        let generic = NseNotice::generic("앨리스");
+        assert_eq!(generic.body, GENERIC);
+        assert_eq!(generic.title, "앨리스");
+        // A text of an epoch the state has not reached, or of one it no longer holds.
+        for other in [&fixture.next, &fixture.stale] {
+            assert_eq!(nse_open(push.clone(), b64(&TAG), b64(&stripped(other))), generic);
+        }
+        // No `e` (a wake push), bad base64, an oversized or a tampered ciphertext.
+        let mut tampered = stripped(&fixture.ciphertexts[0]);
+        *tampered.last_mut().unwrap() ^= 0xFF;
+        for e in [
+            String::new(),
+            "not base64!".to_owned(),
+            b64(&vec![0; PUSH_CIPHER_MAX + 1]),
+            b64(&tampered),
+        ] {
+            assert_eq!(nse_open(push.clone(), b64(&TAG), e), generic);
+        }
+        // A file that is not a state file, a bare snapshot, a state of no group.
+        for bytes in [b"NOPE".to_vec(), fixture.snapshot.clone(), encode_state("x", b"CNS2")] {
+            let (_dir, push) = folder(&bytes);
+            let notice = nse_open(push, b64(&TAG), b64(&stripped(&fixture.ciphertexts[0])));
+            assert!(!notice.decrypted && notice.body == GENERIC, "{notice:?}");
+        }
+        // A tag that is not 16 bytes of unpadded base64url.
+        for tag in [String::new(), b64(&[3; 15]), "AwMDAwMDAwMDAwMDAwMDAw==".to_owned()] {
+            assert_eq!(nse_open(push.clone(), tag, String::new()), NseNotice::generic(""));
+        }
+        // The state is only read: a text still opens after all that.
+        let again = nse_open(push, b64(&TAG), b64(&stripped(&fixture.ciphertexts[1])));
+        assert!(again.decrypted);
     }
 
     #[test]
     fn an_oversized_state_file_is_refused_unread() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("big.bin");
-        let file = File::create(&path).unwrap();
+        let file = File::create(dir.path().join(state_file_name(&TAG))).unwrap();
         file.set_len(MAX_STATE_FILE + 1).unwrap();
         drop(file);
-        let err = probe_decrypt(path.to_string_lossy().into_owned(), Vec::new()).unwrap_err();
-        assert!(matches!(&err, NseError::BadState(why) if why.contains("too large")), "{err:?}");
+        let push = dir.path().to_string_lossy().into_owned();
+        assert_eq!(nse_open(push, b64(&TAG), String::new()), NseNotice::generic(""));
     }
 
-    /// The build refuses `panic = "abort"` (see the top of this file), and a profile setting it
-    /// is caught here as well, because cargo's test profile ignores it.
+    /// A panic inside `nse_open` shows the generic notice instead of crossing into Swift, whose
+    /// binding lifts the result with `try!` and would crash the extension.
+    #[test]
+    fn a_panic_shows_the_generic_notice() {
+        assert_eq!(guarded(|| panic!("inside the decrypt")), NseNotice::generic(""));
+        let fine = NseNotice::silent();
+        assert_eq!(guarded(|| fine.clone()), fine);
+    }
+
+    /// Catching a panic needs unwinding: the build refuses `panic = "abort"` (see the top of
+    /// this file), and a profile setting it is caught here as well, because cargo's test
+    /// profile ignores it.
     #[test]
     fn panic_unwind_is_kept() {
         assert!(std::panic::catch_unwind(|| panic!("caught")).is_err());
@@ -183,22 +258,6 @@ mod tests {
         for line in manifest.lines() {
             let line = line.split('#').next().unwrap().replace(' ', "");
             assert!(!line.starts_with("panic="), "the workspace sets {line}");
-        }
-    }
-
-    #[test]
-    fn core_errors_map_to_the_exported_ones() {
-        let cases = [
-            (nse::NseError::BadState("x"), "BadState"),
-            (nse::NseError::GroupNotFound, "GroupNotFound"),
-            (nse::NseError::BadCiphertext, "BadCiphertext"),
-            (nse::NseError::Decrypt(2), "Decrypt"),
-            (nse::NseError::NotApplication, "NotApplication"),
-            (nse::NseError::NoPreview, "NotApplication"),
-        ];
-        for (core, expected) in cases {
-            let name = format!("{:?}", NseError::from(core));
-            assert!(name.starts_with(expected), "{name} vs {expected}");
         }
     }
 }

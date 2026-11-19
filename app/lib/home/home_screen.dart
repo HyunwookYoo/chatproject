@@ -9,8 +9,6 @@ import '../message/message_model.dart';
 import '../message/screens/conversation_list_screen.dart';
 import '../network/network_client.dart';
 import '../network/network_screen.dart';
-import '../probe/probe_host.dart';
-import '../probe/probe_screen.dart';
 import '../src/rust/api/chat.dart';
 import '../theme/tokens.dart';
 
@@ -26,7 +24,6 @@ class HomeScreen extends StatefulWidget {
   const HomeScreen({
     super.key,
     required this.core,
-    this.probe,
     this.network,
     this.account,
     this.messages,
@@ -38,9 +35,6 @@ class HomeScreen extends StatefulWidget {
   final AccountModel? account;
   final MessageClient? messages;
   final ValueChanged<List<int>>? onOpenConversation;
-
-  /// M1b device probe (iOS only). Null hides the probe button.
-  final ProbeHost? probe;
 
   @override
   State<HomeScreen> createState() => _HomeScreenState();
@@ -141,14 +135,6 @@ class _HomeScreenState extends State<HomeScreen> {
                       icon: const Icon(Icons.hub_outlined, color: AppColors.textSecondary),
                       onPressed: () => Navigator.of(context).push(
                         MaterialPageRoute<void>(builder: (_) => NetworkScreen(client: widget.network!)),
-                      ),
-                    ),
-                  if (widget.probe != null)
-                    IconButton(
-                      tooltip: '알림 측정',
-                      icon: const Icon(Icons.science_outlined, color: AppColors.textSecondary),
-                      onPressed: () => Navigator.of(context).push(
-                        MaterialPageRoute<void>(builder: (_) => ProbeScreen(host: widget.probe!)),
                       ),
                     ),
                 ],

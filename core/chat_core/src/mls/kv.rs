@@ -280,6 +280,10 @@ impl KvStore {
             }
         }
         state.dirty.clear();
+        if written > 0 && scope != GLOBAL {
+            // The iOS notification extension's state file of the conversation is out of date.
+            crate::push::ios_state::changed(scope);
+        }
         Ok(written)
     }
 

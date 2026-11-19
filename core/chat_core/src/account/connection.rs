@@ -165,6 +165,8 @@ pub(crate) enum Input {
     Mls(super::manager::mls::MlsEvent),
     /// A page (or failure) of an own-device sync request (M6).
     Mailbox(super::manager::mailbox::MailboxEvent),
+    /// A push proxy reply, or how a sent `PushHandle` frame ended (M7).
+    Push(super::manager::push::PushEvent),
     Incoming(Connection),
     Control {
         connection: Connection,

@@ -73,6 +73,33 @@ jobs:
       - run: cargo clippy -p chat_core --features test-hooks --all-targets -- -D warnings
       - run: cargo clippy -p chat_ffi --features test-hooks --all-targets -- -D warnings
 
+  # The proxy's tests and clippy run in job rust (`--workspace`). The release build is its own job:
+  # it compiles every dependency again in the release profile, and job rust already needs most of its
+  # 30 minutes on a cold cache.
+  push-proxy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master 2026-10-01
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo build --locked -p push_proxy --release
+      # The e2e harness upstream (Ruling R6) is a debug-only feature: tested and linted here,
+      # never in the release binary above.
+      - run: cargo test --locked -p push_proxy --features fake-upstream --test fake_upstream
+      - run: cargo clippy --locked -p push_proxy --features fake-upstream --all-targets -- -D warnings
+      - name: Release binary has no harness upstream
+        run: |
+          if grep -q 'fake-upstream-url' target/release/push_proxy; then
+            echo 'release push_proxy contains the fake upstream'
+            exit 1
+          fi
+
   bindings:
     strategy:
       matrix:
@@ -350,15 +377,23 @@ jobs:
             python3 tools/ci/check_workflows.py --android-instrumentation "$RUNNER_TEMP/native-worker.log" full
             # android-emulator-runner runs each script line in its own `sh -c`, so every loop must fit on one line.
             set -e; for phase in write read; do adb -s emulator-5554 shell am instrument -w -r -e class dev.chatproject.chat_app.AccountKeyStoreTest#restartPersistence -e accountPhase "$phase" dev.chatproject.chat_app.test/androidx.test.runner.AndroidJUnitRunner | tee "$RUNNER_TEMP/native-restart-$phase.log"; python3 tools/ci/check_workflows.py --android-instrumentation "$RUNNER_TEMP/native-restart-$phase.log" "$phase"; done
-            set -e; for test in app/integration_test/*_test.dart; do case "$test" in *account_storage_test.dart|*message_test.dart|*release_contract_test.dart) continue ;; esac; (cd app && flutter test "${test#app/}" -d emulator-5554); done
-            set -e; for phase in write read locked missing read; do (cd app && flutter test integration_test/account_storage_test.dart -d emulator-5554 --no-uninstall --dart-define=ACCOUNT_STORAGE_PHASE="$phase" --dart-define=ACCOUNT_STORAGE_ROOT=/data/user/0/dev.chatproject.chat_app/files/ci-account-storage); done
-            set -e; for phase in write read; do (cd app && flutter test integration_test/message_test.dart -d emulator-5554 --no-uninstall --dart-define=MESSAGE_TEST_PHASE="$phase" --dart-define=MESSAGE_TEST_ROOT=/data/user/0/dev.chatproject.chat_app/no_backup/ci-message-storage); done
+            adb -s emulator-5554 shell am instrument -w -r -e class dev.chatproject.chat_app.PushReceiverTest dev.chatproject.chat_app.test/androidx.test.runner.AndroidJUnitRunner | tee "$RUNNER_TEMP/push-receiver.log"
+            python3 tools/ci/check_workflows.py --android-instrumentation "$RUNNER_TEMP/push-receiver.log" push
+            # A push with no app process and no activity (M7 spec 5.4): one the core refuses, sent to the debug TestPushReceiver, must show its generic notification before the check run restarts the process.
+            set -e; for i in $(seq 10); do test -z "$(adb -s emulator-5554 shell pidof dev.chatproject.chat_app)" && break; adb -s emulator-5554 shell am kill dev.chatproject.chat_app; sleep 1; done; test -z "$(adb -s emulator-5554 shell pidof dev.chatproject.chat_app)"; adb -s emulator-5554 shell am broadcast --include-stopped-packages -n dev.chatproject.chat_app/.TestPushReceiver -a dev.chatproject.chat_app.TEST_PUSH --es t AAAAAAAAAAAAAAAAAAAAAA --es e x.y; for i in $(seq 30); do adb -s emulator-5554 shell dumpsys notification | grep -qF '|dev.chatproject.chat_app|0|push|' && break; sleep 1; done; if adb -s emulator-5554 shell dumpsys activity activities | grep -qF 'dev.chatproject.chat_app/.MainActivity'; then echo 'The push started an activity'; exit 1; fi; adb -s emulator-5554 shell am instrument -w -r -e class dev.chatproject.chat_app.PushReceiverTest#coldPushShowedNotification -e pushPhase cold dev.chatproject.chat_app.test/androidx.test.runner.AndroidJUnitRunner | tee "$RUNNER_TEMP/push-cold.log"; python3 tools/ci/check_workflows.py --android-instrumentation "$RUNNER_TEMP/push-cold.log" cold
+            # flutter test waits without a bound for an app that never reports (message_test read phase, 2026-11-15): each run is bounded and a failed one prints the state of the app.
+            # Files run once each from a fresh install may be tried once more after a flutter tool failure (APP_TEST_ATTEMPTS, android_app_test.sh); so may message_test.dart's write phase, from a cleared fixture (APP_TEST_RESET); the other stateful phases are not.
+            set -e; for test in app/integration_test/*_test.dart; do case "$test" in *account_storage_test.dart|*message_test.dart|*release_contract_test.dart) continue ;; esac; APP_TEST_ATTEMPTS=2 bash tools/ci/android_app_test.sh "${test#app/}"; done
+            set -e; for phase in write read locked missing read; do bash tools/ci/android_app_test.sh integration_test/account_storage_test.dart --no-uninstall --dart-define=ACCOUNT_STORAGE_PHASE="$phase" --dart-define=ACCOUNT_STORAGE_ROOT=/data/user/0/dev.chatproject.chat_app/files/ci-account-storage; done
+            set -e; for phase in write read; do if [ "$phase" = write ]; then export APP_TEST_ATTEMPTS=2 APP_TEST_RESET=/data/user/0/dev.chatproject.chat_app/no_backup/ci-message-storage; else unset APP_TEST_ATTEMPTS APP_TEST_RESET; fi; bash tools/ci/android_app_test.sh integration_test/message_test.dart --no-uninstall --dart-define=MESSAGE_TEST_PHASE="$phase" --dart-define=MESSAGE_TEST_ROOT=/data/user/0/dev.chatproject.chat_app/no_backup/ci-message-storage; done
             dart --packages=tools/e2e/.dart_tool/package_config.json tools/ci/release_smoke.dart --platform android --artifact "$RUNNER_TEMP/ordinary-release.apk" --serial emulator-5554
             dart --packages=tools/e2e/.dart_tool/package_config.json tools/ci/release_smoke.dart --platform android --artifact "$RUNNER_TEMP/contract-release.apk" --serial emulator-5554 --contract-nonce "$RELEASE_CONTRACT_NONCE"
 
   ios:
     runs-on: macos-26
-    timeout-minutes: 50
+    # Successful runs take 40-45 min; the account/privacy step alone varies 11-25 min by runner, and
+    # a hung first simulator attempt (15 min) plus its retry has taken a passing run to 69 min.
+    timeout-minutes: 90
     env:
       # One Rust slice (arm64) for the simulator instead of arm64 + x86_64.
       FLUTTER_XCODE_ARCHS: arm64
@@ -460,6 +495,9 @@ jobs:
           for phase in write read locked missing read lifecycle; do
             flutter test integration_test/account_storage_test.dart -d "${{ steps.sim.outputs.udid }}" --no-uninstall --dart-define=ACCOUNT_STORAGE_PHASE="$phase" --dart-define=ACCOUNT_STORAGE_ROOT="$container/Library/Application Support/ci-account-storage"
           done
+      - name: Push folder and inbox on the simulator
+        working-directory: app
+        run: flutter test integration_test/push_ios_test.dart -d "${{ steps.sim.outputs.udid }}" --no-uninstall
       - name: Native message storage across simulator processes
         working-directory: app
         run: |

@@ -46,7 +46,10 @@ async fn phone_gets_what_mailbox_kept_in_order_once() {
             conversation: conv,
             peer: b1.peer,
             new_messages: 5,
-            unread: 5
+            unread: 5,
+            title: "remote".into(),
+            preview: Some("text 5 외 4개".into()),
+            silenced: false,
         }]
     );
 }
@@ -253,15 +256,29 @@ async fn sync_killed_after_a_page_notifies_its_texts_after_restart() {
         texts_from(&a1, conv, b1.peer).await.len() == 5 && caught_up(&a1, &a2).await
     );
     quiet(&[&a1, &a2, &b1]).await;
-    assert_eq!(notify_count(&a1), 1, "one notification");
+    // The read first updated what is shown, without alerting (Ruling R21); one notification
+    // alerts after.
+    assert_eq!(notify_count(&a1), 2);
+    let item = NotifyItem {
+        conversation: conv,
+        peer: b1.peer,
+        new_messages: 4,
+        unread: 4,
+        title: "remote".into(),
+        preview: Some("text 5 외 3개".into()),
+        silenced: false,
+    };
     assert_eq!(
         notify_events(&a1),
-        vec![NotifyItem {
-            conversation: conv,
-            peer: b1.peer,
-            new_messages: 4,
-            unread: 4
-        }]
+        vec![
+            NotifyItem {
+                new_messages: 0,
+                unread: 2,
+                preview: Some("text 3 외 1개".into()),
+                ..item.clone()
+            },
+            item
+        ]
     );
 }
 
@@ -282,7 +299,10 @@ async fn sync_killed_after_a_page_notifies_after_restart_without_its_holder() {
             conversation: conv,
             peer: b1.peer,
             new_messages: 3,
-            unread: 3
+            unread: 3,
+            title: "remote".into(),
+            preview: Some("text 3 외 2개".into()),
+            silenced: false,
         }]
     );
     assert_eq!(texts_from(&a1, conv, b1.peer).await.len(), 3);
@@ -311,11 +331,47 @@ async fn failed_or_busy_pull_is_retried_without_a_new_trigger() {
         texts_from(&a1, conv, b1.peer).await.is_empty(),
         "A2 was busy"
     );
+    // The e2e m6 fact of why: the failed request first, then A2's `Busy`.
+    let trace = a1.account.mailbox_test_sync_trace().await.unwrap();
+    assert_eq!(trace.pull_failure, Some("busy"), "{trace:?}");
     a2.account.mailbox_test_hold(false).await.unwrap();
     settle!(
         [&a1, &a2, &b1],
         texts_from(&a1, conv, b1.peer).await.len() == 3 && caught_up(&a1, &a2).await
     );
+}
+
+/// User decision 2026-11-16 (f): A2 answers A1's first pull `Refused` (as right after a join,
+/// before it serves the new device). Over the same session, with nothing else happening, A1
+/// pulls again after a back-off and gets what A2 kept; before, sync over that session ended for
+/// good.
+#[tokio::test]
+async fn refused_pull_is_tried_again_over_the_same_session() {
+    let (mut a, b1, net, conv) = accounts(&[A1, A2], &[B1]).await;
+    let a2 = a.pop().unwrap();
+    let dir = stop(a.pop().unwrap());
+    for n in 1..=2 {
+        delivered(&b1, &a2, &[], n).await;
+    }
+    a2.account.mailbox_test_refuse_pulls(1).await.unwrap();
+    let a1 = start(dir, net.clone()).await;
+    link(&a1, &a2).await;
+    a1.account.mailbox_sync_now().await.unwrap();
+    settle!(
+        [&a1, &a2],
+        a1.account.mailbox_test_sync_trace().await.unwrap().pulls_stopped == 1
+    );
+    assert!(texts_from(&a1, conv, b1.peer).await.is_empty(), "the first pull was refused");
+    let stopped = a1.account.mailbox_test_sync_trace().await.unwrap();
+    let sessions_at_stop = (stopped.dials_ok, stopped.accepts_ok);
+    settle!(
+        [&a1, &a2],
+        texts_from(&a1, conv, b1.peer).await.len() == 2 && caught_up(&a1, &a2).await
+    );
+    let trace = a1.account.mailbox_test_sync_trace().await.unwrap();
+    assert_eq!(trace.pulls_stopped, 1, "{trace:?}");
+    // The same session all along: no new dial or accept brought the texts.
+    assert_eq!((trace.dials_ok, trace.accepts_ok), sessions_at_stop, "{trace:?}");
 }
 
 /// Spec 11 (both ways): A2 is off while A1 and B1 talk. A2 comes back and has the six texts in
@@ -448,4 +504,190 @@ async fn mailbox_entry_failure_sends_no_decrypt_failed_to_sender() {
         .map_or(0, |(_, since)| *since);
     assert!(since > seq, "the unopened entry is passed");
     assert_eq!(a1.account.mailbox_test_counters().await.unwrap().missing, 1);
+}
+
+/// Final fix D (e2e m7 diagnostic run 43707727053): A1 renews the account record (same
+/// generation and devices at a higher seq; the app does so when its DHT lookup comes back empty,
+/// or after 23 h), and A2 finds that renewal by its own lookup. A2 takes it, as it does when the
+/// renewal comes with A1's authentication, stays Active, and accepts A1's sessions again. Before,
+/// A2 held it as a list conflict and refused every own device with `AccountRestricted`.
+#[tokio::test]
+async fn own_device_renewal_found_by_lookup_keeps_the_account_active() {
+    use chat_core::account::{AccountPhase, PublicationState};
+    let (mut a, _b1, net, _conv) = accounts(&[A1, A2], &[B1]).await;
+    let a2 = a.pop().unwrap();
+    let a1 = a.pop().unwrap();
+    for f in [&a1, &a2] {
+        f.clock.advance_seconds(23 * 3600 + 60);
+    }
+    let published = net.publishes.lock().unwrap().len();
+    a1.account.refresh_record(a1.peer).await.unwrap();
+    assert_eq!(net.publishes.lock().unwrap().len(), published + 1, "A1 renewed");
+    // A1 observes its own renewal; A2 finds the same one.
+    a1.account.refresh_record(a1.peer).await.unwrap();
+    a2.account.refresh_record(a2.peer).await.unwrap();
+    let (v1, v2) = (a1.view().await, a2.view().await);
+    assert_eq!(v2.phase, AccountPhase::Active);
+    assert_eq!(v2.publication.state, PublicationState::Observed);
+    assert!(v2.publication.conflict.is_none());
+    assert_eq!(v2.publication.accepted_hash, v1.publication.accepted_hash);
+    assert_eq!(v2.publication.accepted, v1.publication.accepted);
+
+    // The sessions bound to the old record end; the next ones between A1 and A2 are made and
+    // accepted, whichever side dials.
+    let (was1, was2) = (
+        a1.account.mailbox_test_sync_trace().await.unwrap(),
+        a2.account.mailbox_test_sync_trace().await.unwrap(),
+    );
+    let before = attempts(&a1).await + attempts(&a2).await;
+    a1.account.mailbox_sync_now().await.unwrap();
+    settle!([&a1, &a2], {
+        let now = attempts(&a1).await + attempts(&a2).await;
+        if now == before {
+            let _ = a1.account.mailbox_sync_now().await;
+        }
+        now > before && own_session(&a1, &a2).await
+    });
+    let (t1, t2) = (
+        a1.account.mailbox_test_sync_trace().await.unwrap(),
+        a2.account.mailbox_test_sync_trace().await.unwrap(),
+    );
+    assert_eq!((t1.dials_failed, t1.accepts_failed), (was1.dials_failed, was1.accepts_failed), "{t1:?}");
+    assert_eq!((t2.dials_failed, t2.accepts_failed), (was2.dials_failed, was2.accepts_failed), "{t2:?}");
+    assert_eq!(a2.view().await.phase, AccountPhase::Active);
+
+    // A newer record with other devices is still a list change for the user to confirm.
+    let issued = NOW + 23 * 3600 + 120;
+    publish(&net, A, &packet(A, &[A2], A, issued, issued + 600, issued * 1_000_000));
+    let changed = a2.account.refresh_record(a2.peer).await.unwrap_err();
+    assert_eq!(changed.code, ErrorCode::RecordConflict);
+}
+
+/// Ruling R30 (re-review of final fix D): A1 renews (its lookup came back empty) and has not
+/// observed its renewal yet, so it still holds the old record; A2 takes the renewal by lookup
+/// while they have no session. When they authenticate next, A1 shows the old record: same
+/// generation and devices, lower seq. A2 ignores it as stale and stays Active (before: a list
+/// conflict, and every own device refused), and a session comes up, whichever side dials.
+#[tokio::test]
+async fn older_own_record_shown_at_auth_after_a_renewal_is_ignored() {
+    use chat_core::account::{AccountPhase, PublicationState};
+    for a2_dials in [false, true] {
+        let (mut a, _b1, net, _conv) = accounts(&[A1, A2], &[B1]).await;
+        let a2 = a.pop().unwrap();
+        let a1 = a.pop().unwrap();
+        let old = a1.view().await.publication.accepted_hash;
+        net.packets.lock().unwrap().remove(&peer_of(A));
+        a1.account.refresh_record(a1.peer).await.unwrap();
+        let v1 = a1.view().await;
+        assert_eq!(v1.publication.state, PublicationState::Pending, "A1 renewed, unobserved");
+        assert_eq!(v1.publication.accepted_hash, old);
+        // A1's network is off (m7 step 3), so A2 cannot hand it the renewal it finds.
+        a1.slot.network().unwrap().execute(NetworkOp::Stop).await.unwrap();
+        settle!([&a1, &a2], !own_session(&a2, &a1).await);
+        a2.account.refresh_record(a2.peer).await.unwrap();
+        let renewed = a2.view().await.publication.accepted_hash;
+        assert_ne!(renewed, old, "A2 took the renewal");
+        assert_eq!(a1.view().await.publication.accepted_hash, old, "A1 still holds the old one");
+        online(&a1).await;
+        link(&a1, &a2).await;
+        let (was1, was2) = (
+            a1.account.mailbox_test_sync_trace().await.unwrap(),
+            a2.account.mailbox_test_sync_trace().await.unwrap(),
+        );
+
+        let started = tokio::time::Instant::now();
+        let dialer = if a2_dials { &a2 } else { &a1 };
+        settle!([&a1, &a2], {
+            let _ = dialer.account.mailbox_sync_now().await;
+            let view = a2.view().await;
+            assert_eq!(view.phase, AccountPhase::Active, "A2 dials {a2_dials}");
+            assert!(view.publication.conflict.is_none(), "A2 dials {a2_dials}");
+            own_session(&a1, &a2).await && own_session(&a2, &a1).await
+        });
+        assert!(started.elapsed() < Duration::from_secs(20), "A2 dials {a2_dials}: {:?}", started.elapsed());
+        let (v1, v2) = (a1.view().await, a2.view().await);
+        assert_eq!(v2.publication.accepted_hash, renewed);
+        assert_eq!(v1.publication.accepted_hash, renewed, "A1 observed its renewal");
+        assert_eq!(v1.phase, AccountPhase::Active);
+        // E2E 43728038578: the first authentication between them already succeeds, whichever
+        // side holds the newer record; nothing waits for a refused attempt's aftermath.
+        let (t1, t2) = (
+            a1.account.mailbox_test_sync_trace().await.unwrap(),
+            a2.account.mailbox_test_sync_trace().await.unwrap(),
+        );
+        assert_eq!(
+            (t1.dials_failed, t1.accepts_failed, t2.dials_failed, t2.accepts_failed),
+            (was1.dials_failed, was1.accepts_failed, was2.dials_failed, was2.accepts_failed),
+            "A2 dials {a2_dials}: {t1:?} {t2:?}"
+        );
+    }
+}
+
+/// Re-review I1 of R35: my two devices hold two different packets of my record with the same
+/// seq (an IdentityKey holder signed twice: equivocation, M3 5.2 same-seq conflict). Neither
+/// direction authenticates: the dialer's handshake is refused on the record check.
+#[tokio::test]
+async fn own_records_with_equal_seq_and_another_hash_never_authenticate() {
+    for a2_dials in [false, true] {
+        let (mut a, _b1, net, _conv) = accounts(&[A1, A2], &[B1]).await;
+        let a2 = a.pop().unwrap();
+        let a1 = a.pop().unwrap();
+        for f in [&a1, &a2] {
+            f.slot.network().unwrap().execute(NetworkOp::Stop).await.unwrap();
+        }
+        settle!([&a1, &a2], !own_session(&a1, &a2).await && !own_session(&a2, &a1).await);
+        let seq = (NOW + 1) * 1_000_000;
+        publish(&net, A, &packet(A, &[A1, A2], A, NOW + 1, NOW + 601, seq));
+        a1.account.refresh_record(a1.peer).await.unwrap();
+        publish(&net, A, &packet(A, &[A1, A2], A, NOW + 2, NOW + 602, seq));
+        a2.account.refresh_record(a2.peer).await.unwrap();
+        let (h1, h2) = (
+            a1.view().await.publication.accepted_hash,
+            a2.view().await.publication.accepted_hash,
+        );
+        assert_ne!(h1, h2, "each holds its own packet");
+        for f in [&a1, &a2] {
+            online(f).await;
+        }
+        link(&a1, &a2).await;
+        let (dialer, acceptor) = if a2_dials { (&a2, &a1) } else { (&a1, &a2) };
+        // Counted from here: the sessions of the setup are gone with the records' divergence.
+        let (was_d, was_a) = (
+            dialer.account.mailbox_test_sync_trace().await.unwrap(),
+            acceptor.account.mailbox_test_sync_trace().await.unwrap(),
+        );
+        settle!([&a1, &a2], {
+            let _ = dialer.account.mailbox_sync_now().await;
+            dialer.account.mailbox_test_sync_trace().await.unwrap().dials_failed > was_d.dials_failed
+        });
+        quiet(&[&a1, &a2]).await;
+        let (d, acc) = (
+            dialer.account.mailbox_test_sync_trace().await.unwrap(),
+            acceptor.account.mailbox_test_sync_trace().await.unwrap(),
+        );
+        assert_eq!(
+            (d.dials_ok, d.accepts_ok, acc.dials_ok, acc.accepts_ok),
+            (was_d.dials_ok, was_d.accepts_ok, was_a.dials_ok, was_a.accepts_ok),
+            "A2 dials {a2_dials}: no authentication succeeded: {d:?} {acc:?}"
+        );
+        assert!(
+            !own_session(&a1, &a2).await && !own_session(&a2, &a1).await,
+            "A2 dials {a2_dials}: a session came up"
+        );
+        // Whichever side read the other's record first refused it on the record check and closed
+        // (the other then fails unnamed, CI 43742955782), and a side that took the equal-seq
+        // packet as evidence holds it as a conflict (M3 5.2), refusing what follows early.
+        let held = acceptor.view().await.publication.conflict.is_some()
+            || dialer.view().await.publication.conflict.is_some();
+        assert!(
+            d.dial_check == Some("record") || acc.accept_check == Some("record") || held,
+            "A2 dials {a2_dials}: {d:?} {acc:?}"
+        );
+    }
+}
+
+/// Own-device dials and accepts `f` made so far, failed or not.
+async fn attempts(f: &Fixture) -> u64 {
+    let t = f.account.mailbox_test_sync_trace().await.unwrap();
+    t.dials_ok + t.dials_failed + t.accepts_ok + t.accepts_failed
 }

@@ -20,7 +20,13 @@ Future<void> setMailbox({required bool enabled}) =>
 Future<void> markFirstLinkShown() =>
     RustLib.instance.api.crateApiMailboxMarkFirstLinkShown();
 
-/// The app came to the foreground: sync with my other devices now.
+/// The app came back to the foreground with an active account (a launch on screen only starts
+/// the network, `network_start`): the network starts, so a push's use of it leaves it running
+/// (M7 final review, user decision 2026-11-15),
+/// and my other devices sync now (also when the start failed: the sync then reports what it can,
+/// and the start's error is returned after it). Launches in the background never call this: the
+/// FCM receiver and the WorkManager jobs run no Dart, and Dart calls it only once the app is
+/// resumed.
 Future<void> mailboxForeground() =>
     RustLib.instance.api.crateApiMailboxMailboxForeground();
 

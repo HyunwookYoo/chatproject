@@ -48,14 +48,13 @@ class AccountKeyStoreTest {
 
     @Test fun nativeWorkerUsesCachedHelperAndThreadLocalEnvironment() {
         System.loadLibrary("chat_ffi")
-        lateinit var activity: MainActivity
-        InstrumentationRegistry.getInstrumentation().runOnMainSync { activity = MainActivity() }
-        val network = MainActivity::class.java.getDeclaredMethod("initializeNetworkContext", android.content.Context::class.java)
+        // ChatApplication initialized these already; a repeated call answers true.
+        val network = NativeInit::class.java.getDeclaredMethod("initializeNetworkContext", android.content.Context::class.java)
         network.isAccessible = true
-        assertEquals(true, network.invoke(activity, context))
-        val initialize = MainActivity::class.java.getDeclaredMethod("initializeAccountKeyStore", AccountKeyStore::class.java)
+        assertEquals(true, network.invoke(NativeInit, context))
+        val initialize = NativeInit::class.java.getDeclaredMethod("initializeAccountKeyStore", AccountKeyStore::class.java)
         initialize.isAccessible = true
-        assertEquals(true, initialize.invoke(activity, AccountKeyStore(context)))
+        assertEquals(true, initialize.invoke(NativeInit, AccountKeyStore(context)))
         assertTrue(nativeWorkerRoundTrip(id()))
     }
     private fun wrap(store: AccountKeyStore, id: ByteArray): ByteArray {

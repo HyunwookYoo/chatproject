@@ -8,6 +8,7 @@
 //! are bounded before any element is read, and the result must re-encode to exactly the input.
 use super::PAGE_MAX_ENTRIES;
 use crate::account::{InstallationId, PeerId};
+use crate::message::push_store::MAX_HANDLE;
 use crate::message::types::{ConversationId, MessageId};
 use crate::mls::wire::MAX_INNER;
 use crate::{CoreError, ErrorCode};
@@ -115,7 +116,13 @@ pub enum MailboxFrame {
     PlainReq { seq: u64 },
     /// One to `PAGE_MAX_ENTRIES` entries.
     Handoff { entries: Vec<HandoffEntry> },
-    Announce { mailbox: bool },
+    /// Whether the sender is a mailbox, and its own-device push handle (M7 spec 5.2; `None`: it
+    /// has none). Sent as `[1, 4, mailbox, handle or null]`; an M6 device's `[1, 4, mailbox]`
+    /// decodes with no handle.
+    Announce {
+        mailbox: bool,
+        handle: Option<Vec<u8>>,
+    },
 }
 
 /// The answer to a [`MailboxFrame`].
@@ -384,9 +391,13 @@ impl MailboxFrame {
                         .unwrap();
                 }
             }
-            Self::Announce { mailbox } => {
-                e = start(3, OP_ANNOUNCE);
+            Self::Announce { mailbox, handle } => {
+                e = start(4, OP_ANNOUNCE);
                 e.bool(*mailbox).unwrap();
+                match handle {
+                    Some(handle) => e.bytes(handle).unwrap(),
+                    None => e.null().unwrap(),
+                };
             }
         }
         finish(e)
@@ -397,7 +408,9 @@ impl MailboxFrame {
     }
     pub fn decode(inner: &[u8]) -> R<Self> {
         let (mut d, fields, op) = open(inner)?;
-        if fields != 3 {
+        // An M6 `Announce` has no handle field (plan 2, kind 18 `Announce`).
+        let m6_announce = op == OP_ANNOUNCE && fields == 3;
+        if fields != 3 && !(op == OP_ANNOUNCE && fields == 4) {
             return Err(invalid());
         }
         let frame = match op {
@@ -427,12 +440,29 @@ impl MailboxFrame {
                 }
                 Self::Handoff { entries }
             }
-            OP_ANNOUNCE => Self::Announce {
-                mailbox: d.bool().map_err(|_| invalid())?,
-            },
+            OP_ANNOUNCE => {
+                let mailbox = d.bool().map_err(|_| invalid())?;
+                let handle = if m6_announce {
+                    None
+                } else if d.datatype().map_err(|_| invalid())? == minicbor::data::Type::Null {
+                    d.null().map_err(|_| invalid())?;
+                    None
+                } else {
+                    Some(blob(&mut d, MAX_HANDLE)?)
+                };
+                Self::Announce { mailbox, handle }
+            }
             _ => return Err(invalid()),
         };
-        if d.position() != inner.len() || *frame.inner() != *inner {
+        let canonical = match &frame {
+            Self::Announce { mailbox, .. } if m6_announce => {
+                let mut e = start(3, OP_ANNOUNCE);
+                e.bool(*mailbox).unwrap();
+                *finish(e) == *inner
+            }
+            _ => *frame.inner() == *inner,
+        };
+        if d.position() != inner.len() || !canonical {
             return Err(invalid());
         }
         Ok(frame)

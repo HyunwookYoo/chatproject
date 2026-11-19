@@ -243,9 +243,9 @@ typedef void (*UniffiForeignFutureCompleteVoid)(uint64_t, UniffiForeignFutureRes
     );
 
 #endif
-#ifndef UNIFFI_FFIDEF_UNIFFI_CHAT_NSE_FN_FUNC_PROBE_DECRYPT
-#define UNIFFI_FFIDEF_UNIFFI_CHAT_NSE_FN_FUNC_PROBE_DECRYPT
-RustBuffer uniffi_chat_nse_fn_func_probe_decrypt(RustBuffer state_path, RustBuffer ciphertext, RustCallStatus *_Nonnull out_status
+#ifndef UNIFFI_FFIDEF_UNIFFI_CHAT_NSE_FN_FUNC_NSE_OPEN
+#define UNIFFI_FFIDEF_UNIFFI_CHAT_NSE_FN_FUNC_NSE_OPEN
+RustBuffer uniffi_chat_nse_fn_func_nse_open(RustBuffer push_dir, RustBuffer tag_b64, RustBuffer stripped_b64, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_FFI_CHAT_NSE_RUSTBUFFER_ALLOC
@@ -508,9 +508,9 @@ void ffi_chat_nse_rust_future_free_void(uint64_t handle
 void ffi_chat_nse_rust_future_complete_void(uint64_t handle, RustCallStatus *_Nonnull out_status
 );
 #endif
-#ifndef UNIFFI_FFIDEF_UNIFFI_CHAT_NSE_CHECKSUM_FUNC_PROBE_DECRYPT
-#define UNIFFI_FFIDEF_UNIFFI_CHAT_NSE_CHECKSUM_FUNC_PROBE_DECRYPT
-uint16_t uniffi_chat_nse_checksum_func_probe_decrypt(void
+#ifndef UNIFFI_FFIDEF_UNIFFI_CHAT_NSE_CHECKSUM_FUNC_NSE_OPEN
+#define UNIFFI_FFIDEF_UNIFFI_CHAT_NSE_CHECKSUM_FUNC_NSE_OPEN
+uint16_t uniffi_chat_nse_checksum_func_nse_open(void
     
 );
 #endif

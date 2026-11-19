@@ -37,7 +37,9 @@
     "Android owned activity exited",
     "Cannot find the home folder for AVDs. Set ANDROID_AVD_HOME.",
     "Disconnect retained outgoing intent",
+    "E2E_AVD_PROFILE must be ci or local",
     "Existing reverse conflict",
+    "FCM service account file missing",
     "Forbidden replay or retry event observed",
     "Foreground participant is not owned",
     "Future not completed",
@@ -110,6 +112,44 @@
     "Owned Android process changed",
     "Owned process identity unavailable; manual cleanup required",
     "Owned process tree identity or stop failed; manual cleanup required",
+    "Push broadcast failed",
+    "Push scenario deadline: cold_notification",
+    "Push scenario deadline: created",
+    "Push scenario deadline: delivery_cipher",
+    "Push scenario deadline: delivery_read",
+    "Push scenario deadline: delivery_wake",
+    "Push scenario deadline: fcm_platform",
+    "Push scenario deadline: first_text",
+    "Push scenario deadline: handle_at_sender",
+    "Push scenario deadline: initial_account",
+    "Push scenario deadline: isolated_mailbox",
+    "Push scenario deadline: isolated_sender",
+    "Push scenario deadline: mailbox_session_gone",
+    "Push scenario deadline: mailbox_texts",
+    "Push scenario deadline: new_device",
+    "Push scenario deadline: offline_notification",
+    "Push scenario deadline: own_handle_at_mailbox",
+    "Push scenario deadline: pair_awaiting_approval",
+    "Push scenario deadline: pair_code",
+    "Push scenario deadline: pair_joined",
+    "Push scenario deadline: pair_listed",
+    "Push scenario deadline: phone_stopped",
+    "Push scenario deadline: phone_texts",
+    "Push scenario deadline: read_cleared",
+    "Push scenario deadline: reopened",
+    "Push scenario deadline: setup_read",
+    "Push scenario deadline: ticket",
+    "Push scenario deadline: wake_content",
+    "Push scenario: cold_text_once",
+    "Push scenario: distinct_accounts",
+    "Push scenario: no_second_push",
+    "Push scenario: one_conversation",
+    "Push scenario: one_notification",
+    "Push scenario: pair_flow",
+    "Push scenario: pair_same_account",
+    "Push scenario: pair_sas",
+    "Push scenario: phone_once",
+    "Push scenario: wake_title",
     "RPC failed: AccountExists",
     "RPC failed: AccountRestricted",
     "RPC failed: AlreadyStartedDifferentConfig",
@@ -203,7 +243,8 @@
     "android-2",
     "windows-1",
     "windows-2",
-    "node"
+    "node",
+    "mailbox"
   ],
   "android": {
     "screen": [
@@ -648,6 +689,329 @@
       "r2",
       "r3plus",
       "unknown"
+    ],
+    "m7_network_phone": [
+      "Stopped",
+      "Starting",
+      "Online",
+      "Failed",
+      "unknown"
+    ],
+    "m7_network_mailbox": [
+      "Stopped",
+      "Starting",
+      "Online",
+      "Failed",
+      "unknown"
+    ],
+    "m7_network_node": [
+      "Stopped",
+      "Starting",
+      "Online",
+      "Failed",
+      "unknown"
+    ],
+    "m7_read_own_handles": [
+      "h0",
+      "h1plus",
+      "unknown"
+    ],
+    "m7_read_sessions": [
+      "s0",
+      "s1plus",
+      "unknown"
+    ],
+    "m7_read_clears": [
+      "c0",
+      "c1",
+      "c2plus",
+      "unknown"
+    ],
+    "m7_read_items": [
+      "i0",
+      "i1plus",
+      "unknown"
+    ],
+    "m7_fetch_all": [
+      "f0",
+      "f1",
+      "f2plus",
+      "unknown"
+    ],
+    "m7_fetch_online": [
+      "o0",
+      "o1",
+      "o2plus",
+      "unknown"
+    ],
+    "m7_fetch_done": [
+      "d0",
+      "d1",
+      "d2plus",
+      "unknown"
+    ],
+    "m7_fetch_network": [
+      "Stopped",
+      "Starting",
+      "Online",
+      "Failed",
+      "unknown"
+    ],
+    "m7_fetch_dials_ok": [
+      "k0",
+      "k1",
+      "k2plus",
+      "unknown"
+    ],
+    "m7_fetch_dials_failed": [
+      "x0",
+      "x1",
+      "x2plus",
+      "unknown"
+    ],
+    "m7_fetch_dial_error": [
+      "none",
+      "NetworkTimeout",
+      "TransportFailed",
+      "AuthFailed",
+      "Busy",
+      "StorageLocked",
+      "AccountRestricted",
+      "NetworkNotStarted",
+      "other",
+      "unknown"
+    ],
+    "m7_fetch_pulls": [
+      "p0",
+      "p1",
+      "p2plus",
+      "unknown"
+    ],
+    "m7_fetch_pulls_failed": [
+      "pf0",
+      "pf1",
+      "pf2plus",
+      "unknown"
+    ],
+    "m7_fetch_pulls_stopped": [
+      "ps0",
+      "ps1plus",
+      "unknown"
+    ],
+    "m7_mailbox_accepts_ok": [
+      "a0",
+      "a1",
+      "a2",
+      "a3plus",
+      "unknown"
+    ],
+    "m7_mailbox_accepts_failed": [
+      "r0",
+      "r1",
+      "r2plus",
+      "unknown"
+    ],
+    "m7_mailbox_accept_error": [
+      "none",
+      "NetworkTimeout",
+      "TransportFailed",
+      "AuthFailed",
+      "Busy",
+      "StorageLocked",
+      "AccountRestricted",
+      "NetworkNotStarted",
+      "other",
+      "unknown"
+    ],
+    "m7_mailbox_record": [
+      "LocalBlocked",
+      "Pending",
+      "Observed",
+      "Conflict",
+      "unknown"
+    ],
+    "m7_phone_record": [
+      "LocalBlocked",
+      "Pending",
+      "Observed",
+      "Conflict",
+      "unknown"
+    ],
+    "m6_own_sessions_phone": [
+      "s0",
+      "s1plus",
+      "unknown"
+    ],
+    "m6_pulls_phone": [
+      "p0",
+      "p1",
+      "p2plus",
+      "unknown"
+    ],
+    "m6_pulls_done_phone": [
+      "d0",
+      "d1",
+      "d2plus",
+      "unknown"
+    ],
+    "m6_pulls_failed_phone": [
+      "pf0",
+      "pf1",
+      "pf2plus",
+      "unknown"
+    ],
+    "m6_pulls_stopped_phone": [
+      "ps0",
+      "ps1plus",
+      "unknown"
+    ],
+    "m6_own_sessions_mailbox": [
+      "s0",
+      "s1plus",
+      "unknown"
+    ],
+    "m6_pulls_mailbox": [
+      "p0",
+      "p1",
+      "p2plus",
+      "unknown"
+    ],
+    "m6_pulls_done_mailbox": [
+      "d0",
+      "d1",
+      "d2plus",
+      "unknown"
+    ],
+    "m6_pulls_failed_mailbox": [
+      "pf0",
+      "pf1",
+      "pf2plus",
+      "unknown"
+    ],
+    "m6_pulls_stopped_mailbox": [
+      "ps0",
+      "ps1plus",
+      "unknown"
+    ],
+    "m7_fetch_dial_check": [
+      "none",
+      "identity",
+      "certificate",
+      "record",
+      "device",
+      "proof",
+      "grant",
+      "unknown"
+    ],
+    "m7_mailbox_accept_check": [
+      "none",
+      "identity",
+      "certificate",
+      "record",
+      "device",
+      "proof",
+      "grant",
+      "unknown"
+    ],
+    "m6_pull_failure_phone": [
+      "none",
+      "busy",
+      "request",
+      "entries",
+      "storage",
+      "session_gone",
+      "plain",
+      "unknown"
+    ],
+    "m6_own_closes_phone": [
+      "c0",
+      "c1",
+      "c2plus",
+      "unknown"
+    ],
+    "m6_own_close_phone": [
+      "none",
+      "open",
+      "local",
+      "timeout",
+      "reset",
+      "peer_simultaneous_dial",
+      "peer_new_proof",
+      "peer_restricted",
+      "peer_auth_failed",
+      "peer_record_changed",
+      "peer_stopped",
+      "peer_other",
+      "other",
+      "unknown"
+    ],
+    "m6_pull_failure_mailbox": [
+      "none",
+      "busy",
+      "request",
+      "entries",
+      "storage",
+      "session_gone",
+      "plain",
+      "unknown"
+    ],
+    "m6_own_closes_mailbox": [
+      "c0",
+      "c1",
+      "c2plus",
+      "unknown"
+    ],
+    "m6_own_close_mailbox": [
+      "none",
+      "open",
+      "local",
+      "timeout",
+      "reset",
+      "peer_simultaneous_dial",
+      "peer_new_proof",
+      "peer_restricted",
+      "peer_auth_failed",
+      "peer_record_changed",
+      "peer_stopped",
+      "peer_other",
+      "other",
+      "unknown"
+    ],
+    "m7_wake_phone_network_before": [
+      "Stopped",
+      "Starting",
+      "Online",
+      "Failed",
+      "unknown"
+    ],
+    "m7_wake_sender_attempted": [
+      "r0",
+      "r1",
+      "r2plus",
+      "unknown"
+    ],
+    "m7_wake_sender_handles": [
+      "h0",
+      "h1plus",
+      "unknown"
+    ],
+    "m7_wake_phone_text": [
+      "got",
+      "missing",
+      "unknown"
+    ],
+    "m7_wake_mailbox_text": [
+      "got",
+      "missing",
+      "unknown"
+    ],
+    "m7_wake_mailbox_sessions": [
+      "s0",
+      "s1plus",
+      "unknown"
+    ],
+    "logcat_lost": [
+      "lost"
     ]
   },
   "wait_kinds": [

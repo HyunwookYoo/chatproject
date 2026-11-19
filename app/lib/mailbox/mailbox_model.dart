@@ -10,9 +10,14 @@ import 'mailbox_platform.dart';
 /// This device's mailbox setting (M6 spec 4, 8) and the app's foreground and
 /// background hooks into the core.
 class MailboxModel extends ChangeNotifier {
-  MailboxModel(this.client, this.platform);
+  MailboxModel(
+    this.client,
+    this.platform, {
+    AppLifecycleState? Function()? lifecycle,
+  }) : _lifecycle = lifecycle ?? (() => WidgetsBinding.instance.lifecycleState);
   final MailboxClient client;
   final MailboxPlatform platform;
+  final AppLifecycleState? Function() _lifecycle;
 
   bool loaded = false;
   bool enabled = false;
@@ -40,9 +45,18 @@ class MailboxModel extends ChangeNotifier {
   /// Windows shows the first-link screen once (spec 8.1).
   bool get firstLinkDue => windows && loaded && !firstLinkShown;
 
-  /// The account is Active: load the setting once and tell the platform.
+  /// The account is Active: load the setting once and tell the platform. On
+  /// screen the network starts at once (user decision 2026-11-15); a launch in
+  /// the background waits until the app is resumed. Becoming Active syncs
+  /// nothing by itself: an own-device sync right as a device joins could find
+  /// its other device not ready yet (e2e m6 run 43719156130); resumes sync.
   Future<void> accountActive() {
-    _active = true;
+    if (!_active) {
+      _active = true;
+      if (_lifecycle() == AppLifecycleState.resumed) {
+        unawaited(_core(client.startNetwork));
+      }
+    }
     return _loading ??= _load();
   }
 
@@ -65,9 +79,6 @@ class MailboxModel extends ChangeNotifier {
     // Every start, so a restarted Android app restores its service and a
     // Windows --tray start learns the setting.
     _platformPending = !await platform.setMailbox(enabled) && enabled;
-    // Android prompts only on the first run with an active account; it
-    // remembers that it asked.
-    if (android) await platform.requestNotificationPermission();
   }
 
   void lifecycle(AppLifecycleState state) {

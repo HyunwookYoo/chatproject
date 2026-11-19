@@ -25,7 +25,8 @@ pub(crate) struct MessageRepo {
 /// sealed it; the MLS leaf that did is its sender.
 pub(crate) struct OpenFrom {
     pub peer: PeerId,
-    pub transport: InstallationId,
+    /// `None` for a push (M7): no device carried it.
+    pub transport: Option<InstallationId>,
     pub allowed: Vec<InstallationId>,
     /// The own device whose log it came from (a pull), if it did: a text from the other account
     /// stored just now is marked for that pull's notification (Ruling 35).
@@ -75,9 +76,19 @@ pub(crate) enum MessageDbOp {
     /// Test-hook builds: the M4-peer fixture's plaintext frame for a row awaiting encryption.
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     M4Encode(MessageKey),
+    /// Test-hook builds: seals a `PushHandle` (handle, issued at) in the conversation's group
+    /// as this device and returns the MLS ciphertext; only the ratchet changes.
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    SealPushHandle(ConversationId, Vec<u8>, u64),
     MlsGroupOp(ConversationId, super::mls_group::GroupOp),
     /// The device log: pages, cursors, retention (M6).
     Mailbox(super::mailbox_store::MailboxDbOp),
+    /// This device's push handles and their delivery (M7).
+    Push(super::push_store::PushDbOp),
+    /// The outcome of a text's first attempt (`MlsAcked`, `AttemptOutcome`, or `Defer` of a
+    /// text no device was reached for) with its push decision in the same transaction (M7 spec
+    /// 6.1). Replies `Push(Batch)`.
+    FirstAttempt(Box<MessageDbOp>, Box<super::push_store::FirstAttempt>),
     /// Notification items (M6) for texts just stored: per conversation, those of the keys that
     /// came from the other account and are still not seen here; and an item (maybe with no new
     /// message) for each conversation whose messages were read on another own device.
@@ -394,12 +405,7 @@ pub(crate) fn execute(
             commit(tx,#[cfg(all(feature="test-hooks",debug_assertions))] fault)?;
             Ok(MessageDbReply::Done)
         }
-        MessageDbOp::Defer(k, receipt, now) => {
-            let tx = c.transaction().map_err(sql_error)?;
-            schedule_retry(&tx, k, receipt, now)?;
-            commit(tx,#[cfg(all(feature="test-hooks",debug_assertions))] fault)?;
-            Ok(MessageDbReply::Done)
-        }
+        MessageDbOp::Defer(k, receipt, now) => defer(c, k, receipt, now, None, #[cfg(all(feature = "test-hooks", debug_assertions))] fault),
         MessageDbOp::ResetUnlaunched(k, provenance) => {
             if k.sender != identity.peer || k.installation != identity.installation {
                 return Err(invalid());
@@ -474,6 +480,7 @@ pub(crate) fn execute(
             block,
             failure,
             written,
+            None,
             #[cfg(all(feature = "test-hooks", debug_assertions))]
             fault,
         ),
@@ -590,13 +597,31 @@ pub(crate) fn execute(
         MessageDbOp::Reencrypt(key, now, counted) => super::mls_store::reencrypt(c, identity, local, key, now, counted, mls_fault!(fault)),
         MessageDbOp::OpenApp(from, id, ciphertext, now) => super::mls_store::open_app(c, identity, &from, id, ciphertext, now, mls_fault!(fault)),
         MessageDbOp::MarkWaitingPeerUpdate(key, waiting) => super::mls_store::mark_waiting(c, identity, key, waiting, mls_fault!(fault)),
-        MessageDbOp::MlsAcked(key, recipient, now) => super::mls_store::acked(c, identity, key, recipient, now, mls_fault!(fault)),
+        MessageDbOp::MlsAcked(key, recipient, now) => super::mls_store::acked(c, identity, key, recipient, now, None, mls_fault!(fault)),
+        MessageDbOp::FirstAttempt(op, mut first) => {
+            let decide = Some(&mut *first);
+            match *op {
+                MessageDbOp::MlsAcked(key, recipient, now) => super::mls_store::acked(c, identity, key, recipient, now, decide, mls_fault!(fault))?,
+                MessageDbOp::AttemptOutcome(key, block, failure, written) => attempt_outcome(c, key, block, failure, written, decide, #[cfg(all(feature = "test-hooks", debug_assertions))] fault)?,
+                MessageDbOp::Defer(key, false, now) => defer(c, key, false, now, decide, #[cfg(all(feature = "test-hooks", debug_assertions))] fault)?,
+                _ => return Err(invalid()),
+            };
+            Ok(MessageDbReply::Push(super::push_store::PushDbReply::Batch(first.batch.take())))
+        }
         MessageDbOp::ResealReceipt(key) => super::mls_store::reseal_receipt(c, key, mls_fault!(fault)),
         #[cfg(all(feature = "test-hooks", debug_assertions))]
         MessageDbOp::M4Encode(key) => super::mls_store::m4_encode(c, identity, key),
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        MessageDbOp::SealPushHandle(id, handle, issued_at_ms) => super::mls_store::fixture_seal_push_handle(c, identity, local, id, handle, issued_at_ms),
         MessageDbOp::MlsGroupOp(id, op) => super::mls_group::group_op(c, identity, local, id, op, mls_fault!(fault)),
         MessageDbOp::Mailbox(op) => super::mailbox_store::mailbox_op(c, identity, op, mls_fault!(fault)),
-        MessageDbOp::NotifyItems(keys, read) => Ok(MessageDbReply::Notify(notify_items(c, &keys, &read)?)),
+        MessageDbOp::Push(op) => super::push_store::push_op(c, identity, local, op, mls_fault!(fault)),
+        MessageDbOp::NotifyItems(keys, read) => {
+            let tx = c.transaction().map_err(sql_error)?;
+            let items = notify_items(&tx, &keys, &read)?;
+            commit(tx,#[cfg(all(feature="test-hooks",debug_assertions))] fault)?;
+            Ok(MessageDbReply::Notify(items))
+        }
         MessageDbOp::Messages(id, before, n) => {
             let take = limit(n)?;
             let (lamport, install, msg) = match before {
@@ -843,6 +868,10 @@ pub(crate) enum FixtureOp {
     /// Deletes one message row and the jobs that refer to it (as deleting its conversation
     /// would).
     DropMessage(MessageKey, tokio::sync::oneshot::Sender<R<()>>),
+    /// The `push_peer` rows and the number of `mailbox_notify` marks.
+    PushPeerState(tokio::sync::oneshot::Sender<R<super::push_store::PushPeerState>>),
+    /// This device's push rows (`push_local`, `push_tag`, `push_own`, `push_delivery`).
+    PushState(tokio::sync::oneshot::Sender<R<super::push_store::PushState>>),
 }
 #[cfg(all(feature = "test-hooks", debug_assertions))]
 pub(crate) fn fixture(c: &mut Connection, op: FixtureOp) {
@@ -993,6 +1022,12 @@ pub(crate) fn fixture(c: &mut Connection, op: FixtureOp) {
         FixtureOp::MailboxMark(installation, mailbox, at, reply) => {
             let _ = reply.send(super::mailbox_store::fixture_mark(c, installation, mailbox, at));
         }
+        FixtureOp::PushPeerState(reply) => {
+            let _ = reply.send(super::push_store::fixture_peer_state(c));
+        }
+        FixtureOp::PushState(reply) => {
+            let _ = reply.send(super::push_store::fixture_state(c));
+        }
         FixtureOp::DropMessage(k, reply) => {
             let result = ["receipt_job", "mls_receipt", "outbox", "message"].iter().try_for_each(|table| {
                 c.execute(&format!("DELETE FROM {table} WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4"), params![k.conversation.0.as_slice(), k.sender.0.as_slice(), k.installation.0.as_slice(), k.id.0.as_slice()]).map(|_| ()).map_err(sql_error)
@@ -1127,8 +1162,16 @@ pub(crate) enum MessageDbReply {
     /// when the text came from the other account and was stored just now.
     OpenedText(crate::mls::wire::MlsReply, MessageKey, bool),
     /// The reply for my `Read` receipt from another of my devices that made messages of the
-    /// conversation read here just now (M6, spec 6.4).
+    /// conversation read here just now (M6, spec 6.4), or ended its generic push notification
+    /// (Ruling R21).
     OpenedRead(crate::mls::wire::MlsReply, ConversationId),
+    /// The reply for a `PushHandle` of the other account's device `installation` (its MLS
+    /// leaf) that just changed what `push_peer` holds for it in `conversation` (M7 spec 5.2).
+    OpenedPushHandle {
+        reply: crate::mls::wire::MlsReply,
+        conversation: ConversationId,
+        installation: InstallationId,
+    },
     /// The account a receipt goes to, and whether the message came over MLS (its receipt may
     /// then go to any device of that account in the group).
     ReceiptPeer(PeerId, bool),
@@ -1140,11 +1183,18 @@ pub(crate) enum MessageDbReply {
     NotCurrent,
     Group(super::mls_group::GroupReply),
     Mailbox(super::mailbox_store::MailboxDbReply),
+    Push(super::push_store::PushDbReply),
     Notify(Vec<crate::event::NotifyItem>),
+    /// `MarkRead`: how many messages were read just now, and the conversation's notification
+    /// item when the read changed what it shows (none otherwise; Ruling R21).
+    Read(u64, Vec<crate::event::NotifyItem>),
     Conversation(ConversationView),
     Message(MessageView),
     Messages(MessagePage),
     Conversations(ConversationPage),
+    /// Test-hook builds: an MLS ciphertext a fixture sealed.
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    Ciphertext(Vec<u8>),
 }
 impl MessageRepo {
     pub(crate) fn new(storage: StorageHandle, local: &LocalAccount) -> Self {
@@ -1240,9 +1290,11 @@ impl MessageDbOp {
             // The M4-peer fixture's frame is what its enqueue would have stored: not a step
             // of the attempt that fault tests interrupt.
             #[cfg(all(feature = "test-hooks", debug_assertions))]
-            Self::M4Encode(_) => false,
+            Self::M4Encode(_) | Self::SealPushHandle(..) => false,
             Self::MlsGroupOp(_, op) => op.writes(),
             Self::Mailbox(op) => op.writes(),
+            Self::Push(op) => op.writes(),
+            Self::FirstAttempt(op, _) => return op.faultable(identity),
             _ => self.key(identity)?.is_some(),
         })
     }
@@ -1257,7 +1309,7 @@ impl MessageDbOp {
     }
     pub(crate) fn key(&self, identity: Identity) -> R<Option<MessageKey>> {
         Ok(match self {
-            Self::Observed(op) => return op.key(identity),
+            Self::Observed(op) | Self::FirstAttempt(op, _) => return op.key(identity),
             Self::MarkRead(_, keys, ..) => keys.first().copied(),
             Self::Enqueue(peer, id, _, _) => Some(MessageKey {
                 conversation: conversation_id(identity.peer, *peer)?,
@@ -1286,44 +1338,104 @@ impl MessageDbOp {
 /// counted per conversation, with the conversation's peer and unread count. Each conversation of
 /// `read` (read on another own device) gets an item too, with no new message if none counted: the
 /// app clears or updates what it shows for it.
+///
+/// Ruling R13 (final review 1): the first text of the other account notified after a generic
+/// push notification ("새 메시지") of its conversation alerted takes that notification's place,
+/// in this transaction: silently (the generic one alerted for it, `silenced`), and ending it, so
+/// the next text alerts. One that came read already clears or updates what it shows.
 pub(super) fn notify_items(
-    c: &Connection,
+    tx: &Transaction<'_>,
     keys: &[MessageKey],
     read: &[ConversationId],
 ) -> R<Vec<crate::event::NotifyItem>> {
     let keys: std::collections::BTreeSet<MessageKey> = keys.iter().copied().collect();
     let mut counts: std::collections::BTreeMap<ConversationId, u32> =
         read.iter().map(|id| (*id, 0)).collect();
+    let mut received = std::collections::BTreeSet::new();
     for k in keys {
-        let unseen: bool = c
+        let seen: Option<bool> = tx
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM message WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4 AND outgoing=0 AND seen_local=0)",
+                "SELECT seen_local FROM message WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4 AND outgoing=0",
                 params![k.conversation.0.as_slice(), k.sender.0.as_slice(), k.installation.0.as_slice(), k.id.0.as_slice()],
                 |r| r.get(0),
             )
+            .optional()
             .map_err(sql_error)?;
-        if unseen {
-            *counts.entry(k.conversation).or_default() += 1;
+        match seen {
+            Some(false) => *counts.entry(k.conversation).or_default() += 1,
+            Some(true) => {}
+            None => continue,
+        }
+        received.insert(k.conversation);
+    }
+    let mut ended = std::collections::BTreeSet::new();
+    for conversation in received {
+        if super::push_store::end_generic(tx, conversation)? {
+            counts.entry(conversation).or_default();
+            ended.insert(conversation);
         }
     }
     counts
         .into_iter()
         .map(|(conversation, new_messages)| {
-            let (peer, unread) = c
+            let (peer, unread) = tx
                 .query_row(
                     "SELECT peer,unread FROM conversation WHERE id=?1",
                     params![conversation.0.as_slice()],
                     |r| Ok((bytes::<32>(r, 0)?, uint(r, 1)?)),
                 )
                 .map_err(sql_error)?;
+            let silenced = new_messages > 0 && ended.contains(&conversation);
             Ok(crate::event::NotifyItem {
                 conversation,
                 peer: PeerId(peer),
-                new_messages,
+                new_messages: if silenced { 0 } else { new_messages },
                 unread,
+                // The alias is the actor's (`publish_notify`); the store has no contacts.
+                title: String::new(),
+                preview: last_unread_preview(tx, conversation, unread)?,
+                silenced,
             })
         })
         .collect()
+}
+/// Longest start of a text a notification shows, in bytes (M7; the iOS extension's too).
+pub(crate) const PREVIEW_BYTES: usize = 48;
+/// The start of `body` a notification shows: at most `PREVIEW_BYTES` bytes, cut at a character
+/// boundary.
+pub(crate) fn preview_prefix(body: &str) -> &str {
+    let mut end = body.len().min(PREVIEW_BYTES);
+    while !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    &body[..end]
+}
+/// A notification's body (M7): the start of the last unread text (`preview_prefix`), and
+/// `"<start> 외 N개"` when `more` (N) other messages are unread too.
+pub fn preview_text(body: &str, more: u32) -> String {
+    let prefix = preview_prefix(body);
+    if more == 0 {
+        prefix.to_owned()
+    } else {
+        format!("{prefix} 외 {more}개")
+    }
+}
+/// `preview_text` of the conversation's last unread text from the other account, the other
+/// unread ones counted; `None` with nothing unread.
+fn last_unread_preview(c: &Connection, conversation: ConversationId, unread: u64) -> R<Option<String>> {
+    if unread == 0 {
+        return Ok(None);
+    }
+    let body: Option<String> = c
+        .query_row(
+            "SELECT body FROM message WHERE conversation=?1 AND outgoing=0 AND seen_local=0 ORDER BY lamport DESC,sender_install DESC,msg_id DESC LIMIT 1",
+            params![conversation.0.as_slice()],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    let more = u32::try_from(unread - 1).unwrap_or(u32::MAX);
+    Ok(body.map(|body| preview_text(&body, more)))
 }
 impl MessageRepo {
     pub(crate) async fn operation(&self, op: MessageDbOp) -> R<MessageDbReply> {
@@ -1652,12 +1764,15 @@ fn applied(
     )?;
     Ok(MessageDbReply::Done)
 }
+/// `first`: the text's first attempt, decided on in this transaction before the row can go (not
+/// for a message given up on).
 fn attempt_outcome(
     c: &mut Connection,
     k: MessageKey,
     block: Option<BlockReason>,
     failure: Option<ErrorCode>,
     written: bool,
+    first: Option<&mut super::push_store::FirstAttempt>,
     #[cfg(all(feature = "test-hooks", debug_assertions))] fault: Option<
         crate::storage::worker::CommitFault,
     >,
@@ -1667,6 +1782,9 @@ fn attempt_outcome(
     // until the user's Retry; a late attempt outcome must not revive it.
     let exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM outbox WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4 AND reencrypts<3)",params![k.conversation.0.as_slice(),k.sender.0.as_slice(),k.installation.0.as_slice(),k.id.0.as_slice()],|r|r.get(0)).map_err(sql_error)?;
     if exists {
+        if let Some(first) = first {
+            first.decide(&tx, k)?;
+        }
         let reason = block.map(|b| match b {
             BlockReason::Account => 1,
             BlockReason::ContactRequired => 2,
@@ -1840,6 +1958,25 @@ fn outbox_delay_cap(c: &Connection) -> R<u64> {
     } else {
         super::scheduler::MAX_DELAY_MS
     })
+}
+/// The job backs off; `first`: a text's first attempt reached no device, decided on here too.
+fn defer(
+    c: &mut Connection,
+    k: MessageKey,
+    receipt: bool,
+    now: u64,
+    first: Option<&mut super::push_store::FirstAttempt>,
+    #[cfg(all(feature = "test-hooks", debug_assertions))] fault: Option<
+        crate::storage::worker::CommitFault,
+    >,
+) -> R<MessageDbReply> {
+    let tx = c.transaction().map_err(sql_error)?;
+    if let Some(first) = first {
+        first.decide(&tx, k)?;
+    }
+    schedule_retry(&tx, k, receipt, now)?;
+    commit(tx,#[cfg(all(feature = "test-hooks", debug_assertions))] fault)?;
+    Ok(MessageDbReply::Done)
 }
 pub(super) fn schedule_retry(tx: &Transaction<'_>, k: MessageKey, receipt: bool, now: u64) -> R<()> {
     let table = if receipt { "receipt_job" } else { "outbox" };
@@ -2366,10 +2503,20 @@ fn mark_read(
         )
         .map_err(sql_error)?;
     }
+    // The user read the conversation here (also when nothing was unread, Ruling R13).
+    let ended = super::push_store::read_up(&tx, id)?;
+    // Ruling R21: what the notification shows follows the read (cancelled once nothing is
+    // unread, else updated without alerting); a read that changed nothing leaves it.
+    let notify = if changed > 0 || ended {
+        notify_items(&tx, &[], &[id])?
+    } else {
+        Vec::new()
+    };
     commit(
         tx,
         #[cfg(all(feature = "test-hooks", debug_assertions))]
         fault,
     )?;
-    Ok(MessageDbReply::Done)
+    // How many were read just now (M7: only those clear notifications on my other devices).
+    Ok(MessageDbReply::Read(changed as u64, notify))
 }

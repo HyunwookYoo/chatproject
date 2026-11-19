@@ -9,10 +9,12 @@ crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
 chat_core = { path = "../../core/chat_core" }
+push_wire = { path = "../../core/push_wire" }
 flutter_rust_bridge = "=2.11.1"
 uniffi = "=0.32.2"
 zeroize = "=1.9.0"
-tokio = { version = "1", features = ["rt"] }
+serde_json = "=1.0.151"
+tokio = { version = "1", features = ["rt", "time"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "=0.61.2", features = ["Win32_Security_Cryptography", "Win32_Foundation"] }

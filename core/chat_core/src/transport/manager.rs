@@ -64,6 +64,9 @@ pub(crate) struct Gate {
     account_opened: AtomicBool,
     revision: AtomicU64,
     cancel: Mutex<CancellationToken>,
+    /// Starts asked for (`NetworkOp::Start`, a key installed with start): a received push that
+    /// started the network stops it only if nobody else asked for a start since (M7).
+    starts: AtomicU64,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     fail_bind: std::sync::atomic::AtomicBool,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
@@ -132,11 +135,14 @@ impl NetworkHandle {
     pub(crate) fn block(&self) -> u64 { self.gate.block() }
     pub(crate) fn begin_account(&self) -> u64 { self.gate.account_opened.store(true, Ordering::Release); self.block() }
     pub(crate) fn desired_suspend(&self) -> bool { self.gate.desired_suspend() }
+    /// How many starts were asked for so far.
+    pub(crate) fn starts(&self) -> u64 { self.gate.starts.load(Ordering::Acquire) }
     pub(crate) fn lifecycle_gate(&self, suspend: bool) { self.gate.lifecycle(suspend); }
     pub(crate) fn release(&self, ticket: u64) {
         let _ = self.gate.revision.compare_exchange(ticket, ticket + 1, Ordering::AcqRel, Ordering::Acquire);
     }
     pub(crate) async fn install_key(&self, key: SecretKey, start: bool, ticket: u64) -> Result<(), CoreError> {
+        if start { self.gate.starts.fetch_add(1, Ordering::AcqRel); }
         let (reply, received) = oneshot::channel();
         if self.controls.try_send(Control::Activate { key: Box::new(key), start, ticket, reply }).is_err() {
             // No transition was queued: remain blocked, with the persisted key untouched.
@@ -228,6 +234,7 @@ impl NetworkHandle {
     }
     pub async fn execute(&self, op: NetworkOp) -> Result<NetworkReply, CoreError> {
         if self.gate.blocked() && !matches!(op, NetworkOp::Info) { return Err(err(ErrorCode::Busy)); }
+        if matches!(op, NetworkOp::Start) { self.gate.starts.fetch_add(1, Ordering::AcqRel); }
         let (reply, received) = oneshot::channel();
         self.commands
             .try_send(Envelope { op, reply })

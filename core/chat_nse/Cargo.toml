@@ -5,14 +5,16 @@ edition = "2024"
 publish = false
 
 [lib]
-# staticlib: linked into the iOS notification extension. lib: used by tools/nse_fixture.
+# staticlib: linked into the iOS notification extension. lib: for the tests.
 # No cdylib: `-lchat_nse` would pick a .dylib that sits next to the .a.
 crate-type = ["staticlib", "lib"]
 
 [dependencies]
-chat_core = { path = "../chat_core", features = ["nse"] }
-thiserror = "2"
+# No default features: `push-http` (reqwest, rustls, web roots) stays out of the extension.
+chat_core = { path = "../chat_core", default-features = false, features = ["nse"] }
+push_wire = { path = "../push_wire" }
 uniffi = "=0.32.2"
 
 [dev-dependencies]
+chat_core = { path = "../chat_core", default-features = false, features = ["nse-fixture"] }
 tempfile = "3"

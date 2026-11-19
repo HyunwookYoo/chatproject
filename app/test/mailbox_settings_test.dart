@@ -78,7 +78,8 @@ void main() {
     await tester.tap(find.text(_deviceSwitch));
     await tester.pumpAndSettle();
     expect(client.sets, [true]);
-    expect(platform.calls.skip(2), [
+    // After the start's setMailbox:false.
+    expect(platform.calls.skip(1), [
       'setMailbox:true',
       'requestBatteryExemption',
     ]);
@@ -101,7 +102,7 @@ void main() {
   }, variant: TargetPlatformVariant.only(TargetPlatform.android));
 
   test('the stored setting reaches the platform once the account is Active; '
-      'Android asks the notification permission once', () async {
+      'the notification permission is asked elsewhere (M7)', () async {
     debugDefaultTargetPlatformOverride = TargetPlatform.android;
     addTearDown(() => debugDefaultTargetPlatformOverride = null);
     final client = FakeMailboxClient()..enabled = true;
@@ -112,10 +113,7 @@ void main() {
     await model.accountActive();
     expect(client.states, 1);
     expect(model.enabled, isTrue);
-    expect(platform.calls, [
-      'setMailbox:true',
-      'requestNotificationPermission',
-    ]);
+    expect(platform.calls, ['setMailbox:true']);
   });
 
   test('Windows never asks a notification permission at startup', () async {
@@ -153,7 +151,11 @@ void main() {
     debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
     addTearDown(() => debugDefaultTargetPlatformOverride = null);
     final client = FakeMailboxClient();
-    final model = MailboxModel(client, FakeMailboxPlatform());
+    final model = MailboxModel(
+      client,
+      FakeMailboxPlatform(),
+      lifecycle: () => AppLifecycleState.hidden,
+    );
     addTearDown(model.dispose);
     model.lifecycle(AppLifecycleState.hidden);
     await pumpEventQueue();
@@ -173,6 +175,47 @@ void main() {
     await pumpEventQueue();
     expect(client.foregrounds, 2);
     expect(client.backgrounds, 2);
+  });
+
+  // Final review, user decision 2026-11-15: an Active account on screen
+  // starts the network; a launch in the background (no Dart in FCM,
+  // WorkManager; an iOS background refresh may start the engine) waits until
+  // the app comes to the foreground. Becoming Active syncs nothing by itself
+  // (e2e m6 run 43719156130: an own-device sync at that moment kept the new
+  // mailbox from its phone's log); every resume does, as before.
+  test('an Active account on screen starts the network at once, a '
+      'background launch only when it is resumed', () async {
+    final client = FakeMailboxClient();
+    final model = MailboxModel(
+      client,
+      FakeMailboxPlatform(),
+      lifecycle: () => AppLifecycleState.resumed,
+    );
+    addTearDown(model.dispose);
+    await model.accountActive();
+    await model.accountActive();
+    await pumpEventQueue();
+    expect((client.starts, client.foregrounds), (1, 0));
+
+    for (final launched in [null, AppLifecycleState.hidden]) {
+      final background = FakeMailboxClient();
+      final model = MailboxModel(
+        background,
+        FakeMailboxPlatform(),
+        lifecycle: () => launched,
+      );
+      addTearDown(model.dispose);
+      await model.accountActive();
+      await pumpEventQueue();
+      expect(
+        (background.starts, background.foregrounds),
+        (0, 0),
+        reason: 'launched $launched',
+      );
+      model.lifecycle(AppLifecycleState.resumed);
+      await pumpEventQueue();
+      expect(background.foregrounds, 1);
+    }
   });
 
   testWidgets(

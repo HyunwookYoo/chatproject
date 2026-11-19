@@ -100,6 +100,9 @@ account packet은 `_account` TXT의 base64url(no padding) deterministic CBOR pay
 | 정상 완료 + 유효 최신본 | 해당 base로 갱신/사용자가 승인한 추가·해제. 이미 할당한 자기 후속 packet이 확인된 경우는 성공으로 수용하고, 예상하지 않은 변경은 충돌로 보류 |
 | 정상 완료 + 문구 복구, usable record 없음/만료 또는 기존 목록 대체 필요 | 사용자가 “이전 기기를 제외하고 복구”를 확인하면 아래 replacement 게시. 관측한 만료본의 seq와 남아 있는 로컬 high-water도 보존 |
 
+
+**M7에서 고침 (2026-11-15, Ruling R28·R30).** 내 다른 기기가 만든 **같은 generation·같은 기기 목록**(이 기기가 해제한 기기는 뺀 목록)의 더 높은 seq 갱신본은 "예상하지 않은 변경"이 아니다. 조회로 보든 상호 인증의 record 교환으로 받든 수용한다(내 pending이 없고 보류 중인 충돌이 없으며 지금 유효할 때). 상호 인증에서 내 기기가 보인 record가 수용한 것과 **같은 generation·같은 기기 목록이지만 seq가 더 낮으면** 그 기기가 아직 갱신본을 못 본 것이므로 무시한다(충돌로 보류하지 않고, 그 기기에 다시 연결해 갱신본을 건넨다). 조회로 온 더 낮은 seq와, 기기 목록이나 generation이 다른 record는 지금처럼 충돌로 보류한다.
+
 따라서 7일 넘게 모두 꺼져 있었더라도 저장된 기기는 같은 generation을 갱신하고, 모든 기기를 잃은 사용자는 문구 복구 replacement로 진행할 수 있다. 결과 없음만으로 이전 기록을 자동 덮어쓰거나 자동 복구하지 않는다. 뒤늦게 더 높은 이전 작성자의 record가 발견되면 성공을 유지한 채 숨기지 않고 충돌/기기 확인 상태로 전환한다.
 
 **제안: 조용한 자동 병합보다 명시적인 충돌 보류를 우선한다.** 현재 base와 다른 record를 발견하면 새 추가/해제 intent를 자동으로 덮어쓰지 않고 `목록 충돌 — 내 기기에서 다시 확인`으로 둔다. 이미 승인한 추가 intent도 새 목록에 여유가 있는지 재확인한다. 어떤 발행본에도 5대를 넘겨 넣지 않으며 경쟁한 여섯 번째 기기는 활성 완료로 표시하지 않는다. 연속/동시 QR 연결은 기기별 한 세션만 허용한다.
@@ -123,6 +126,8 @@ TLS binding은 pinned iroh 1.3.0의 `Connection::export_keying_material(output, 
 유효기간 안의 마지막 수용 signed cache가 있고 이후 더 높은 record/다른 generation/제거/충돌을 관측하지 않았다면, 조회 불가에도 그 cache와 새 proof로 일반 재접속을 허용한다. UI에는 `캐시로 기기 확인 · 목록 갱신 지연`을 보인다. 새 기기 추가·해제·recovery replacement의 승인/발행에는 이 예외를 쓰지 않고 §5.1의 정상 조회/로컬 확인을 요구한다. fresh lookup도 전역 revocation 부재를 증명하지 않으므로 cache와 lookup 양쪽 모두 알려진 상태까지의 인증이라는 한계를 유지한다.
 
 접속 권한은 검증한 record hash/generation/만료에 묶인다. 만료 시 연결을 **제한 상태**로 바꾸고 연락처/계정 데이터·변경 intent 송수신을 중단한다. 이때 공개 signed record 교환과 재인증 handshake만 허용하며, §5.1 갱신본을 검증한 뒤 새 nonce/proof가 성공해야 일반 기능을 재개한다. 같은 generation의 더 높은 record를 수용해도 재인증 전에는 기존 권한을 이어 쓰지 않는다. remote installation 제거/tombstone이면 즉시 해당 권한/연결을 종료한다. generation 변경/동일 seq 충돌은 해당 계정의 기존 권한을 모두 무효화하고, 충돌 해소 및 새 record 기반 재인증 전 데이터를 주고받지 않는다. 내 installation이 새 목록에서 빠졌으면 내 일반 계정 활동도 보류한다.
+
+**M7에서 고침 (2026-11-16, Ruling R35).** 내 기기끼리의 재인증은 갱신을 사이에 두고도 된다: 서로 보인 내 record가 **같은 generation·같은 기기 목록**(이 기기가 해제한 기기는 뺀 목록)이고 seq만 다르면 같은 권한으로 보고, 더 높은 seq의 record로 권한을 묶는다(낮은 쪽은 그 record를 받아들인다). **seq가 같은데 packet이 다르면** 위의 동일 seq 충돌이므로 거절한다. 연락처(다른 계정)와의 인증은 지금처럼 정확히 같은 record여야 한다.
 
 M2의 transport-connected 시각/500 ms 지표는 그대로 둔다. 추가 cert/record/proof 처리가 끝난 `account-auth-ready`를 별도 상태로 기록하며 이 늦은 시각으로 M2 측정 정의를 바꾸거나 기존 미달을 통과 처리하지 않는다.
 

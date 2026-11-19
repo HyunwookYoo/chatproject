@@ -1,9 +1,14 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
     <uses-permission android:name="android.permission.INTERNET"/>
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
     <uses-permission android:name="android.permission.CAMERA"/>
     <!-- Optional mailbox mode (spec 8.2): a remoteMessaging foreground service the
-         user turns on while the app is on screen. No boot start, no receiver. -->
+         user turns on while the app is on screen. Nothing starts at boot: WorkManager's
+         merged boot receiver and its permission are removed (below), and the daily push
+         renewal is scheduled again when the app next starts (ChatApplication, KEEP). The
+         shipped manifest is checked by tools/ci/check_release_hooks.py. -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" tools:node="remove"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_REMOTE_MESSAGING"/>
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"/>
@@ -14,7 +19,7 @@
         android:fullBackupContent="@xml/account_backup_rules"
         android:dataExtractionRules="@xml/account_data_extraction_rules"
         android:label="ChatProject"
-        android:name="${applicationName}"
+        android:name=".ChatApplication"
         android:icon="@mipmap/ic_launcher">
         <activity
             android:name=".MainActivity"
@@ -49,6 +54,21 @@
             android:name=".MailboxService"
             android:foregroundServiceType="remoteMessaging"
             android:exported="false"/>
+        <!-- Pushes (M7 spec 5.4): FCM data messages, handled without Flutter. Not a
+             foreground service: a push shows only message notifications. -->
+        <service
+            android:name=".PushService"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.google.firebase.MESSAGING_EVENT"/>
+            </intent-filter>
+        </service>
+        <meta-data
+            android:name="com.google.firebase.messaging.default_notification_channel_id"
+            android:value="messages" />
+        <receiver
+            android:name="androidx.work.impl.background.systemalarm.RescheduleReceiver"
+            tools:node="remove" />
         <!-- Don't delete the meta-data below.
              This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->
         <meta-data

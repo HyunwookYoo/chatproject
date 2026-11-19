@@ -122,7 +122,13 @@ async fn announce_reaches_own_devices_only() {
     // A contact announcing itself is refused, and nothing is recorded.
     let reply = b1
         .account
-        .mailbox_test_exchange(a1_id, MailboxFrame::Announce { mailbox: true })
+        .mailbox_test_exchange(
+            a1_id,
+            MailboxFrame::Announce {
+                mailbox: true,
+                handle: None,
+            },
+        )
         .await
         .unwrap();
     assert!(reply == MailboxReply::Refused);

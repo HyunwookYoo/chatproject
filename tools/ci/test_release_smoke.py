@@ -112,6 +112,9 @@ class Fake implements ProcessRunner {
             'phase': mode == 'android-contract2-cleanup' && launches == 3 ? 'reopened' : phase,
             'binding': base64Encode(List.filled(20, 7)), 'instance': 'android-$launches'});
         }
+        // ChatApplication's one line once the release build reached Rust (M1a carry-forward 1).
+        final native = 'I/ChatProject(${320 + launches}): ChatProject native ok 0.1.0';
+        if (mode != 'android-no-native') output = '$native\n${mode == 'android-native-twice' ? '$native\n' : ''}$output';
       }
       child.code.complete(commandExit);
     } else if (exe.endsWith('chat_app.exe')) {
@@ -264,6 +267,14 @@ class ReleaseSmokeTests(unittest.TestCase):
         data = self.probe('android-contract2-cleanup', False)
         self.assertEqual(data['launches'], 3)
         self.assertEqual(data['ownership']['activities'], [])
+
+    def test_android_requires_exactly_one_native_ok_line(self):
+        for mode in ('android-no-native', 'android-native-twice'):
+            with self.subTest(mode=mode):
+                data = self.probe(mode, False)
+                self.assertTrue(data['forceStopped'])
+        data = self.probe('android-native-twice', False)
+        self.assertIn('native', data['result'])
 
     def test_android_release_rejects_backup_enabled_manifest(self):
         self.probe('android-backup', False)

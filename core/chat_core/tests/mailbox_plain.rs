@@ -104,7 +104,10 @@ async fn unopenable_entry_is_stored_from_plaintext() {
             conversation: conv,
             peer: b1.peer,
             new_messages: 1,
-            unread: 1
+            unread: 1,
+            title: "remote".into(),
+            preview: Some("text 1".into()),
+            silenced: false,
         }]
     );
     assert_eq!(notify_count(&a1), 1, "one notification");

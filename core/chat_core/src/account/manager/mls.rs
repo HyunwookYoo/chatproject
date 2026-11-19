@@ -29,7 +29,7 @@ use crate::message::mls_group::{
     Committed, Delivery, DueDelivery, GroupOp, GroupReply, Outcome, OwnWelcome,
 };
 use crate::message::store::{MessageDbOp, MessageDbReply, OpenFrom, conversation_id};
-use crate::message::types::{BlockReason, ConversationId};
+use crate::message::types::{BlockReason, ConversationId, MessageKey};
 use crate::message::wire::{Frame, RejectReason};
 use crate::mls::{
     group::{CLASS_FUTURE_EPOCH, CLASS_OTHER, CLASS_OUT_OF_ORDER, inspect_key_package},
@@ -260,11 +260,19 @@ enum Task {
     Dial,
 }
 
+/// A dial of another device that authenticated, ready to be installed.
+type DialedAccount = (
+    iroh::endpoint::Connection,
+    auth::AuthGrant,
+    Option<Box<crate::account::publication::SignedRecord>>,
+);
 enum Answer {
     Reply(Result<MlsReply, ErrorCode>),
     Lookup(Result<Lookup, CoreError>),
     /// A dial run outside the actor (`dial_unreachable`): the connection and its proof.
-    Dial(Result<(iroh::endpoint::Connection, auth::AuthGrant), CoreError>),
+    /// The connection and grant, with my own record the grant was made on when my other device
+    /// showed a renewal of it this device has not taken yet (Ruling R35).
+    Dial(Result<DialedAccount, CoreError>),
 }
 
 /// Who made a received kind 17 request: the account and installation that sent it (its MLS
@@ -288,6 +296,17 @@ pub(super) enum Via {
         #[allow(dead_code)]
         seq: u64,
     },
+    /// A push (M7 spec 5.3): no device carried it, nobody waits for an answer, and nothing is
+    /// sent to the sender (it learns of the delivery from its next direct attempt).
+    Push,
+}
+
+/// What opening one received application ciphertext did.
+pub(super) struct Received {
+    /// The answer to its sender: `None` when it carried a text M4 would refuse.
+    pub reply: Option<MlsReply>,
+    /// The text it carried, and whether that was stored just now.
+    pub text: Option<(MessageKey, bool)>,
 }
 
 /// The answer to one kind 17 request, or one record lookup, this actor started.
@@ -1824,7 +1843,9 @@ impl Manager {
                 }
                 // A device presenting another record than this one fails the handshake. The
                 // record it showed is not observed here: record changes belong to the lookup
-                // and record-review flows (a lagging device must not raise a conflict).
+                // and record-review flows (a lagging device must not raise a conflict). One
+                // exception (Ruling R35): my other device's renewal of my record, which the
+                // grant was made on; the actor takes it only as a renewal (`dialed`).
                 let mut evidence = None;
                 let grant = auth::authenticate(
                     connected.clone(),
@@ -1836,7 +1857,10 @@ impl Manager {
                     None,
                 )
                 .await?;
-                Ok((connected, grant))
+                let renewal = evidence
+                    .filter(|e| grant.record_hash != record.hash && e.hash == grant.record_hash)
+                    .map(Box::new);
+                Ok((connected, grant, renewal))
             };
             let result = tokio::select! {biased;
                 _ = cancel.cancelled() => Err(unavailable(ErrorCode::StorageLocked)),
@@ -1880,16 +1904,39 @@ impl Manager {
 
     /// A spawned dial came back: the session is installed (checked again here, as for
     /// `connect_account`).
-    async fn dialed(
-        &mut self,
-        dialed: Result<(iroh::endpoint::Connection, auth::AuthGrant), CoreError>,
-    ) {
+    async fn dialed(&mut self, peer: PeerId, dialed: Result<DialedAccount, CoreError>) {
         #[cfg(all(feature = "test-hooks", debug_assertions))]
         {
             self.messages.mls.settled += 1;
         }
-        if let Ok((conn, grant)) = dialed {
-            let _ = self.install_grant(conn, grant, None).await;
+        let installed = match dialed {
+            Ok((conn, grant, renewal)) => {
+                // Ruling R35: the grant is on my other device's renewal of my record. Taken
+                // here only if it is one (my exact pending packet, or `is_renewal`); anything
+                // else is left to the lookup flows and the grant then fails as before.
+                if let Some(signed) = renewal {
+                    self.take_own_renewal(&signed).await;
+                }
+                self.install_grant(conn, grant, None).await
+            }
+            Err(error) => Err(error),
+        };
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        self.trace_own_dial(peer, &installed);
+        #[cfg(not(all(feature = "test-hooks", debug_assertions)))]
+        let _ = (peer, installed);
+    }
+
+    /// Takes my own record `signed` that my other device showed while this one dialed it, by
+    /// the same acceptance as `apply_record_change` (`RecordState::accept_own`); anything else
+    /// is left as it is (never a conflict on the dial path).
+    async fn take_own_renewal(&mut self, signed: &crate::account::publication::SignedRecord) {
+        let (Ok(request), Ok(local)) = (self.ready(), self.local()) else {
+            return;
+        };
+        let mut records = local.records.clone();
+        if records.accept_own(signed, self.services.clock.unix_seconds()) {
+            let _ = self.commit_records(records, request).await;
         }
     }
 
@@ -1923,7 +1970,7 @@ impl Manager {
     /// The current devices of `peer` as this device holds its record: those its accepted
     /// record lists, and for this account without the ones it revoked (by installation or
     /// transport key, as the group's leaf vetting drops them).
-    fn current_installations(&self, peer: PeerId) -> Vec<InstallationId> {
+    pub(super) fn current_installations(&self, peer: PeerId) -> Vec<InstallationId> {
         let Ok(local) = self.local() else {
             return Vec::new();
         };
@@ -2097,7 +2144,7 @@ impl Manager {
             (Task::Lookup { peer }, Answer::Lookup(lookup)) => {
                 self.looked_up(peer, lookup, request).await
             }
-            (_, Answer::Dial(dialed)) => self.dialed(dialed).await,
+            (_, Answer::Dial(dialed)) => self.dialed(answered, dialed).await,
             (task, Answer::Reply(result)) => {
                 let _ = self.mls_answer(task, result, request).await;
             }
@@ -2616,7 +2663,30 @@ impl Manager {
         via: &Via,
         request: Request,
     ) -> Result<Option<MlsReply>, CoreError> {
-        let sender = from.peer;
+        self.open_received(
+            from.peer,
+            Some(from.installation),
+            conversation,
+            ciphertext,
+            via,
+            request,
+        )
+        .await
+        .map(|received| received.reply)
+    }
+
+    /// `receive_app` of a ciphertext from `sender`'s account carried by its device `carrier`, or
+    /// by no device (`None`: a push, `Via::Push`); tells which text it carried too.
+    pub(super) async fn open_received(
+        &mut self,
+        sender: PeerId,
+        carrier: Option<InstallationId>,
+        conversation: ConversationId,
+        ciphertext: Vec<u8>,
+        via: &Via,
+        request: Request,
+    ) -> Result<Received, CoreError> {
+        let answer = |reply| Received { reply, text: None };
         // Application messages come from the conversation's peer account, or (spec 5.3) are a
         // copy of what another device of this account sent in a conversation with a contact.
         let own = sender == self.local()?.keys.peer_id();
@@ -2624,15 +2694,15 @@ impl Manager {
             .conversation_peer(conversation, sender)
             .filter(|peer| own || *peer == sender)
         else {
-            return Ok(Some(MlsReply::ContactRequired));
+            return Ok(answer(Some(MlsReply::ContactRequired)));
         };
         let open = OpenFrom {
             peer: sender,
-            transport: from.installation,
+            transport: carrier,
             allowed: self.current_installations(sender),
             pull: match via {
                 Via::Mailbox { holder, .. } => Some(*holder),
-                Via::Direct(_) => None,
+                Via::Direct(_) | Via::Push => None,
             },
         };
         let op = MessageDbOp::OpenApp(
@@ -2642,11 +2712,14 @@ impl Manager {
             self.services.clock.wall_ms(),
         );
         let result = self.message_db(op, request).await;
-        if result.is_ok() && !own {
-            self.speaks_mls(from.installation);
+        if result.is_ok()
+            && !own
+            && let Some(carrier) = carrier
+        {
+            self.speaks_mls(carrier);
         }
         match result {
-            Ok(MessageDbReply::Opened(reply)) => Ok(Some(reply)),
+            Ok(MessageDbReply::Opened(reply)) => Ok(answer(Some(reply))),
             Ok(MessageDbReply::OpenedText(reply, key, new)) => {
                 // The keyed response checkpoint of tests: the Ack that stores this text.
                 #[cfg(all(feature = "test-hooks", debug_assertions))]
@@ -2656,35 +2729,40 @@ impl Manager {
                 if new {
                     self.text_stored(key, via, request).await;
                 }
-                Ok(Some(reply))
+                Ok(Received {
+                    reply: Some(reply),
+                    text: Some((key, new)),
+                })
             }
             // My read on another own device: shown here as read, its notification cleared.
             Ok(MessageDbReply::OpenedRead(reply, conversation)) => {
                 self.read_synced(conversation, via, request).await;
-                Ok(Some(reply))
+                Ok(answer(Some(reply)))
             }
-            Ok(MessageDbReply::Rejected) => Ok(None),
-            // Sealed by a device of the account that is not current here. Directly: refused,
-            // whoever carries it. From another own device's log (final review I3): that device
-            // took it while the leaf was current (it was a member of the group the message
-            // opened in), so it is not taken from the ciphertext but goes to the plaintext
-            // hand-over (spec 6.3), not skipped.
+            // A peer device's push handle went into `push_peer` (M7 spec 5.2): nothing to show.
+            Ok(MessageDbReply::OpenedPushHandle { reply, .. }) => Ok(answer(Some(reply))),
+            Ok(MessageDbReply::Rejected) => Ok(answer(None)),
+            // Sealed by a device of the account that is not current here. Directly or by push:
+            // refused, whoever carries it. From another own device's log (final review I3): that
+            // device took it while the leaf was current (it was a member of the group the
+            // message opened in), so it is not taken from the ciphertext but goes to the
+            // plaintext hand-over (spec 6.3), not skipped.
             Ok(MessageDbReply::NotCurrent) => match via {
-                Via::Direct(_) => Ok(None),
-                Via::Mailbox { .. } => Ok(Some(MlsReply::DecryptFailed {
+                Via::Direct(_) | Via::Push => Ok(answer(None)),
+                Via::Mailbox { .. } => Ok(answer(Some(MlsReply::DecryptFailed {
                     class: CLASS_OTHER,
                     epoch: 0,
-                })),
+                }))),
             },
             Ok(MessageDbReply::FarAhead { epoch }) => match via {
-                Via::Direct(_) => Ok(Some(
+                Via::Direct(_) => Ok(answer(Some(
                     self.move_epoch(conversation, peer, epoch, request).await?,
-                )),
+                ))),
                 // No sender waits to seal it again in a new epoch: it is not opened here.
-                Via::Mailbox { .. } => Ok(Some(MlsReply::DecryptFailed {
+                Via::Mailbox { .. } | Via::Push => Ok(answer(Some(MlsReply::DecryptFailed {
                     class: CLASS_OUT_OF_ORDER,
                     epoch,
-                })),
+                }))),
             },
             Ok(_) => Err(unavailable(ErrorCode::InvalidMessage)),
             // The MLS sender is not the authenticated device, or the message conflicts.
@@ -2694,7 +2772,7 @@ impl Manager {
                     ErrorCode::InvalidMessage | ErrorCode::MessageConflict
                 ) =>
             {
-                Ok(None)
+                Ok(answer(None))
             }
             Err(error) => Err(error),
         }

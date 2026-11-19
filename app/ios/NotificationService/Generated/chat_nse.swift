@@ -465,31 +465,23 @@ fileprivate final class UniffiHandleMap<T>: @unchecked Sendable {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-fileprivate struct FfiConverterUInt32: FfiConverterPrimitive {
-    typealias FfiType = UInt32
-    typealias SwiftType = UInt32
+fileprivate struct FfiConverterBool : FfiConverter {
+    typealias FfiType = Int8
+    typealias SwiftType = Bool
 
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UInt32 {
+    public static func lift(_ value: Int8) throws -> Bool {
+        return value != 0
+    }
+
+    public static func lower(_ value: Bool) -> Int8 {
+        return value ? 1 : 0
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Bool {
         return try lift(readInt(&buf))
     }
 
-    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
-        writeInt(&buf, lower(value))
-    }
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-fileprivate struct FfiConverterUInt64: FfiConverterPrimitive {
-    typealias FfiType = UInt64
-    typealias SwiftType = UInt64
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UInt64 {
-        return try lift(readInt(&buf))
-    }
-
-    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+    public static func write(_ value: Bool, into buf: inout [UInt8]) {
         writeInt(&buf, lower(value))
     }
 }
@@ -540,62 +532,43 @@ fileprivate struct FfiConverterString: FfiConverter {
     }
 }
 
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-fileprivate struct FfiConverterData: FfiConverterRustBuffer {
-    typealias SwiftType = Data
 
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Data {
-        let len: Int32 = try readInt(&buf)
-        return Data(try readBytes(&buf, count: Int(len)))
-    }
-
-    public static func write(_ value: Data, into buf: inout [UInt8]) {
-        let len = Int32(value.count)
-        writeInt(&buf, len)
-        writeBytes(&buf, value)
-    }
-}
-
-
-public struct ProbeOutcome: Equatable, Hashable {
+/**
+ * What the notification of one push shows.
+ */
+public struct NseNotice: Equatable, Hashable {
     /**
-     * Bytes of the message text.
+     * The contact's alias, or "새 메시지" without one. Empty with `body`: show nothing.
      */
-    public var plaintextLen: UInt32
+    public var title: String
     /**
-     * Up to 48 bytes of the text, for the notification body.
+     * The start of the text (at most 48 bytes, whole characters), or "새 메시지". Empty: the
+     * tag names no conversation of this device (withdrawn, or the conversation is gone), and
+     * nothing is shown.
      */
-    public var preview: String
+    public var body: String
     /**
-     * Reading the state file.
+     * The body is the text.
      */
-    public var loadMicros: UInt64
-    /**
-     * Decoding the snapshot, loading the group, TLS decode and `process_message`.
-     */
-    public var decryptMicros: UInt64
+    public var decrypted: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
     public init(
         /**
-         * Bytes of the message text.
-         */plaintextLen: UInt32, 
+         * The contact's alias, or "새 메시지" without one. Empty with `body`: show nothing.
+         */title: String, 
         /**
-         * Up to 48 bytes of the text, for the notification body.
-         */preview: String, 
+         * The start of the text (at most 48 bytes, whole characters), or "새 메시지". Empty: the
+         * tag names no conversation of this device (withdrawn, or the conversation is gone), and
+         * nothing is shown.
+         */body: String, 
         /**
-         * Reading the state file.
-         */loadMicros: UInt64, 
-        /**
-         * Decoding the snapshot, loading the group, TLS decode and `process_message`.
-         */decryptMicros: UInt64) {
-        self.plaintextLen = plaintextLen
-        self.preview = preview
-        self.loadMicros = loadMicros
-        self.decryptMicros = decryptMicros
+         * The body is the text.
+         */decrypted: Bool) {
+        self.title = title
+        self.body = body
+        self.decrypted = decrypted
     }
 
     
@@ -604,28 +577,26 @@ public struct ProbeOutcome: Equatable, Hashable {
 }
 
 #if compiler(>=6)
-extension ProbeOutcome: Sendable {}
+extension NseNotice: Sendable {}
 #endif
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public struct FfiConverterTypeProbeOutcome: FfiConverterRustBuffer {
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ProbeOutcome {
+public struct FfiConverterTypeNseNotice: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> NseNotice {
         return
-            try ProbeOutcome(
-                plaintextLen: FfiConverterUInt32.read(from: &buf), 
-                preview: FfiConverterString.read(from: &buf), 
-                loadMicros: FfiConverterUInt64.read(from: &buf), 
-                decryptMicros: FfiConverterUInt64.read(from: &buf)
+            try NseNotice(
+                title: FfiConverterString.read(from: &buf), 
+                body: FfiConverterString.read(from: &buf), 
+                decrypted: FfiConverterBool.read(from: &buf)
         )
     }
 
-    public static func write(_ value: ProbeOutcome, into buf: inout [UInt8]) {
-        FfiConverterUInt32.write(value.plaintextLen, into: &buf)
-        FfiConverterString.write(value.preview, into: &buf)
-        FfiConverterUInt64.write(value.loadMicros, into: &buf)
-        FfiConverterUInt64.write(value.decryptMicros, into: &buf)
+    public static func write(_ value: NseNotice, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.title, into: &buf)
+        FfiConverterString.write(value.body, into: &buf)
+        FfiConverterBool.write(value.decrypted, into: &buf)
     }
 }
 
@@ -633,133 +604,37 @@ public struct FfiConverterTypeProbeOutcome: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeProbeOutcome_lift(_ buf: RustBuffer) throws -> ProbeOutcome {
-    return try FfiConverterTypeProbeOutcome.lift(buf)
+public func FfiConverterTypeNseNotice_lift(_ buf: RustBuffer) throws -> NseNotice {
+    return try FfiConverterTypeNseNotice.lift(buf)
 }
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeProbeOutcome_lower(_ value: ProbeOutcome) -> RustBuffer {
-    return FfiConverterTypeProbeOutcome.lower(value)
-}
-
-
-public 
-enum NseError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError {
-
-    
-    
-    case BadState(message: String)
-    
-    case GroupNotFound(message: String)
-    
-    case BadCiphertext(message: String)
-    
-    case Decrypt(message: String)
-    
-    case NotApplication(message: String)
-    
-
-    
-
-    
-
-    
-    public var errorDescription: String? {
-        String(reflecting: self)
-    }
-    
-}
-
-#if compiler(>=6)
-extension NseError: Sendable {}
-#endif
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterTypeNseError: FfiConverterRustBuffer {
-    typealias SwiftType = NseError
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> NseError {
-        let variant: Int32 = try readInt(&buf)
-        switch variant {
-
-        
-
-        
-        case 1: return .BadState(
-            message: try FfiConverterString.read(from: &buf)
-        )
-        
-        case 2: return .GroupNotFound(
-            message: try FfiConverterString.read(from: &buf)
-        )
-        
-        case 3: return .BadCiphertext(
-            message: try FfiConverterString.read(from: &buf)
-        )
-        
-        case 4: return .Decrypt(
-            message: try FfiConverterString.read(from: &buf)
-        )
-        
-        case 5: return .NotApplication(
-            message: try FfiConverterString.read(from: &buf)
-        )
-        
-
-        default: throw UniffiInternalError.unexpectedEnumCase
-        }
-    }
-
-    public static func write(_ value: NseError, into buf: inout [UInt8]) {
-        switch value {
-
-        
-
-        
-        case .BadState(_ /* message is ignored*/):
-            writeInt(&buf, Int32(1))
-        case .GroupNotFound(_ /* message is ignored*/):
-            writeInt(&buf, Int32(2))
-        case .BadCiphertext(_ /* message is ignored*/):
-            writeInt(&buf, Int32(3))
-        case .Decrypt(_ /* message is ignored*/):
-            writeInt(&buf, Int32(4))
-        case .NotApplication(_ /* message is ignored*/):
-            writeInt(&buf, Int32(5))
-
-        
-        }
-    }
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeNseError_lift(_ buf: RustBuffer) throws -> NseError {
-    return try FfiConverterTypeNseError.lift(buf)
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeNseError_lower(_ value: NseError) -> RustBuffer {
-    return FfiConverterTypeNseError.lower(value)
+public func FfiConverterTypeNseNotice_lower(_ value: NseNotice) -> RustBuffer {
+    return FfiConverterTypeNseNotice.lower(value)
 }
 /**
- * Reads the state file (a `chat_core::mls::nse::export_snapshot` snapshot) and decrypts one
- * `MlsMessageOut` wire encoding of a `PrivateMessage` against it.
+ * The notification of one push: `tag_b64` is its `t`, `stripped_b64` its `e` (empty for a
+ * wake push), both base64url without padding; `push_dir` is `<App Group>/push`.
+ *
+ * * No state file for the tag: nothing is shown (`title` and `body` empty).
+ * * A bad tag, a state file that cannot be read (before the first unlock, for one) or
+ * decoded, no `e`, or a ciphertext that does not open against the state (the state is older
+ * than the message, or it is not a text): "새 메시지", with the alias as the title if the
+ * file has one.
+ * * Otherwise the alias and the start of the text.
+ *
+ * Reads one file, writes nothing, and never fails: a panic inside is caught and shows the
+ * generic notice ("새 메시지").
  */
-public func probeDecrypt(statePath: String, ciphertext: Data)throws  -> ProbeOutcome  {
-    return try  FfiConverterTypeProbeOutcome_lift(try rustCallWithError(FfiConverterTypeNseError_lift) {
+public func nseOpen(pushDir: String, tagB64: String, strippedB64: String) -> NseNotice  {
+    return try!  FfiConverterTypeNseNotice_lift(try! rustCall() {
         uniffiCallStatus in
-    uniffi_chat_nse_fn_func_probe_decrypt(
-        FfiConverterString.lower(statePath),
-        FfiConverterData.lower(ciphertext),uniffiCallStatus
+    uniffi_chat_nse_fn_func_nse_open(
+        FfiConverterString.lower(pushDir),
+        FfiConverterString.lower(tagB64),
+        FfiConverterString.lower(strippedB64),uniffiCallStatus
     )
 })
 }
@@ -779,7 +654,7 @@ private let initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
-    if (uniffi_chat_nse_checksum_func_probe_decrypt() != 19322) {
+    if (uniffi_chat_nse_checksum_func_nse_open() != 49635) {
         return InitializationResult.apiChecksumMismatch
     }
 

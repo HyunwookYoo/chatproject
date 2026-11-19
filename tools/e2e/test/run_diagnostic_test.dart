@@ -409,6 +409,9 @@ void main() {
     ('chat_node', ['PRIVATE_TOKEN', 'relay'], 'owned_chat_node_exit', 1),
     ('emulator', ['PRIVATE_TOKEN'], 'owned_emulator_exit', 1),
     ('chat_app', ['PRIVATE_TOKEN'], 'owned_windows_exit', 1),
+    // Any adb child other than the diagnostic logcat reader still fails the run
+    // (user decision (g) is by role, not by the adb name).
+    ('adb', ['logcat', 'PRIVATE_TOKEN'], 'owned_child_exit', 1),
     ('chat_relay', ['PRIVATE_TOKEN'], 'owned_child_exit', 1),
     ('dart', [], 'owned_child_exit', 0),
   ]) {
@@ -477,6 +480,46 @@ void main() {
       },
     );
   }
+
+  // User decision (g), 2026-11-18: the app's diagnostic logcat reader (E2E 43747301926 m2,
+  // `adb logcat --pid` exited 255) is not part of the scenario. Its exit is the fact
+  // `logcat_lost`, and the scenario's own outcome decides the run.
+  test(
+    'a diagnostic logcat that exits mid-scenario does not fail the run',
+    () async {
+      final runner = run.reflectee as dynamic;
+      phase('scenario');
+      failureFacts.clear();
+      addTearDown(failureFacts.clear);
+      final source = Platform.isWindows
+          ? '${Platform.environment['SystemRoot']}/System32/where.exe'
+          : '/bin/false';
+      final executable = await File(
+        source,
+      ).copy('${logs.path}/adb${Platform.isWindows ? '.exe' : ''}');
+      if (!Platform.isWindows) {
+        expect(
+          (await Process.run('chmod', ['+x', executable.path])).exitCode,
+          0,
+        );
+      }
+      final process = await runner.startDiagnosticLog(executable.path, [
+        'logcat',
+        '--pid=PRIVATE_TOKEN',
+      ]);
+      expect(await process.exitCode, isNonZero);
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      expect(runner.fatal.isCompleted, isFalse);
+      expect(runner.firstFailure, isNull);
+      expect(runner.safeFailure, isNull);
+      // The scenario goes on; its own result stands.
+      expect(await runner.wait(Future.value(7)), 7);
+      expect(runner.facts(), {'logcat_lost': 'lost'});
+      expect(runner.facts().toString(), isNot(contains('PRIVATE_TOKEN')));
+      await runner.stop(process);
+      expect(runner.active, isEmpty);
+    },
+  );
 
   test(
     'wait records the original error before cancellation callbacks',

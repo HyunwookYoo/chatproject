@@ -169,10 +169,7 @@ async fn start_as(seed: u8, dir: tempfile::TempDir, backend: Arc<Backend>) -> Fi
     slot.network().unwrap().configure_local(None).await.unwrap();
     let clock = Arc::new(FakeClock::new(NOW, 0));
     let account = slot
-        .open_account_with_services(
-            support::protector(),
-            AccountServices::new(backend, clock.clone()),
-        )
+        .open_account_with_services(support::protector(), services(backend, clock.clone()))
         .unwrap();
     lifecycle_idle_handle(&account).await;
     account.snapshot().await.unwrap();

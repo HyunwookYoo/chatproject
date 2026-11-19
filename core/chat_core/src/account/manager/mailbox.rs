@@ -39,8 +39,8 @@
 //! drops the duplicate.
 //!
 //! The mailbox role (spec 8.4): a device set as a mailbox (`set_mailbox`) tells my other devices
-//! with `Announce`, when it changes and on every session with one that becomes ready, and never
-//! a contact. What they announce is recorded (`mailbox_device`): it is where handoffs go, which
+//! with `Announce`, when it changes and on every session with one that becomes ready, again
+//! until that device took it (one at a time per device), and never a contact. What they announce is recorded (`mailbox_device`): it is where handoffs go, which
 //! of my devices `mailbox_sync_now` dials first, and what `ConnectionSnapshot::mailbox_ok`
 //! reports. A mailbox takes handoffs only while it is one (what it took it tries until settled),
 //! and records its uptime every `UPTIME_EVERY_MS` (M6 records it, nothing judges it).
@@ -79,6 +79,21 @@ const PULL_RETRY_MAX_MS: u64 = 30_000;
 /// notified with the next pull from that device that ends, or this long after the start when no
 /// pull from it runs by then.
 const RESTART_NOTIFY_MS: u64 = 60_000;
+/// An `Announce` my other device did not take (`Busy`, no answer) is sent again after a
+/// back-off, `ANNOUNCE_RETRY_MIN_MS` doubling with each failure in a row up to
+/// `ANNOUNCE_RETRY_MAX_MS`. An M6 device answers `Busy` to the four-field form it cannot read,
+/// for as long as the session lasts: the cap keeps that to one `Announce` per 5 minutes.
+const ANNOUNCE_RETRY_MIN_MS: u64 = 5_000;
+const ANNOUNCE_RETRY_MAX_MS: u64 = 300_000;
+/// A session whose pull was answered `Refused` or broke the order rules is not synced over for
+/// `STOPPED_RETRY_MIN_MS`, doubling with each such stop in a row from the same device up to
+/// `STOPPED_RETRY_MAX_MS`; then that device is pulled from again (user decision 2026-11-16: a
+/// device that refused right after a join serves the new device a moment later).
+const STOPPED_RETRY_MIN_MS: u64 = 5_000;
+const STOPPED_RETRY_MAX_MS: u64 = 300_000;
+
+/// What an `Announce` says: whether this device is a mailbox, its own-device push handle.
+type Told = (bool, Option<Vec<u8>>);
 
 /// A handed-off ciphertext's row: the device that handed it over, conversation, message.
 type HandoffKey = (InstallationId, ConversationId, MessageId);
@@ -92,9 +107,12 @@ pub(crate) struct Runtime {
     /// Own devices whose last pull failed: the scheduler time it is tried again (`u64::MAX`:
     /// it was), and the back-off that wait was. Gone once a pull from it gets to the end.
     retry: BTreeMap<InstallationId, (u64, u64)>,
-    /// Connections (`stable_id`) this device stopped syncing over: `Refused`, or a page that
-    /// broke the order rules.
-    stopped: BTreeSet<usize>,
+    /// Connections (`stable_id`) this device stopped syncing over for now (`Refused`, or a page
+    /// that broke the order rules): the device, and the scheduler time it is pulled from again.
+    stopped: BTreeMap<usize, (InstallationId, u64)>,
+    /// Per own device: the last wait of `stopped` (`STOPPED_RETRY_MIN_MS` doubling). Gone once a
+    /// pull from it gets to the end.
+    stop_delay: BTreeMap<InstallationId, u64>,
     /// The log's head (largest seq handed out) after the last storage operation.
     pub(super) head: u64,
     /// Per own device: the head it was last told about, and when (scheduler time).
@@ -122,9 +140,17 @@ pub(crate) struct Runtime {
     enabled: Option<bool>,
     /// My devices recorded as mailboxes (`None`: read at the next poll).
     mailboxes: Option<BTreeSet<InstallationId>>,
-    /// Own devices whose session became ready: told at the next poll whether this one is a
-    /// mailbox.
-    announce_due: BTreeSet<InstallationId>,
+    /// What each of my other devices took from this one's last `Announce` (whether this one is
+    /// a mailbox, its own-device push handle), over its current session. A device whose entry
+    /// differs from what holds now is told at the next poll, one `Announce` at a time, until it
+    /// takes it: a lost or `Busy` answer is not the end (e2e m7 run 2).
+    told: BTreeMap<InstallationId, Told>,
+    /// Own devices an `Announce` is on its way to.
+    telling: BTreeSet<InstallationId>,
+    /// Own devices whose last `Announce` was not taken: the scheduler time they are told again,
+    /// the back-off that wait was, and what that `Announce` said (a changed value is told at
+    /// once, with the back-off from the start).
+    tell_at: BTreeMap<InstallationId, (u64, u64, Told)>,
     /// Scheduler time this device, while a mailbox, next records that it is up.
     uptime_at: u64,
     /// Each `Announce` sent: to which device, saying what.
@@ -162,9 +188,21 @@ pub(crate) struct Runtime {
     /// Page requests still to fail as timed out, without being sent.
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     fail_pulls: u32,
+    /// Page requests from my other devices still to answer `Refused`.
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    refuse_pulls: u32,
+    /// How sessions with my other devices came about and how pulls ended (e2e m7).
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    trace: SyncTrace,
 }
 
 impl Runtime {
+    /// e2e m6: a session with one of my other devices closed (`close_name`).
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    pub(super) fn note_own_close(&mut self, conn: &iroh::endpoint::Connection) {
+        self.trace.own_closes += 1;
+        self.trace.own_close = Some(close_name(conn));
+    }
     /// Pulls from `installation` at the next poll, or again once its running pull ends.
     fn schedule(&mut self, installation: InstallationId) {
         match self.pulls.get_mut(&installation) {
@@ -185,6 +223,33 @@ impl Runtime {
             });
         self.retry
             .insert(installation, (now.saturating_add(delay), delay));
+    }
+    /// Sync over connection `conn` with `installation` stops for now (`Refused`, or a page out
+    /// of order): that device is pulled from again after a back-off twice the last one
+    /// (`STOPPED_RETRY_MIN_MS` the first time), at most `STOPPED_RETRY_MAX_MS`.
+    fn stop(&mut self, conn: usize, installation: InstallationId, now: u64) {
+        let delay = self
+            .stop_delay
+            .get(&installation)
+            .map_or(STOPPED_RETRY_MIN_MS, |last| {
+                last.saturating_mul(2).min(STOPPED_RETRY_MAX_MS)
+            });
+        self.stop_delay.insert(installation, delay);
+        self.stopped
+            .insert(conn, (installation, now.saturating_add(delay)));
+    }
+    /// The `Announce` saying `told` was not taken by `installation`: it is told again after a
+    /// back-off twice the last one for the same value (`ANNOUNCE_RETRY_MIN_MS` the first time),
+    /// at most `ANNOUNCE_RETRY_MAX_MS`.
+    fn tell_later(&mut self, installation: InstallationId, told: Told, now: u64) {
+        let delay = match self.tell_at.get(&installation) {
+            Some((_, last, tried)) if *tried == told => {
+                last.saturating_mul(2).min(ANNOUNCE_RETRY_MAX_MS)
+            }
+            _ => ANNOUNCE_RETRY_MIN_MS,
+        };
+        self.tell_at
+            .insert(installation, (now.saturating_add(delay), delay, told));
     }
     fn halted(&self) -> bool {
         #[cfg(all(feature = "test-hooks", debug_assertions))]
@@ -236,6 +301,11 @@ enum Step {
     Plain {
         page: Resolving,
         answers: Vec<Result<MailboxReply, ErrorCode>>,
+    },
+    /// The answer of my other device (the event's `holder`) to an `Announce` saying `told`.
+    Announced {
+        told: Told,
+        answer: Result<MailboxReply, ErrorCode>,
     },
     /// The peer's answer to one attempt of a handed-off ciphertext (`grant`: the session it
     /// went over; the event's `holder` is that session's device).
@@ -387,10 +457,18 @@ pub(crate) enum MailboxTest {
     Hold(bool),
     /// The next this many page requests of pulls fail as timed out, without being sent.
     FailPulls(u32),
+    /// The next this many page requests from my other devices are answered `Refused`.
+    RefusePulls(u32),
     Counters,
+    /// My other devices with a ready session now.
+    OwnSessions,
+    /// Each read clear decided (M7 spec 7): my other devices with a ready session then, and the
+    /// `read` items pushed.
+    ReadClears,
     HandoffSends,
     Announces,
     SyncDials,
+    SyncTrace,
 }
 #[cfg(all(feature = "test-hooks", debug_assertions))]
 pub(crate) enum MailboxTestReply {
@@ -399,7 +477,63 @@ pub(crate) enum MailboxTestReply {
     Counters(MailboxCounters),
     Sends(Vec<(u64, [u8; 32])>),
     Announces(Vec<(InstallationId, bool)>),
+    Sessions(Vec<InstallationId>),
+    ReadClears(Vec<(u32, u32)>),
     Dials(Vec<InstallationId>),
+    Trace(SyncTrace),
+}
+
+/// Since this core started (e2e m7 `read_cleared`): dials of my other devices that came back
+/// installed or failed, connections from them accepted or refused (each with the last failure's
+/// code and, for an authentication refusal, the check that refused it: `auth::AuthCheck::name`),
+/// and pulls started and how they ended.
+#[cfg(all(feature = "test-hooks", debug_assertions))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SyncTrace {
+    pub dials_ok: u64,
+    pub dials_failed: u64,
+    pub dial_error: Option<ErrorCode>,
+    pub dial_check: Option<&'static str>,
+    pub accepts_ok: u64,
+    pub accepts_failed: u64,
+    pub accept_error: Option<ErrorCode>,
+    pub accept_check: Option<&'static str>,
+    pub pulls: u64,
+    pub pulls_done: u64,
+    pub pulls_failed: u64,
+    pub pulls_stopped: u64,
+    /// Why the last failed pull failed (`pull_failed`).
+    pub pull_failure: Option<&'static str>,
+    /// Sessions with my other devices that closed, and how the last one did (`close_name`).
+    pub own_closes: u64,
+    pub own_close: Option<&'static str>,
+}
+
+/// How a connection ended, as a fixed name (e2e facts): by this side (`local`), by the peer
+/// with one of this app's close reasons (`peer_*`) or another one (`peer_other`), an idle
+/// timeout, a reset, or something else.
+#[cfg(all(feature = "test-hooks", debug_assertions))]
+fn close_name(conn: &iroh::endpoint::Connection) -> &'static str {
+    use iroh::endpoint::ConnectionError as E;
+    const PEER: [(&[u8], &str); 6] = [
+        (b"simultaneous dial", "peer_simultaneous_dial"),
+        (b"new account proof", "peer_new_proof"),
+        (b"account restricted", "peer_restricted"),
+        (b"account authentication failed", "peer_auth_failed"),
+        (b"account record changed", "peer_record_changed"),
+        (b"account stopped", "peer_stopped"),
+    ];
+    match conn.close_reason() {
+        None => "open",
+        Some(E::LocallyClosed) => "local",
+        Some(E::TimedOut) => "timeout",
+        Some(E::Reset) => "reset",
+        Some(E::ApplicationClosed(close)) => PEER
+            .iter()
+            .find(|(reason, _)| close.reason.as_ref() == *reason)
+            .map_or("peer_other", |(_, name)| name),
+        Some(_) => "other",
+    }
 }
 
 /// What own-device sync counted since this core started (for the M6 results).
@@ -462,10 +596,39 @@ impl AccountHandle {
     pub async fn mailbox_test_hold(&self, hold: bool) -> Result<(), CoreError> {
         self.mailbox_test(MailboxTest::Hold(hold)).await.map(|_| ())
     }
+    /// My other devices this core has a ready session with now.
+    pub async fn mailbox_test_own_sessions(&self) -> Result<Vec<InstallationId>, CoreError> {
+        match self.mailbox_test(MailboxTest::OwnSessions).await? {
+            MailboxTestReply::Sessions(sessions) => Ok(sessions),
+            _ => unreachable!(),
+        }
+    }
+    /// Each read clear this core decided, in order: my other devices with a ready session at
+    /// that moment, and the `read` items it pushed (M7 spec 7).
+    pub async fn push_test_read_clears(&self) -> Result<Vec<(u32, u32)>, CoreError> {
+        match self.mailbox_test(MailboxTest::ReadClears).await? {
+            MailboxTestReply::ReadClears(clears) => Ok(clears),
+            _ => unreachable!(),
+        }
+    }
+    /// How sessions with my other devices came about and how pulls ended, since this core
+    /// started.
+    pub async fn mailbox_test_sync_trace(&self) -> Result<SyncTrace, CoreError> {
+        match self.mailbox_test(MailboxTest::SyncTrace).await? {
+            MailboxTestReply::Trace(trace) => Ok(trace),
+            _ => unreachable!(),
+        }
+    }
     /// The next `requests` page requests of this core's pulls fail as a timeout would, without
     /// being sent.
     pub async fn mailbox_test_fail_pulls(&self, requests: u32) -> Result<(), CoreError> {
         self.mailbox_test(MailboxTest::FailPulls(requests))
+            .await
+            .map(|_| ())
+    }
+    /// The next `requests` page requests from my other devices are answered `Refused`.
+    pub async fn mailbox_test_refuse_pulls(&self, requests: u32) -> Result<(), CoreError> {
+        self.mailbox_test(MailboxTest::RefusePulls(requests))
             .await
             .map(|_| ())
     }
@@ -540,6 +703,11 @@ impl Manager {
                 self.messages.mailbox.fail_pulls = requests;
                 MailboxTestReply::Done
             }
+            MailboxTest::RefusePulls(requests) => {
+                self.messages.mailbox.refuse_pulls = requests;
+                MailboxTestReply::Done
+            }
+            MailboxTest::SyncTrace => MailboxTestReply::Trace(self.messages.mailbox.trace),
             MailboxTest::Counters => MailboxTestReply::Counters(MailboxCounters {
                 missing: self.messages.mailbox.missing,
                 notifications: self.messages.mailbox.alerts,
@@ -547,6 +715,15 @@ impl Manager {
             }),
             MailboxTest::HandoffSends => {
                 MailboxTestReply::Sends(self.messages.mailbox.handoff_sends.clone())
+            }
+            MailboxTest::OwnSessions => MailboxTestReply::Sessions(
+                self.own_sessions()
+                    .iter()
+                    .map(|s| s.grant.installation)
+                    .collect(),
+            ),
+            MailboxTest::ReadClears => {
+                MailboxTestReply::ReadClears(self.messages.push.read_clear_log.clone())
             }
             MailboxTest::Announces => {
                 MailboxTestReply::Announces(self.messages.mailbox.announces.clone())
@@ -579,6 +756,57 @@ impl Manager {
             .collect()
     }
 
+    /// e2e m7: a dial of `peer`'s device came back, installed or not; counted for my devices.
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    pub(super) fn trace_own_dial(&mut self, peer: PeerId, result: &Result<(), CoreError>) {
+        if self.local().map(|local| local.keys.peer_id()).ok() != Some(peer) {
+            return;
+        }
+        let trace = &mut self.messages.mailbox.trace;
+        match result {
+            Ok(()) => trace.dials_ok += 1,
+            Err(error) => {
+                trace.dials_failed += 1;
+                trace.dial_error = Some(error.code);
+                trace.dial_check = auth::AuthCheck::of(error).map(auth::AuthCheck::name);
+            }
+        }
+    }
+
+    /// e2e m7: a connection that came in was installed or refused; counted when its endpoint is
+    /// one of my other devices.
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    pub(super) fn trace_own_accept(
+        &mut self,
+        conn: &iroh::endpoint::Connection,
+        result: &Result<(), CoreError>,
+    ) {
+        let remote = *conn.remote_id().as_bytes();
+        let own = self
+            .local()
+            .ok()
+            .and_then(|local| local.records.accepted.as_ref())
+            .is_some_and(|record| {
+                record
+                    .record
+                    .devices
+                    .iter()
+                    .any(|d| d.transport_public_key == remote)
+            });
+        if !own {
+            return;
+        }
+        let trace = &mut self.messages.mailbox.trace;
+        match result {
+            Ok(()) => trace.accepts_ok += 1,
+            Err(error) => {
+                trace.accepts_failed += 1;
+                trace.accept_error = Some(error.code);
+                trace.accept_check = auth::AuthCheck::of(error).map(auth::AuthCheck::name);
+            }
+        }
+    }
+
     /// A session became ready (`install_grant`): with another own device, this device pulls its
     /// log, and that device (doing the same) needs no `Notify` for what is logged so far; it is
     /// told whether this device is a mailbox (spec 8.4); then what this device has not delivered
@@ -599,7 +827,9 @@ impl Manager {
             .notified
             .insert(grant.installation, (mailbox.head, now));
         mailbox.schedule(grant.installation);
-        mailbox.announce_due.insert(grant.installation);
+        // A new session: that device is told again whether this one is a mailbox.
+        mailbox.told.remove(&grant.installation);
+        mailbox.tell_at.remove(&grant.installation);
         mailbox.handoff_due = true;
     }
 
@@ -623,8 +853,8 @@ impl Manager {
         }
     }
 
-    /// Sets this device's mailbox role and tells my other devices with a ready session; one
-    /// without a session is told once its session is ready.
+    /// Sets this device's mailbox role; my other devices are told at the next poll (one
+    /// without a session once its session is ready).
     pub(super) async fn set_mailbox(&mut self, enabled: bool) -> Result<(), CoreError> {
         let request = self.ready()?;
         self.mailbox_db(MailboxDbOp::SetEnabled(enabled), request)
@@ -633,15 +863,6 @@ impl Manager {
         mailbox.enabled = Some(enabled);
         // Up from now on: recorded at the next poll.
         mailbox.uptime_at = 0;
-        let stopped = &self.messages.mailbox.stopped;
-        let sessions: Vec<Session> = self
-            .own_sessions()
-            .into_iter()
-            .filter(|s| !stopped.contains(&s.conn.stable_id()))
-            .collect();
-        for session in sessions {
-            self.announce(session, enabled);
-        }
         Ok(())
     }
 
@@ -652,21 +873,60 @@ impl Manager {
             .map(|_| ())
     }
 
-    /// Spec 8.4: tells another own device whether this one is a mailbox, in a spawned task (its
-    /// answer changes nothing). Never a contact: the role is for my devices to know.
-    fn announce(&mut self, session: Session, mailbox: bool) {
+    /// Spec 8.4: tells another own device whether this one is a mailbox, with the own-device
+    /// push handle (M7 spec 5.2), in a spawned task; its answer comes back as
+    /// `Step::Announced`. Never a contact: the role is for my devices to know.
+    fn announce(&mut self, session: Session, told: Told, ticket: u64) {
         if self.local().map(|local| local.keys.peer_id()).ok() != Some(session.grant.peer) {
             return;
         }
+        let installation = session.grant.installation;
         #[cfg(all(feature = "test-hooks", debug_assertions))]
-        self.messages
-            .mailbox
-            .announces
-            .push((session.grant.installation, mailbox));
-        let body = MailboxFrame::Announce { mailbox }.encode();
+        self.messages.mailbox.announces.push((installation, told.0));
+        self.messages.mailbox.telling.insert(installation);
+        let body = MailboxFrame::Announce {
+            mailbox: told.0,
+            handle: told.1.clone(),
+        }
+        .encode();
+        let mailbox = self.auth.send.clone();
         tokio::spawn(async move {
-            let _ = exchange(&session, &body).await;
+            let answer = exchange(&session, &body).await;
+            let _ = mailbox
+                .send(Input::Mailbox(MailboxEvent {
+                    ticket,
+                    holder: installation,
+                    conn: session.conn.stable_id(),
+                    step: Step::Announced { told, answer },
+                }))
+                .await;
         });
+    }
+
+    /// My other device's answer to an `Announce`: taken (`Ok`, or `Refused`: not mine any more;
+    /// not sent again over this session until it changes), otherwise told again after a growing
+    /// back-off (`tell_later`). An M6 device answers `Busy` to the four-field form it cannot
+    /// decode, so it is asked at most every `ANNOUNCE_RETRY_MAX_MS` while the session lasts.
+    fn announce_answered(
+        &mut self,
+        ticket: u64,
+        installation: InstallationId,
+        told: Told,
+        answer: Result<MailboxReply, ErrorCode>,
+    ) {
+        self.messages.mailbox.telling.remove(&installation);
+        if !self.ready().is_ok_and(|r| r.ticket == ticket) {
+            return;
+        }
+        let now = self.schedule_now();
+        let mailbox = &mut self.messages.mailbox;
+        match answer {
+            Ok(MailboxReply::Ok | MailboxReply::Refused) => {
+                mailbox.tell_at.remove(&installation);
+                mailbox.told.insert(installation, told);
+            }
+            _ => mailbox.tell_later(installation, told, now),
+        }
     }
 
     /// The app goes to the background or exits (spec 7): hands what this device has not
@@ -696,7 +956,8 @@ impl Manager {
             .own_sessions()
             .into_iter()
             .filter(|s| {
-                mailboxes.contains(&s.grant.installation) && !stopped.contains(&s.conn.stable_id())
+                mailboxes.contains(&s.grant.installation)
+                    && !stopped.contains_key(&s.conn.stable_id())
             })
             .collect();
         if targets.is_empty() {
@@ -714,11 +975,24 @@ impl Manager {
                 .message_db(MessageDbOp::SealPending(conversation, now), request)
                 .await;
         }
-        let MailboxDbReply::Handoff(entries) =
+        let MailboxDbReply::Handoff(mut entries) =
             self.mailbox_db(MailboxDbOp::HandoffRows, request).await?
         else {
             return Err(unavailable(ErrorCode::InvalidMessage));
         };
+        // M7: a text handed over before its first attempt had a result is pushed now; the
+        // mailbox never pushes (spec 6.1).
+        self.push_handed_off(&entries, request).await;
+        // M7: the queued `PushHandle` frames go along (one per conversation and frame).
+        if let MessageDbReply::Push(crate::message::push_store::PushDbReply::Handoff(push)) = self
+            .message_db(
+                MessageDbOp::Push(crate::message::push_store::PushDbOp::HandOff),
+                request,
+            )
+            .await?
+        {
+            entries.extend(push);
+        }
         let batches = handoff_batches(entries);
         let handed: usize = batches.iter().map(Vec::len).sum();
         let frames: Vec<_> = batches
@@ -799,6 +1073,13 @@ impl Manager {
         if self.messages.mailbox.held() {
             return Ok(MailboxReply::Busy.encode().to_vec());
         }
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        if self.messages.mailbox.refuse_pulls > 0
+            && matches!(MailboxFrame::decode(inner), Ok(MailboxFrame::SyncReq { .. }))
+        {
+            self.messages.mailbox.refuse_pulls -= 1;
+            return Ok(MailboxReply::Refused.encode().to_vec());
+        }
         let reply = match MailboxFrame::decode(inner) {
             Ok(MailboxFrame::SyncReq { since_seq }) => {
                 let op = MailboxDbOp::Page {
@@ -859,10 +1140,11 @@ impl Manager {
             }
             // Spec 8.4: whether that device is a mailbox, recorded for handoffs, dialing order
             // and `mailbox_ok`.
-            Ok(MailboxFrame::Announce { mailbox }) => {
+            Ok(MailboxFrame::Announce { mailbox, handle }) => {
                 let op = MailboxDbOp::Announced {
                     installation,
                     mailbox,
+                    handle,
                     at: self.services.clock.wall_ms(),
                 };
                 match self.mailbox_db(op, request).await {
@@ -952,25 +1234,50 @@ impl Manager {
         }
         let sessions = self.own_sessions();
         let mailbox = &mut self.messages.mailbox;
-        mailbox
-            .stopped
-            .retain(|id| sessions.iter().any(|s| s.conn.stable_id() == *id));
+        let Runtime { stopped, due, .. } = mailbox;
+        // A stopped session whose wait is over is synced over again: its device is due.
+        stopped.retain(|id, (installation, until)| {
+            if !sessions.iter().any(|s| s.conn.stable_id() == *id) {
+                return false;
+            }
+            if now >= *until {
+                due.insert(*installation);
+                return false;
+            }
+            true
+        });
         let usable: Vec<Session> = sessions
             .into_iter()
-            .filter(|s| !mailbox.stopped.contains(&s.conn.stable_id()))
+            .filter(|s| !mailbox.stopped.contains_key(&s.conn.stable_id()))
             .collect();
         let ok = mailbox
             .mailboxes
             .as_ref()
             .is_some_and(|m| usable.iter().any(|s| m.contains(&s.grant.installation)));
         let enabled = mailbox.enabled.unwrap_or(false);
-        let announce: Vec<Session> = std::mem::take(&mut mailbox.announce_due)
-            .into_iter()
-            .filter_map(|i| usable.iter().find(|s| s.grant.installation == i).cloned())
+        let want = (enabled, self.push_own_handle());
+        // Before `push_local` is read the own-device handle is not known: an `Announce` then
+        // would say "none" and my other device would drop the handle it keeps.
+        let loaded = self.push_loaded();
+        let now_tell = self.schedule_now();
+        let mailbox = &self.messages.mailbox;
+        let announce: Vec<Session> = usable
+            .iter()
+            .filter(|s| {
+                let i = &s.grant.installation;
+                loaded
+                    && !mailbox.telling.contains(i)
+                    && mailbox.told.get(i) != Some(&want)
+                    && mailbox
+                        .tell_at
+                        .get(i)
+                        .is_none_or(|(at, _, tried)| now_tell >= *at || *tried != want)
+            })
+            .cloned()
             .collect();
         self.bus.set_mailbox_ok(ok);
         for session in announce {
-            self.announce(session, enabled);
+            self.announce(session, want.clone(), request.ticket);
         }
         let mailbox = &mut self.messages.mailbox;
         // Failed pulls whose back-off is over are due again.
@@ -1289,6 +1596,10 @@ impl Manager {
         else {
             return Err(unavailable(ErrorCode::InvalidMessage));
         };
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        {
+            self.messages.mailbox.trace.pulls += 1;
+        }
         self.messages.mailbox.pulls.insert(
             installation,
             Pull {
@@ -1342,6 +1653,10 @@ impl Manager {
             step,
         } = event;
         let step = match step {
+            Step::Announced { told, answer } => {
+                self.announce_answered(ticket, holder, told, answer);
+                return;
+            }
             Step::Handoff {
                 key,
                 ct_hash,
@@ -1379,13 +1694,18 @@ impl Manager {
                         (entries, next_seq, more)
                     }
                     // Not now: asked again after a back-off.
-                    Ok(MailboxReply::Busy) | Err(_) => {
-                        self.end_pull(holder, Ended::Failed, request).await;
+                    Ok(MailboxReply::Busy) => {
+                        self.pull_failed(holder, "busy", request).await;
                         return;
                     }
-                    // `Refused`, or a page out of order: no more syncing over this session.
+                    Err(_) => {
+                        self.pull_failed(holder, "request", request).await;
+                        return;
+                    }
+                    // `Refused`, or a page out of order: no syncing over this session for now.
                     Ok(_) => {
-                        self.messages.mailbox.stopped.insert(conn);
+                        let now = self.schedule_now();
+                        self.messages.mailbox.stop(conn, holder, now);
                         self.end_pull(holder, Ended::Stopped, request).await;
                         return;
                     }
@@ -1396,7 +1716,7 @@ impl Manager {
                     return;
                 }
                 let Ok(summary) = summary else {
-                    self.end_pull(holder, Ended::Failed, request).await;
+                    self.pull_failed(holder, "entries", request).await;
                     return;
                 };
                 if !summary.unopened.is_empty() {
@@ -1419,11 +1739,11 @@ impl Manager {
                 }
                 (page.next_seq, page.more)
             }
-            Step::Handoff { .. } => unreachable!("taken above"),
+            Step::Handoff { .. } | Step::Announced { .. } => unreachable!("taken above"),
         };
         let pulled = MailboxDbOp::Pulled { holder, next_seq };
         if self.mailbox_db(pulled, request).await.is_err() {
-            self.end_pull(holder, Ended::Failed, request).await;
+            self.pull_failed(holder, "storage", request).await;
             return;
         }
         #[cfg(all(feature = "test-hooks", debug_assertions))]
@@ -1443,7 +1763,7 @@ impl Manager {
         match session {
             Some(session) if more => self.request_page(&session, next_seq, request),
             // The rest of the log over another session, if one comes.
-            None if more => self.end_pull(holder, Ended::Failed, request).await,
+            None if more => self.pull_failed(holder, "session_gone", request).await,
             _ => self.end_pull(holder, Ended::Done, request).await,
         }
     }
@@ -1589,7 +1909,7 @@ impl Manager {
             .find(|s| s.conn.stable_id() == conn)
         else {
             // The session is gone: the page is pulled again over the next one.
-            self.end_pull(holder, Ended::Failed, request).await;
+            self.pull_failed(holder, "session_gone", request).await;
             return;
         };
         let mailbox = self.auth.send.clone();
@@ -1639,7 +1959,7 @@ impl Manager {
                         return false;
                     }
                     if stored.is_err() {
-                        self.end_pull(holder, Ended::Failed, request).await;
+                        self.pull_failed(holder, "entries", request).await;
                         return false;
                     }
                 }
@@ -1650,19 +1970,24 @@ impl Manager {
                     }
                 }
                 // Not now: the page is pulled (and its entries asked for) again after a back-off.
-                Ok(MailboxReply::Busy) | Err(_) => {
-                    self.end_pull(holder, Ended::Failed, request).await;
+                Ok(MailboxReply::Busy) => {
+                    self.pull_failed(holder, "busy", request).await;
+                    return false;
+                }
+                Err(_) => {
+                    self.pull_failed(holder, "request", request).await;
                     return false;
                 }
                 Ok(_) => {
-                    self.messages.mailbox.stopped.insert(conn);
+                    let now = self.schedule_now();
+                    self.messages.mailbox.stop(conn, holder, now);
                     self.end_pull(holder, Ended::Stopped, request).await;
                     return false;
                 }
             }
         }
         if !complete {
-            self.end_pull(holder, Ended::Failed, request).await;
+            self.pull_failed(holder, "plain", request).await;
         }
         complete
     }
@@ -1716,10 +2041,12 @@ impl Manager {
 
     /// A text from the other account was stored just now: notified at once when it came
     /// directly, with the rest of its pull when it came from another own device's log (the
-    /// storing transaction marked it for that, Ruling 35).
+    /// storing transaction marked it for that, Ruling 35), and by the push's own processing
+    /// when a push brought it (`push_received`, which knows whether it was read already).
     pub(super) async fn text_stored(&mut self, key: MessageKey, via: &Via, request: Request) {
         match via {
             Via::Direct(_) => self.notify(vec![key], Vec::new(), request).await,
+            Via::Push => {}
             Via::Mailbox { .. } => {
                 #[cfg(all(feature = "test-hooks", debug_assertions))]
                 {
@@ -1742,7 +2069,7 @@ impl Manager {
         request: Request,
     ) {
         match via {
-            Via::Direct(_) => self.notify(Vec::new(), vec![conversation], request).await,
+            Via::Direct(_) | Via::Push => self.notify(Vec::new(), vec![conversation], request).await,
             Via::Mailbox { holder, .. } => {
                 if let Some(pull) = self.messages.mailbox.pulls.get_mut(holder) {
                     pull.read.insert(conversation);
@@ -1756,15 +2083,35 @@ impl Manager {
     /// elsewhere; also what a run that died before its pull ended stored (Ruling 35). A pull that
     /// failed is tried again after a back-off (final review I1: nothing else may come to pull
     /// again); one that got to the end of the log ends the back-off.
+    /// A pull from `holder` failed for now (`reason`, a fixed name the e2e m6 facts note:
+    /// busy, request, entries, storage, session_gone, plain); it is tried again after a back-off.
+    async fn pull_failed(&mut self, holder: InstallationId, reason: &'static str, request: Request) {
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        if self.messages.mailbox.pulls.contains_key(&holder) {
+            self.messages.mailbox.trace.pull_failure = Some(reason);
+        }
+        #[cfg(not(all(feature = "test-hooks", debug_assertions)))]
+        let _ = reason;
+        self.end_pull(holder, Ended::Failed, request).await;
+    }
+
     async fn end_pull(&mut self, holder: InstallationId, ended: Ended, request: Request) {
         let Some(pull) = self.messages.mailbox.pulls.remove(&holder) else {
             return;
         };
         let now = self.schedule_now();
         let mailbox = &mut self.messages.mailbox;
+        let done = matches!(ended, Ended::Done);
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        match ended {
+            Ended::Done => mailbox.trace.pulls_done += 1,
+            Ended::Failed => mailbox.trace.pulls_failed += 1,
+            Ended::Stopped => mailbox.trace.pulls_stopped += 1,
+        }
         match ended {
             Ended::Done => {
                 mailbox.retry.remove(&holder);
+                mailbox.stop_delay.remove(&holder);
             }
             Ended::Failed => mailbox.back_off(holder, now),
             Ended::Stopped => {}
@@ -1781,6 +2128,10 @@ impl Manager {
         if let Ok(MailboxDbReply::Notify(items)) = self.mailbox_db(op, request).await {
             self.publish_notify(items);
         }
+        if done {
+            // A read clear push (M7 spec 7) waits for a sync to end.
+            self.push_pull_done();
+        }
     }
 
     async fn notify(&mut self, keys: Vec<MessageKey>, read: Vec<ConversationId>, request: Request) {
@@ -1792,10 +2143,12 @@ impl Manager {
         }
     }
 
-    fn publish_notify(&mut self, items: Vec<crate::event::NotifyItem>) {
+    pub(super) fn publish_notify(&mut self, mut items: Vec<crate::event::NotifyItem>) {
         if items.is_empty() {
             return;
         }
+        // The alias, and a fetch for a wake push taking over its generic notification (M7).
+        self.push_notify_items(&mut items);
         #[cfg(all(feature = "test-hooks", debug_assertions))]
         {
             let new: u64 = items.iter().map(|i| u64::from(i.new_messages)).sum();

@@ -48,6 +48,38 @@ class ReleaseHooksTests(unittest.TestCase):
         (app / "chat_ffi").write_bytes(MACHO + marker)
         self.check(app, False)
 
+    def test_release_apk_rejects_the_debug_test_push_receiver(self):
+        clean = {"lib/x86_64/libchat_ffi.so": b"ELF clean", "classes.dex": b"dex\nLdev/chatproject/chat_app/PushService;",
+                 "AndroidManifest.xml": ".PushService".encode("utf-16-le")}
+        self.check(self.apk(clean), True)
+        for name, data in (
+            ("classes2.dex", b"dex\nLdev/chatproject/chat_app/TestPushReceiver;"),
+            ("classes.dex", b"dex\ndev.chatproject.chat_app.TEST_PUSH"),
+            ("AndroidManifest.xml", ".TestPushReceiver".encode("utf-16-le")),
+            ("AndroidManifest.xml", b"dev.chatproject.chat_app.TEST_PUSH"),
+        ):
+            with self.subTest(name=name, data=data):
+                self.check(self.apk({**clean, name: data}), False)
+
+    def test_release_apk_manifest_starts_nothing_at_boot(self):
+        # Final review 6: WorkManager's merged RescheduleReceiver and its permission are removed
+        # (tools:node="remove"); the shipped manifest is what counts, not the source one. The
+        # dex keeps WorkManager's code, so only the manifest is looked at.
+        clean = {"lib/x86_64/libchat_ffi.so": b"ELF clean",
+                 "classes.dex": b"dex\nandroidx/work/impl/background/systemalarm/RescheduleReceiver;"
+                                b"android.intent.action.BOOT_COMPLETED",
+                 "AndroidManifest.xml": "android.intent.action.TIME_SET".encode("utf-16-le")}
+        self.check(self.apk(clean), True)
+        for text in (
+            "android.permission.RECEIVE_BOOT_COMPLETED",
+            "android.intent.action.BOOT_COMPLETED",
+            "android.intent.action.LOCKED_BOOT_COMPLETED",
+            "androidx.work.impl.background.systemalarm.RescheduleReceiver",
+        ):
+            for encoding in ("utf-16-le", "utf-8"):
+                with self.subTest(text=text, encoding=encoding):
+                    self.check(self.apk({**clean, "AndroidManifest.xml": text.encode(encoding)}), False)
+
     def test_no_native_apk_fails(self):
         self.check(self.apk({"assets/readme": b"clean"}), False)
 

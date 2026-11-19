@@ -5,6 +5,9 @@ import 'package:flutter/foundation.dart' show listEquals;
 import '../mailbox/first_link_screen.dart';
 import '../mailbox/mailbox_model.dart';
 import '../mailbox/mailbox_settings_screen.dart';
+import '../push/notification_permission_screen.dart';
+import '../push/notification_settings_screen.dart';
+import '../push/push_model.dart';
 import '../src/rust/api/account.dart' as a;
 import 'account_model.dart';
 import 'sensitive_screen.dart';
@@ -19,7 +22,17 @@ import 'screens/invite_screen.dart';
 import 'screens/contact_preview_screen.dart';
 import 'screens/safety_screen.dart';
 
-enum _Page { home, words, confirm, recover, invite, preview, contact, safety }
+enum _Page {
+  home,
+  words,
+  confirm,
+  recover,
+  invite,
+  preview,
+  contact,
+  safety,
+  notifications,
+}
 
 /// One application model; only short-lived display state belongs to this route.
 class AccountRoutes extends StatefulWidget {
@@ -30,12 +43,14 @@ class AccountRoutes extends StatefulWidget {
     this.onPair,
     this.onOpenConversation,
     this.mailbox,
+    this.push,
   });
   final AccountModel model;
   final Widget child;
   final VoidCallback? onPair;
   final ValueChanged<List<int>>? onOpenConversation;
   final MailboxModel? mailbox;
+  final PushModel? push;
   @override
   State<AccountRoutes> createState() => _AccountRoutesState();
 }
@@ -56,13 +71,18 @@ class _AccountRoutesState extends State<AccountRoutes>
   int _ticket = 0;
   bool _working = false;
   String? _routeError;
+
+  /// The notification question was shown in this run.
+  bool _pushAsked = false;
   AccountModel get model => widget.model;
   @override
   void initState() {
     super.initState();
     model.addListener(_changed);
+    widget.push?.addListener(_askPush);
     WidgetsBinding.instance.addObserver(this);
     _mailboxActive();
+    WidgetsBinding.instance.addPostFrameCallback((_) => _askPush());
     unawaited(
       _links.start((payload) {
         _incomingInvite = payload;
@@ -74,6 +94,7 @@ class _AccountRoutesState extends State<AccountRoutes>
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     widget.mailbox?.lifecycle(state);
+    widget.push?.lifecycle(state);
     // Before a display exists there is no SensitiveScreen observer yet.
     if (state != AppLifecycleState.resumed && _page == _Page.home && _working) {
       unawaited(_cancel());
@@ -108,12 +129,34 @@ class _AccountRoutesState extends State<AccountRoutes>
   void _mailboxActive() {
     if (model.snapshot?.phase == a.AccountPhase.active) {
       unawaited(widget.mailbox?.accountActive());
+      unawaited(widget.push?.start());
     }
+  }
+
+  /// The page after onboarding: the notification question while the platform
+  /// has not asked yet, once per run.
+  _Page _afterOnboarding() {
+    if (_pushAsked || widget.push?.askDue != true) return _Page.home;
+    _pushAsked = true;
+    return _Page.notifications;
+  }
+
+  /// A device onboarded before the update is asked on its first run after it.
+  void _askPush() {
+    if (!mounted ||
+        _page != _Page.home ||
+        _working ||
+        model.snapshot?.phase != a.AccountPhase.active) {
+      return;
+    }
+    final page = _afterOnboarding();
+    if (page != _Page.home) setState(() => _page = page);
   }
 
   void _changed() {
     if (!mounted) return;
     _mailboxActive();
+    _askPush();
     _consumeInvite();
     setState(() {
       final safety = _safety;
@@ -168,6 +211,7 @@ class _AccountRoutesState extends State<AccountRoutes>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    widget.push?.removeListener(_askPush);
     model.removeListener(_changed);
     _links.dispose();
     _incomingInvite = null;
@@ -229,7 +273,7 @@ class _AccountRoutesState extends State<AccountRoutes>
       if (ok) {
         _flow = null;
         _drop();
-        _page = _Page.home;
+        _page = _afterOnboarding();
       }
     });
   }
@@ -242,7 +286,7 @@ class _AccountRoutesState extends State<AccountRoutes>
     if (!_current(ticket)) return;
     setState(() {
       _working = false;
-      if (ok) _page = _Page.home;
+      if (ok) _page = _afterOnboarding();
     });
   }
 
@@ -335,6 +379,11 @@ class _AccountRoutesState extends State<AccountRoutes>
       builder: (_) => MailboxSettingsScreen(model: mailbox),
     ),
   );
+  void _pushSettings(PushModel push) => Navigator.of(context).push(
+    MaterialPageRoute<void>(
+      builder: (_) => NotificationSettingsScreen(model: push),
+    ),
+  );
   Widget _contactDetail() {
     final selectedPeer = List<int>.of(_contact!.peerId);
     final remote = model.snapshot?.remoteRecords
@@ -396,6 +445,11 @@ class _AccountRoutesState extends State<AccountRoutes>
         TextButton(
           onPressed: () => _mailboxSettings(mailbox),
           child: const Text('메일박스'),
+        ),
+      if (widget.push case final PushModel push when PushModel.supported)
+        TextButton(
+          onPressed: () => _pushSettings(push),
+          child: const Text('알림'),
         ),
       Text('연락처', style: Theme.of(context).textTheme.headlineMedium),
       const SizedBox(height: 16),
@@ -490,6 +544,12 @@ class _AccountRoutesState extends State<AccountRoutes>
         display: _safety!.display,
         busy: busy,
         onConfirm: _verify,
+      ),
+      _Page.notifications => NotificationPermissionScreen(
+        model: widget.push!,
+        onDone: () {
+          if (mounted && _page == _Page.notifications) _go(_Page.home);
+        },
       ),
       _Page.home =>
         unconfigured

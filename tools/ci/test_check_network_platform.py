@@ -7,10 +7,7 @@ from check_network_platform import check
 
 
 ACTIVITY = """class MainActivity : FlutterActivity() {
-    private external fun initializeNetworkContext(context: Context): Boolean
     override fun onCreate(savedInstanceState: Bundle?) {
-        System.loadLibrary("chat_ffi")
-        check(initializeNetworkContext(applicationContext)) { "Network context initialization failed" }
         super.onCreate(savedInstanceState)
     }
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
@@ -29,6 +26,23 @@ ACTIVITY = """class MainActivity : FlutterActivity() {
     }
 }
 """
+APPLICATION = """class ChatApplication : Application() {
+    override fun onCreate() {
+        System.loadLibrary("chat_ffi")
+        NativeInit.initialize(this)
+        uniffiEnsureInitialized()
+        nativeSetNotifier(Notifications(this))
+        super.onCreate()
+    }
+}
+"""
+NATIVE_INIT = """object NativeInit {
+    private external fun initializeNetworkContext(context: Context): Boolean
+    fun initialize(context: Context) {
+        check(initializeNetworkContext(context.applicationContext)) { "Network context initialization failed" }
+    }
+}
+"""
 JNI = """struct ContextState { vm: JavaVM, context: GlobalRef }
 static JVM_PTR: OnceLock<usize> = OnceLock::new();
 static CONTEXT: OnceLock<ContextState> = OnceLock::new();
@@ -38,7 +52,7 @@ pub extern "system" fn JNI_OnLoad(vm: *mut jni::sys::JavaVM, _reserved: *mut c_v
     JVM_PTR.set(vm as usize);
     JNI_VERSION_1_6
 }
-pub extern "system" fn Java_dev_chatproject_chat_1app_MainActivity_initializeNetworkContext(
+pub extern "system" fn Java_dev_chatproject_chat_1app_NativeInit_initializeNetworkContext(
     env: JNIEnv, _this: JObject, context: JObject,
 ) -> jboolean {
     let _init = INIT.lock();
@@ -52,10 +66,12 @@ pub extern "system" fn Java_dev_chatproject_chat_1app_MainActivity_initializeNet
     JNI_TRUE
 }
 """
-MANIFEST = '<manifest xmlns:android="http://schemas.android.com/apk/res/android"><uses-permission android:name="android.permission.INTERNET"/><uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/><application/></manifest>'
-KEEP = '-keepclasseswithmembernames class dev.chatproject.chat_app.MainActivity { native <methods>; }'
+MANIFEST = '<manifest xmlns:android="http://schemas.android.com/apk/res/android"><uses-permission android:name="android.permission.INTERNET"/><uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/><application android:name=".ChatApplication"/></manifest>'
+KEEP = '-keepclasseswithmembernames class dev.chatproject.chat_app.NativeInit { native <methods>; }'
 PATHS = {
     "activity": "app/android/app/src/main/kotlin/dev/chatproject/chat_app/MainActivity.kt",
+    "application": "app/android/app/src/main/kotlin/dev/chatproject/chat_app/ChatApplication.kt",
+    "native_init": "app/android/app/src/main/kotlin/dev/chatproject/chat_app/NativeInit.kt",
     "manifest": "app/android/app/src/main/AndroidManifest.xml",
     "keep": "app/android/app/proguard-rules.pro",
     "jni": "app/rust/src/android_jni.rs",
@@ -70,7 +86,8 @@ class NetworkPlatformTest(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = pathlib.Path(self.temp.name)
         for name, text in {
-            "activity": ACTIVITY, "manifest": MANIFEST, "keep": KEEP,
+            "activity": ACTIVITY, "application": APPLICATION, "native_init": NATIVE_INIT,
+            "manifest": MANIFEST, "keep": KEEP,
             "jni": JNI, "lib": '#[cfg(target_os = "android")]\nmod android_jni;',
         }.items():
             self.write(name, text)
@@ -100,13 +117,28 @@ class NetworkPlatformTest(unittest.TestCase):
         self.reject("manifest", MANIFEST.replace('<uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>', ''), "ACCESS_NETWORK_STATE")
 
     def test_permission_nested_in_application_is_not_main_permission(self):
-        self.reject("manifest", MANIFEST.replace('<application/>', '<application><uses-permission android:name="android.permission.INTERNET"/></application>').replace('<uses-permission android:name="android.permission.INTERNET"/>', '', 1), "INTERNET")
+        self.reject("manifest", MANIFEST.replace('<application android:name=".ChatApplication"/>', '<application android:name=".ChatApplication"><uses-permission android:name="android.permission.INTERNET"/></application>').replace('<uses-permission android:name="android.permission.INTERNET"/>', '', 1), "INTERNET")
 
-    def test_load_after_flutter_initialization(self):
-        self.reject("activity", ACTIVITY.replace('        System.loadLibrary("chat_ffi")', '        super.onCreate(savedInstanceState)\n        System.loadLibrary("chat_ffi")'), "before super")
+    def test_load_after_application_super(self):
+        self.reject("application", APPLICATION.replace('        System.loadLibrary("chat_ffi")', '        super.onCreate()\n        System.loadLibrary("chat_ffi")'), "before super")
+
+    def test_binding_check_and_notifier_are_required_in_order(self):
+        self.reject("application", APPLICATION.replace("        uniffiEnsureInitialized()\n", ""), "before super")
+        self.reject("application", APPLICATION.replace("        nativeSetNotifier(Notifications(this))\n", ""), "before super")
+        self.reject("application", APPLICATION.replace("        NativeInit.initialize(this)\n        uniffiEnsureInitialized()",
+                                                       "        uniffiEnsureInitialized()\n        NativeInit.initialize(this)"), "before super")
+
+    def test_manifest_must_start_the_initializing_application(self):
+        self.reject("manifest", MANIFEST.replace(' android:name=".ChatApplication"', ''), "ChatApplication")
 
     def test_activity_context_is_not_application_context(self):
-        self.reject("activity", ACTIVITY.replace("initializeNetworkContext(applicationContext)", "initializeNetworkContext(this)"), "applicationContext")
+        self.reject("native_init", NATIVE_INIT.replace("initializeNetworkContext(context.applicationContext)", "initializeNetworkContext(context)"), "applicationContext")
+
+    def test_jni_method_outside_native_init_is_rejected(self):
+        self.reject("native_init", NATIVE_INIT.replace("object NativeInit", "class NativeInit"), "NativeInit")
+        self.write("native_init", NATIVE_INIT)
+        self.reject("activity", ACTIVITY.replace("class MainActivity : FlutterActivity() {",
+                                                 "class MainActivity : FlutterActivity() {\n    private external fun initializeNetworkContext(context: Context): Boolean"), "NativeInit owns")
 
     def test_unguarded_debug_channel(self):
         self.reject("activity", ACTIVITY.replace("if ((applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0)", "if (true)", 1), "Debug channel")

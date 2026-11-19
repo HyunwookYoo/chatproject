@@ -122,11 +122,73 @@ Future<void> notePairSide(
       : 'unknown';
 }
 
+/// [value] as a fixed fact bucket: `<prefix><n>`, `<prefix><top>plus`, or
+/// `unknown` when it is not a count.
+String factBucket(Object? value, String prefix, int top) =>
+    _bucket(value, prefix, top);
+
 String _bucket(Object? value, String prefix, int top) => value is! int
     ? 'unknown'
     : value >= top
     ? '$prefix${top}plus'
     : '$prefix$value';
+
+/// Notes one m6 A side's own-device sync as buckets (`push_local_test_counts`):
+/// `m6_own_sessions_<side>` (ready sessions with my other devices now),
+/// `m6_pulls_<side>` (pulls started since the core started) and how they
+/// ended (`_done`, `_failed`, `_stopped`: a `Refused` or out-of-order page ends
+/// syncing over that session). `unknown` when it could not be read.
+Future<void> noteOwnSync(String side, Future<Object?> Function() facts) async {
+  Object? value;
+  try {
+    value = await facts();
+  } catch (_) {
+    value = null;
+  }
+  final map = value is Map ? value : const {};
+  failureFacts['m6_own_sessions_$side'] = _bucket(map['own_sessions'], 's', 1);
+  failureFacts['m6_pulls_$side'] = _bucket(map['pulls'], 'p', 2);
+  failureFacts['m6_pulls_done_$side'] = _bucket(map['pulls_done'], 'd', 2);
+  failureFacts['m6_pulls_failed_$side'] = _bucket(map['pulls_failed'], 'pf', 2);
+  failureFacts['m6_pulls_stopped_$side'] = _bucket(
+    map['pulls_stopped'],
+    'ps',
+    1,
+  );
+  failureFacts['m6_pull_failure_$side'] = _named(
+    map['pull_failure'],
+    _pullFailures,
+  );
+  failureFacts['m6_own_closes_$side'] = _bucket(map['own_closes'], 'c', 2);
+  failureFacts['m6_own_close_$side'] = _named(map['own_close'], _closes);
+}
+
+const _pullFailures = {
+  'none',
+  'busy',
+  'request',
+  'entries',
+  'storage',
+  'session_gone',
+  'plain',
+};
+const _closes = {
+  'none',
+  'open',
+  'local',
+  'timeout',
+  'reset',
+  'peer_simultaneous_dial',
+  'peer_new_proof',
+  'peer_restricted',
+  'peer_auth_failed',
+  'peer_record_changed',
+  'peer_stopped',
+  'peer_other',
+  'other',
+};
+String _named(Object? value, Set<String> names) =>
+    names.contains(value) ? value as String : 'unknown';
 
 /// Notes one m6 side's MLS group for the conversation as buckets
 /// (`message_local_test_group_facts`): `m6_group_<side>` (members or `none`),
@@ -169,7 +231,9 @@ void noteWait(String name, int ms) {
   if (ms > (waitMs[name] ?? -1)) waitMs[name] = ms;
 }
 
-final _scenarioOp = RegExp(r'^(?:account|message|mailbox)_local_[a-z_]{1,48}$');
+final _scenarioOp = RegExp(
+  r'^(?:account|message|mailbox|push)_local_[a-z_]{1,48}$',
+);
 
 /// The [waitsLimit] slowest waits whose name is a listed failure text, a listed
 /// m2 kind or a scenario op, slowest first; null when none is left.
