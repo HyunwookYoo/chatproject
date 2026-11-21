@@ -16,6 +16,18 @@ cargo build --locked -p push_proxy --release
 # binary: target/release/push_proxy
 ```
 
+A server too small to build it (1 GB RAM) takes the binary from CI instead: the
+`push-proxy` job of every `ci` run uploads `push_proxy-x86_64-linux`, built on
+Ubuntu 24.04 for x86_64 (the server needs the same or a newer glibc). Download
+it from a green run of `main` and copy it over:
+
+```sh
+gh run download <run-id> -n push_proxy-x86_64-linux -D push_proxy-bin
+scp push_proxy-bin/push_proxy ubuntu@<server>:/tmp/push_proxy
+# on the server, in place of the target/release path in the install step below:
+sudo install -m 0755 /tmp/push_proxy /usr/local/bin/push_proxy
+```
+
 Configuration is environment variables and secret file paths only. Errors name
 the variable, never its value.
 

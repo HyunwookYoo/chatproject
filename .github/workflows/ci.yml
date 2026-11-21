@@ -77,7 +77,8 @@ jobs:
   # it compiles every dependency again in the release profile, and job rust already needs most of its
   # 30 minutes on a cold cache.
   push-proxy:
-    runs-on: ubuntu-latest
+    # Pinned to the server's OS: the uploaded binary links against this glibc (Oracle VM: Ubuntu 24.04).
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -99,6 +100,13 @@ jobs:
             echo 'release push_proxy contains the fake upstream'
             exit 1
           fi
+      # The deploy binary: download it from the run page and copy it to the server (README).
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: push_proxy-x86_64-linux
+          path: target/release/push_proxy
+          if-no-files-found: error
+          retention-days: 30
 
   bindings:
     strategy:
