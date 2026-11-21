@@ -28,6 +28,14 @@ scp push_proxy-bin/push_proxy ubuntu@<server>:/tmp/push_proxy
 sudo install -m 0755 /tmp/push_proxy /usr/local/bin/push_proxy
 ```
 
+[`deploy/setup.sh`](deploy/setup.sh) does every server step below on an Ubuntu
+24.04 VM (the Oracle Cloud image): swap, Caddy, the VM firewall, the user, the
+files, the systemd unit and the Caddyfile. Copy the binary to `/tmp/push_proxy`
+and, on the first run, the service account to `/tmp/fcm-service-account.json`,
+then run `sudo bash /tmp/setup.sh <domain>`. Run it again with a new binary to
+upgrade; it keeps the existing handle key. Change the unit or the Caddyfile here
+and in the script together.
+
 Configuration is environment variables and secret file paths only. Errors name
 the variable, never its value.
 
