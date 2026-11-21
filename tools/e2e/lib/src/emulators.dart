@@ -28,7 +28,8 @@ const cleanSnapshot = 'clean';
 List<String> bootArgs(EmulatorSpec spec) => [
       '-avd', spec.avd,
       '-port', '${spec.port}',
-      '-snapshot', cleanSnapshot,
+      // Probe: cold boot instead of loading the clean snapshot (emulator 37.3.10 check).
+      '-no-snapshot-load',
       '-no-snapshot-save',
       '-no-window', '-no-audio', '-no-boot-anim',
     ];
@@ -82,7 +83,7 @@ class Emulators {
     required this.avdHome,
     this.flutter = 'flutter',
     this.pollInterval = const Duration(seconds: 2),
-    this.bootTimeout = const Duration(seconds: 180),
+    this.bootTimeout = const Duration(seconds: 600),
     this.settleTimeout = const Duration(minutes: 10),
     this.settlePoll = const Duration(seconds: 15),
     Future<void> Function(Duration)? sleep,
