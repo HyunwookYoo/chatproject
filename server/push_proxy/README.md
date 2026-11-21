@@ -16,6 +16,26 @@ cargo build --locked -p push_proxy --release
 # binary: target/release/push_proxy
 ```
 
+A server too small to build it (1 GB RAM) takes the binary from CI instead: the
+`push-proxy` job of every `ci` run uploads `push_proxy-x86_64-linux`, built on
+Ubuntu 24.04 for x86_64 (the server needs the same or a newer glibc). Download
+it from a green run of `main` and copy it over:
+
+```sh
+gh run download <run-id> -n push_proxy-x86_64-linux -D push_proxy-bin
+scp push_proxy-bin/push_proxy ubuntu@<server>:/tmp/push_proxy
+# on the server, in place of the target/release path in the install step below:
+sudo install -m 0755 /tmp/push_proxy /usr/local/bin/push_proxy
+```
+
+[`deploy/setup.sh`](deploy/setup.sh) does every server step below on an Ubuntu
+24.04 VM (the Oracle Cloud image): swap, Caddy, the VM firewall, the user, the
+files, the systemd unit and the Caddyfile. Copy the binary to `/tmp/push_proxy`
+and, on the first run, the service account to `/tmp/fcm-service-account.json`,
+then run `sudo bash /tmp/setup.sh <domain>`. Run it again with a new binary to
+upgrade; it keeps the existing handle key. Change the unit or the Caddyfile here
+and in the script together.
+
 Configuration is environment variables and secret file paths only. Errors name
 the variable, never its value.
 
