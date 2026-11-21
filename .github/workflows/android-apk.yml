@@ -1,0 +1,74 @@
+name: android-apk
+
+# A release APK for trying push on a real phone: the app with google-services.json and the
+# deployed push proxy address built in. Start it with an `android-apk-<n>` tag on a pushed commit,
+# or from the Actions tab once the workflow is on main. google-services.json lives in the
+# `android-apk` Environment as the GOOGLE_SERVICES_JSON secret; it ends up inside the APK anyway,
+# but stays out of the repository and the logs.
+on:
+  workflow_dispatch:
+  push:
+    tags: ['android-apk-*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-apk
+  cancel-in-progress: false
+
+env:
+  FLUTTER_VERSION: 3.44.6
+  RUST_TOOLCHAIN: 1.92.0
+  # cargokit (app/rust_builder) builds with this toolchain. Must equal RUST_TOOLCHAIN.
+  CARGOKIT_TOOLCHAIN: 1.92.0
+  # Read by the Rust build (option_env! in app/rust/src/native.rs); server/push_proxy/README.md.
+  CHATPROJECT_PUSH_URL: https://chatproject-push.duckdns.org
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: android-apk
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master 2026-10-01
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: aarch64-linux-android
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+      - name: Place google-services.json for this build only
+        env:
+          SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+        run: |
+          if [ -z "$SERVICES_JSON" ]; then
+            echo 'GOOGLE_SERVICES_JSON is not set in the android-apk Environment'
+            exit 1
+          fi
+          umask 077
+          printf '%s' "$SERVICES_JSON" > app/android/app/google-services.json
+      - name: Release APK (arm64 phones)
+        working-directory: app
+        run: |
+          flutter pub get
+          test "$CARGOKIT_TOOLCHAIN" = '1.92.0'
+          flutter build apk --release --target-platform android-arm64 --target lib/main.dart
+          rm -f android/app/google-services.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: chatproject-android-arm64
+          path: app/build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
+          retention-days: 14
+      - name: Remove google-services.json
+        if: always()
+        run: rm -f app/android/app/google-services.json
