@@ -24,6 +24,11 @@ const testEmulators = [EmulatorSpec('chat_e2e_1', 5554), EmulatorSpec('chat_e2e_
 /// Snapshot taken right after the first full boot; every test boot starts from it.
 const cleanSnapshot = 'clean';
 
+/// The software GPU, as in ci.yml's android job. With the default mode, emulator 37.3.10
+/// froze the first emulator once the app started drawing. Snapshot and test boots must
+/// use the same mode.
+const _gpuArgs = ['-gpu', 'swiftshader_indirect'];
+
 /// Arguments for a test boot: clean snapshot, no window, changes thrown away on exit.
 List<String> bootArgs(EmulatorSpec spec) => [
       '-avd', spec.avd,
@@ -31,6 +36,7 @@ List<String> bootArgs(EmulatorSpec spec) => [
       '-snapshot', cleanSnapshot,
       '-no-snapshot-save',
       '-no-window', '-no-audio', '-no-boot-anim',
+      ..._gpuArgs,
     ];
 
 /// Arguments for the one-time full boot that produces the clean snapshot.
@@ -40,6 +46,7 @@ List<String> firstBootArgs(EmulatorSpec spec) => [
       '-no-snapshot-load',
       '-no-snapshot-save',
       '-no-window', '-no-audio', '-no-boot-anim',
+      ..._gpuArgs,
     ];
 
 /// Parses `adb devices` output into serial → state ("device", "offline", ...).

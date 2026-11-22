@@ -408,6 +408,12 @@ void main() {
     expect(firstBootArgs(testEmulators.first), contains('-no-snapshot-save'));
   });
 
+  test('snapshot and test boots both render with the software GPU', () {
+    for (final args in [bootArgs(testEmulators.first), firstBootArgs(testEmulators.first)]) {
+      expect(args, containsAllInOrder(['-gpu', 'swiftshader_indirect']));
+    }
+  });
+
   test('waitBooted returns once boot_completed is 1', () async {
     var polls = 0;
     final runner = FakeRunner((exe, args) {
