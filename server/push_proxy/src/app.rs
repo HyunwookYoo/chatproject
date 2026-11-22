@@ -6,12 +6,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
-use axum::extract::{ConnectInfo, DefaultBodyLimit, Request, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, FromRequest, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
-use axum::{Extension, Router, middleware};
+use axum::{Router, middleware};
 use push_wire::{
     BASE64URL_NOPAD, HANDLE_LIFETIME_MS, HandleError, HandlePlain, HandleRequest, HandleResponse,
     MAX_BODY, MAX_ITEMS, MAX_TOKEN, PUSH_CIPHER_MAX, Platform, PushItem, PushItemKind, PushRequest,
@@ -120,20 +120,21 @@ async fn time_limit(State(limit): State<Duration>, request: Request, next: Next)
         .unwrap_or_else(|_| StatusCode::REQUEST_TIMEOUT.into_response())
 }
 
-async fn handle(
-    State(shared): State<Arc<Shared>>,
-    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
-    headers: HeaderMap,
-    body: Result<Bytes, BytesRejection>,
-) -> Response {
+/// Takes the whole request so the limit is decided before any of the body is
+/// read: a limited client never gets to upload it.
+async fn handle(State(shared): State<Arc<Shared>>, request: Request) -> Response {
     let state = &shared.state;
     let now = (state.clock)();
-    let peer = peer.map(|Extension(ConnectInfo(addr))| addr);
-    let ip = client_ip(peer, &headers, state.trust_proxy);
+    let peer = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(addr)| *addr);
+    let ip = client_ip(peer, request.headers(), state.trust_proxy);
     if !shared.limiter.allow_ip(ip, now) {
         return StatusCode::TOO_MANY_REQUESTS.into_response();
     }
-    let body = match body {
+    // Same extractor as `/push`, so `DefaultBodyLimit` still applies.
+    let body = match Bytes::from_request(request, &()).await {
         Ok(body) => body,
         Err(rejection) => return rejection.status().into_response(),
     };
@@ -258,7 +259,11 @@ fn decide(shared: &Shared, item: PushItem, now: u64) -> Result<Outgoing, PushRes
     };
     // The slot first: a full proxy must not spend the handle's token.
     let permit = shared.limiter.send_permit().ok_or(PushResult::Limited)?;
-    if !shared.limiter.allow_handle(&bytes, now) {
+    if !shared.limiter.allow_handle(&bytes, now)
+        || !shared
+            .limiter
+            .allow_token(plain.platform, &plain.token, now)
+    {
         return Err(PushResult::Limited);
     }
     Ok(Outgoing {

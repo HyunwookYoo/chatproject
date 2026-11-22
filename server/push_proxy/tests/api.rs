@@ -311,6 +311,109 @@ async fn per_handle_rate_limit() {
 }
 
 #[tokio::test]
+async fn per_token_rate_limit_spans_handles() {
+    // Handles are free to mint for a token: the device's budget is the token's,
+    // whatever handles (tags) it is spread over.
+    let mut setup = Setup::new(test_key());
+    setup.limits.token_per_minute = 1;
+    setup.limits.token_burst = 3;
+    let p = setup.start();
+    let a = p.issue(Platform::Fcm, "tok-shared", [30; 16]).await;
+    let b = p.issue(Platform::Fcm, "tok-shared", [31; 16]).await;
+    let c = p.issue(Platform::Fcm, "tok-shared", [32; 16]).await;
+    let elsewhere = p.issue(Platform::Fcm, "tok-other", [33; 16]).await;
+
+    let (_, results) = p
+        .push(vec![
+            item(&a, PushItemKind::Wake),
+            item(&a, PushItemKind::Wake),
+            item(&b, PushItemKind::Wake),
+            item(&c, PushItemKind::Wake),
+            item(&elsewhere, PushItemKind::Wake),
+        ])
+        .await;
+    assert_eq!(
+        results,
+        vec![
+            PushResult::Ok,
+            PushResult::Ok,
+            PushResult::Ok,
+            PushResult::Limited,
+            PushResult::Ok
+        ]
+    );
+    p.set_now(T0 + 60_000);
+    assert_eq!(
+        p.push(vec![item(&c, PushItemKind::Wake)]).await.1,
+        vec![PushResult::Ok]
+    );
+    assert_eq!(deliveries(&p.fcm, 5).await.len(), 5);
+}
+
+#[tokio::test]
+async fn handle_issuance_limit_groups_ipv6_by_64_and_unmaps_ipv4() {
+    let mut setup = Setup::new(test_key());
+    setup.trust_proxy = true;
+    let p = setup.start();
+    let req = handle_req(Platform::Fcm, "tok", [34; 16]);
+    // Thirty addresses of one /64 share one bucket.
+    for i in 1..=30 {
+        let ip = format!("2001:db8:1:2::{i:x}");
+        assert_eq!(
+            p.handle_status(&req, Some(&ip)).await,
+            StatusCode::OK,
+            "{ip}"
+        );
+    }
+    assert_eq!(
+        p.handle_status(&req, Some("2001:db8:1:2:ffff:1:2:3")).await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(
+        p.handle_status(&req, Some("2001:db8:1:3::1")).await,
+        StatusCode::OK,
+        "the next /64"
+    );
+
+    // An IPv4 client written as IPv4-mapped IPv6 is that IPv4 client.
+    for _ in 0..30 {
+        assert_eq!(
+            p.handle_status(&req, Some("203.0.113.20")).await,
+            StatusCode::OK
+        );
+    }
+    assert_eq!(
+        p.handle_status(&req, Some("::ffff:203.0.113.20")).await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(
+        p.handle_status(&req, Some("203.0.113.21")).await,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn limited_handle_request_is_refused_before_its_body() {
+    let p = Setup::new(test_key()).start();
+    let req = handle_req(Platform::Fcm, "tok", [35; 16]);
+    for _ in 0..30 {
+        assert_eq!(p.handle_status(&req, None).await, StatusCode::OK);
+    }
+    // A body that never arrives: the answer must not wait for it.
+    let body = Body::from_stream(futures_util::stream::pending::<
+        Result<axum::body::Bytes, std::io::Error>,
+    >());
+    let mut over = Request::post("/handle").body(body).unwrap();
+    over.extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from((PEER, 40_000))));
+    let resp = tokio::time::timeout(Duration::from_secs(2), p.app.clone().oneshot(over))
+        .await
+        .expect("waited for the body")
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
 async fn handle_issuance_limited_per_ip() {
     let p = Setup::new(test_key()).start();
     let req = handle_req(Platform::Fcm, "tok", [8; 16]);
@@ -668,7 +771,11 @@ async fn stalled_headers_close_the_connection() {
         .await
         .unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(serve(listener, p.app.clone(), Duration::from_millis(200)));
+    let limits = Limits {
+        header_timeout: Duration::from_millis(200),
+        ..Limits::default()
+    };
+    tokio::spawn(serve(listener, p.app.clone(), limits));
 
     // A complete request is served.
     let mut ok = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -709,4 +816,158 @@ async fn stalled_headers_close_the_connection() {
     let mut rest = Vec::new();
     let closed = tokio::time::timeout(Duration::from_secs(5), silent.read_to_end(&mut rest)).await;
     assert!(closed.is_ok(), "silent connection still open after 5 s");
+}
+
+/// Serves `p` on a fresh localhost port with `limits`; returns the address.
+async fn serve_on_port(p: &Proxy, limits: Limits) -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind(SocketAddr::from((PEER, 0)))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(serve(listener, p.app.clone(), limits));
+    addr
+}
+
+/// Reads until the server closes `stream`; `None` if still open after `wait`.
+async fn closed_within(stream: &mut tokio::net::TcpStream, wait: Duration) -> Option<Vec<u8>> {
+    let mut got = Vec::new();
+    match tokio::time::timeout(wait, stream.read_to_end(&mut got)).await {
+        Ok(_) => Some(got),
+        Err(_) => None,
+    }
+}
+
+async fn served_ok(addr: SocketAddr) -> bool {
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let body = br#"{"items":[]}"#;
+    let head = format!(
+        "POST /push HTTP/1.1{CRLF}Host: proxy{CRLF}Content-Length: {}{CRLF}Connection: close{CRLF}{CRLF}",
+        body.len()
+    );
+    if stream.write_all(head.as_bytes()).await.is_err() || stream.write_all(body).await.is_err() {
+        return false;
+    }
+    closed_within(&mut stream, Duration::from_secs(5))
+        .await
+        .is_some_and(|answer| answer.starts_with(b"HTTP/1.1 200"))
+}
+
+#[tokio::test]
+async fn connections_beyond_the_cap_are_closed() {
+    let p = Setup::new(test_key()).start();
+    let addr = serve_on_port(
+        &p,
+        Limits {
+            max_connections: 2,
+            header_timeout: Duration::from_secs(30),
+            ..Limits::default()
+        },
+    )
+    .await;
+    let mut held = Vec::new();
+    for _ in 0..2 {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream.write_all(b"POST /push HTTP/1.1\r\n").await.unwrap();
+        held.push(stream);
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut third = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let got = closed_within(&mut third, Duration::from_secs(2)).await;
+    assert_eq!(
+        got.as_deref(),
+        Some(&b""[..]),
+        "third connection not closed"
+    );
+
+    // A freed slot serves again.
+    drop(held.pop());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(served_ok(addr).await);
+}
+
+#[tokio::test]
+async fn connection_lifetime_is_bounded() {
+    let mut setup = Setup::new(test_key());
+    setup.limits.request_timeout = Duration::from_secs(30);
+    let p = setup.start();
+    let addr = serve_on_port(
+        &p,
+        Limits {
+            header_timeout: Duration::from_secs(30),
+            connection_lifetime: Duration::from_millis(300),
+            connection_grace: Duration::from_millis(200),
+            ..Limits::default()
+        },
+    )
+    .await;
+
+    // An idle keep-alive connection is closed once its lifetime is up.
+    let mut idle = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let body = br#"{"items":[]}"#;
+    let head = format!(
+        "POST /push HTTP/1.1{CRLF}Host: proxy{CRLF}Content-Length: {}{CRLF}{CRLF}",
+        body.len()
+    );
+    idle.write_all(head.as_bytes()).await.unwrap();
+    idle.write_all(body).await.unwrap();
+    let answer = closed_within(&mut idle, Duration::from_secs(5))
+        .await
+        .expect("keep-alive connection still open after 5 s");
+    assert!(
+        answer.starts_with(b"HTTP/1.1 200"),
+        "{}",
+        String::from_utf8_lossy(&answer)
+    );
+
+    // A request still in progress (its body stalls) is cut after the grace period.
+    let mut stalled = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let start = Instant::now();
+    stalled
+        .write_all(
+            format!("POST /push HTTP/1.1{CRLF}Host: proxy{CRLF}Content-Length: 100{CRLF}{CRLF}{{")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        closed_within(&mut stalled, Duration::from_secs(5))
+            .await
+            .is_some(),
+        "stalled request still open after 5 s"
+    );
+    let took = start.elapsed();
+    assert!(
+        took >= Duration::from_millis(400) && took < Duration::from_secs(3),
+        "{took:?}"
+    );
+}
+
+#[tokio::test]
+async fn served_requests_carry_the_tcp_peer() {
+    // Through `serve`, the /handle limit keys on the real TCP peer.
+    let p = Setup::new(test_key()).start();
+    let addr = serve_on_port(&p, Limits::default()).await;
+    let req = serde_json::to_vec(&handle_req(Platform::Fcm, "tok", [36; 16])).unwrap();
+    let status = |body: Vec<u8>, from: [u8; 4]| async move {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind(SocketAddr::from((from, 0))).unwrap();
+        let mut stream = socket.connect(addr).await.unwrap();
+        let head = format!(
+            "POST /handle HTTP/1.1{CRLF}Host: proxy{CRLF}Content-Length: {}{CRLF}Connection: close{CRLF}{CRLF}",
+            body.len()
+        );
+        stream.write_all(head.as_bytes()).await.unwrap();
+        stream.write_all(&body).await.unwrap();
+        let answer = closed_within(&mut stream, Duration::from_secs(5))
+            .await
+            .unwrap();
+        String::from_utf8_lossy(&answer[..12]).into_owned()
+    };
+    for _ in 0..30 {
+        assert_eq!(status(req.clone(), PEER).await, "HTTP/1.1 200");
+    }
+    assert_eq!(status(req.clone(), PEER).await, "HTTP/1.1 429");
+    // Another loopback address is another client.
+    assert_eq!(status(req.clone(), [127, 0, 0, 2]).await, "HTTP/1.1 200");
 }
