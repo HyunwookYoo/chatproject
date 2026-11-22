@@ -11,7 +11,7 @@ mod sweep;
 
 pub use app::{AppState, Clock, router};
 pub use config::{Config, ConfigError};
-pub use limit::Limits;
+pub use limit::{Limits, MAX_CONNECTIONS, serve_limits};
 pub use log::{LogSink, stderr_sink};
 pub use store::{Store, StoreError, SweepCounts};
 pub use sweep::{SWEEP_EVERY, run_sweeper, sweep};

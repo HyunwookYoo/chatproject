@@ -57,6 +57,10 @@ range or a bad signature is `bad`; the other items still run.
 - `CREATE` 500 an hour, burst 200, per client (an IPv4 address or an IPv6 /64).
   `SEND` 60 a minute, burst 20, per queue. `RECV` and `ACK` 120 requests a
   minute per client, each. Buckets are in memory and start full after a restart.
+  A `CREATE` or `SEND` item takes its token before its signature is checked,
+  so a badly signed item spends a token and one over the limit costs no verify.
+- At most 128 open connections; one more is closed at once. That bounds the
+  server's memory to about 225 MiB of held 1 MiB uploads.
 - Every hour (and at start): entries older than 24 hours, acked hashes past
   their 20 minutes, and queues with no command for 30 days are deleted.
 

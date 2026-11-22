@@ -4,19 +4,21 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
 use axum::extract::ConnectInfo;
 use axum::http::{Request, StatusCode, header};
 use http_body_util::BodyExt;
-use queue_server::{AppState, Limits, Store, router, sweep};
+use queue_server::{AppState, Limits, MAX_CONNECTIONS, Store, router, serve_limits, sweep};
 use queue_wire::{
     AckItem, BASE64URL_NOPAD, CommandName, CreateItem, DeleteItem, ENTRY_TTL_MS, Entry,
     IDLE_DELETE_MS, ItemResult, MAX_BODY, MAX_CT, MAX_ITEMS, MAX_UNACKED, QueueId, QueueRequest,
     QueueResponse, RecvItem, SendItem, Signed, TS_SKEW_MS, public_key, sign, signing_bytes,
 };
 use serde::Serialize;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower::ServiceExt;
 
 const T0: u64 = 1_800_000_000_000;
@@ -812,6 +814,70 @@ async fn send_rate_limit_per_queue() {
     assert_eq!(s.entries(&q, 0).await.len(), 21);
 }
 
+/// A CREATE whose signature does not match its keys.
+fn badly_signed_create(q: &Q, ts: u64) -> CreateItem {
+    CreateItem {
+        sender_pub: b64(&public_key(&[0x99; 32])),
+        ..q.create(ts)
+    }
+}
+
+#[tokio::test]
+async fn create_over_the_limit_is_limited_before_the_signature_is_checked() {
+    let s = start(Limits::default());
+    let a = Some("203.0.113.5");
+    // Badly signed items spend the caller's own tokens...
+    for from in [0, 100] {
+        let items = (from..from + 100)
+            .map(|n| badly_signed_create(&Q::new(n), T0))
+            .collect();
+        let results = s.post_from(a, CommandName::Create, items).await;
+        assert!(results.iter().all(|r| *r == ItemResult::Bad));
+    }
+    // ...and past them an item is `limited`, signed well or not: a `bad`
+    // here would mean its signature was checked.
+    let results = s
+        .post_from(
+            a,
+            CommandName::Create,
+            vec![
+                Q::new(200).create(T0),
+                badly_signed_create(&Q::new(201), T0),
+            ],
+        )
+        .await;
+    assert_eq!(results, vec![ItemResult::Limited, ItemResult::Limited]);
+    assert_eq!(s.rows("queue"), 0);
+    // Another client still gets its signature checked.
+    let b = Some("203.0.113.6");
+    let results = s
+        .post_from(
+            b,
+            CommandName::Create,
+            vec![badly_signed_create(&Q::new(202), T0)],
+        )
+        .await;
+    assert_eq!(results, vec![ItemResult::Bad]);
+}
+
+#[tokio::test]
+async fn send_over_the_limit_is_limited_before_the_signature_is_checked() {
+    let s = start(Limits::default());
+    let q = Q::new(1);
+    s.create(&q).await;
+    let now = s.now();
+    let forged = |ct: &[u8]| SendItem {
+        sig: q.sig(&q.recipient, &Signed::Send { ct }, now),
+        ..q.send(ct, now)
+    };
+    let mut items: Vec<SendItem> = (0..20u8).map(|i| forged(&[i])).collect();
+    items.push(q.send(b"good", now));
+    items.push(forged(b"forged"));
+    let results = s.post(CommandName::Send, items).await;
+    assert!(results[..20].iter().all(|r| *r == ItemResult::Bad));
+    assert_eq!(results[20..], [ItemResult::Limited, ItemResult::Limited]);
+}
+
 #[tokio::test]
 async fn recv_rate_limit_per_client() {
     let s = start(Limits::default());
@@ -924,5 +990,67 @@ async fn request_shape_errors() {
     assert_eq!(
         s.app.clone().oneshot(req).await.unwrap().status(),
         StatusCode::METHOD_NOT_ALLOWED
+    );
+}
+
+/// Reads until the server closes `stream`; `None` if still open after `wait`.
+async fn closed_within(stream: &mut tokio::net::TcpStream, wait: Duration) -> Option<Vec<u8>> {
+    let mut got = Vec::new();
+    tokio::time::timeout(wait, stream.read_to_end(&mut got))
+        .await
+        .ok()
+        .map(|_| got)
+}
+
+#[tokio::test]
+async fn connections_past_the_cap_are_closed() {
+    let s = start(Limits::default());
+    let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(http_guard::serve(listener, s.app.clone(), serve_limits()));
+    let head = "POST /q/send HTTP/1.1
+Host: q
+";
+    let mut held = Vec::new();
+    for _ in 0..MAX_CONNECTIONS {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream.write_all(head.as_bytes()).await.unwrap();
+        held.push(stream);
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut over = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let got = closed_within(&mut over, Duration::from_secs(2)).await;
+    assert_eq!(
+        got.as_deref(),
+        Some(&b""[..]),
+        "connection past the cap not closed"
+    );
+
+    // A freed slot serves again.
+    drop(held.pop());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let body = br#"{"items":[]}"#;
+    let request = format!(
+        "POST /q/send HTTP/1.1
+Host: q
+Content-Length: {}
+Connection: close
+
+",
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+    stream.write_all(body).await.unwrap();
+    let answer = closed_within(&mut stream, Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert!(
+        answer.starts_with(b"HTTP/1.1 200"),
+        "{}",
+        String::from_utf8_lossy(&answer)
     );
 }

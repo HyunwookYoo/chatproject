@@ -3,8 +3,8 @@
 
 use std::process::ExitCode;
 
-use http_guard::{ServeLimits, serve};
-use queue_server::{AppState, Config, Store, router, run_sweeper};
+use http_guard::serve;
+use queue_server::{AppState, Config, Store, router, run_sweeper, serve_limits};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -33,6 +33,6 @@ async fn main() -> ExitCode {
     state.limits.max_bytes = config.max_bytes;
     state.trust_proxy = config.trust_proxy;
     tokio::spawn(run_sweeper(store, state.clock.clone(), state.log.clone()));
-    serve(listener, router(state), ServeLimits::default()).await;
+    serve(listener, router(state), serve_limits()).await;
     ExitCode::SUCCESS
 }

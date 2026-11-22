@@ -101,7 +101,8 @@ const ACKED_KEEP_MS: u64 = 2 * TS_SKEW_MS;
 /// Room in a RECV answer for the JSON around the entries: every result's
 /// envelope and the outer object.
 const ANSWER_RESERVE: usize = 64 * MAX_ITEMS + 64;
-/// The JSON of one entry around its base64 `ct`: two u64 fields and the keys.
+/// The JSON of one entry around its base64 `ct`: two u64 fields, the keys and
+/// the comma before the next entry. Checked against serde in the tests.
 const ENTRY_JSON: usize = 64;
 
 /// A RECV answer's budget: the JSON stays within [`MAX_BODY`].
@@ -117,6 +118,8 @@ pub enum StoreError {
     Schema,
     /// The worker thread is gone.
     Stopped,
+    /// The job panicked; its transaction rolled back and the worker goes on.
+    Panicked,
 }
 
 impl fmt::Display for StoreError {
@@ -126,6 +129,7 @@ impl fmt::Display for StoreError {
             StoreError::Database => f.write_str("database error"),
             StoreError::Schema => f.write_str("unknown schema version"),
             StoreError::Stopped => f.write_str("store worker stopped"),
+            StoreError::Panicked => f.write_str("store job panicked"),
         }
     }
 }
@@ -177,7 +181,7 @@ impl Store {
         let (reply, answer) = oneshot::channel();
         let job: Job = Box::new(move |conn| {
             let result = catch_unwind(AssertUnwindSafe(|| in_transaction(conn, f)))
-                .unwrap_or(Err(StoreError::Stopped));
+                .unwrap_or(Err(StoreError::Panicked));
             // The request may have timed out and gone; nothing to tell then.
             let _ = reply.send(result);
         });
@@ -481,6 +485,39 @@ mod tests {
             Store::open(&dir.path().join("q.db")).err(),
             Some(StoreError::Schema)
         );
+    }
+
+    #[test]
+    fn entry_json_covers_the_largest_entry_around_its_ct() {
+        let entry = Entry {
+            seq: u64::MAX,
+            ct: String::new(),
+            ts: u64::MAX,
+        };
+        let json = serde_json::to_vec(&entry).unwrap();
+        assert!(json.len() + ",".len() <= ENTRY_JSON, "{}", json.len());
+    }
+
+    #[tokio::test]
+    async fn a_panicking_job_is_reported_as_a_panic_and_the_worker_goes_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("q.db")).unwrap();
+        let panicked = store
+            .run(|_| -> rusqlite::Result<()> { panic!("test panic") })
+            .await;
+        assert_eq!(panicked.err(), Some(StoreError::Panicked));
+        assert_eq!(StoreError::Panicked.to_string(), "store job panicked");
+        let id = [7; 32];
+        let created = store
+            .run(move |tx| {
+                let keys = Keys {
+                    recipient_pub: [1; 32],
+                    sender_pub: [2; 32],
+                };
+                tx.create(&id, &keys, 0)
+            })
+            .await;
+        assert_eq!(created, Ok(true));
     }
 
     #[test]

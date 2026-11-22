@@ -1,5 +1,6 @@
 //! The five commands (spec 9.2). Each item takes one path: decode at the
-//! boundary, then on the store worker verify, limit, store.
+//! boundary, then on the store worker limit, verify, store. The rate token
+//! comes before the signature so a caller over its limit costs no verify.
 
 use std::net::IpAddr;
 
@@ -93,14 +94,14 @@ impl Command for Create {
     }
 
     fn run(self, tx: &Tx, ctx: &mut Ctx) -> rusqlite::Result<ItemResult> {
+        if !ctx.limiter.allow_create(ctx.client, ctx.now) {
+            return Ok(ItemResult::Limited);
+        }
         let signed = Signed::Create {
             sender_pub: &self.keys.sender_pub,
         };
         if !self.head.signed_by(&self.keys.recipient_pub, &signed) {
             return Ok(ItemResult::Bad);
-        }
-        if !ctx.limiter.allow_create(ctx.client, ctx.now) {
-            return Ok(ItemResult::Limited);
         }
         Ok(if tx.create(&self.head.id, &self.keys, ctx.now)? {
             ItemResult::Ok
@@ -129,14 +130,16 @@ impl Command for Send {
         let Some(keys) = tx.keys(&self.head.id)? else {
             return Ok(ItemResult::Gone);
         };
+        // Before the verify: a holder of the queue id without the sender key
+        // can then spend this queue's tokens, but never the worker's CPU.
+        if !ctx.limiter.allow_send(&self.head.id, ctx.now) {
+            return Ok(ItemResult::Limited);
+        }
         if !self
             .head
             .signed_by(&keys.sender_pub, &Signed::Send { ct: &self.ct })
         {
             return Ok(ItemResult::Bad);
-        }
-        if !ctx.limiter.allow_send(&self.head.id, ctx.now) {
-            return Ok(ItemResult::Limited);
         }
         Ok(
             match tx.send(&self.head.id, &self.ct, ctx.now, ctx.max_bytes)? {

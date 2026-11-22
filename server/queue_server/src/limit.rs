@@ -6,11 +6,27 @@ use std::net::IpAddr;
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
-use http_guard::{Buckets, client_key};
+use http_guard::{Buckets, ServeLimits, client_key};
 use queue_wire::QueueId;
 
+/// Open connections: the bound on memory across requests. A SEND upload near
+/// `MAX_BODY` (1 MiB) held open measured 1.73 MiB of private memory per
+/// connection (500 held: 2,948 KiB idle, 888,932 KiB held). 128 × 1.73 MiB
+/// ≈ 221 MiB, under the ~256 MB this server may take on the 952 MB VM it
+/// shares with push_proxy. A RECV answer is at most `MAX_BODY`, below that
+/// per-connection cost.
+pub const MAX_CONNECTIONS: usize = 128;
+
+/// The connection bounds [`http_guard::serve`] runs this server with.
+pub fn serve_limits() -> ServeLimits {
+    ServeLimits {
+        max_connections: MAX_CONNECTIONS,
+        ..ServeLimits::default()
+    }
+}
+
 /// Rates and bursts, the size cap and the request bound. The connection
-/// bounds are [`http_guard::ServeLimits`].
+/// bounds are [`serve_limits`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Limits {
     /// `CREATE` items per client (an IPv4 address or an IPv6 /64), per hour.
