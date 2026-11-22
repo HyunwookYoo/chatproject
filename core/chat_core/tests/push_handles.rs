@@ -309,25 +309,28 @@ async fn own_handle_rides_announce_and_m6_announce_still_decodes() {
     // A device without a handle announces none: A1 keeps nothing for A2.
     assert!(mine.own.is_empty());
 
-    // M6 sends `[1, 4, mailbox]`; M7 `[1, 4, mailbox, handle or null]`.
+    // M6 sends `[1, 4, mailbox]`; M7 `[1, 4, mailbox, handle or null]`; M8 adds `qualified`.
     let m6 = [0x83, 0x01, 0x04, 0xf5];
     assert!(
         MailboxFrame::decode(&m6).unwrap()
             == MailboxFrame::Announce {
                 mailbox: true,
-                handle: None
+                handle: None,
+                qualified: false,
             }
     );
     let with = MailboxFrame::Announce {
         mailbox: false,
         handle: Some(vec![7; 40]),
+        qualified: false,
     };
     assert!(MailboxFrame::decode(&with.inner()).unwrap() == with);
     let without = MailboxFrame::Announce {
         mailbox: true,
         handle: None,
+        qualified: false,
     };
-    assert_eq!(*without.inner(), [0x84, 0x01, 0x04, 0xf5, 0xf6]);
+    assert_eq!(*without.inner(), [0x85, 0x01, 0x04, 0xf5, 0xf6, 0xf4]);
     assert!(MailboxFrame::decode(&without.inner()).unwrap() == without);
     for bad in [
         &[0x84, 0x01, 0x04, 0xf5, 0x40][..],

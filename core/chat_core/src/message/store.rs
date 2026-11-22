@@ -76,10 +76,11 @@ pub(crate) enum MessageDbOp {
     /// Test-hook builds: the M4-peer fixture's plaintext frame for a row awaiting encryption.
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     M4Encode(MessageKey),
-    /// Test-hook builds: seals a `PushHandle` (handle, issued at) in the conversation's group
-    /// as this device and returns the MLS ciphertext; only the ratchet changes.
+    /// Test-hook builds: seals a `PushHandle` or `QueueRef` (content, issued at) in the
+    /// conversation's group as this device and returns the MLS ciphertext; only the ratchet
+    /// changes.
     #[cfg(all(feature = "test-hooks", debug_assertions))]
-    SealPushHandle(ConversationId, Vec<u8>, u64),
+    SealRouting(ConversationId, crate::mls::payload::Content, u64),
     MlsGroupOp(ConversationId, super::mls_group::GroupOp),
     /// The device log: pages, cursors, retention (M6).
     Mailbox(super::mailbox_store::MailboxDbOp),
@@ -612,7 +613,7 @@ pub(crate) fn execute(
         #[cfg(all(feature = "test-hooks", debug_assertions))]
         MessageDbOp::M4Encode(key) => super::mls_store::m4_encode(c, identity, key),
         #[cfg(all(feature = "test-hooks", debug_assertions))]
-        MessageDbOp::SealPushHandle(id, handle, issued_at_ms) => super::mls_store::fixture_seal_push_handle(c, identity, local, id, handle, issued_at_ms),
+        MessageDbOp::SealRouting(id, content, issued_at_ms) => super::mls_store::fixture_seal_routing(c, identity, local, id, content, issued_at_ms),
         MessageDbOp::MlsGroupOp(id, op) => super::mls_group::group_op(c, identity, local, id, op, mls_fault!(fault)),
         MessageDbOp::Mailbox(op) => super::mailbox_store::mailbox_op(c, identity, op, mls_fault!(fault)),
         MessageDbOp::Push(op) => super::push_store::push_op(c, identity, local, op, mls_fault!(fault)),
@@ -1290,7 +1291,7 @@ impl MessageDbOp {
             // The M4-peer fixture's frame is what its enqueue would have stored: not a step
             // of the attempt that fault tests interrupt.
             #[cfg(all(feature = "test-hooks", debug_assertions))]
-            Self::M4Encode(_) | Self::SealPushHandle(..) => false,
+            Self::M4Encode(_) | Self::SealRouting(..) => false,
             Self::MlsGroupOp(_, op) => op.writes(),
             Self::Mailbox(op) => op.writes(),
             Self::Push(op) => op.writes(),

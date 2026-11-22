@@ -296,7 +296,22 @@ impl Messages {
         handle: Vec<u8>,
         issued_at_ms: u64,
     ) -> Result<Vec<u8>, CoreError> {
-        match self.mls(MessageDbOp::SealPushHandle(conversation, handle, issued_at_ms)).await? {
+        let content = crate::mls::payload::Content::PushHandle { handle };
+        match self.mls(MessageDbOp::SealRouting(conversation, content, issued_at_ms)).await? {
+            MessageDbReply::Ciphertext(ciphertext) => Ok(ciphertext),
+            _ => unreachable!(),
+        }
+    }
+    /// The MLS ciphertext of a `QueueRef` this device seals in the conversation's group for
+    /// `queue` (`None`: withdrawn) at `issued_at_ms` (nothing is queued or logged).
+    pub async fn mls_seal_queue_ref(
+        &self,
+        conversation: ConversationId,
+        queue: Option<QueueRefBody>,
+        issued_at_ms: u64,
+    ) -> Result<Vec<u8>, CoreError> {
+        let content = crate::mls::payload::Content::QueueRef(queue);
+        match self.mls(MessageDbOp::SealRouting(conversation, content, issued_at_ms)).await? {
             MessageDbReply::Ciphertext(ciphertext) => Ok(ciphertext),
             _ => unreachable!(),
         }
@@ -1569,6 +1584,7 @@ pub use crate::message::wire::{decode as decode_message, Frame as MessageFrame};
 pub use crate::account::MessageMutation;
 pub use crate::mls::wire::{MlsFrame, MlsReply};
 pub use crate::mls::push_ct::{PushCtError, restore_group_id, strip_group_id};
+pub use crate::mls::payload::QueueRefBody;
 pub use crate::message::push_store::{
     PushDeliveryRow, PushPeerRow, PushPeerState, PushState, PushTagRow,
 };

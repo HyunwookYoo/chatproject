@@ -78,8 +78,8 @@ fn independent_vectors_for_requests_and_replies() {
         let inner = hex(v["inner"].as_str().unwrap());
         let wire = hex(v["wire"].as_str().unwrap());
         if v["kind"] == "frame" {
-            // M6's `Announce` has no handle field: M7 still decodes it (with no handle) but
-            // sends the four-field form (`own_handle_rides_announce_and_m6_announce_still_decodes`).
+            // M6's `Announce` has no handle field: M8 still decodes it (with no handle, not
+            // qualified) but sends the five-field form (`announce_decodes_3_4_5_fields`).
             if let Some(mailbox) = match name {
                 "announce_true" => Some(true),
                 "announce_false" => Some(false),
@@ -88,12 +88,13 @@ fn independent_vectors_for_requests_and_replies() {
                 let frame = MailboxFrame::Announce {
                     mailbox,
                     handle: None,
+                    qualified: false,
                 };
                 assert!(MailboxFrame::decode(&inner).unwrap() == frame, "decode: {name}");
-                let mut m7 = inner[..inner.len() - 1].to_vec();
-                m7[0] = 0x84;
-                m7.extend([inner[inner.len() - 1], 0xf6]);
-                assert!(*frame.inner() == m7, "inner: {name}");
+                let mut m8 = inner[..inner.len() - 1].to_vec();
+                m8[0] = 0x85;
+                m8.extend([inner[inner.len() - 1], 0xf6, 0xf4]);
+                assert!(*frame.inner() == m8, "inner: {name}");
                 seen += 1;
                 continue;
             }

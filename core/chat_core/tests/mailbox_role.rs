@@ -127,6 +127,7 @@ async fn announce_reaches_own_devices_only() {
             MailboxFrame::Announce {
                 mailbox: true,
                 handle: None,
+                qualified: false,
             },
         )
         .await

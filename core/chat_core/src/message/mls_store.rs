@@ -1004,6 +1004,10 @@ pub(super) fn open_app(
                 }
                 Stored::Yes
             }
+            // M8 spec 7.2: the sender's queue (or its withdrawal), from either account, since
+            // my other devices send in this conversation too. Taken (processed, logged,
+            // acknowledged) and not kept yet: storing it in `queue_peer` goes here.
+            Content::QueueRef(_) => Stored::Yes,
             // Content this version does not know is dropped (spec 5.1 `Custom` fallback).
             Content::Custom { .. } => Stored::Yes,
         };
@@ -1692,23 +1696,29 @@ pub(super) fn fixture_state(c: &Connection, conversation: ConversationId) -> R<M
     })
 }
 
-/// Test-only: seals a `PushHandle` of this device in the conversation's group and returns the
-/// MLS ciphertext. Only the ratchet changes (no frame is queued or logged).
+/// Test-only: seals a `PushHandle` or `QueueRef` of this device in the conversation's group and
+/// returns the MLS ciphertext. Only the ratchet changes (no frame is queued or logged).
 #[cfg(all(feature = "test-hooks", debug_assertions))]
-pub(super) fn fixture_seal_push_handle(
+pub(super) fn fixture_seal_routing(
     c: &mut Connection,
     identity: Identity,
     local: &LocalAccount,
     conversation: ConversationId,
-    handle: Vec<u8>,
+    content: Content,
     issued_at_ms: u64,
 ) -> R<MessageDbReply> {
+    use crate::mls::payload::{push_handle_message, queue_ref_message};
+    let message = match content {
+        Content::PushHandle { handle } => {
+            push_handle_message(identity.installation, issued_at_ms, handle)
+        }
+        Content::QueueRef(queue) => queue_ref_message(identity.installation, issued_at_ms, queue),
+        _ => return Err(invalid()),
+    };
     let tx = c.transaction().map_err(sql)?;
     let group = group_row(&tx, conversation)?.ok_or_else(missing)?;
     let provider = MlsProvider::new(KvStore::load_scope(&tx, conversation.0)?);
     let (signer, _) = signer_of(local);
-    let message =
-        crate::mls::payload::push_handle_message(identity.installation, issued_at_ms, handle);
     let ciphertext = group::seal(&provider, &signer, &group.group_id, &message)?;
     provider.storage().flush(&tx, conversation.0)?;
     finish(tx, NO_FAULT)?;

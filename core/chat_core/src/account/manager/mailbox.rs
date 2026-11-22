@@ -887,6 +887,8 @@ impl Manager {
         let body = MailboxFrame::Announce {
             mailbox: told.0,
             handle: told.1.clone(),
+            // No device computes its qualification yet.
+            qualified: false,
         }
         .encode();
         let mailbox = self.auth.send.clone();
@@ -1140,7 +1142,11 @@ impl Manager {
             }
             // Spec 8.4: whether that device is a mailbox, recorded for handoffs, dialing order
             // and `mailbox_ok`.
-            Ok(MailboxFrame::Announce { mailbox, handle }) => {
+            Ok(MailboxFrame::Announce {
+                mailbox,
+                handle,
+                qualified: _,
+            }) => {
                 let op = MailboxDbOp::Announced {
                     installation,
                     mailbox,
