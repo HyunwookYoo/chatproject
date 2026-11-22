@@ -31,8 +31,9 @@ scp queue_server-bin/queue_server ubuntu@<server>:/tmp/queue_server
 The push proxy's [`deploy/setup.sh`](../push_proxy/deploy/setup.sh) sets up
 both servers, since they share the VM, the swap, the firewall and one Caddy
 site: it installs the binary, the user, the systemd unit and the Caddyfile
-below. Copy the binary to `/tmp/queue_server` (on the first run also the push
-proxy's files, see its [README](../push_proxy/README.md)), then run
+below, which it checks with `caddy validate` before it replaces the old one.
+Copy the binary to `/tmp/queue_server` (on the first run also the push proxy's
+files, see its [README](../push_proxy/README.md)), then run
 `sudo bash /tmp/setup.sh <domain>`. Run it again with a new binary to upgrade;
 it never touches `/var/lib/queue_server`, so the queues stay. Change the unit or
 the Caddyfile here and in the script together.
@@ -76,6 +77,7 @@ Restart=on-failure
 RestartSec=2
 # 128 connections hold at most ~221 MiB of request bodies (src/limit.rs).
 MemoryMax=256M
+MemorySwapMax=0
 # The server writes its database and nothing else.
 StateDirectory=queue_server
 StateDirectoryMode=0700
@@ -104,9 +106,10 @@ journalctl -u queue_server -f   # the request and sweep lines
 ```
 
 `MemoryMax` is the connection cap's bound (`MAX_CONNECTIONS` in
-`src/limit.rs`) plus room for the process itself: past it the kernel kills the
-server and systemd starts it again. A restart loses only the in-memory rate
-buckets; the queues and entries are in the database.
+`src/limit.rs`) plus room for the process itself. `MemorySwapMax=0` keeps the
+server out of the VM's swap, so past `MemoryMax` the kernel drops its page
+cache, then kills it, and systemd starts it again. A restart loses only the
+in-memory rate buckets; the queues and entries are in the database.
 
 ## Caddy
 
@@ -164,7 +167,7 @@ range or a bad signature is `bad`; the other items still run.
   A `CREATE` or `SEND` item takes its token before its signature is checked,
   so a badly signed item spends a token and one over the limit costs no verify.
 - At most 128 open connections; one more is closed at once. That bounds the
-  server's memory to about 225 MiB of held 1 MiB uploads.
+  server's memory to about 221 MiB of held 1 MiB uploads.
 - Every hour (and at start): entries older than 24 hours, acked hashes past
   their 20 minutes, and queues with no command for 30 days are deleted.
 

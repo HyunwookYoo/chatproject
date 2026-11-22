@@ -121,6 +121,7 @@ Restart=on-failure
 RestartSec=2
 # 128 connections hold at most ~221 MiB of request bodies (src/limit.rs).
 MemoryMax=256M
+MemorySwapMax=0
 # The server writes its database and nothing else.
 StateDirectory=queue_server
 StateDirectoryMode=0700
@@ -145,8 +146,10 @@ for unit in push_proxy queue_server; do
   systemctl restart "$unit"
 done
 
-echo "== Caddy"
-cat > /etc/caddy/Caddyfile <<EOF
+echo "== Caddy: validate the new Caddyfile, then replace the old one"
+new=$(mktemp /etc/caddy/Caddyfile.XXXXXX)
+chmod 0644 "$new"
+cat > "$new" <<EOF
 $DOMAIN {
 	handle /q/* {
 		reverse_proxy 127.0.0.1:8788
@@ -156,13 +159,28 @@ $DOMAIN {
 	}
 }
 EOF
-systemctl reload caddy || systemctl restart caddy
+if ! caddy validate --config "$new" --adapter caddyfile; then
+  rm -f "$new"
+  echo "new Caddyfile invalid: /etc/caddy/Caddyfile and the running Caddy are unchanged"
+  exit 1
+fi
+mv "$new" /etc/caddy/Caddyfile
+systemctl reload-or-restart caddy
 
-echo "== check"
-sleep 3
-systemctl is-active push_proxy queue_server caddy
+echo "== check: each service active for 5 s"
+down=""
+for _ in 1 2 3 4 5; do
+  sleep 1
+  for unit in push_proxy queue_server caddy; do
+    systemctl is-active --quiet "$unit" || down="$down $unit"
+  done
+done
 journalctl -u push_proxy -n 5 --no-pager
 journalctl -u queue_server -n 5 --no-pager
+if [ -n "$down" ]; then
+  echo "not active: $(printf '%s\n' $down | sort -u | xargs)"
+  exit 1
+fi
 echo "HTTPS status from this server (any 4xx means TLS and the server answer; /q/recv is the queue server):"
 for path in handle q/recv; do
   curl -sS -o /dev/null -w "/$path %{http_code}\n" --max-time 60 "https://$DOMAIN/$path" || echo "no answer yet: Caddy may still be getting the certificate (journalctl -u caddy)"

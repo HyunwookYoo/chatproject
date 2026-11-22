@@ -35,8 +35,9 @@ files, the systemd unit and the Caddyfile. It sets up the
 to `/tmp/push_proxy` and `/tmp/queue_server` and, on the first run, the service
 account to `/tmp/fcm-service-account.json`, then run
 `sudo bash /tmp/setup.sh <domain>`. Run it again with a new binary (either or
-both) to upgrade; it keeps the existing handle key. Change the unit or the
-Caddyfile here and in the script together.
+both) to upgrade; it keeps the existing handle key. Change the unit here and the
+Caddyfile in the [queue server README](../queue_server/README.md#caddy), each
+together with the script.
 
 Configuration is environment variables and secret file paths only. Errors name
 the variable, never its value.
