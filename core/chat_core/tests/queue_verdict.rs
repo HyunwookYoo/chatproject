@@ -225,8 +225,18 @@ async fn seen_on_auth_and_announce() {
         "seen when its Announce came"
     );
 
-    // A2 off, A1 25 hours later: unseen for more than 24 hours.
+    // A2 off, A1 25 hours later: unseen for more than 24 hours. A1's end of the session is
+    // closed as QUIC's idle timeout would (about 30 s of real time), or the hourly run would
+    // count the session as a sighting.
     let a2_dir = stop(a2);
+    a1.account.mls_test_close_session(a2_id).await.unwrap();
+    until!(
+        a1.account
+            .mailbox_test_own_sessions()
+            .await
+            .unwrap()
+            .is_empty()
+    );
     a1.clock.advance_seconds(25 * 3_600).unwrap();
     until!(queue(&a1).await.verdict == Verdict::NoMailbox);
     assert!(queue(&a1).await.using_queue);
@@ -235,7 +245,7 @@ async fn seen_on_auth_and_announce() {
     let a2 = start(a2_dir, net.clone()).await;
     a2.account.mailbox_test_hold(true).await.unwrap();
     a2.clock.advance_seconds(25 * 3_600).unwrap();
-    // A2 dials: A1 still holds the old connection (no idle timeout in this time) and would not.
+    // A2 dials.
     link(&a1, &a2).await;
     a2.account.mailbox_sync_now().await.unwrap();
     let at_auth = a1.clock.wall_ms();
@@ -258,6 +268,37 @@ async fn seen_on_auth_and_announce() {
         [&a1, &a2],
         known(&a1, &a2).await.unwrap().2 == Some(at_announce)
     );
+}
+
+/// Spec 5.1 rule 3: a session that stays open is a sighting. A2 says nothing new while A1's
+/// wall clock steps 25 hours (its scheduler clock one); A1's hourly run sees A2 over the open
+/// session, so the qualified mailbox still counts.
+#[tokio::test]
+async fn open_session_keeps_the_mailbox_seen() {
+    let (a1, a2, _net) = pair_of_devices().await;
+    qualified_mailbox(&a1, &a2).await;
+    let a2_id = installation(&a2).await;
+    // Whatever is still on its way settles first.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let sent = told(&a2, &a1).await.len();
+    let start = verdicts(&a1).await;
+
+    a1.clock
+        .set_unix_seconds(a1.clock.unix_seconds() + 25 * 3_600);
+    let stepped = a1.clock.wall_ms();
+    a1.clock.advance_monotonic_ms(HOUR_MS);
+    until!(verdicts(&a1).await > start);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert!(own_session(&a1, &a2).await, "the same session, still open");
+    assert_eq!(told(&a2, &a1).await.len(), sent, "no new Announce");
+    assert_eq!(
+        queue(&a1).await.verdict,
+        Verdict::HasMailbox {
+            installation: a2_id
+        }
+    );
+    assert_eq!(known(&a1, &a2).await.unwrap().2, Some(stepped));
 }
 
 /// The setting, the qualification and the verdict survive a restart: worked out again from what

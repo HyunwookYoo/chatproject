@@ -49,8 +49,9 @@
 //! whether it qualifies, and every device works out from what it knows of my devices whether
 //! the account has a qualified mailbox (`mailbox/verdict.rs`). The verdict is worked out again
 //! sooner only when what it is made of changes: this device's role, or what a received
-//! `Announce` or a session says of a device in a way that counts (`changes_verdict`). A
-//! changed qualification is announced like a changed role.
+//! `Announce` or a session says of a device in a way that counts (`changes_verdict`). The
+//! hourly run first sees again my devices whose session is still open, so a long session keeps
+//! its device counted. A changed qualification is announced like a changed role.
 use super::mls::{Origin, Via};
 use super::*;
 use crate::account::{
@@ -938,11 +939,10 @@ impl Manager {
     /// is the one last worked out (worked out now if none is yet).
     pub(super) async fn queue_state(&mut self) -> Result<QueueStateView, CoreError> {
         let request = self.ready()?;
-        let verdict = match self.messages.mailbox.verdict {
-            Some(verdict) => verdict,
+        let (verdict, facts) = match self.messages.mailbox.verdict {
+            Some(verdict) => (verdict, self.queue_facts(None, request).await?),
             None => self.judge(request).await?,
         };
-        let facts = self.queue_facts(request).await?;
         Ok(QueueStateView {
             mode: facts.mode,
             verdict,
@@ -959,9 +959,14 @@ impl Manager {
             .map(|_| ())
     }
 
-    async fn queue_facts(&mut self, request: Request) -> Result<QueueFacts, CoreError> {
+    async fn queue_facts(
+        &mut self,
+        hourly: Option<Vec<InstallationId>>,
+        request: Request,
+    ) -> Result<QueueFacts, CoreError> {
         let op = MailboxDbOp::QueueFacts {
             now: self.services.clock.wall_ms(),
+            hourly,
         };
         match self.mailbox_db(op, request).await? {
             MailboxDbReply::Queue(facts) => Ok(facts),
@@ -970,14 +975,21 @@ impl Manager {
     }
 
     /// Works the verdict out (spec 5.1) from the stored facts, and first this device's
-    /// qualification when it is due (`judge_at`: hourly, and after the role changed). The
-    /// result is stored; a changed qualification is announced at the next poll (`told`).
-    async fn judge(&mut self, request: Request) -> Result<Verdict, CoreError> {
+    /// qualification when it is due (`judge_at`: hourly, and after the role changed), when my
+    /// devices with a ready session are also seen now (spec 5.1 rule 3). The result is stored;
+    /// a changed qualification is announced at the next poll (`told`).
+    async fn judge(&mut self, request: Request) -> Result<(Verdict, QueueFacts), CoreError> {
         let me = self.local()?.device.installation_id();
         let now = self.schedule_now();
         let wall = self.services.clock.wall_ms();
-        let facts = self.queue_facts(request).await?;
         let requalify = now >= self.messages.mailbox.judge_at;
+        let hourly = requalify.then(|| {
+            self.own_sessions()
+                .iter()
+                .map(|s| s.grant.installation)
+                .collect()
+        });
+        let facts = self.queue_facts(hourly, request).await?;
         let qualified = if requalify {
             facts.enabled && qualifies(facts.uptime_7d_permille, facts.recorded_ms)
         } else {
@@ -1005,7 +1017,7 @@ impl Manager {
         {
             mailbox.verdicts += 1;
         }
-        Ok(verdict)
+        Ok((verdict, facts))
     }
 
     pub(super) async fn mark_first_link_shown(&mut self) -> Result<(), CoreError> {

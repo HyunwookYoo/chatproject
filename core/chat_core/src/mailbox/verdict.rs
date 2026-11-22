@@ -46,7 +46,8 @@ pub struct MailboxFact {
 
 impl MailboxFact {
     /// Spec 5.1 rules 1 to 3 at `now_ms`. A last-seen time ahead of `now_ms` (the wall clock went
-    /// back) counts as seen.
+    /// back) counts as seen; the store's hourly run sets such a time to now, so the 24 hours run
+    /// from there.
     pub(crate) fn counts(&self, now_ms: u64) -> bool {
         self.mailbox
             && self.qualified

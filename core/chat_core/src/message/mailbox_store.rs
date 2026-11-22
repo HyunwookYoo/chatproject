@@ -319,8 +319,15 @@ pub(crate) enum MailboxDbOp {
         installation: InstallationId,
         at: u64,
     },
-    /// What the verdict is worked out from at `now` (wall time): `Queue`.
-    QueueFacts { now: u64 },
+    /// What the verdict is worked out from at `now` (wall time): `Queue`. On the hourly run
+    /// (`hourly`: my devices with a ready session), first, in the same transaction, a last-seen
+    /// time ahead of `now` becomes `now` (the wall clock went back: a mailbox that goes dark
+    /// then still drops out 24 hours later), and those devices are seen now (spec 5.1 rule 3:
+    /// a session that stays open is a sighting).
+    QueueFacts {
+        now: u64,
+        hourly: Option<Vec<InstallationId>>,
+    },
     /// The verdict was worked out at `at` (wall time), with this device's qualification when
     /// that was worked out again (`None`: kept). `Count(1)` when the qualification was written.
     Judged { qualified: Option<bool>, at: u64 },
@@ -351,7 +358,7 @@ impl MailboxDbOp {
                 | Self::HandoffRows
                 | Self::HandoffDue(_)
                 | Self::Local { .. }
-                | Self::QueueFacts { .. }
+                | Self::QueueFacts { hourly: None, .. }
         )
     }
 }
@@ -687,15 +694,23 @@ pub(super) fn mailbox_op(
         MailboxDbOp::Seen { installation, at } => {
             let tx = c.transaction().map_err(sql)?;
             let before = device_fact(&tx, installation)?;
-            tx.execute(
-                "UPDATE mailbox_device SET last_seen_ms=?2 WHERE installation=?1",
-                params![installation.0.as_slice(), integer(at)?],
-            )
-            .map_err(sql)?;
+            see(&tx, installation, at)?;
             finish(tx, fault)?;
             MailboxDbReply::Fact(before)
         }
-        MailboxDbOp::QueueFacts { now } => MailboxDbReply::Queue(queue_facts(c, now)?),
+        MailboxDbOp::QueueFacts { now, hourly: None } => {
+            MailboxDbReply::Queue(queue_facts(c, now)?)
+        }
+        MailboxDbOp::QueueFacts {
+            now,
+            hourly: Some(sessions),
+        } => {
+            let tx = c.transaction().map_err(sql)?;
+            mark_seen(&tx, &sessions, now)?;
+            let facts = queue_facts(&tx, now)?;
+            finish(tx, fault)?;
+            MailboxDbReply::Queue(facts)
+        }
         MailboxDbOp::Judged { qualified, at } => {
             let tx = c.transaction().map_err(sql)?;
             let changed = match qualified {
@@ -860,6 +875,31 @@ fn queue_facts(c: &Connection, now: u64) -> R<QueueFacts> {
         recorded_ms,
         devices,
     })
+}
+
+/// The hourly last-seen upkeep at `now`: a time ahead of `now` becomes `now`, then `sessions`
+/// are seen now. Both match at most one `mailbox_device` row per device of the account, and
+/// with no session and no clock gone back they change none.
+fn mark_seen(tx: &Transaction, sessions: &[InstallationId], now: u64) -> R<()> {
+    tx.execute(
+        "UPDATE mailbox_device SET last_seen_ms=?1 WHERE last_seen_ms>?1",
+        params![integer(now)?],
+    )
+    .map_err(sql)?;
+    for &installation in sessions {
+        see(tx, installation, now)?;
+    }
+    Ok(())
+}
+
+/// My device `installation` was seen at `at` (only a recorded device is written).
+fn see(tx: &Transaction, installation: InstallationId, at: u64) -> R<()> {
+    tx.execute(
+        "UPDATE mailbox_device SET last_seen_ms=?2 WHERE installation=?1",
+        params![installation.0.as_slice(), integer(at)?],
+    )
+    .map_err(sql)?;
+    Ok(())
 }
 
 /// `queue_local.mode`: 0 auto, 1 always, 2 never.
@@ -1768,5 +1808,48 @@ mod tests {
         );
         // The wall clock went back before the first record: nothing recorded.
         assert_eq!(queue_facts(&c, now - 4 * day).unwrap().recorded_ms, 0);
+    }
+
+    /// The hourly run: a last-seen time ahead of now (the wall clock went back) becomes now, so a
+    /// mailbox that then goes dark drops out 24 hours later, not 24 hours plus the step; a device
+    /// with a ready session is seen now; any other is kept. A plain read writes nothing.
+    #[test]
+    fn hourly_facts_clamp_and_see_sessions() {
+        let mut c = fresh();
+        let day = 86_400_000;
+        let now = 10 * day;
+        let (ahead, session, earlier) = (
+            InstallationId([1; 32]),
+            InstallationId([2; 32]),
+            InstallationId([3; 32]),
+        );
+        for (i, seen) in [
+            (ahead, now + 2 * day),
+            (session, now - 3),
+            (earlier, now - 5),
+        ] {
+            c.execute(
+                "INSERT INTO mailbox_device VALUES(?1,1,5,1,?2)",
+                params![i.0.as_slice(), integer(seen).unwrap()],
+            )
+            .unwrap();
+        }
+        let me = Identity {
+            peer: PeerId([0; 32]),
+            installation: InstallationId([0; 32]),
+        };
+        let facts = |c: &mut Connection, hourly| {
+            let op = MailboxDbOp::QueueFacts { now, hourly };
+            match mailbox_op(c, me, op, super::super::mls_store::NO_FAULT).unwrap() {
+                MessageDbReply::Mailbox(MailboxDbReply::Queue(facts)) => facts
+                    .devices
+                    .iter()
+                    .map(|f| f.last_seen_ms.unwrap())
+                    .collect::<Vec<_>>(),
+                _ => panic!("not facts"),
+            }
+        };
+        assert_eq!(facts(&mut c, None), [now + 2 * day, now - 3, now - 5]);
+        assert_eq!(facts(&mut c, Some(vec![session])), [now, now, now - 5]);
     }
 }
