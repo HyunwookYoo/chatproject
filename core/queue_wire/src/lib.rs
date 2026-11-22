@@ -33,22 +33,12 @@ pub type QueueId = [u8; 32];
 
 const DOMAIN: &[u8] = b"chatproject-queue-v1";
 
-/// The five commands. Each names the `body` it signs, so the client and the
-/// server hash the same bytes. A body is the command's own raw field bytes,
-/// decoded from base64 where the JSON carries base64.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CommandName {
-    /// Signed by the recipient key. Body = `sender_pub` (32 bytes). The
-    /// signature is checked under `recipient_pub`, and Ed25519 hashes the
-    /// verifying key into every signature, so both keys are bound.
     Create,
-    /// Signed by the sender key. Body = `ct`.
     Send,
-    /// Signed by the recipient key. Body = `since_seq` u64be.
     Recv,
-    /// Signed by the recipient key. Body = `upto_seq` u64be.
     Ack,
-    /// Signed by the recipient key. Body = empty.
     Delete,
 }
 
@@ -75,11 +65,50 @@ impl CommandName {
     }
 }
 
+/// One command's signed fields, decoded from base64 where the JSON carries base64.
+/// `SEND` is signed by the sender key, every other command by the recipient key.
+pub enum Signed<'a> {
+    /// Checked under `recipient_pub`, which Ed25519 hashes into the signature,
+    /// so both keys are bound.
+    Create {
+        sender_pub: &'a [u8; 32],
+    },
+    Send {
+        ct: &'a [u8],
+    },
+    Recv {
+        since_seq: u64,
+    },
+    Ack {
+        upto_seq: u64,
+    },
+    Delete,
+}
+
+impl Signed<'_> {
+    pub fn command(&self) -> CommandName {
+        match self {
+            Signed::Create { .. } => CommandName::Create,
+            Signed::Send { .. } => CommandName::Send,
+            Signed::Recv { .. } => CommandName::Recv,
+            Signed::Ack { .. } => CommandName::Ack,
+            Signed::Delete => CommandName::Delete,
+        }
+    }
+}
+
 /// The bytes a command's signature covers =
-/// "chatproject-queue-v1" 0x00 | command name | 0x00 | queue_id 32 | ts_ms u64be | SHA-256(body) 32.
-/// See [`CommandName`] for each command's `body`.
-pub fn signing_bytes(cmd: CommandName, queue_id: &QueueId, ts_ms: u64, body: &[u8]) -> Vec<u8> {
-    let name = cmd.name();
+/// "chatproject-queue-v1" 0x00 | command name | 0x00 | queue_id 32 | ts_ms u64be | SHA-256(body) 32,
+/// where body is the command's one field as raw bytes (u64be for a seq), empty for `DELETE`.
+pub fn signing_bytes(signed: &Signed, queue_id: &QueueId, ts_ms: u64) -> Vec<u8> {
+    let body_hash = match *signed {
+        Signed::Create { sender_pub } => Sha256::digest(sender_pub),
+        Signed::Send { ct } => Sha256::digest(ct),
+        Signed::Recv { since_seq } => Sha256::digest(since_seq.to_be_bytes()),
+        Signed::Ack { upto_seq } => Sha256::digest(upto_seq.to_be_bytes()),
+        Signed::Delete => Sha256::digest(b""),
+    };
+    let name = signed.command().name();
     let mut out = Vec::with_capacity(DOMAIN.len() + 1 + name.len() + 1 + 32 + 8 + 32);
     out.extend_from_slice(DOMAIN);
     out.push(0);
@@ -87,7 +116,7 @@ pub fn signing_bytes(cmd: CommandName, queue_id: &QueueId, ts_ms: u64, body: &[u
     out.push(0);
     out.extend_from_slice(queue_id);
     out.extend_from_slice(&ts_ms.to_be_bytes());
-    out.extend_from_slice(&Sha256::digest(body));
+    out.extend_from_slice(&body_hash);
     out
 }
 
@@ -322,9 +351,20 @@ mod tests {
     const QUEUE: QueueId = [0x33; 32];
     const TS: u64 = 1_700_000_000_000;
 
+    /// The signing bytes spelled out by hand from the layout, for one command name and body.
+    fn layout(name: &str, body: &[u8]) -> Vec<u8> {
+        let mut want = b"chatproject-queue-v1\0".to_vec();
+        want.extend_from_slice(name.as_bytes());
+        want.push(0);
+        want.extend_from_slice(&QUEUE);
+        want.extend_from_slice(&TS.to_be_bytes());
+        want.extend_from_slice(&Sha256::digest(body));
+        want
+    }
+
     #[test]
     fn sign_then_verify() {
-        let bytes = signing_bytes(CommandName::Send, &QUEUE, TS, b"ciphertext");
+        let bytes = signing_bytes(&Signed::Send { ct: b"ciphertext" }, &QUEUE, TS);
         let sig = sign(&SENDER, &bytes);
         assert!(verify(&public_key(&SENDER), &bytes, &sig));
         // Deterministic: the same key and bytes give the same signature.
@@ -333,63 +373,105 @@ mod tests {
 
     #[test]
     fn other_key_command_queue_ts_or_body_fails() {
-        let bytes = signing_bytes(CommandName::Recv, &QUEUE, TS, &7u64.to_be_bytes());
+        let bytes = signing_bytes(&Signed::Recv { since_seq: 7 }, &QUEUE, TS);
         let sig = sign(&RECIPIENT, &bytes);
         let public = public_key(&RECIPIENT);
         assert!(verify(&public, &bytes, &sig));
 
         assert!(!verify(&public_key(&SENDER), &bytes, &sig), "key");
 
+        // ACK 7 has the same body bytes as RECV 7, so only the name tells them apart.
+        let seven = 7u64.to_be_bytes();
         for other in [
-            CommandName::Create,
-            CommandName::Send,
-            CommandName::Ack,
-            CommandName::Delete,
+            Signed::Create {
+                sender_pub: &SENDER,
+            },
+            Signed::Send { ct: &seven },
+            Signed::Ack { upto_seq: 7 },
+            Signed::Delete,
         ] {
-            let changed = signing_bytes(other, &QUEUE, TS, &7u64.to_be_bytes());
-            assert!(!verify(&public, &changed, &sig), "command {other:?}");
+            let changed = signing_bytes(&other, &QUEUE, TS);
+            assert!(!verify(&public, &changed, &sig), "{:?}", other.command());
         }
 
         let mut queue = QUEUE;
         queue[31] ^= 1;
-        let changed = signing_bytes(CommandName::Recv, &queue, TS, &7u64.to_be_bytes());
+        let changed = signing_bytes(&Signed::Recv { since_seq: 7 }, &queue, TS);
         assert!(!verify(&public, &changed, &sig), "queue_id");
 
-        let changed = signing_bytes(CommandName::Recv, &QUEUE, TS + 1, &7u64.to_be_bytes());
+        let changed = signing_bytes(&Signed::Recv { since_seq: 7 }, &QUEUE, TS + 1);
         assert!(!verify(&public, &changed, &sig), "ts");
 
-        let changed = signing_bytes(CommandName::Recv, &QUEUE, TS, &8u64.to_be_bytes());
+        let changed = signing_bytes(&Signed::Recv { since_seq: 8 }, &QUEUE, TS);
         assert!(!verify(&public, &changed, &sig), "body");
     }
 
     #[test]
     fn signing_bytes_layout() {
-        let body = b"body";
-        let bytes = signing_bytes(CommandName::Delete, &QUEUE, TS, body);
+        let bytes = signing_bytes(&Signed::Delete, &QUEUE, TS);
         let mut want = b"chatproject-queue-v1\0DELETE\0".to_vec();
         want.extend_from_slice(&QUEUE);
         want.extend_from_slice(&TS.to_be_bytes());
-        want.extend_from_slice(&Sha256::digest(body));
+        want.extend_from_slice(&Sha256::digest(b""));
         assert_eq!(bytes, want);
         assert_eq!(bytes.capacity(), bytes.len(), "one exact allocation");
 
-        let names = [
-            (CommandName::Create, "CREATE", "/q/create"),
-            (CommandName::Send, "SEND", "/q/send"),
-            (CommandName::Recv, "RECV", "/q/recv"),
-            (CommandName::Ack, "ACK", "/q/ack"),
-            (CommandName::Delete, "DELETE", "/q/delete"),
+        let paths = [
+            (
+                Signed::Create {
+                    sender_pub: &SENDER,
+                },
+                "/q/create",
+            ),
+            (Signed::Send { ct: b"ct" }, "/q/send"),
+            (Signed::Recv { since_seq: 1 }, "/q/recv"),
+            (Signed::Ack { upto_seq: 1 }, "/q/ack"),
+            (Signed::Delete, "/q/delete"),
         ];
-        for (cmd, name, path) in names {
-            let bytes = signing_bytes(cmd, &QUEUE, TS, &[]);
-            assert_eq!(&bytes[21..21 + name.len()], name.as_bytes());
-            assert_eq!(cmd.path(), path);
+        for (signed, path) in paths {
+            assert_eq!(signed.command().path(), path);
         }
     }
 
     #[test]
+    fn create_signs_sender_pub() {
+        let bytes = signing_bytes(
+            &Signed::Create {
+                sender_pub: &SENDER,
+            },
+            &QUEUE,
+            TS,
+        );
+        assert_eq!(bytes, layout("CREATE", &SENDER));
+    }
+
+    #[test]
+    fn send_signs_ct() {
+        let bytes = signing_bytes(&Signed::Send { ct: b"mls ct" }, &QUEUE, TS);
+        assert_eq!(bytes, layout("SEND", b"mls ct"));
+    }
+
+    #[test]
+    fn recv_signs_since_seq_big_endian() {
+        let bytes = signing_bytes(&Signed::Recv { since_seq: 0x0102 }, &QUEUE, TS);
+        assert_eq!(bytes, layout("RECV", &[0, 0, 0, 0, 0, 0, 1, 2]));
+    }
+
+    #[test]
+    fn ack_signs_upto_seq_big_endian() {
+        let bytes = signing_bytes(&Signed::Ack { upto_seq: 0x0304 }, &QUEUE, TS);
+        assert_eq!(bytes, layout("ACK", &[0, 0, 0, 0, 0, 0, 3, 4]));
+    }
+
+    #[test]
+    fn delete_signs_empty_body() {
+        let bytes = signing_bytes(&Signed::Delete, &QUEUE, TS);
+        assert_eq!(bytes, layout("DELETE", b""));
+    }
+
+    #[test]
     fn verify_refuses_bad_keys_and_signatures_without_panicking() {
-        let bytes = signing_bytes(CommandName::Ack, &QUEUE, TS, &3u64.to_be_bytes());
+        let bytes = signing_bytes(&Signed::Ack { upto_seq: 3 }, &QUEUE, TS);
         let sig = sign(&RECIPIENT, &bytes);
         let public = public_key(&RECIPIENT);
 
@@ -450,7 +532,10 @@ mod tests {
         // The path a client and the server take together: build, sign, send as JSON,
         // decode at the boundary, rebuild the signing bytes, verify.
         let ct = b"mls ciphertext".to_vec();
-        let sig = sign(&SENDER, &signing_bytes(CommandName::Send, &QUEUE, TS, &ct));
+        let sig = sign(
+            &SENDER,
+            &signing_bytes(&Signed::Send { ct: &ct }, &QUEUE, TS),
+        );
         let item = SendItem {
             queue_id: BASE64URL_NOPAD.encode(&QUEUE),
             ct: BASE64URL_NOPAD.encode(&ct),
@@ -464,7 +549,7 @@ mod tests {
         let queue_id = decode_array::<32>(&item.queue_id).unwrap();
         let ct = decode_ct(&item.ct).unwrap();
         let sig = decode_array::<64>(&item.sig).unwrap();
-        let bytes = signing_bytes(CommandName::Send, &queue_id, item.ts, &ct);
+        let bytes = signing_bytes(&Signed::Send { ct: &ct }, &queue_id, item.ts);
         assert!(verify(&public_key(&SENDER), &bytes, &sig));
     }
 
