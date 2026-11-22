@@ -11,7 +11,8 @@ use axum::extract::ConnectInfo;
 use axum::http::{Request, StatusCode, header};
 use futures_util::StreamExt;
 use http_body_util::BodyExt;
-use push_proxy::{AppState, Delivery, DeliveryKind, FakeUpstream, Limits, router, serve};
+use http_guard::{ServeLimits, serve};
+use push_proxy::{AppState, Delivery, DeliveryKind, FakeUpstream, Limits, router};
 use push_wire::{
     BASE64URL_NOPAD, HANDLE_LIFETIME_MS, HandlePlain, HandleRequest, HandleResponse, MAX_BODY,
     MAX_ITEMS, MAX_TOKEN, PUSH_CIPHER_MAX, Platform, PushItem, PushItemKind, PushRequest,
@@ -771,9 +772,9 @@ async fn stalled_headers_close_the_connection() {
         .await
         .unwrap();
     let addr = listener.local_addr().unwrap();
-    let limits = Limits {
+    let limits = ServeLimits {
         header_timeout: Duration::from_millis(200),
-        ..Limits::default()
+        ..ServeLimits::default()
     };
     tokio::spawn(serve(listener, p.app.clone(), limits));
 
@@ -819,7 +820,7 @@ async fn stalled_headers_close_the_connection() {
 }
 
 /// Serves `p` on a fresh localhost port with `limits`; returns the address.
-async fn serve_on_port(p: &Proxy, limits: Limits) -> SocketAddr {
+async fn serve_on_port(p: &Proxy, limits: ServeLimits) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind(SocketAddr::from((PEER, 0)))
         .await
         .unwrap();
@@ -857,10 +858,10 @@ async fn connections_beyond_the_cap_are_closed() {
     let p = Setup::new(test_key()).start();
     let addr = serve_on_port(
         &p,
-        Limits {
+        ServeLimits {
             max_connections: 2,
             header_timeout: Duration::from_secs(30),
-            ..Limits::default()
+            ..ServeLimits::default()
         },
     )
     .await;
@@ -893,11 +894,11 @@ async fn connection_lifetime_is_bounded() {
     let p = setup.start();
     let addr = serve_on_port(
         &p,
-        Limits {
+        ServeLimits {
             header_timeout: Duration::from_secs(30),
             connection_lifetime: Duration::from_millis(300),
             connection_grace: Duration::from_millis(200),
-            ..Limits::default()
+            ..ServeLimits::default()
         },
     )
     .await;
@@ -947,7 +948,7 @@ async fn connection_lifetime_is_bounded() {
 async fn served_requests_carry_the_tcp_peer() {
     // Through `serve`, the /handle limit keys on the real TCP peer.
     let p = Setup::new(test_key()).start();
-    let addr = serve_on_port(&p, Limits::default()).await;
+    let addr = serve_on_port(&p, ServeLimits::default()).await;
     let req = serde_json::to_vec(&handle_req(Platform::Fcm, "tok", [36; 16])).unwrap();
     let status = |body: Vec<u8>, from: [u8; 4]| async move {
         let socket = tokio::net::TcpSocket::new_v4().unwrap();

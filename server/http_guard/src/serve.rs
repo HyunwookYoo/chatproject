@@ -4,7 +4,7 @@
 //! fires there and a client that never finishes its headers holds the
 //! connection forever. This loop sets the timer, caps how many connections are
 //! open at once and how long each one lives; the rest of a request is bounded
-//! by `Limits::request_timeout` inside the router.
+//! by a request timeout inside the router.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -20,14 +20,41 @@ use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tower_service::Service;
 
-use crate::limit::Limits;
-
 /// Pause after a failed `accept` (for example out of file descriptors).
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
+/// The bounds [`serve`] puts on each connection and on how many are open.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ServeLimits {
+    /// For the request head (HTTP/1 header read). Over it the connection is
+    /// closed.
+    pub header_timeout: Duration,
+    /// Open connections. A connection beyond it is closed as soon as it is
+    /// accepted.
+    pub max_connections: usize,
+    /// A connection this old stops taking requests and closes once the
+    /// current one is answered, which bounds a slow reader of the response too.
+    pub connection_lifetime: Duration,
+    /// After `connection_lifetime`, how long the current request may still
+    /// take before the connection is dropped.
+    pub connection_grace: Duration,
+}
+
+impl Default for ServeLimits {
+    fn default() -> Self {
+        ServeLimits {
+            header_timeout: Duration::from_secs(10),
+            // Behind Caddy these are Caddy's upstream connections.
+            max_connections: 1_024,
+            connection_lifetime: Duration::from_secs(60),
+            connection_grace: Duration::from_secs(10),
+        }
+    }
+}
+
 /// Serves `app` on `listener` until the process ends. Each request carries
 /// `ConnectInfo<SocketAddr>` of its TCP peer.
-pub async fn serve(listener: TcpListener, app: Router, limits: Limits) {
+pub async fn serve(listener: TcpListener, app: Router, limits: ServeLimits) {
     let open = Arc::new(Semaphore::new(
         limits.max_connections.min(Semaphore::MAX_PERMITS),
     ));
@@ -35,7 +62,7 @@ pub async fn serve(listener: TcpListener, app: Router, limits: Limits) {
         let (stream, peer) = match listener.accept().await {
             Ok(accepted) => accepted,
             Err(e) => {
-                eprintln!("push_proxy: accept failed: {}", e.kind());
+                eprintln!("http_guard: accept failed: {}", e.kind());
                 tokio::time::sleep(ACCEPT_BACKOFF).await;
                 continue;
             }

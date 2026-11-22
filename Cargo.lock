@@ -2114,6 +2114,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "http_guard"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "hyper",
+ "hyper-util",
+ "tokio",
+ "tower-service",
+]
+
+[[package]]
 name = "httparse"
 version = "1.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4312,6 +4323,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.3.4",
  "http-body-util",
+ "http_guard",
  "hyper",
  "hyper-util",
  "jsonwebtoken",
@@ -4327,7 +4339,6 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower",
- "tower-service",
 ]
 
 [[package]]

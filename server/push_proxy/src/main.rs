@@ -5,9 +5,10 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
 
+use http_guard::{ServeLimits, serve};
 use push_proxy::{
     APNS_PRODUCTION, APNS_SANDBOX, ApnsConfig, ApnsEnv, ApnsUpstream, AppState, Config,
-    FCM_ENDPOINT, FcmUpstream, GOOGLE_TOKEN_URL, Upstream, Url, router, serve,
+    FCM_ENDPOINT, FcmUpstream, GOOGLE_TOKEN_URL, Upstream, Url, router,
 };
 
 #[tokio::main]
@@ -48,8 +49,7 @@ async fn run(config: Config, mut state: AppState) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let limits = state.limits;
-    serve(listener, router(state), limits).await;
+    serve(listener, router(state), ServeLimits::default()).await;
     ExitCode::SUCCESS
 }
 
