@@ -46,6 +46,18 @@ async fn queue(f: &Fixture) -> QueueStateView {
     f.account.queue_state().await.unwrap()
 }
 
+/// Whether the table of spec 5.3 wants a queue for `view`'s mode and verdict. No queue server
+/// is configured here, so none is made: `using_queue` (an `Active` queue exists) stays false;
+/// `queue_lifecycle.rs` makes them.
+fn wants(view: &QueueStateView) -> bool {
+    assert!(!view.using_queue);
+    match view.mode {
+        QueueMode::Always => true,
+        QueueMode::Never => false,
+        QueueMode::Auto => view.verdict == Verdict::NoMailbox,
+    }
+}
+
 /// What `f` recorded of `of`: (mailbox, qualified, last seen).
 async fn known(f: &Fixture, of: &Fixture) -> Option<(bool, bool, Option<u64>)> {
     let id = installation(of).await;
@@ -107,7 +119,7 @@ async fn qualified_announced_only_on_change() {
         Verdict::NoMailbox,
         "a mailbox just set does not qualify"
     );
-    assert!(fresh.using_queue);
+    assert!(wants(&fresh));
 
     a2.account
         .mailbox_test_seed_uptime(950, WEEK_MS)
@@ -117,7 +129,7 @@ async fn qualified_announced_only_on_change() {
     assert_eq!(told(&a2, &a1).await.last(), Some(&(true, true)));
     let mine = queue(&a2).await;
     assert_eq!(
-        (mine.verdict, mine.using_queue, mine.uptime_7d_permille),
+        (mine.verdict, wants(&mine), mine.uptime_7d_permille),
         (
             Verdict::HasMailbox {
                 installation: a2_id
@@ -129,7 +141,7 @@ async fn qualified_announced_only_on_change() {
     );
     let theirs = queue(&a1).await;
     assert_eq!(
-        (theirs.verdict, theirs.using_queue),
+        (theirs.verdict, wants(&theirs)),
         (
             Verdict::HasMailbox {
                 installation: a2_id
@@ -161,9 +173,9 @@ async fn qualified_announced_only_on_change() {
     assert_eq!(told(&a2, &a1).await.len(), sent + 1);
     assert_eq!(told(&a2, &a1).await.last(), Some(&(true, false)));
     assert_eq!(queue(&a1).await.verdict, Verdict::NoMailbox);
-    assert!(queue(&a1).await.using_queue);
+    assert!(wants(&queue(&a1).await));
     assert!(
-        queue(&a2).await.using_queue,
+        wants(&queue(&a2).await),
         "an unqualified mailbox uses a queue"
     );
 }
@@ -239,7 +251,7 @@ async fn seen_on_auth_and_announce() {
     );
     a1.clock.advance_seconds(25 * 3_600).unwrap();
     until!(queue(&a1).await.verdict == Verdict::NoMailbox);
-    assert!(queue(&a1).await.using_queue);
+    assert!(wants(&queue(&a1).await));
 
     // A2 back but silent (it sends no `Announce` while held): the session alone is a sighting.
     let a2 = start(a2_dir, net.clone()).await;
@@ -316,7 +328,7 @@ async fn queue_state_survives_restart() {
     a2.account.set_queue_mode(QueueMode::Never).await.unwrap();
     let a1_before = queue(&a1).await;
     assert_eq!(
-        (a1_before.mode, a1_before.verdict, a1_before.using_queue),
+        (a1_before.mode, a1_before.verdict, wants(&a1_before)),
         (QueueMode::Always, has, true)
     );
     let a2_local = mailbox(&a2).await.queue_local;
@@ -327,7 +339,7 @@ async fn queue_state_survives_restart() {
     assert_eq!(queue(&a1).await, a1_before);
     let mine = queue(&a2).await;
     assert_eq!(
-        (mine.mode, mine.verdict, mine.using_queue),
+        (mine.mode, mine.verdict, wants(&mine)),
         (QueueMode::Never, has, false)
     );
     let after = mailbox(&a2).await.queue_local;
@@ -337,5 +349,5 @@ async fn queue_state_survives_restart() {
         "qualified, and since the same time"
     );
     a1.account.set_queue_mode(QueueMode::Auto).await.unwrap();
-    assert!(!queue(&a1).await.using_queue);
+    assert!(!wants(&queue(&a1).await));
 }
