@@ -1,17 +1,18 @@
 //! `/handle` and `/push` (spec 9.2). Routes decide; upstreams deliver.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, FromRequest, Request, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Router, middleware};
+use http_guard::client_ip;
 use push_wire::{
     BASE64URL_NOPAD, HANDLE_LIFETIME_MS, HandleError, HandlePlain, HandleRequest, HandleResponse,
     MAX_BODY, MAX_ITEMS, MAX_TOKEN, PUSH_CIPHER_MAX, Platform, PushItem, PushItemKind, PushRequest,
@@ -142,20 +143,6 @@ async fn handle(State(shared): State<Arc<Shared>>, request: Request) -> Response
         Ok(resp) => json(serde_json::to_vec(&resp)),
         Err(status) => status.into_response(),
     }
-}
-
-/// The client for the `/handle` limit. Behind a trusted reverse proxy that
-/// appends the peer it saw, the last `X-Forwarded-For` entry; else the TCP peer.
-fn client_ip(peer: Option<SocketAddr>, headers: &HeaderMap, trust_proxy: bool) -> IpAddr {
-    let forwarded = || {
-        let value = headers.get_all("x-forwarded-for").iter().next_back()?;
-        value.to_str().ok()?.rsplit(',').next()?.trim().parse().ok()
-    };
-    if trust_proxy && let Some(ip) = forwarded() {
-        return ip;
-    }
-    // No peer only happens in-process (tests, fakes): they share one bucket.
-    peer.map_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED), |addr| addr.ip())
 }
 
 fn issue(state: &AppState, body: &[u8], now: u64) -> Result<HandleResponse, StatusCode> {

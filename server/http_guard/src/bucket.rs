@@ -3,22 +3,22 @@
 
 use std::collections::HashMap;
 use std::hash::Hash;
-use std::net::{IpAddr, Ipv6Addr};
 
 const MINUTE_MS: u64 = 60_000;
-/// One token in bucket units. A bucket refills `per_minute` units per ms, so
-/// `per_minute` tokens a minute, with integer arithmetic only.
-const UNIT: u64 = MINUTE_MS;
+const HOUR_MS: u64 = 3_600_000;
 
 struct Bucket {
     units: u64,
     at_ms: u64,
 }
 
-/// One token bucket per key: `per_minute` tokens a minute, at most `burst`
-/// at once. A key not seen yet starts full.
+/// One token bucket per key: `rate` tokens per window, at most `burst` at
+/// once. A key not seen yet starts full.
 pub struct Buckets<K> {
-    per_minute: u64,
+    /// One token in bucket units: the window in ms. A bucket refills `rate`
+    /// units per ms, so `rate` tokens a window, with integer arithmetic only.
+    unit: u64,
+    rate: u64,
     capacity: u64,
     map: HashMap<K, Bucket>,
     last_sweep_ms: u64,
@@ -26,9 +26,18 @@ pub struct Buckets<K> {
 
 impl<K: Hash + Eq> Buckets<K> {
     pub fn new(per_minute: u32, burst: u32) -> Self {
+        Self::with_window(MINUTE_MS, per_minute, burst)
+    }
+
+    pub fn per_hour(per_hour: u32, burst: u32) -> Self {
+        Self::with_window(HOUR_MS, per_hour, burst)
+    }
+
+    fn with_window(window_ms: u64, rate: u32, burst: u32) -> Self {
         Buckets {
-            per_minute: u64::from(per_minute),
-            capacity: u64::from(burst) * UNIT,
+            unit: window_ms,
+            rate: u64::from(rate),
+            capacity: u64::from(burst) * window_ms,
             map: HashMap::new(),
             last_sweep_ms: 0,
         }
@@ -37,15 +46,15 @@ impl<K: Hash + Eq> Buckets<K> {
     /// Takes one token from `key`'s bucket; `false` if it is empty.
     pub fn take(&mut self, key: K, now_ms: u64) -> bool {
         self.sweep(now_ms);
-        let (per_minute, capacity) = (self.per_minute, self.capacity);
+        let (unit, rate, capacity) = (self.unit, self.rate, self.capacity);
         let b = self.map.entry(key).or_insert(Bucket {
             units: capacity,
             at_ms: now_ms,
         });
-        b.units = refilled(b, now_ms, per_minute, capacity);
+        b.units = refilled(b, now_ms, rate, capacity);
         b.at_ms = b.at_ms.max(now_ms);
-        if b.units >= UNIT {
-            b.units -= UNIT;
+        if b.units >= unit {
+            b.units -= unit;
             true
         } else {
             false
@@ -59,28 +68,15 @@ impl<K: Hash + Eq> Buckets<K> {
             return;
         }
         self.last_sweep_ms = now_ms;
-        let (per_minute, capacity) = (self.per_minute, self.capacity);
+        let (rate, capacity) = (self.rate, self.capacity);
         self.map
-            .retain(|_, b| refilled(b, now_ms, per_minute, capacity) < capacity);
+            .retain(|_, b| refilled(b, now_ms, rate, capacity) < capacity);
     }
 }
 
-fn refilled(b: &Bucket, now_ms: u64, per_minute: u64, capacity: u64) -> u64 {
-    let gained = now_ms.saturating_sub(b.at_ms).saturating_mul(per_minute);
+fn refilled(b: &Bucket, now_ms: u64, rate: u64, capacity: u64) -> u64 {
+    let gained = now_ms.saturating_sub(b.at_ms).saturating_mul(rate);
     b.units.saturating_add(gained).min(capacity)
-}
-
-/// One client for a per-client limit: an IPv4 address, or an IPv6 /64 (the
-/// smallest block a provider hands out, and every address in it is the
-/// holder's). IPv4-mapped IPv6 is the IPv4 address.
-pub fn client_key(ip: IpAddr) -> IpAddr {
-    match ip {
-        IpAddr::V4(_) => ip,
-        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
-            Some(v4) => IpAddr::V4(v4),
-            None => IpAddr::V6(Ipv6Addr::from_bits(v6.to_bits() & !u128::from(u64::MAX))),
-        },
-    }
 }
 
 #[cfg(test)]
@@ -113,5 +109,20 @@ mod tests {
         assert!(b.take(0u8, 3_601_000));
         assert!(b.take(0u8, 3_601_000));
         assert!(!b.take(0u8, 3_601_000));
+    }
+
+    #[test]
+    fn per_hour_refills_per_hour_and_caps_at_burst() {
+        // 500 an hour is one token every 7.2 s, which no per-minute integer rate gives.
+        let mut b = Buckets::per_hour(500, 2);
+        assert!(b.take(0u8, 0));
+        assert!(b.take(0u8, 0));
+        assert!(!b.take(0u8, 0));
+        assert!(!b.take(0u8, 7_199));
+        assert!(b.take(0u8, 7_200));
+        assert!(!b.take(0u8, 7_200));
+        assert!(b.take(0u8, 3_600_000));
+        assert!(b.take(0u8, 3_600_000));
+        assert!(!b.take(0u8, 3_600_000));
     }
 }
