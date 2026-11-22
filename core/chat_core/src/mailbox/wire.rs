@@ -118,8 +118,9 @@ pub enum MailboxFrame {
     Handoff { entries: Vec<HandoffEntry> },
     /// Whether the sender is a mailbox, its own-device push handle (M7 spec 5.2; `None`: it has
     /// none), and whether it is a qualified mailbox (M8 spec 5.2). Sent as `[1, 4, mailbox,
-    /// handle or null, qualified]`; an M6 device's `[1, 4, mailbox]` decodes with no handle, and
-    /// it and an M7 device's `[1, 4, mailbox, handle or null]` as not qualified.
+    /// handle or null, true]` when qualified and as M7's `[1, 4, mailbox, handle or null]`
+    /// otherwise; an M6 device's `[1, 4, mailbox]` decodes with no handle, and it, the M7 form
+    /// and `[.., false]` as not qualified.
     Announce {
         mailbox: bool,
         handle: Option<Vec<u8>>,
@@ -127,7 +128,7 @@ pub enum MailboxFrame {
     },
 }
 
-/// Fields of the `Announce` this version sends, and the most it reads.
+/// Fields of the `Announce` this version sends when qualified, and the most it reads.
 const ANNOUNCE_FIELDS: u64 = 5;
 
 /// The first `fields` fields of an `Announce` (3 to `ANNOUNCE_FIELDS`, the forms M6, M7 and M8
@@ -423,8 +424,9 @@ impl MailboxFrame {
                 handle,
                 qualified,
             } => {
+                // Four fields while not qualified: what M7 reads (it refuses five).
                 return announce_inner(
-                    ANNOUNCE_FIELDS,
+                    if *qualified { ANNOUNCE_FIELDS } else { 4 },
                     *mailbox,
                     handle.as_deref(),
                     *qualified,
@@ -770,8 +772,12 @@ mod tests {
                 for handle in [None, Some(&longest[..])] {
                     let frame = announce(mailbox, handle, qualified);
                     let inner = frame.inner();
-                    assert_eq!(inner[..3], [0x85, 0x01, 0x04]);
-                    assert_eq!(inner[inner.len() - 1], 0xf4 | u8::from(qualified));
+                    if qualified {
+                        assert_eq!(inner[..3], [0x85, 0x01, 0x04]);
+                        assert_eq!(inner[inner.len() - 1], 0xf5);
+                    } else {
+                        assert_eq!(inner[..3], [0x84, 0x01, 0x04]);
+                    }
                     assert!(MailboxFrame::decode(&inner).unwrap() == frame);
                 }
             }
@@ -780,9 +786,31 @@ mod tests {
             *announce(true, None, true).inner(),
             [0x85, 0x01, 0x04, 0xf5, 0xf6, 0xf5]
         );
+        // What an M8 device that is not qualified never sends, it still reads.
+        let five = [0x85, 0x01, 0x04, 0xf4, 0x41, 0x07, 0xf4];
+        assert!(MailboxFrame::decode(&five).unwrap() == announce(false, Some(&[7]), false));
+    }
+
+    /// Controller decision on the Task 6 review: while not qualified, M8 sends the four-field
+    /// form M7 reads, so an M7 own device keeps the mailbox flag and the push handle; only a
+    /// qualified mailbox sends five fields, which M7 refuses (`Busy`).
+    #[test]
+    fn four_field_announce_while_not_qualified() {
+        let m7 = |inner: &[u8]| MailboxFrame::decode_as(inner, M7_ANNOUNCE_FIELDS);
+        for mailbox in [false, true] {
+            for handle in [None, Some(&[7u8; 40][..])] {
+                let frame = announce(mailbox, handle, false);
+                let inner = frame.inner();
+                assert_eq!(inner[0], 0x84, "four fields");
+                assert!(m7(&inner).unwrap() == frame, "M7 reads all of it");
+                let qualified = announce(mailbox, handle, true).inner();
+                assert_eq!(qualified[0], 0x85);
+                assert!(m7(&qualified).is_err());
+            }
+        }
         assert_eq!(
-            *announce(false, Some(&[7]), false).inner(),
-            [0x85, 0x01, 0x04, 0xf4, 0x41, 0x07, 0xf4]
+            *announce(true, Some(&[7]), false).inner(),
+            [0x84, 0x01, 0x04, 0xf5, 0x41, 0x07]
         );
     }
 
@@ -795,9 +823,8 @@ mod tests {
         let five = announce(true, Some(&[7]), true).inner();
         assert_eq!(m7(&five).err().map(|e| e.code), Some(ErrorCode::InvalidMessage));
         assert!(MailboxFrame::decode(&five).unwrap() == announce(true, Some(&[7]), true));
-        // Even unqualified: the shape alone is refused.
-        let five = announce(false, None, false).inner();
-        assert!(m7(&five).is_err());
+        // Even unqualified: the shape alone is refused (M8 sends it only when qualified).
+        assert!(m7(&[0x85, 0x01, 0x04, 0xf4, 0xf6, 0xf4]).is_err());
         // What M6 and M7 send it still reads.
         assert!(m7(&[0x83, 0x01, 0x04, 0xf5]).unwrap() == announce(true, None, false));
         assert!(

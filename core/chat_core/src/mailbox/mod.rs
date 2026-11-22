@@ -4,6 +4,7 @@
 //! until they land.
 #![allow(dead_code)]
 
+pub(crate) mod verdict;
 pub(crate) mod wire;
 
 /// Account frame kind of the own-device sync protocol.

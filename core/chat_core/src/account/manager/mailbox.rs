@@ -43,18 +43,28 @@
 //! until that device took it (one at a time per device), and never a contact. What they announce is recorded (`mailbox_device`): it is where handoffs go, which
 //! of my devices `mailbox_sync_now` dials first, and what `ConnectionSnapshot::mailbox_ok`
 //! reports. A mailbox takes handoffs only while it is one (what it took it tries until settled),
-//! and records its uptime every `UPTIME_EVERY_MS` (M6 records it, nothing judges it).
+//! and records its uptime every `UPTIME_EVERY_MS`.
+//!
+//! The verdict (M8 spec 5): every `VERDICT_EVERY_MS`, a mailbox works out from its uptime
+//! whether it qualifies, and every device works out from what it knows of my devices whether
+//! the account has a qualified mailbox (`mailbox/verdict.rs`). The verdict is worked out again
+//! sooner only when what it is made of changes: this device's role, or what a received
+//! `Announce` or a session says of a device in a way that counts (`changes_verdict`). A
+//! changed qualification is announced like a changed role.
 use super::mls::{Origin, Via};
 use super::*;
 use crate::account::{
     auth,
     connection::{Input, Session},
 };
+use crate::mailbox::verdict::{
+    self, MailboxFact, QueueMode, VERDICT_EVERY_MS, Verdict, changes_verdict, qualifies,
+};
 use crate::mailbox::wire::{
     EntryBody, HandoffEntry, LogEntry, MailboxFrame, MailboxReply, PlainRecord, handoff_batches,
 };
 use crate::message::{
-    mailbox_store::{HandoffOutcome, MailboxDbOp, MailboxDbReply},
+    mailbox_store::{HandoffOutcome, MailboxDbOp, MailboxDbReply, QueueFacts},
     store::{MessageDbOp, MessageDbReply},
     types::{ConversationId, MessageId, MessageKey},
 };
@@ -92,8 +102,9 @@ const ANNOUNCE_RETRY_MAX_MS: u64 = 300_000;
 const STOPPED_RETRY_MIN_MS: u64 = 5_000;
 const STOPPED_RETRY_MAX_MS: u64 = 300_000;
 
-/// What an `Announce` says: whether this device is a mailbox, its own-device push handle.
-type Told = (bool, Option<Vec<u8>>);
+/// What an `Announce` says: whether this device is a mailbox, its own-device push handle,
+/// whether it qualifies.
+type Told = (bool, Option<Vec<u8>>, bool);
 
 /// A handed-off ciphertext's row: the device that handed it over, conversation, message.
 type HandoffKey = (InstallationId, ConversationId, MessageId);
@@ -153,9 +164,20 @@ pub(crate) struct Runtime {
     tell_at: BTreeMap<InstallationId, (u64, u64, Told)>,
     /// Scheduler time this device, while a mailbox, next records that it is up.
     uptime_at: u64,
-    /// Each `Announce` sent: to which device, saying what.
+    /// This device's qualification as last worked out (`None`: not yet since the start).
+    qualified: Option<bool>,
+    /// The verdict as last worked out (`None`: work it out at the next poll).
+    verdict: Option<Verdict>,
+    /// Scheduler time the qualification and the verdict are next worked out.
+    judge_at: u64,
+    /// My devices with a session that became ready since the last poll (seen, spec 5.1).
+    seen: BTreeSet<InstallationId>,
+    /// Verdicts worked out since this core started.
     #[cfg(all(feature = "test-hooks", debug_assertions))]
-    announces: Vec<(InstallationId, bool)>,
+    verdicts: u64,
+    /// Each `Announce` sent: to which device, whether it said mailbox and qualified.
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    announces: Vec<(InstallationId, bool, bool)>,
     /// The devices the last `mailbox_sync_now` dialed, in order.
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     sync_dials: Vec<InstallationId>,
@@ -469,6 +491,10 @@ pub(crate) enum MailboxTest {
     Announces,
     SyncDials,
     SyncTrace,
+    /// e2e m8: this device's uptime records become `permille` with `recorded_ms` recorded, and
+    /// its qualification is worked out at the next poll.
+    SeedUptime { permille: u32, recorded_ms: u64 },
+    Verdicts,
 }
 #[cfg(all(feature = "test-hooks", debug_assertions))]
 pub(crate) enum MailboxTestReply {
@@ -476,7 +502,8 @@ pub(crate) enum MailboxTestReply {
     Done,
     Counters(MailboxCounters),
     Sends(Vec<(u64, [u8; 32])>),
-    Announces(Vec<(InstallationId, bool)>),
+    Announces(Vec<(InstallationId, bool, bool)>),
+    Verdicts(u64),
     Sessions(Vec<InstallationId>),
     ReadClears(Vec<(u32, u32)>),
     Dials(Vec<InstallationId>),
@@ -640,11 +667,35 @@ impl AccountHandle {
             _ => unreachable!(),
         }
     }
-    /// Each `Announce` this device sent, in order: to which device, and whether it said it is a
-    /// mailbox.
-    pub async fn mailbox_test_announces(&self) -> Result<Vec<(InstallationId, bool)>, CoreError> {
+    /// Each `Announce` this device sent, in order: to which device, whether it said it is a
+    /// mailbox, and whether it said it qualifies.
+    pub async fn mailbox_test_announces(
+        &self,
+    ) -> Result<Vec<(InstallationId, bool, bool)>, CoreError> {
         match self.mailbox_test(MailboxTest::Announces).await? {
             MailboxTestReply::Announces(announces) => Ok(announces),
+            _ => unreachable!(),
+        }
+    }
+    /// e2e m8: replaces this device's uptime records so that `permille` of the 7-day window is
+    /// up, the earliest record starting `recorded_ms` ago; the qualification is worked out
+    /// again at the next poll. Refused when more is up than recorded.
+    pub async fn mailbox_test_seed_uptime(
+        &self,
+        permille: u32,
+        recorded_ms: u64,
+    ) -> Result<(), CoreError> {
+        self.mailbox_test(MailboxTest::SeedUptime {
+            permille,
+            recorded_ms,
+        })
+        .await
+        .map(|_| ())
+    }
+    /// How many verdicts this core worked out since it started.
+    pub async fn mailbox_test_verdicts(&self) -> Result<u64, CoreError> {
+        match self.mailbox_test(MailboxTest::Verdicts).await? {
+            MailboxTestReply::Verdicts(n) => Ok(n),
             _ => unreachable!(),
         }
     }
@@ -731,6 +782,21 @@ impl Manager {
             MailboxTest::SyncDials => {
                 MailboxTestReply::Dials(self.messages.mailbox.sync_dials.clone())
             }
+            MailboxTest::SeedUptime {
+                permille,
+                recorded_ms,
+            } => {
+                let request = self.ready()?;
+                let op = MailboxDbOp::SeedUptime {
+                    permille,
+                    recorded_ms,
+                    now: self.services.clock.wall_ms(),
+                };
+                self.mailbox_db(op, request).await?;
+                self.messages.mailbox.judge_at = 0;
+                MailboxTestReply::Done
+            }
+            MailboxTest::Verdicts => MailboxTestReply::Verdicts(self.messages.mailbox.verdicts),
         })
     }
 
@@ -829,6 +895,7 @@ impl Manager {
         mailbox.schedule(grant.installation);
         // A new session: that device is told again whether this one is a mailbox.
         mailbox.told.remove(&grant.installation);
+        mailbox.seen.insert(grant.installation);
         mailbox.tell_at.remove(&grant.installation);
         mailbox.handoff_due = true;
     }
@@ -861,9 +928,84 @@ impl Manager {
             .await?;
         let mailbox = &mut self.messages.mailbox;
         mailbox.enabled = Some(enabled);
-        // Up from now on: recorded at the next poll.
+        // Up from now on: recorded at the next poll, and qualified (or not) again with it.
         mailbox.uptime_at = 0;
+        mailbox.judge_at = 0;
         Ok(())
+    }
+
+    /// The server queue setting, the verdict and this device's uptime (M8 spec 5). The verdict
+    /// is the one last worked out (worked out now if none is yet).
+    pub(super) async fn queue_state(&mut self) -> Result<QueueStateView, CoreError> {
+        let request = self.ready()?;
+        let verdict = match self.messages.mailbox.verdict {
+            Some(verdict) => verdict,
+            None => self.judge(request).await?,
+        };
+        let facts = self.queue_facts(request).await?;
+        Ok(QueueStateView {
+            mode: facts.mode,
+            verdict,
+            using_queue: verdict::wants_queue(facts.mode, &verdict),
+            uptime_7d_permille: facts.uptime_7d_permille,
+        })
+    }
+
+    /// Sets the server queue setting (M8 spec 5.3). The verdict does not depend on it.
+    pub(super) async fn set_queue_mode(&mut self, mode: QueueMode) -> Result<(), CoreError> {
+        let request = self.ready()?;
+        self.mailbox_db(MailboxDbOp::SetQueueMode(mode), request)
+            .await
+            .map(|_| ())
+    }
+
+    async fn queue_facts(&mut self, request: Request) -> Result<QueueFacts, CoreError> {
+        let op = MailboxDbOp::QueueFacts {
+            now: self.services.clock.wall_ms(),
+        };
+        match self.mailbox_db(op, request).await? {
+            MailboxDbReply::Queue(facts) => Ok(facts),
+            _ => Err(unavailable(ErrorCode::InvalidMessage)),
+        }
+    }
+
+    /// Works the verdict out (spec 5.1) from the stored facts, and first this device's
+    /// qualification when it is due (`judge_at`: hourly, and after the role changed). The
+    /// result is stored; a changed qualification is announced at the next poll (`told`).
+    async fn judge(&mut self, request: Request) -> Result<Verdict, CoreError> {
+        let me = self.local()?.device.installation_id();
+        let now = self.schedule_now();
+        let wall = self.services.clock.wall_ms();
+        let facts = self.queue_facts(request).await?;
+        let requalify = now >= self.messages.mailbox.judge_at;
+        let qualified = if requalify {
+            facts.enabled && qualifies(facts.uptime_7d_permille, facts.recorded_ms)
+        } else {
+            facts.qualified
+        };
+        let mine = MailboxFact {
+            installation: me,
+            mailbox: facts.enabled,
+            qualified,
+            last_seen_ms: None,
+        };
+        let verdict = verdict::verdict(&mine, &facts.devices, wall);
+        let op = MailboxDbOp::Judged {
+            qualified: requalify.then_some(qualified),
+            at: wall,
+        };
+        self.mailbox_db(op, request).await?;
+        let mailbox = &mut self.messages.mailbox;
+        mailbox.qualified = Some(qualified);
+        mailbox.verdict = Some(verdict);
+        if requalify {
+            mailbox.judge_at = now.saturating_add(VERDICT_EVERY_MS);
+        }
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        {
+            mailbox.verdicts += 1;
+        }
+        Ok(verdict)
     }
 
     pub(super) async fn mark_first_link_shown(&mut self) -> Result<(), CoreError> {
@@ -882,13 +1024,15 @@ impl Manager {
         }
         let installation = session.grant.installation;
         #[cfg(all(feature = "test-hooks", debug_assertions))]
-        self.messages.mailbox.announces.push((installation, told.0));
+        self.messages
+            .mailbox
+            .announces
+            .push((installation, told.0, told.2));
         self.messages.mailbox.telling.insert(installation);
         let body = MailboxFrame::Announce {
             mailbox: told.0,
             handle: told.1.clone(),
-            // No device computes its qualification yet.
-            qualified: false,
+            qualified: told.2,
         }
         .encode();
         let mailbox = self.auth.send.clone();
@@ -1141,25 +1285,37 @@ impl Manager {
                 }
             }
             // Spec 8.4: whether that device is a mailbox, recorded for handoffs, dialing order
-            // and `mailbox_ok`.
+            // and `mailbox_ok`; M8 spec 5.1: whether it qualifies, and that it was seen now.
             Ok(MailboxFrame::Announce {
                 mailbox,
                 handle,
-                qualified: _,
+                qualified,
             }) => {
+                let at = self.services.clock.wall_ms();
                 let op = MailboxDbOp::Announced {
                     installation,
                     mailbox,
                     handle,
-                    at: self.services.clock.wall_ms(),
+                    qualified,
+                    at,
                 };
                 match self.mailbox_db(op, request).await {
-                    Ok(MailboxDbReply::Count(changed)) => {
+                    Ok(MailboxDbReply::Fact(before)) => {
+                        let after = MailboxFact {
+                            installation,
+                            mailbox,
+                            qualified,
+                            last_seen_ms: Some(at),
+                        };
                         let runtime = &mut self.messages.mailbox;
                         runtime.mailboxes = None;
                         // A device that just became a mailbox gets what is not delivered.
-                        if mailbox && changed > 0 {
+                        if mailbox && !before.is_some_and(|b| b.mailbox) {
                             runtime.handoff_due = true;
+                        }
+                        // The same `Announce` again changes nothing the verdict is made of.
+                        if changes_verdict(before.as_ref(), &after, at) {
+                            runtime.verdict = None;
                         }
                         MailboxReply::Ok
                     }
@@ -1224,8 +1380,10 @@ impl Manager {
             }
             let mailbox = &mut self.messages.mailbox;
             mailbox.devices = Some(others);
-            // Revoked devices' announcements went with them.
+            // Revoked devices' announcements went with them, and with them what they counted
+            // for in the verdict.
             mailbox.mailboxes = None;
+            mailbox.verdict = None;
         }
         let now = self.schedule_now();
         if now >= self.messages.mailbox.prune_at {
@@ -1261,10 +1419,16 @@ impl Manager {
             .as_ref()
             .is_some_and(|m| usable.iter().any(|s| m.contains(&s.grant.installation)));
         let enabled = mailbox.enabled.unwrap_or(false);
-        let want = (enabled, self.push_own_handle());
+        let qualified = mailbox.qualified;
+        let want = (
+            enabled,
+            self.push_own_handle(),
+            qualified.unwrap_or(false),
+        );
         // Before `push_local` is read the own-device handle is not known: an `Announce` then
-        // would say "none" and my other device would drop the handle it keeps.
-        let loaded = self.push_loaded();
+        // would say "none" and my other device would drop the handle it keeps. Nor is it sent
+        // before the qualification is worked out.
+        let loaded = self.push_loaded() && qualified.is_some();
         let now_tell = self.schedule_now();
         let mailbox = &self.messages.mailbox;
         let announce: Vec<Session> = usable
@@ -1350,7 +1514,8 @@ impl Manager {
 
     /// The mailbox role's upkeep (spec 8.4): this device's setting and my mailboxes are read
     /// when not known, and while this device is a mailbox it records every `UPTIME_EVERY_MS`
-    /// that it is up.
+    /// that it is up. Then the verdict (M8 spec 5.1): my devices seen over a new session are
+    /// recorded as seen now, and the verdict is worked out when it is due.
     async fn mailbox_role(&mut self, request: Request) -> Result<(), CoreError> {
         let wall = self.services.clock.wall_ms();
         if self.messages.mailbox.enabled.is_none() {
@@ -1376,6 +1541,30 @@ impl Manager {
             self.mailbox_db(MailboxDbOp::Uptime { now: wall }, request)
                 .await?;
             self.messages.mailbox.uptime_at = now.saturating_add(UPTIME_EVERY_MS);
+        }
+        while let Some(installation) = self.messages.mailbox.seen.first().copied() {
+            let op = MailboxDbOp::Seen {
+                installation,
+                at: wall,
+            };
+            let MailboxDbReply::Fact(before) = self.mailbox_db(op, request).await? else {
+                return Err(unavailable(ErrorCode::InvalidMessage));
+            };
+            let mailbox = &mut self.messages.mailbox;
+            mailbox.seen.remove(&installation);
+            if let Some(before) = before {
+                let after = MailboxFact {
+                    last_seen_ms: Some(wall),
+                    ..before
+                };
+                if changes_verdict(Some(&before), &after, wall) {
+                    mailbox.verdict = None;
+                }
+            }
+        }
+        let mailbox = &self.messages.mailbox;
+        if mailbox.verdict.is_none() || now >= mailbox.judge_at {
+            self.judge(request).await?;
         }
         Ok(())
     }

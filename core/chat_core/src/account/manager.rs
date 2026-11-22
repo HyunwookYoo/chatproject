@@ -9,6 +9,7 @@ use super::{
     random_secret, recovery,
     storage::{KeyProtector, schema::AccountState},
 };
+use crate::mailbox::verdict::{QueueMode, Verdict};
 use crate::{CoreError, ErrorCode, NetworkHandle, storage::worker::StorageHandle};
 use std::{
     path::Path,
@@ -65,6 +66,21 @@ pub struct MailboxStateView {
     /// Time up as a mailbox within the last 7 days, per mille of them.
     pub uptime_7d_permille: u32,
 }
+
+/// This device's server queue (M8 spec 5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueueStateView {
+    pub mode: QueueMode,
+    /// Whether the account has a qualified mailbox, as last worked out (hourly, and when what
+    /// it is made of changes).
+    pub verdict: Verdict,
+    /// Whether this device uses a server queue. While no queue is made yet, this is what the
+    /// table of spec 5.3 wants for `mode` and `verdict`; once queues are made, it says that
+    /// this device has one.
+    pub using_queue: bool,
+    /// Time up as a mailbox within the last 7 days, per mille of them.
+    pub uptime_7d_permille: u32,
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CandidateInfo {
     pub installation_id: InstallationId,
@@ -93,6 +109,8 @@ enum Command {
     MailboxState(oneshot::Sender<Result<MailboxStateView,CoreError>>),
     SetMailbox(bool,oneshot::Sender<Result<(),CoreError>>),
     MailboxFirstLinkShown(oneshot::Sender<Result<(),CoreError>>),
+    QueueState(oneshot::Sender<Result<QueueStateView,CoreError>>),
+    SetQueueMode(QueueMode,oneshot::Sender<Result<(),CoreError>>),
     PushSetToken(crate::push::Platform,String,oneshot::Sender<Result<(),CoreError>>),
     PushSetEnabled(bool,oneshot::Sender<Result<(),CoreError>>),
     PushStatus(oneshot::Sender<Result<crate::push::PushStatus,CoreError>>),
@@ -175,6 +193,8 @@ impl Command {
             Self::MailboxState(reply)=>{let _=reply.send(Err(error));}
             Self::SetMailbox(_,reply)=>{let _=reply.send(Err(error));}
             Self::MailboxFirstLinkShown(reply)=>{let _=reply.send(Err(error));}
+            Self::QueueState(reply)=>{let _=reply.send(Err(error));}
+            Self::SetQueueMode(_,reply)=>{let _=reply.send(Err(error));}
             Self::PushSetToken(_,_,reply)|Self::PushSetEnabled(_,reply)=>{let _=reply.send(Err(error));}
             Self::PushStatus(reply)=>{let _=reply.send(Err(error));}
             Self::PushRenewDue(_,reply)=>{let _=reply.send(Err(error));}
@@ -443,7 +463,7 @@ impl AccountHandle {
         self.send(Command::MailboxBackground).await
     }
     /// This device's mailbox setting, whether the first-link screen was shown, and its uptime
-    /// over the last 7 days (spec 8.4: recorded only, nothing is judged from it in M6).
+    /// over the last 7 days (spec 8.4; M8 judges its qualification from it, `queue_state`).
     pub async fn mailbox_state(&self) -> Result<MailboxStateView, CoreError> {
         self.send(Command::MailboxState).await
     }
@@ -456,6 +476,15 @@ impl AccountHandle {
     /// The first-link screen (spec 8.1) was shown; it is not shown again.
     pub async fn mark_first_link_shown(&self) -> Result<(), CoreError> {
         self.send(Command::MailboxFirstLinkShown).await
+    }
+    /// The server queue setting, whether the account has a qualified mailbox, whether this
+    /// device uses a queue, and its uptime (M8 spec 5).
+    pub async fn queue_state(&self) -> Result<QueueStateView, CoreError> {
+        self.send(Command::QueueState).await
+    }
+    /// Sets the server queue setting (M8 spec 5.3).
+    pub async fn set_queue_mode(&self, mode: QueueMode) -> Result<(), CoreError> {
+        self.send(|reply| Command::SetQueueMode(mode, reply)).await
     }
     pub async fn refresh_record(&self, peer: PeerId) -> Result<(), CoreError> {
         self.send(|reply| Command::Refresh(peer, reply)).await
@@ -1278,6 +1307,8 @@ impl Manager {
                         Command::MailboxState(reply)=>{let result=self.mailbox_state().await;let _=reply.send(result);}
                         Command::SetMailbox(enabled,reply)=>{let result=self.set_mailbox(enabled).await;let _=reply.send(result);}
                         Command::MailboxFirstLinkShown(reply)=>{let result=self.mark_first_link_shown().await;let _=reply.send(result);}
+                        Command::QueueState(reply)=>{let result=self.queue_state().await;let _=reply.send(result);}
+                        Command::SetQueueMode(mode,reply)=>{let result=self.set_queue_mode(mode).await;let _=reply.send(result);}
                         Command::PushSetToken(platform,token,reply)=>{let result=self.push_set_token(platform,token).await;let _=reply.send(result);}
                         Command::PushSetEnabled(enabled,reply)=>{let result=self.push_set_enabled(enabled).await;let _=reply.send(result);}
                         Command::PushStatus(reply)=>{let result=self.push_status().await;let _=reply.send(result);}

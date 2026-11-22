@@ -12,8 +12,9 @@
 //! note for the device that handed it over.
 //!
 //! The mailbox role itself (`mailbox_local`: set on this device; `mailbox_device`: what my other
-//! devices announced; `mailbox_uptime`: this device's up periods while it is a mailbox) is kept
-//! here too (spec 8.4).
+//! devices announced, and when this device last saw each; `mailbox_uptime`: this device's up
+//! periods while it is a mailbox) is kept here too (spec 8.4), with the M8 queue setting and
+//! this device's qualification (`queue_local`, M8 spec 5).
 use super::mls_group::sql;
 use super::mls_store::{Fault, finish, store_plain};
 use super::scheduler::retry_delay_capped;
@@ -25,6 +26,7 @@ use crate::CoreError;
 use crate::account::{InstallationId, PeerId};
 use crate::mailbox::{
     MAILBOX_MAX_DELAY_MS, MAILBOX_RETENTION_MS, PAGE_MAX_ENTRIES, UPTIME_GAP_MS, UPTIME_WINDOW_MS,
+    verdict::{MailboxFact, QueueMode},
     wire::{
         EntryBody, HandoffEntry, LogEntry, MAX_ENTRY_BODY, PlainRecord, decode_note, note_body,
         page,
@@ -301,14 +303,37 @@ pub(crate) enum MailboxDbOp {
     SetEnabled(bool),
     /// The first-link screen (spec 8.1) was shown.
     FirstLinkShown,
-    /// Own device `installation` announced at `at` whether it is a mailbox, and its own-device
-    /// push handle (M7 spec 5.2; `None`: it has none). `Count(1)` when the mailbox role changed
-    /// what is recorded (a device not recorded counts as not a mailbox).
+    /// Own device `installation` announced at `at` whether it is a mailbox, its own-device
+    /// push handle (M7 spec 5.2; `None`: it has none) and whether it qualifies (M8 spec 5.2); it
+    /// was seen then. `Fact` is what was recorded of it before (`None`: nothing).
     Announced {
         installation: InstallationId,
         mailbox: bool,
         handle: Option<Vec<u8>>,
+        qualified: bool,
         at: u64,
+    },
+    /// Own device `installation` was seen at `at` (an authenticated session, M8 spec 5.1 rule
+    /// 3). Only a recorded device is written. `Fact` is what was recorded of it before.
+    Seen {
+        installation: InstallationId,
+        at: u64,
+    },
+    /// What the verdict is worked out from at `now` (wall time): `Queue`.
+    QueueFacts { now: u64 },
+    /// The verdict was worked out at `at` (wall time), with this device's qualification when
+    /// that was worked out again (`None`: kept). `Count(1)` when the qualification was written.
+    Judged { qualified: Option<bool>, at: u64 },
+    /// Sets the server queue setting (M8 spec 5.3).
+    SetQueueMode(QueueMode),
+    /// e2e m8: this device's uptime records become `permille` of the 7-day window up, the
+    /// earliest one starting `recorded_ms` before `now` (wall time). Refused when that does not
+    /// fit (more up than recorded).
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    SeedUptime {
+        permille: u32,
+        recorded_ms: u64,
+        now: u64,
     },
     /// This device is up as a mailbox at `now` (wall time): the last period goes on if it ended
     /// at most `UPTIME_GAP_MS` before, otherwise a new one starts; periods that ended more than
@@ -326,6 +351,7 @@ impl MailboxDbOp {
                 | Self::HandoffRows
                 | Self::HandoffDue(_)
                 | Self::Local { .. }
+                | Self::QueueFacts { .. }
         )
     }
 }
@@ -381,7 +407,25 @@ pub(crate) enum MailboxDbReply {
     },
     /// This device is not a mailbox: the handoff was not taken.
     Disabled,
+    /// What was recorded of one of my devices before a write (`None`: nothing).
+    Fact(Option<MailboxFact>),
+    Queue(QueueFacts),
     Notify(Vec<crate::event::NotifyItem>),
+}
+
+/// What a device works the verdict out from (M8 spec 5.1), read in one go.
+pub(crate) struct QueueFacts {
+    pub mode: QueueMode,
+    /// This device is set as a mailbox.
+    pub enabled: bool,
+    /// This device's qualification as last worked out (`queue_local.qualified`).
+    pub qualified: bool,
+    pub uptime_7d_permille: u32,
+    /// From the start of the earliest uptime record to now (0: none). Periods are recorded
+    /// only while the role is on, so this is time recorded since the role was on.
+    pub recorded_ms: u64,
+    /// What my other devices announced, by installation.
+    pub devices: Vec<MailboxFact>,
 }
 
 pub(super) fn mailbox_op(
@@ -626,24 +670,81 @@ pub(super) fn mailbox_op(
             installation,
             mailbox,
             handle,
+            qualified,
             at,
         } => {
             let tx = c.transaction().map_err(sql)?;
-            let before: bool = tx
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM mailbox_device WHERE installation=?1 AND mailbox=1)",
-                    params![installation.0.as_slice()],
-                    |r| r.get(0),
-                )
-                .map_err(sql)?;
+            let before = device_fact(&tx, installation)?;
             tx.execute(
-                "INSERT INTO mailbox_device(installation,mailbox,announced_at_ms) VALUES(?1,?2,?3) ON CONFLICT(installation) DO UPDATE SET mailbox=excluded.mailbox,announced_at_ms=excluded.announced_at_ms",
-                params![installation.0.as_slice(), mailbox, integer(at)?],
+                "INSERT INTO mailbox_device(installation,mailbox,announced_at_ms,qualified,last_seen_ms) VALUES(?1,?2,?3,?4,?3) ON CONFLICT(installation) DO UPDATE SET mailbox=excluded.mailbox,announced_at_ms=excluded.announced_at_ms,qualified=excluded.qualified,last_seen_ms=excluded.last_seen_ms",
+                params![installation.0.as_slice(), mailbox, integer(at)?, qualified],
             )
             .map_err(sql)?;
             super::push_store::store_own_handle(&tx, installation, handle.as_deref())?;
             finish(tx, fault)?;
-            MailboxDbReply::Count(u64::from(before != mailbox))
+            MailboxDbReply::Fact(before)
+        }
+        MailboxDbOp::Seen { installation, at } => {
+            let tx = c.transaction().map_err(sql)?;
+            let before = device_fact(&tx, installation)?;
+            tx.execute(
+                "UPDATE mailbox_device SET last_seen_ms=?2 WHERE installation=?1",
+                params![installation.0.as_slice(), integer(at)?],
+            )
+            .map_err(sql)?;
+            finish(tx, fault)?;
+            MailboxDbReply::Fact(before)
+        }
+        MailboxDbOp::QueueFacts { now } => MailboxDbReply::Queue(queue_facts(c, now)?),
+        MailboxDbOp::Judged { qualified, at } => {
+            let tx = c.transaction().map_err(sql)?;
+            let changed = match qualified {
+                Some(qualified) => set_qualified(&tx, qualified, at)?,
+                None => false,
+            };
+            tx.execute(
+                "UPDATE queue_local SET verdict_at_ms=?1 WHERE id=1",
+                params![integer(at)?],
+            )
+            .map_err(sql)?;
+            finish(tx, fault)?;
+            MailboxDbReply::Count(u64::from(changed))
+        }
+        MailboxDbOp::SetQueueMode(mode) => {
+            let tx = c.transaction().map_err(sql)?;
+            tx.execute(
+                "UPDATE queue_local SET mode=?1 WHERE id=1",
+                params![mode_code(mode)],
+            )
+            .map_err(sql)?;
+            finish(tx, fault)?;
+            MailboxDbReply::Count(1)
+        }
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        MailboxDbOp::SeedUptime {
+            permille,
+            recorded_ms,
+            now,
+        } => {
+            let up = u64::from(permille) * (UPTIME_WINDOW_MS / 1000);
+            if permille > 1000 || up > recorded_ms || recorded_ms > now {
+                return Err(invalid());
+            }
+            let tx = c.transaction().map_err(sql)?;
+            tx.execute("DELETE FROM mailbox_uptime", []).map_err(sql)?;
+            tx.execute(
+                "INSERT INTO mailbox_uptime VALUES(?1,?2)",
+                params![integer(now - up)?, integer(now)?],
+            )
+            .map_err(sql)?;
+            // The earliest record: a moment `recorded_ms` ago (none if it is the one above).
+            tx.execute(
+                "INSERT OR IGNORE INTO mailbox_uptime VALUES(?1,?1)",
+                params![integer(now - recorded_ms)?],
+            )
+            .map_err(sql)?;
+            finish(tx, fault)?;
+            MailboxDbReply::Count(1)
         }
         MailboxDbOp::Uptime { now } => {
             let tx = c.transaction().map_err(sql)?;
@@ -698,6 +799,97 @@ fn record_uptime(tx: &Transaction, now: u64) -> R<()> {
         }
     }
     Ok(())
+}
+
+const FACT: &str = "SELECT installation,mailbox,qualified,last_seen_ms FROM mailbox_device";
+
+fn fact_row(r: &rusqlite::Row) -> rusqlite::Result<MailboxFact> {
+    let seen: Option<i64> = r.get(3)?;
+    Ok(MailboxFact {
+        installation: InstallationId(bytes(r, 0)?),
+        mailbox: r.get(1)?,
+        qualified: r.get(2)?,
+        last_seen_ms: seen
+            .map(u64::try_from)
+            .transpose()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+    })
+}
+
+/// What is recorded of my device `installation` (`None`: nothing).
+fn device_fact(c: &Connection, installation: InstallationId) -> R<Option<MailboxFact>> {
+    c.query_row(
+        &format!("{FACT} WHERE installation=?1"),
+        params![installation.0.as_slice()],
+        fact_row,
+    )
+    .optional()
+    .map_err(sql)
+}
+
+/// Reads `mailbox_local`, `queue_local`, the uptime records' sum and start (both through the
+/// `started_at_ms` key) and `mailbox_device` (at most one row per device of the account).
+fn queue_facts(c: &Connection, now: u64) -> R<QueueFacts> {
+    let (mode, qualified): (i64, bool) = c
+        .query_row(
+            "SELECT mode,qualified FROM queue_local WHERE id=1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map_err(sql)?;
+    let earliest: Option<i64> = c
+        .query_row("SELECT min(started_at_ms) FROM mailbox_uptime", [], |r| {
+            r.get(0)
+        })
+        .map_err(sql)?;
+    let recorded_ms = earliest
+        .and_then(|e| u64::try_from(e).ok())
+        .map_or(0, |e| now.saturating_sub(e));
+    let devices = c
+        .prepare(&format!("{FACT} ORDER BY installation"))
+        .map_err(sql)?
+        .query_map([], fact_row)
+        .map_err(sql)?
+        .collect::<Result<_, _>>()
+        .map_err(sql)?;
+    Ok(QueueFacts {
+        mode: queue_mode(mode)?,
+        enabled: mailbox_enabled(c)?,
+        qualified,
+        uptime_7d_permille: uptime_permille(c, now)?,
+        recorded_ms,
+        devices,
+    })
+}
+
+/// `queue_local.mode`: 0 auto, 1 always, 2 never.
+fn queue_mode(code: i64) -> R<QueueMode> {
+    match code {
+        0 => Ok(QueueMode::Auto),
+        1 => Ok(QueueMode::Always),
+        2 => Ok(QueueMode::Never),
+        _ => Err(invalid()),
+    }
+}
+fn mode_code(mode: QueueMode) -> i64 {
+    match mode {
+        QueueMode::Auto => 0,
+        QueueMode::Always => 1,
+        QueueMode::Never => 2,
+    }
+}
+
+/// Writes this device's qualification worked out at `at`. `queue_local.qualified_at_ms` is when
+/// the value last changed: set with the first value worked out (never NULL after that), moved
+/// only when the value changes. Returns whether the row was written.
+fn set_qualified(tx: &Transaction, qualified: bool, at: u64) -> R<bool> {
+    let changed = tx
+        .execute(
+            "UPDATE queue_local SET qualified=?1,qualified_at_ms=?2 WHERE id=1 AND (qualified<>?1 OR qualified_at_ms IS NULL)",
+            params![qualified, integer(at)?],
+        )
+        .map_err(sql)?;
+    Ok(changed > 0)
 }
 
 /// The time up within the 7 days before `now`, per mille of them.
@@ -1270,6 +1462,10 @@ pub struct MailboxState {
     pub device_rows: Vec<(InstallationId, bool)>,
     /// `mailbox_uptime` as `(started_at_ms, ended_at_ms)`, oldest first.
     pub uptime: Vec<(u64, u64)>,
+    /// `mailbox_device` as `(installation, qualified, last_seen_ms)`, by installation (M8).
+    pub seen_rows: Vec<(InstallationId, bool, Option<u64>)>,
+    /// `queue_local` as `(mode, qualified, qualified_at_ms, verdict_at_ms)` (M8).
+    pub queue_local: (QueueMode, bool, Option<u64>, Option<u64>),
 }
 
 /// One `mailbox_handoff` row, for fixture assertions.
@@ -1362,7 +1558,41 @@ pub(super) fn fixture_state(c: &Connection) -> R<MailboxState> {
             .collect::<Result<_, _>>()
             .map_err(sql)?
     };
+    let optional = |r: &rusqlite::Row, n| -> rusqlite::Result<Option<u64>> {
+        let value: Option<i64> = r.get(n)?;
+        value
+            .map(u64::try_from)
+            .transpose()
+            .map_err(|_| rusqlite::Error::InvalidQuery)
+    };
+    let seen_rows = {
+        let mut q = c
+            .prepare("SELECT installation,qualified,last_seen_ms FROM mailbox_device ORDER BY installation")
+            .map_err(sql)?;
+        q.query_map([], |r| {
+            Ok((InstallationId(bytes(r, 0)?), r.get(1)?, optional(r, 2)?))
+        })
+        .map_err(sql)?
+        .collect::<Result<_, _>>()
+        .map_err(sql)?
+    };
+    let (mode, qualified, qualified_at, verdict_at) = c
+        .query_row(
+            "SELECT mode,qualified,qualified_at_ms,verdict_at_ms FROM queue_local WHERE id=1",
+            [],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get(1)?,
+                    optional(r, 2)?,
+                    optional(r, 3)?,
+                ))
+            },
+        )
+        .map_err(sql)?;
     Ok(MailboxState {
+        seen_rows,
+        queue_local: (queue_mode(mode)?, qualified, qualified_at, verdict_at),
         entries,
         cursors: pairs("mailbox_cursor", "next_seq")?,
         pulls: pairs("mailbox_pull", "since_seq")?,
@@ -1450,4 +1680,93 @@ pub(super) fn fixture_seed(c: &Connection, installation: InstallationId, at: u64
     )
     .map_err(sql)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fresh() -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(include_str!("../storage/schema.sql"))
+            .unwrap();
+        c
+    }
+    fn local(c: &Connection) -> (bool, Option<i64>) {
+        c.query_row(
+            "SELECT qualified,qualified_at_ms FROM queue_local WHERE id=1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    }
+
+    /// `qualified_at_ms` is when `qualified` last changed: NULL only before the first value,
+    /// kept while the value is worked out again the same, moved when it changes.
+    #[test]
+    fn qualified_at_pairs_with_qualified() {
+        let mut c = fresh();
+        assert_eq!(local(&c), (false, None));
+        let mut write = |qualified, at| {
+            let tx = c.transaction().unwrap();
+            let wrote = set_qualified(&tx, qualified, at).unwrap();
+            tx.commit().unwrap();
+            wrote
+        };
+        assert!(write(false, 10), "the first value is written, even unchanged");
+        assert!(!write(false, 20));
+        assert!(write(true, 30));
+        assert!(!write(true, 40));
+        assert!(write(false, 50));
+        assert_eq!(local(&c), (false, Some(50)));
+    }
+
+    /// The facts: `recorded_ms` from the earliest record, the qualification and mode as stored,
+    /// and each recorded device with its qualification and last-seen time.
+    #[test]
+    fn queue_facts_read_what_the_verdict_needs() {
+        let c = fresh();
+        let day = 86_400_000;
+        let now = 10 * day;
+        let facts = queue_facts(&c, now).unwrap();
+        assert_eq!(
+            (facts.mode, facts.enabled, facts.qualified, facts.recorded_ms),
+            (QueueMode::Auto, false, false, 0)
+        );
+        assert!(facts.devices.is_empty());
+        c.execute_batch(&format!(
+            "INSERT INTO mailbox_uptime VALUES({},{}); INSERT INTO mailbox_uptime VALUES({},{now});
+             UPDATE queue_local SET mode=2;
+             INSERT INTO mailbox_device VALUES(x'{}',1,5,1,7); INSERT INTO mailbox_device VALUES(x'{}',0,5,0,NULL);",
+            now - 3 * day,
+            now - 2 * day,
+            now - day,
+            "02".repeat(32),
+            "01".repeat(32),
+        ))
+        .unwrap();
+        let facts = queue_facts(&c, now).unwrap();
+        assert_eq!(facts.mode, QueueMode::Never);
+        assert_eq!(facts.recorded_ms, 3 * day);
+        assert_eq!(facts.uptime_7d_permille, 2 * 1000 / 7);
+        assert_eq!(
+            facts.devices,
+            [
+                MailboxFact {
+                    installation: InstallationId([1; 32]),
+                    mailbox: false,
+                    qualified: false,
+                    last_seen_ms: None,
+                },
+                MailboxFact {
+                    installation: InstallationId([2; 32]),
+                    mailbox: true,
+                    qualified: true,
+                    last_seen_ms: Some(7),
+                },
+            ]
+        );
+        // The wall clock went back before the first record: nothing recorded.
+        assert_eq!(queue_facts(&c, now - 4 * day).unwrap().recorded_ms, 0);
+    }
 }

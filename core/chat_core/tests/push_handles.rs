@@ -309,7 +309,8 @@ async fn own_handle_rides_announce_and_m6_announce_still_decodes() {
     // A device without a handle announces none: A1 keeps nothing for A2.
     assert!(mine.own.is_empty());
 
-    // M6 sends `[1, 4, mailbox]`; M7 `[1, 4, mailbox, handle or null]`; M8 adds `qualified`.
+    // M6 sends `[1, 4, mailbox]`; M7 `[1, 4, mailbox, handle or null]`; M8 adds `qualified`,
+    // only when it is true (an M7 device refuses five fields).
     let m6 = [0x83, 0x01, 0x04, 0xf5];
     assert!(
         MailboxFrame::decode(&m6).unwrap()
@@ -330,7 +331,7 @@ async fn own_handle_rides_announce_and_m6_announce_still_decodes() {
         handle: None,
         qualified: false,
     };
-    assert_eq!(*without.inner(), [0x85, 0x01, 0x04, 0xf5, 0xf6, 0xf4]);
+    assert_eq!(*without.inner(), [0x84, 0x01, 0x04, 0xf5, 0xf6]);
     assert!(MailboxFrame::decode(&without.inner()).unwrap() == without);
     for bad in [
         &[0x84, 0x01, 0x04, 0xf5, 0x40][..],
@@ -404,7 +405,7 @@ async fn announce_to_a_busy_device_backs_off_to_a_cap() {
     settle!([&a1, &b1], push_state(&a1).await.own_handle.is_some());
     async fn sent(a1: &Fixture, to: chat_core::account::InstallationId) -> usize {
         let all = a1.account.mailbox_test_announces().await.unwrap();
-        all.iter().filter(|(i, _)| *i == to).count()
+        all.iter().filter(|(i, ..)| *i == to).count()
     }
     // Scheduler time in 5 s steps, each step long enough for the Busy answer to come back.
     async fn run(a1: &Fixture, seconds: u64) {
