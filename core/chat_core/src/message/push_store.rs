@@ -401,7 +401,7 @@ pub(super) fn push_op(
         PushDbOp::DueDeliveries { now, recipients } => due(c, now, &recipients)?,
         PushDbOp::UnreachableDue { now } => {
             let mut q = c
-                .prepare("SELECT DISTINCT d.conversation,d.recipient_install,v.peer FROM push_delivery d JOIN conversation v ON v.id=d.conversation WHERE d.next_retry_at_ms<=?1 ORDER BY d.recipient_install,d.conversation LIMIT ?2")
+                .prepare("SELECT DISTINCT d.conversation,d.recipient_install,v.peer FROM push_delivery d JOIN conversation v ON v.id=d.conversation WHERE d.kind=1 AND d.next_retry_at_ms<=?1 ORDER BY d.recipient_install,d.conversation LIMIT ?2")
                 .map_err(sql)?;
             let rows = q
                 .query_map(params![integer(now)?, UNREACHABLE_MAX], |r| {
@@ -433,14 +433,14 @@ pub(super) fn push_op(
             let changed = match outcome {
                 Delivery::Acked | Delivery::Settled => tx
                     .execute(
-                        "DELETE FROM push_delivery WHERE conversation=?1 AND recipient_install=?2 AND msg_id=?3",
+                        "DELETE FROM push_delivery WHERE conversation=?1 AND recipient_install=?2 AND kind=1 AND msg_id=?3",
                         key,
                     )
                     .map_err(sql)?,
                 Delivery::Retry => {
                     let attempts: Option<u64> = tx
                         .query_row(
-                            "SELECT attempts FROM push_delivery WHERE conversation=?1 AND recipient_install=?2 AND msg_id=?3",
+                            "SELECT attempts FROM push_delivery WHERE conversation=?1 AND recipient_install=?2 AND kind=1 AND msg_id=?3",
                             key,
                             |r| uint(r, 0),
                         )
@@ -452,7 +452,7 @@ pub(super) fn push_op(
                             let attempts = attempts.saturating_add(1).min(u64::from(u32::MAX));
                             let next = now.saturating_add(super::scheduler::retry_delay(attempts));
                             tx.execute(
-                                "UPDATE push_delivery SET attempts=?4,next_retry_at_ms=?5 WHERE conversation=?1 AND recipient_install=?2 AND msg_id=?3",
+                                "UPDATE push_delivery SET attempts=?4,next_retry_at_ms=?5 WHERE conversation=?1 AND recipient_install=?2 AND kind=1 AND msg_id=?3",
                                 params![
                                     conversation.0.as_slice(),
                                     recipient.0.as_slice(),
@@ -802,7 +802,7 @@ fn seal(
         // One frame per recipient: a newer one replaces what is still queued (plan 2).
         for recipient in recipients {
             tx.execute(
-                "INSERT OR REPLACE INTO push_delivery VALUES(?1,?2,?3,?4,0,?5,0)",
+                "INSERT OR REPLACE INTO push_delivery VALUES(?1,?2,1,?3,?4,0,?5,0)",
                 params![
                     conversation.0.as_slice(),
                     recipient.0.as_slice(),
@@ -836,7 +836,7 @@ fn due(c: &Connection, now: u64, recipients: &[InstallationId]) -> R<PushDbReply
     } else {
         let reachable = vec!["?"; recipients.len()].join(",");
         let mut q = c
-            .prepare(&format!("SELECT conversation,recipient_install,msg_id,wire FROM push_delivery WHERE next_retry_at_ms<=? AND recipient_install IN ({reachable}) ORDER BY next_retry_at_ms,conversation,recipient_install LIMIT {DUE_MAX}"))
+            .prepare(&format!("SELECT conversation,recipient_install,msg_id,wire FROM push_delivery WHERE kind=1 AND next_retry_at_ms<=? AND recipient_install IN ({reachable}) ORDER BY next_retry_at_ms,conversation,recipient_install LIMIT {DUE_MAX}"))
             .map_err(sql)?;
         let mut values: Vec<rusqlite::types::Value> = vec![now_value.into()];
         values.extend(recipients.iter().map(|r| r.0.to_vec().into()));
@@ -854,7 +854,7 @@ fn due(c: &Connection, now: u64, recipients: &[InstallationId]) -> R<PushDbReply
     };
     let (next, left) = c
         .query_row(
-            "SELECT (SELECT min(next_retry_at_ms) FROM push_delivery WHERE next_retry_at_ms>?1),EXISTS(SELECT 1 FROM push_delivery WHERE next_retry_at_ms<=?1)",
+            "SELECT (SELECT min(next_retry_at_ms) FROM push_delivery WHERE kind=1 AND next_retry_at_ms>?1),EXISTS(SELECT 1 FROM push_delivery WHERE kind=1 AND next_retry_at_ms<=?1)",
             params![now_value],
             |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, bool>(1)?)),
         )
@@ -873,7 +873,7 @@ fn hand_off(c: &mut Connection, fault: Fault) -> R<Vec<HandoffEntry>> {
     let tx = c.transaction().map_err(sql)?;
     let rows: Vec<QueuedFrame> = {
         let mut q = tx
-            .prepare("SELECT d.conversation,v.peer,d.msg_id,min(d.wire) FROM push_delivery d JOIN conversation v ON v.id=d.conversation GROUP BY d.conversation,d.msg_id ORDER BY d.conversation,d.msg_id")
+            .prepare("SELECT d.conversation,v.peer,d.msg_id,min(d.wire) FROM push_delivery d JOIN conversation v ON v.id=d.conversation WHERE d.kind=1 GROUP BY d.conversation,d.msg_id ORDER BY d.conversation,d.msg_id")
             .map_err(sql)?;
         q.query_map([], |r| {
             Ok((bytes(r, 0)?, bytes(r, 1)?, bytes(r, 2)?, r.get(3)?))
@@ -882,7 +882,7 @@ fn hand_off(c: &mut Connection, fault: Fault) -> R<Vec<HandoffEntry>> {
         .collect::<Result<_, _>>()
         .map_err(sql)?
     };
-    tx.execute("UPDATE push_delivery SET handed_off=1 WHERE handed_off=0", [])
+    tx.execute("UPDATE push_delivery SET handed_off=1 WHERE kind=1 AND handed_off=0", [])
         .map_err(sql)?;
     finish(tx, fault)?;
     // The row holds the complete kind 17 `App` frame; the mailbox gets its ciphertext.
@@ -994,7 +994,7 @@ pub(super) fn drop_delivered(
     msg_id: MessageId,
 ) -> R<()> {
     tx.execute(
-        "DELETE FROM push_delivery WHERE conversation=?1 AND msg_id=?2",
+        "DELETE FROM push_delivery WHERE conversation=?1 AND kind=1 AND msg_id=?2",
         params![conversation.0.as_slice(), msg_id.0.as_slice()],
     )
     .map_err(sql)?;
@@ -1259,7 +1259,7 @@ pub(super) fn fixture_state(c: &rusqlite::Connection) -> R<PushState> {
         .collect::<Result<_, _>>()
         .map_err(sql)?;
     let deliveries = c
-        .prepare("SELECT conversation,recipient_install,msg_id,attempts,handed_off FROM push_delivery ORDER BY conversation,recipient_install")
+        .prepare("SELECT conversation,recipient_install,msg_id,attempts,handed_off FROM push_delivery WHERE kind=1 ORDER BY conversation,recipient_install")
         .map_err(sql)?
         .query_map([], |r| {
             Ok(PushDeliveryRow {

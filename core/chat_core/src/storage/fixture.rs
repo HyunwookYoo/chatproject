@@ -514,6 +514,16 @@ pub struct DbProbe {
     pub mailbox_local: Vec<(i64, i64, i64)>,
     /// `push_local` rows; empty before v4.
     pub push_local: Vec<PushLocalProbe>,
+    /// Canonical dump of every `mailbox_*` and `push_*` table (all columns, column order),
+    /// keyed by name. Omits the columns v5 adds: `mailbox_device.qualified`,
+    /// `mailbox_device.last_seen_ms` and `push_delivery.kind`.
+    pub v4_rows: Vec<(String, Vec<u8>)>,
+    /// `queue_local` rows; empty before v5.
+    pub queue_local: Vec<QueueLocalProbe>,
+    /// `push_delivery.kind` by conversation and recipient; empty before v5.
+    pub push_delivery_kind: Vec<i64>,
+    /// `mailbox_device` (qualified, last_seen_ms) by installation; empty before v5.
+    pub mailbox_device_v5: Vec<(i64, Option<i64>)>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PushLocalProbe {
@@ -524,6 +534,14 @@ pub struct PushLocalProbe {
     pub own_tag: Vec<u8>,
     pub own_handle: Option<Vec<u8>>,
     pub own_issued_at_ms: Option<i64>,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueLocalProbe {
+    pub id: i64,
+    pub mode: i64,
+    pub qualified: i64,
+    pub qualified_at_ms: Option<i64>,
+    pub verdict_at_ms: Option<i64>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboxProbe {
@@ -606,6 +624,42 @@ INSERT INTO storage_meta_v2
 DROP TABLE storage_meta;
 ALTER TABLE storage_meta_v2 RENAME TO storage_meta;
 ";
+const V4_DOWNGRADE: &str = "
+DROP TABLE queue_local;
+DROP TABLE queue_own;
+DROP TABLE queue_peer;
+DROP TABLE queue_delivery;
+ALTER TABLE mailbox_device DROP COLUMN last_seen_ms;
+ALTER TABLE mailbox_device DROP COLUMN qualified;
+CREATE TABLE push_delivery_v4 (
+    conversation BLOB NOT NULL CHECK(length(conversation)=32),
+    recipient_install BLOB NOT NULL CHECK(length(recipient_install)=32),
+    msg_id BLOB NOT NULL CHECK(length(msg_id)=16),
+    wire BLOB NOT NULL CHECK(length(wire) BETWEEN 1 AND 61440),
+    attempts INTEGER NOT NULL CHECK(attempts BETWEEN 0 AND 4294967295),
+    next_retry_at_ms INTEGER NOT NULL CHECK(next_retry_at_ms>=0),
+    handed_off INTEGER NOT NULL CHECK(handed_off IN (0,1)),
+    PRIMARY KEY(conversation, recipient_install)
+) STRICT;
+INSERT INTO push_delivery_v4
+    SELECT conversation,recipient_install,msg_id,wire,attempts,next_retry_at_ms,handed_off
+    FROM push_delivery WHERE kind=1;
+DROP TABLE push_delivery;
+ALTER TABLE push_delivery_v4 RENAME TO push_delivery;
+CREATE TABLE storage_meta_v4 (
+    singleton INTEGER PRIMARY KEY NOT NULL CHECK(singleton = 1),
+    schema_version INTEGER NOT NULL CHECK(schema_version = 4),
+    db_id BLOB NOT NULL CHECK(length(db_id) = 16),
+    binding BLOB NOT NULL,
+    legacy_hash BLOB CHECK(legacy_hash IS NULL OR length(legacy_hash) = 32),
+    migration_ready INTEGER NOT NULL CHECK(migration_ready IN (0, 1)),
+    message_revision INTEGER NOT NULL CHECK(message_revision BETWEEN 0 AND 9223372036854775807)
+) STRICT;
+INSERT INTO storage_meta_v4
+    SELECT singleton,4,db_id,binding,legacy_hash,migration_ready,message_revision FROM storage_meta;
+DROP TABLE storage_meta;
+ALTER TABLE storage_meta_v4 RENAME TO storage_meta;
+";
 const V3_DOWNGRADE: &str = "
 DROP TABLE push_local;
 DROP TABLE push_tag;
@@ -651,7 +705,10 @@ fn probe(c: &rusqlite::Connection) -> Result<DbProbe, CoreError> {
         .map_err(probe_error)?
         .query_map([], |r| {
             let sql: String = r.get(1)?;
+            // ADD COLUMN splices its text in before the closing paren, so space before `,` and
+            // `)` is not compared.
             let sql = sql.replace('"', "").split_whitespace().collect::<Vec<_>>().join(" ");
+            let sql = sql.replace(" ,", ",").replace(" )", ")");
             Ok((r.get(0)?, sql))
         })
         .map_err(probe_error)?
@@ -663,7 +720,11 @@ fn probe(c: &rusqlite::Connection) -> Result<DbProbe, CoreError> {
     )?;
     let mut v2_rows = Vec::new();
     for table in &tables {
-        if table.starts_with("mailbox_") || table.starts_with("push_") || table == "sqlite_sequence" {
+        if table.starts_with("mailbox_")
+            || table.starts_with("push_")
+            || table.starts_with("queue_")
+            || table == "sqlite_sequence"
+        {
             continue;
         }
         let later = |column: &String| {
@@ -728,6 +789,66 @@ fn probe(c: &rusqlite::Connection) -> Result<DbProbe, CoreError> {
     } else {
         Vec::new()
     };
+    let mut v4_rows = Vec::new();
+    for table in tables.iter().filter(|t| t.starts_with("mailbox_") || t.starts_with("push_")) {
+        let later = |column: &String| {
+            (table == "mailbox_device" && (column == "qualified" || column == "last_seen_ms"))
+                || (table == "push_delivery" && column == "kind")
+        };
+        let columns: Vec<String> = names(&format!("SELECT name FROM pragma_table_info('{table}') ORDER BY cid"))?
+            .into_iter()
+            .filter(|column| !later(column))
+            .collect();
+        let columns = columns.join(",");
+        v4_rows.push((table.clone(), dump_rows(c, &format!("SELECT {columns} FROM {table} ORDER BY {columns}"))?.0));
+    }
+    let has_column = |table: &str, column: &str| -> Result<bool, CoreError> {
+        c.query_row(
+            &format!("SELECT count(*) FROM pragma_table_info('{table}') WHERE name='{column}'"),
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n == 1)
+        .map_err(probe_error)
+    };
+    let queue_local = if tables.iter().any(|t| t == "queue_local") {
+        c.prepare("SELECT id,mode,qualified,qualified_at_ms,verdict_at_ms FROM queue_local ORDER BY id")
+            .map_err(probe_error)?
+            .query_map([], |r| {
+                Ok(QueueLocalProbe {
+                    id: r.get(0)?,
+                    mode: r.get(1)?,
+                    qualified: r.get(2)?,
+                    qualified_at_ms: r.get(3)?,
+                    verdict_at_ms: r.get(4)?,
+                })
+            })
+            .map_err(probe_error)?
+            .collect::<Result<_, _>>()
+            .map_err(probe_error)?
+    } else {
+        Vec::new()
+    };
+    let push_delivery_kind = if has_column("push_delivery", "kind")? {
+        c.prepare("SELECT kind FROM push_delivery ORDER BY conversation,recipient_install,kind")
+            .map_err(probe_error)?
+            .query_map([], |r| r.get(0))
+            .map_err(probe_error)?
+            .collect::<Result<_, _>>()
+            .map_err(probe_error)?
+    } else {
+        Vec::new()
+    };
+    let mailbox_device_v5 = if has_column("mailbox_device", "qualified")? {
+        c.prepare("SELECT qualified,last_seen_ms FROM mailbox_device ORDER BY installation")
+            .map_err(probe_error)?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(probe_error)?
+            .collect::<Result<_, _>>()
+            .map_err(probe_error)?
+    } else {
+        Vec::new()
+    };
     let outbox = c
         .prepare(&format!(
             "SELECT msg_id,codec,wire,attempts,retry_delay_ms,next_retry_at_ms,dispatch_state,{columns} \
@@ -762,6 +883,10 @@ fn probe(c: &rusqlite::Connection) -> Result<DbProbe, CoreError> {
         v2_rows,
         mailbox_local,
         push_local,
+        v4_rows,
+        queue_local,
+        push_delivery_kind,
+        mailbox_device_v5,
     })
 }
 /// Canonical, type-tagged dump of every row `sql` returns, and the row count.
@@ -1138,7 +1263,7 @@ impl Fixture {
             })
         })
     }
-    /// Rewrite a closed, migrated store into the exact M4 (schema v1) shape: the push, mailbox and MLS
+    /// Rewrite a closed, migrated store into the exact M4 (schema v1) shape: the queue, push, mailbox and MLS
     /// tables and the v2/v4 outbox columns go away, `user_version` and `schema_version` return to 1, and
     /// every queued row becomes the M4 plaintext job (codec 1) with the canonical text frame an
     /// M4 app would have queued for it. Only valid while no row is sealed (codec 2).
@@ -1181,6 +1306,7 @@ impl Fixture {
                 )
                 .map_err(probe_error)?;
             }
+            tx.execute_batch(V4_DOWNGRADE).map_err(probe_error)?;
             tx.execute_batch(V3_DOWNGRADE).map_err(probe_error)?;
             tx.execute_batch(V2_DOWNGRADE).map_err(probe_error)?;
             tx.execute_batch(V1_DOWNGRADE).map_err(probe_error)?;
@@ -1188,24 +1314,71 @@ impl Fixture {
             tx.commit().map_err(probe_error)
         })
     }
-    /// Rewrite a closed, migrated store into the exact M5 (schema v2) shape: the push and mailbox
+    /// Rewrite a closed, migrated store into the exact M5 (schema v2) shape: the queue, push and mailbox
     /// tables and `outbox.pushed` go away and `user_version` and `schema_version` return to 2.
     pub fn downgrade_to_v2(root: &Path, p: Arc<dyn KeyProtector>) -> Result<(), CoreError> {
         crate::storage::migration::with_raw_connection(root, &*p, |c| {
             let tx = c.transaction().map_err(probe_error)?;
+            tx.execute_batch(V4_DOWNGRADE).map_err(probe_error)?;
             tx.execute_batch(V3_DOWNGRADE).map_err(probe_error)?;
             tx.execute_batch(V2_DOWNGRADE).map_err(probe_error)?;
             tx.pragma_update(None, "user_version", 2).map_err(probe_error)?;
             tx.commit().map_err(probe_error)
         })
     }
-    /// Rewrite a closed, migrated store into the exact M6 (schema v3) shape: the push tables and
+    /// Rewrite a closed, migrated store into the exact M6 (schema v3) shape: the queue and push tables and
     /// `outbox.pushed` go away and `user_version` and `schema_version` return to 3.
     pub fn downgrade_to_v3(root: &Path, p: Arc<dyn KeyProtector>) -> Result<(), CoreError> {
         crate::storage::migration::with_raw_connection(root, &*p, |c| {
             let tx = c.transaction().map_err(probe_error)?;
+            tx.execute_batch(V4_DOWNGRADE).map_err(probe_error)?;
             tx.execute_batch(V3_DOWNGRADE).map_err(probe_error)?;
             tx.pragma_update(None, "user_version", 3).map_err(probe_error)?;
+            tx.commit().map_err(probe_error)
+        })
+    }
+    /// Rewrite a closed, migrated store into the exact M7 (schema v4) shape: the queue tables and
+    /// the v5 `mailbox_device` columns go away, `push_delivery` keeps its PushHandle (kind 1) rows
+    /// without `kind`, and `user_version` and `schema_version` return to 4.
+    pub fn downgrade_to_v4(root: &Path, p: Arc<dyn KeyProtector>) -> Result<(), CoreError> {
+        crate::storage::migration::with_raw_connection(root, &*p, |c| {
+            let tx = c.transaction().map_err(probe_error)?;
+            tx.execute_batch(V4_DOWNGRADE).map_err(probe_error)?;
+            tx.pragma_update(None, "user_version", 4).map_err(probe_error)?;
+            tx.commit().map_err(probe_error)
+        })
+    }
+    /// Give a closed v4 store's first conversation two queued `push_delivery` rows (two
+    /// recipients, distinct retry facts, one handed off), a `push_peer` row and a `mailbox_device`
+    /// row, written in the exact v4 column shapes.
+    pub fn seed_v4_rows(root: &Path, p: Arc<dyn KeyProtector>) -> Result<(), CoreError> {
+        crate::storage::migration::with_raw_connection(root, &*p, |c| {
+            let tx = c.transaction().map_err(probe_error)?;
+            let conversation: Vec<u8> = tx
+                .query_row("SELECT id FROM conversation ORDER BY id LIMIT 1", [], |r| r.get(0))
+                .map_err(probe_error)?;
+            for (n, attempts, next, handed_off) in [(3u8, 0, 1_000, 0), (4u8, 7, 99_000, 1)] {
+                tx.execute(
+                    "INSERT INTO push_delivery VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                    rusqlite::params![
+                        conversation,
+                        [n; 32].as_slice(),
+                        [n; 16].as_slice(),
+                        [n; 8].as_slice(),
+                        attempts,
+                        next,
+                        handed_off
+                    ],
+                )
+                .map_err(probe_error)?;
+            }
+            tx.execute(
+                "INSERT INTO push_peer VALUES(?1,?2,x'0102',5,6)",
+                rusqlite::params![conversation, [3u8; 32].as_slice()],
+            )
+            .map_err(probe_error)?;
+            tx.execute("INSERT INTO mailbox_device VALUES(?1,1,42)", [[5u8; 32].as_slice()])
+                .map_err(probe_error)?;
             tx.commit().map_err(probe_error)
         })
     }
@@ -1281,6 +1454,12 @@ impl Fixture {
     pub fn v3_reader_check(root: &Path, p: Arc<dyn KeyProtector>) -> Result<(), CoreError> {
         crate::storage::migration::with_raw_connection(root, &*p, |c| {
             crate::storage::migration::ready_v3(c)
+        })
+    }
+    /// Run the M7 (v4) reader's version check against a closed store.
+    pub fn v4_reader_check(root: &Path, p: Arc<dyn KeyProtector>) -> Result<(), CoreError> {
+        crate::storage::migration::with_raw_connection(root, &*p, |c| {
+            crate::storage::migration::ready_v4(c)
         })
     }
     /// The next schema upgrade of the store under `root` fails after its DDL, before commit.

@@ -637,7 +637,7 @@ pub(super) fn mailbox_op(
                 )
                 .map_err(sql)?;
             tx.execute(
-                "INSERT INTO mailbox_device VALUES(?1,?2,?3) ON CONFLICT(installation) DO UPDATE SET mailbox=excluded.mailbox,announced_at_ms=excluded.announced_at_ms",
+                "INSERT INTO mailbox_device(installation,mailbox,announced_at_ms) VALUES(?1,?2,?3) ON CONFLICT(installation) DO UPDATE SET mailbox=excluded.mailbox,announced_at_ms=excluded.announced_at_ms",
                 params![installation.0.as_slice(), mailbox, integer(at)?],
             )
             .map_err(sql)?;
@@ -1385,7 +1385,7 @@ pub(super) fn fixture_mark(
     at: u64,
 ) -> R<()> {
     c.execute(
-        "INSERT INTO mailbox_device VALUES(?1,?2,?3) ON CONFLICT(installation) DO UPDATE SET mailbox=excluded.mailbox,announced_at_ms=excluded.announced_at_ms",
+        "INSERT INTO mailbox_device(installation,mailbox,announced_at_ms) VALUES(?1,?2,?3) ON CONFLICT(installation) DO UPDATE SET mailbox=excluded.mailbox,announced_at_ms=excluded.announced_at_ms",
         params![installation.0.as_slice(), mailbox, integer(at)?],
     )
     .map_err(sql)?;
@@ -1435,7 +1435,7 @@ pub(super) fn fixture_seed(c: &Connection, installation: InstallationId, at: u64
     let at = integer(at)?;
     let i = installation.0.as_slice();
     c.execute(
-        "INSERT INTO mailbox_device VALUES(?1,1,?2)",
+        "INSERT INTO mailbox_device(installation,mailbox,announced_at_ms) VALUES(?1,1,?2)",
         params![i, at],
     )
     .map_err(sql)?;
