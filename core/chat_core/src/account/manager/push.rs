@@ -52,7 +52,8 @@ use crate::account::connection::{Input, Session};
 use crate::message::{
     mls_group::Delivery,
     push_store::{
-        FirstAttempt, Issued, PushBatch, PushDbOp, PushDbReply, PushDue, RenewPlan, Tagged,
+        FirstAttempt, FrameKind, Issued, PushBatch, PushDbOp, PushDbReply, PushDue, RenewPlan,
+        Tagged,
     },
     store::{MessageDbOp, MessageDbReply},
     types::{ConversationId, MessageId, MessageKey},
@@ -210,6 +211,7 @@ pub(crate) enum PushEvent {
         ticket: u64,
         conversation: ConversationId,
         recipient: InstallationId,
+        kind: FrameKind,
         msg_id: MessageId,
         outcome: Delivery,
     },
@@ -1022,6 +1024,7 @@ impl Manager {
                 ticket,
                 conversation,
                 recipient,
+                kind,
                 msg_id,
                 outcome,
             } => {
@@ -1034,6 +1037,7 @@ impl Manager {
                 let op = PushDbOp::Delivered {
                     conversation,
                     recipient,
+                    kind,
                     msg_id,
                     outcome,
                     now: self.schedule_now(),
@@ -1738,6 +1742,7 @@ fn push_launch(
                 ticket,
                 conversation: row.conversation,
                 recipient: row.recipient,
+                kind: row.kind,
                 msg_id: row.msg_id,
                 outcome,
             }))
