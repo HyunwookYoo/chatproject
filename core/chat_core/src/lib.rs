@@ -13,6 +13,7 @@ pub mod mls;
 #[cfg(not(feature = "nse"))]
 mod mls;
 pub mod push;
+pub mod queue;
 mod storage;
 pub mod transport;
 

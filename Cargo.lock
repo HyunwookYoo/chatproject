@@ -698,6 +698,8 @@ dependencies = [
  "pkarr",
  "push_proxy",
  "push_wire",
+ "queue_server",
+ "queue_wire",
  "reqwest",
  "rmp-serde",
  "rusqlite",
