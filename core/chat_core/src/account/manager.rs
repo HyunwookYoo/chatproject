@@ -74,9 +74,8 @@ pub struct QueueStateView {
     /// Whether the account has a qualified mailbox, as last worked out (hourly, and when what
     /// it is made of changes).
     pub verdict: Verdict,
-    /// Whether this device uses a server queue. While no queue is made yet, this is what the
-    /// table of spec 5.3 wants for `mode` and `verdict`; once queues are made, it says that
-    /// this device has one.
+    /// Whether this device uses a server queue: it has an `Active` queue the server took (the
+    /// table of spec 5.3 says what is wanted; `manager/queue.rs` makes it so).
     pub using_queue: bool,
     /// Time up as a mailbox within the last 7 days, per mille of them.
     pub uptime_7d_permille: u32,
@@ -263,6 +262,8 @@ struct Shared {
     /// The latest `push_configure`, taken by the actor at its next poll, and the network a
     /// received push started (M7).
     push: push::Shared,
+    /// The latest `queue_configure`, taken by the actor at its next poll (M8).
+    queue: queue::Shared,
 }
 #[derive(Clone)]
 pub struct AccountHandle {
@@ -326,6 +327,7 @@ impl AccountHandle {
             requests,
             status: AtomicU64::new(ticket << 2),
             push: Default::default(),
+            queue: Default::default(),
         });
         let (commands, input) = mpsc::channel(32);
         let auth = super::connection::Runtime::default();
@@ -2107,6 +2109,7 @@ mod tests {
             requests,
             status: AtomicU64::new((ticket << 2) | 1),
             push: Default::default(),
+            queue: Default::default(),
         });
         let sink = Arc::new(BoundarySink {
             network,
@@ -2240,6 +2243,7 @@ mod tests {
             requests,
             status: AtomicU64::new(ticket << 2),
             push: Default::default(),
+            queue: Default::default(),
         });
         let backend = Arc::new(Backend {
             absent: AtomicBool::new(false),
@@ -2352,6 +2356,7 @@ mod tests {
                     requests,
                     status: AtomicU64::new(ticket << 2),
                     push: Default::default(),
+                    queue: Default::default(),
                 }),
                 services: offline_services(),
             };
@@ -2484,6 +2489,7 @@ mod tests {
             requests,
             status: AtomicU64::new(ticket << 2),
             push: Default::default(),
+            queue: Default::default(),
         });
         let mut manager = Manager {
             messages: Default::default(),
@@ -2583,6 +2589,7 @@ mod tests {
             requests,
             status: AtomicU64::new(ticket << 2),
             push: Default::default(),
+            queue: Default::default(),
         });
         let mut manager = Manager {
             messages: Default::default(),
@@ -3213,6 +3220,7 @@ impl Manager {
             Input::Mls(event)=>self.mls_event(event).await,
             Input::Mailbox(event)=>self.mailbox_event(event).await,
             Input::Push(event)=>self.push_event(event).await,
+            Input::Queue(event)=>self.queue_event(event).await,
             Input::Incoming(conn) => {
                 // My device that showed an older record of the accepted shape (Ruling R30), dialed
                 // back if its authentication still fails (Ruling R31).
@@ -4039,5 +4047,6 @@ pub(super) mod mls;
 pub use mls::GroupState;
 pub(super) mod mailbox;
 pub(super) mod push;
+pub(super) mod queue;
 #[cfg(all(feature="test-hooks",debug_assertions))]
 pub use mailbox::MailboxCounters;

@@ -1005,9 +1005,19 @@ pub(super) fn open_app(
                 Stored::Yes
             }
             // M8 spec 7.2: the sender's queue (or its withdrawal), from either account, since
-            // my other devices send in this conversation too. Taken (processed, logged,
-            // acknowledged) and not kept yet: storing it in `queue_peer` goes here.
-            Content::QueueRef(_) => Stored::Yes,
+            // my other devices send in this conversation too.
+            Content::QueueRef(queue) => {
+                super::queue_store::store_peer_ref(
+                    &tx,
+                    conversation,
+                    sender_install,
+                    queue.as_ref(),
+                    message.sent_at_ms,
+                    now,
+                    from.queue_url.as_deref(),
+                )?;
+                Stored::Yes
+            }
             // Content this version does not know is dropped (spec 5.1 `Custom` fallback).
             Content::Custom { .. } => Stored::Yes,
         };
@@ -1833,6 +1843,7 @@ mod tests {
             transport: Some(b2.installation_id()),
             allowed: vec![b1.installation_id(), b2.installation_id()],
             pull: None,
+            queue_url: None,
         };
         let reply = open(&mut b1_connection, own, ciphertext);
         assert!(matches!(
@@ -1863,6 +1874,7 @@ mod tests {
             transport: Some(a1.installation_id()),
             allowed: vec![a1.installation_id()],
             pull: None,
+            queue_url: None,
         };
         let reply = open(&mut b1_connection, peer, ciphertext);
         assert!(matches!(
@@ -1980,6 +1992,7 @@ mod tests {
                     transport: Some(a_device.installation_id()),
                     allowed: vec![a_device.installation_id()],
                     pull: None,
+                    queue_url: None,
                 },
                 conversation,
                 ciphertext.clone(),

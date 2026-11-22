@@ -2704,6 +2704,7 @@ impl Manager {
                 Via::Mailbox { holder, .. } => Some(*holder),
                 Via::Direct(_) | Via::Push => None,
             },
+            queue_url: self.queue_url(),
         };
         let op = MessageDbOp::OpenApp(
             open,

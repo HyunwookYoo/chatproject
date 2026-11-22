@@ -946,17 +946,25 @@ impl Manager {
         Ok(QueueStateView {
             mode: facts.mode,
             verdict,
-            using_queue: verdict::wants_queue(facts.mode, &verdict),
+            using_queue: self.queue_using(request).await?,
             uptime_7d_permille: facts.uptime_7d_permille,
         })
     }
 
-    /// Sets the server queue setting (M8 spec 5.3). The verdict does not depend on it.
+    /// The verdict as last worked out (`None`: not yet since it last had to be worked out
+    /// again), for the queues (`manager/queue.rs`) to follow.
+    pub(super) fn mailbox_verdict(&self) -> Option<Verdict> {
+        self.messages.mailbox.verdict
+    }
+
+    /// Sets the server queue setting (M8 spec 5.3). The verdict does not depend on it; the
+    /// queues follow it at the next poll.
     pub(super) async fn set_queue_mode(&mut self, mode: QueueMode) -> Result<(), CoreError> {
         let request = self.ready()?;
         self.mailbox_db(MailboxDbOp::SetQueueMode(mode), request)
-            .await
-            .map(|_| ())
+            .await?;
+        self.queue_changed();
+        Ok(())
     }
 
     async fn queue_facts(

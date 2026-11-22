@@ -18,7 +18,9 @@
 //!   replaces what is still queued. The queue is sent like `mls_delivery`: over a ready
 //!   session, one frame per recipient at a time, a recipient without one dialed at most every
 //!   `DIAL_RETRY_MS`, back-off 1 s doubling to 5 min. A mailbox handoff (M6 spec 7) carries the
-//!   queue too; its `Delivered` note empties the rows of that frame.
+//!   queue too; its `Delivered` note empties the rows of that frame. The `QueueRef` frames of
+//!   this device's server queues (M8, `manager/queue.rs`) are rows of their own kind in the same
+//!   table, sent, acknowledged and handed off the same way.
 //! * Push off: every conversation that had a handle gets a withdrawal (an empty handle), the
 //!   token and handles are dropped, and no proxy request is made until push is on again.
 //! * What revoked or unlisted devices announced, and what is queued for them, goes when the
@@ -511,6 +513,17 @@ impl Manager {
     /// `push_local` was read, so `push_own_handle` is what is stored.
     pub(super) fn push_loaded(&self) -> bool {
         self.messages.push.loaded
+    }
+
+    /// The hash of the device lists this poll pruned against (`None` before the first).
+    pub(super) fn push_devices(&self) -> Option<[u8; 32]> {
+        self.messages.push.fingerprint
+    }
+
+    /// New frames were queued in `push_delivery` (the queues' `QueueRef`s): read at the next
+    /// poll.
+    pub(super) fn push_deliver_soon(&mut self) {
+        self.messages.push.delivery_at = None;
     }
 
     /// Reads `push_local` again. A changed own-device handle reaches my other devices with the

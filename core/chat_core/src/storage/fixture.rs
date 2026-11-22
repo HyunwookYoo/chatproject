@@ -269,7 +269,36 @@ impl Messages {
         ciphertext: Vec<u8>,
         now: u64,
     ) -> Result<crate::mls::wire::MlsReply, CoreError> {
-        let from = crate::message::store::OpenFrom { peer: sender, transport: Some(transport), allowed, pull };
+        let from = crate::message::store::OpenFrom { peer: sender, transport: Some(transport), allowed, pull, queue_url: None };
+        self.mls_open(from, conversation, ciphertext, now).await
+    }
+    /// `mls_open_app` on a device whose queue server is `queue_url`: a `QueueRef` on it is
+    /// taken (M8 spec 7.2).
+    pub async fn mls_open_app_queue(
+        &self,
+        sender: crate::account::PeerId,
+        installation: crate::account::InstallationId,
+        conversation: ConversationId,
+        ciphertext: Vec<u8>,
+        now: u64,
+        queue_url: &str,
+    ) -> Result<crate::mls::wire::MlsReply, CoreError> {
+        let from = crate::message::store::OpenFrom {
+            peer: sender,
+            transport: Some(installation),
+            allowed: vec![installation],
+            pull: None,
+            queue_url: Some(queue_url.into()),
+        };
+        self.mls_open(from, conversation, ciphertext, now).await
+    }
+    async fn mls_open(
+        &self,
+        from: crate::message::store::OpenFrom,
+        conversation: ConversationId,
+        ciphertext: Vec<u8>,
+        now: u64,
+    ) -> Result<crate::mls::wire::MlsReply, CoreError> {
         let op = MessageDbOp::OpenApp(from, conversation, ciphertext, now);
         match self.mls(op).await? {
             MessageDbReply::Opened(reply)
@@ -1154,6 +1183,12 @@ impl Fixture {
         self.handle.0.test(TestOp::Message(FixtureOp::PushPeerState(tx))).await;
         rx.await.unwrap()
     }
+    /// This device's queues and the ones other devices announced (M8).
+    pub async fn queue_tables(&self) -> Result<QueueTables, CoreError> {
+        let (tx, rx) = oneshot::channel();
+        self.handle.0.test(TestOp::Message(FixtureOp::QueueTables(tx))).await;
+        rx.await.unwrap()
+    }
     /// This device's push setting, handles and their queued deliveries.
     pub async fn push_state(&self) -> Result<PushState, CoreError> {
         let (tx, rx) = oneshot::channel();
@@ -1585,6 +1620,7 @@ pub use crate::account::MessageMutation;
 pub use crate::mls::wire::{MlsFrame, MlsReply};
 pub use crate::mls::push_ct::{PushCtError, restore_group_id, strip_group_id};
 pub use crate::mls::payload::QueueRefBody;
+pub use crate::message::queue_store::{QueueOwnRow, QueuePeerRow, QueueTables};
 pub use crate::message::push_store::{
     PushDeliveryRow, PushPeerRow, PushPeerState, PushState, PushTagRow,
 };

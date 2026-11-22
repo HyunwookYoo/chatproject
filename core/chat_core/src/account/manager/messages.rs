@@ -73,6 +73,8 @@ pub(super) struct Runtime {
     pub(super) mailbox: super::mailbox::Runtime,
     /// Push handle state (`manager/push.rs`).
     pub(super) push: super::push::Runtime,
+    /// Server queue state (`manager/queue.rs`).
+    pub(super) queue: super::queue::Runtime,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     writes: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
@@ -1876,6 +1878,8 @@ impl Manager {
         self.poll_push().await;
         // Own-device sync: device list, retention, pulls and `Notify`s (`manager/mailbox.rs`).
         self.poll_mailbox().await;
+        // Server queues (`manager/queue.rs`): after the verdict `poll_mailbox` works out.
+        self.poll_queue().await;
         #[cfg(all(feature = "test-hooks", debug_assertions))]
         if self.messages.scheduler_held {
             return;
