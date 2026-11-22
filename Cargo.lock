@@ -4353,6 +4353,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "queue_server"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "http-body-util",
+ "http_guard",
+ "queue_wire",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "tower",
+]
+
+[[package]]
 name = "queue_wire"
 version = "0.1.0"
 dependencies = [
