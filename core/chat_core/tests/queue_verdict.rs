@@ -161,7 +161,7 @@ async fn qualified_announced_only_on_change() {
     }
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(told(&a2, &a1).await.len(), sent);
-    assert_eq!(mailbox(&a2).await.queue_local.1, true);
+    assert!(mailbox(&a2).await.queue_local.1);
     assert_eq!(mailbox(&a2).await.queue_local.2, qualified_at);
 
     // Down to 500 per mille: worked out at the next poll after the seed, announced once.
