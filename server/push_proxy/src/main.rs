@@ -48,8 +48,8 @@ async fn run(config: Config, mut state: AppState) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let header_timeout = state.limits.header_timeout;
-    serve(listener, router(state), header_timeout).await;
+    let limits = state.limits;
+    serve(listener, router(state), limits).await;
     ExitCode::SUCCESS
 }
 
