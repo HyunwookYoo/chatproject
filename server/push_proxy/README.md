@@ -30,11 +30,13 @@ sudo install -m 0755 /tmp/push_proxy /usr/local/bin/push_proxy
 
 [`deploy/setup.sh`](deploy/setup.sh) does every server step below on an Ubuntu
 24.04 VM (the Oracle Cloud image): swap, Caddy, the VM firewall, the user, the
-files, the systemd unit and the Caddyfile. Copy the binary to `/tmp/push_proxy`
-and, on the first run, the service account to `/tmp/fcm-service-account.json`,
-then run `sudo bash /tmp/setup.sh <domain>`. Run it again with a new binary to
-upgrade; it keeps the existing handle key. Change the unit or the Caddyfile here
-and in the script together.
+files, the systemd unit and the Caddyfile. It sets up the
+[queue server](../queue_server/README.md) on the same VM too. Copy the binaries
+to `/tmp/push_proxy` and `/tmp/queue_server` and, on the first run, the service
+account to `/tmp/fcm-service-account.json`, then run
+`sudo bash /tmp/setup.sh <domain>`. Run it again with a new binary (either or
+both) to upgrade; it keeps the existing handle key. Change the unit or the
+Caddyfile here and in the script together.
 
 Configuration is environment variables and secret file paths only. Errors name
 the variable, never its value.
@@ -133,13 +135,9 @@ keep opening as long as the keys are the same.
 ## Caddy (TLS, Let's Encrypt)
 
 `/etc/caddy/Caddyfile`, with `push.example.com` pointing at the server and ports
-80 and 443 open (Caddy obtains and renews the certificate itself):
-
-```caddy
-push.example.com {
-	reverse_proxy 127.0.0.1:8787
-}
-```
+80 and 443 open (Caddy obtains and renews the certificate itself): every path
+but `/q/*` goes to the proxy on `127.0.0.1:8787`. The file, with the queue
+server's route, is in the [queue server README](../queue_server/README.md#caddy).
 
 Caddy replaces any client-sent `X-Forwarded-For` with the peer address it saw,
 which is what `PUSH_TRUST_PROXY=1` relies on. Keep `PUSH_LISTEN` on

@@ -17,6 +17,26 @@ cargo build --locked -p queue_server --release
 # binary: target/release/queue_server
 ```
 
+The server (the push proxy's 1 GB VM) takes the binary from CI: the
+`push-proxy` job of every `ci` run uploads `queue_server-x86_64-linux` next to
+`push_proxy-x86_64-linux`, built on Ubuntu 24.04 for x86_64 (the server needs
+the same or a newer glibc). Download it from a green run of `main` and copy it
+over:
+
+```sh
+gh run download <run-id> -n queue_server-x86_64-linux -D queue_server-bin
+scp queue_server-bin/queue_server ubuntu@<server>:/tmp/queue_server
+```
+
+The push proxy's [`deploy/setup.sh`](../push_proxy/deploy/setup.sh) sets up
+both servers, since they share the VM, the swap, the firewall and one Caddy
+site: it installs the binary, the user, the systemd unit and the Caddyfile
+below. Copy the binary to `/tmp/queue_server` (on the first run also the push
+proxy's files, see its [README](../push_proxy/README.md)), then run
+`sudo bash /tmp/setup.sh <domain>`. Run it again with a new binary to upgrade;
+it never touches `/var/lib/queue_server`, so the queues stay. Change the unit or
+the Caddyfile here and in the script together.
+
 Configuration is environment variables only. Errors name the variable, never
 its value.
 
@@ -26,6 +46,90 @@ its value.
 | `QUEUE_DB` | SQLite file, default `/var/lib/queue_server/queue.db`; created on first start |
 | `QUEUE_MAX_BYTES` | used bytes of the file (SQLite pages in use) past which `SEND` is `limited`, default 2 GiB |
 | `QUEUE_TRUST_PROXY` | `1` only behind the reverse proxy: per-client limits then use the last `X-Forwarded-For` entry. Unset or `0`: the TCP peer |
+
+## Files on the server
+
+| Path | Mode | Content |
+|---|---|---|
+| `/var/lib/queue_server/` | `0700 queue-server` | systemd's `StateDirectory`: `queue.db` and its `-wal` and `-shm` files. The only place the server writes |
+
+There is no secret and no env file: the variables are in the unit.
+
+## systemd
+
+`/etc/systemd/system/queue_server.service`:
+
+```ini
+[Unit]
+Description=ChatProject queue server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=queue-server
+Group=queue-server
+Environment=QUEUE_LISTEN=127.0.0.1:8788
+Environment=QUEUE_DB=/var/lib/queue_server/queue.db
+Environment=QUEUE_TRUST_PROXY=1
+ExecStart=/usr/local/bin/queue_server
+Restart=on-failure
+RestartSec=2
+# 128 connections hold at most ~221 MiB of request bodies (src/limit.rs).
+MemoryMax=256M
+# The server writes its database and nothing else.
+StateDirectory=queue_server
+StateDirectoryMode=0700
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```sh
+useradd --system --no-create-home --shell /usr/sbin/nologin queue-server
+install -m 0755 target/release/queue_server /usr/local/bin/queue_server
+systemctl daemon-reload
+systemctl enable --now queue_server
+journalctl -u queue_server -f   # the request and sweep lines
+```
+
+`MemoryMax` is the connection cap's bound (`MAX_CONNECTIONS` in
+`src/limit.rs`) plus room for the process itself: past it the kernel kills the
+server and systemd starts it again. A restart loses only the in-memory rate
+buckets; the queues and entries are in the database.
+
+## Caddy
+
+The push proxy's site, with `/q/*` routed here. `/etc/caddy/Caddyfile`, with
+`push.example.com` pointing at the server and ports 80 and 443 open:
+
+```caddy
+push.example.com {
+	handle /q/* {
+		reverse_proxy 127.0.0.1:8788
+	}
+	handle {
+		reverse_proxy 127.0.0.1:8787
+	}
+}
+```
+
+The paths keep their `/q/` prefix (`handle`, not `handle_path`): the server
+routes `/q/create` and the rest as they are. Caddy replaces any client-sent
+`X-Forwarded-For` with the peer address it saw, which is what
+`QUEUE_TRUST_PROXY=1` relies on; keep `QUEUE_LISTEN` on `127.0.0.1` so nothing
+reaches the server around Caddy. Leave Caddy's access log off: it would record
+client IPs.
 
 ## Commands
 
