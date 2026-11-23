@@ -331,8 +331,8 @@ async fn never_mode_sends_nothing() {
 }
 
 /// Review Focus 5: a peer announces a queue on another server. The device takes the frame
-/// (acknowledged, nothing left to send it) and keeps nothing of it, so nothing it ever sends
-/// reaches that server.
+/// (acknowledged, nothing left to send it) and keeps nothing of it. (That nothing it sends
+/// reaches that server is Task 10's to show, once it sends.)
 #[tokio::test]
 async fn foreign_queue_url_is_ignored() {
     let (mut a, b1, net, conv) = queue_accounts(&[A1]).await;
@@ -355,13 +355,81 @@ async fn foreign_queue_url_is_ignored() {
     );
     assert_eq!(peer_queue(&b1, conv, &a1).await, None);
     assert_eq!(peer_queue(&a1, conv, &b1).await, None);
-    let foreign = active(&a1).await[0].queue_id;
-    assert!(
-        server
-            .calls_from(&b1)
-            .iter()
-            .all(|c| !c.queues.contains(&foreign))
+    let _ = server;
+}
+
+/// Spec 5.3: in the mode "always" the device keeps a queue even while its account has a
+/// qualified mailbox (spec 2's exception): it creates one and announces it.
+#[tokio::test]
+async fn always_mode_makes_a_queue_beside_a_qualified_mailbox() {
+    let (mut a, b1, net, conv) = queue_accounts(&[A1, A2]).await;
+    let (a1, a2) = (a.remove(0), a.remove(0));
+    let server = queue_server(&net);
+    a1.account.set_queue_mode(QueueMode::Always).await.unwrap();
+    qualified_mailbox(&a1, &a2, &[&b1]).await;
+    for f in [&a1, &a2, &b1] {
+        configure(f, QUEUE_URL);
+    }
+    settle!(
+        [&a1, &a2, &b1],
+        peer_queue(&b1, conv, &a1).await.flatten().is_some()
+            && queue_ref_deliveries(&a1).await == 0
     );
+    let a2_id = installation(&a2).await;
+    assert_eq!(
+        verdict(&a1).await,
+        Verdict::HasMailbox {
+            installation: a2_id
+        }
+    );
+    let mine = active(&a1).await;
+    assert_eq!(mine.len(), 1);
+    assert!(mine[0].server_confirmed);
+    assert_eq!(
+        peer_queue(&b1, conv, &a1).await.flatten().map(|q| q.1),
+        Some(mine[0].queue_id)
+    );
+    assert_eq!(server.sent(&a1, CommandName::Create).len(), 1);
+    assert!(a1.account.queue_state().await.unwrap().using_queue);
+}
+
+/// Review M1: the server refuses every `CREATE` item (`limited`) for good. The device asks
+/// again at the hourly check, not at each step of the back-off, so a lasting refusal costs the
+/// server's limit (500 items an hour) one item an hour for each queue.
+#[tokio::test]
+async fn refused_create_waits_for_the_hourly_check() {
+    let (mut a, _b1, net, _conv) = queue_accounts(&[A1]).await;
+    let a1 = a.remove(0);
+    let none = queue_server::Limits {
+        create_per_hour: 0,
+        create_burst: 0,
+        ..Default::default()
+    };
+    let server = queue_server_with(&net, none);
+    configure(&a1, QUEUE_URL);
+    settle!([&a1], !server.sent(&a1, CommandName::Create).is_empty());
+    // 50 minutes of scheduler time: the M4 back-off (1 s doubling to 5 min) would have asked
+    // about 15 times by then.
+    for _ in 0..100 {
+        a1.clock.advance_monotonic_ms(30_000);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(server.sent(&a1, CommandName::Create).len(), 1);
+    let mine = active(&a1).await;
+    assert_eq!(mine.len(), 1);
+    assert!(!mine[0].server_confirmed);
+    for _ in 0..30 {
+        a1.clock.advance_monotonic_ms(30_000);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    settle!([&a1], server.sent(&a1, CommandName::Create).len() == 2);
+    // The same queue, asked for again.
+    let named: Vec<QueueId> = server
+        .sent(&a1, CommandName::Create)
+        .into_iter()
+        .flat_map(|c| c.queues)
+        .collect();
+    assert_eq!(named, [mine[0].queue_id, mine[0].queue_id]);
 }
 
 /// Review I1: a `QueueRef` that reaches the device right after `queue_configure`, before the
@@ -376,7 +444,7 @@ async fn queue_ref_right_after_configure_is_kept() {
     let body = chat_core::storage_fixture::QueueRefBody {
         server_url: QUEUE_URL.into(),
         queue_id: [7; 32],
-        sender_secret: [8; 32],
+        sender_secret: [8; 32].into(),
     };
     let ct = a1
         .account
@@ -422,7 +490,7 @@ async fn newer_queue_ref_frame_wins_and_tombstone_stays() {
     let late = |queue: &QueueOwnRow| chat_core::storage_fixture::QueueRefBody {
         server_url: QUEUE_URL.into(),
         queue_id: queue.queue_id,
-        sender_secret: queue.sender_secret,
+        sender_secret: queue.sender_secret.into(),
     };
     // The first queue's frame again, late: the second stays.
     let ct = a_messages

@@ -93,8 +93,8 @@ pub struct QueueRefBody {
     /// 1 to `MAX_SERVER_URL` bytes.
     pub server_url: String,
     pub queue_id: [u8; 32],
-    /// Ed25519 private key.
-    pub sender_secret: [u8; 32],
+    /// Ed25519 private key, wiped when the body drops.
+    pub sender_secret: Zeroizing<[u8; 32]>,
 }
 
 impl fmt::Debug for QueueRefBody {
@@ -301,7 +301,7 @@ impl ChatMessage {
                         .array(3)?
                         .str(&queue.server_url)?
                         .bytes(&queue.queue_id)?
-                        .bytes(&queue.sender_secret)?;
+                        .bytes(queue.sender_secret.as_slice())?;
                 }
                 Content::Custom { kind, data } => {
                     e.array(2)?.u64(u64::from(*kind))?.bytes(data)?;
@@ -391,7 +391,7 @@ impl ChatMessage {
                     Some(QueueRefBody {
                         server_url: server_url.to_owned(),
                         queue_id: fixed(d)?,
-                        sender_secret: fixed(d)?,
+                        sender_secret: Zeroizing::new(fixed(d)?),
                     })
                 })
             }
@@ -684,7 +684,7 @@ mod tests {
         QueueRefBody {
             server_url: server_url.into(),
             queue_id: [5; 32],
-            sender_secret: [6; 32],
+            sender_secret: [6; 32].into(),
         }
     }
 
@@ -827,7 +827,7 @@ mod tests {
         let body = QueueRefBody {
             server_url: "https://hidden.example".into(),
             queue_id: [0xab; 32],
-            sender_secret: [0xcd; 32],
+            sender_secret: [0xcd; 32].into(),
         };
         let m = message(Content::QueueRef(Some(body.clone())));
         for printed in [format!("{m:?}"), format!("{body:?}"), format!("{body:#?}")] {

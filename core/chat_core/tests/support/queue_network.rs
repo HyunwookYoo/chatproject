@@ -46,12 +46,13 @@ struct FakeQueueServer {
 }
 
 impl FakeQueueServer {
-    fn new() -> Arc<Self> {
+    fn new(limits: queue_server::Limits) -> Arc<Self> {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("queue.db");
         let store = queue_server::Store::open(&db).unwrap();
         let now = Arc::new(AtomicU64::new(NOW * 1_000));
         let mut state = queue_server::AppState::new(store);
+        state.limits = limits;
         let clock = now.clone();
         state.clock = Arc::new(move || clock.load(Ordering::SeqCst));
         state.log = Arc::new(|_: &str| {});
@@ -253,7 +254,12 @@ impl QueueServer for QueueFrom {
 
 /// The queue server every core on `net` reaches from now on.
 fn queue_server(net: &Arc<Backend>) -> Arc<FakeQueueServer> {
-    let server = FakeQueueServer::new();
+    queue_server_with(net, queue_server::Limits::default())
+}
+
+/// The same, with `limits` instead of the spec's.
+fn queue_server_with(net: &Arc<Backend>, limits: queue_server::Limits) -> Arc<FakeQueueServer> {
+    let server = FakeQueueServer::new(limits);
     let at = server.clone();
     *net.queue.lock().unwrap() = Some(Arc::new(move |clock: &Arc<FakeClock>| {
         Arc::new(QueueFrom {

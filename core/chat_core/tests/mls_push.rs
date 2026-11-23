@@ -281,7 +281,7 @@ async fn queue_ref_is_not_a_text() {
     let queue = QueueRefBody {
         server_url: "https://queue.example".into(),
         queue_id: [0x31; 32],
-        sender_secret: [0x32; 32],
+        sender_secret: [0x32; 32].into(),
     };
     let sealed = [
         a.m.mls_seal_queue_ref(conversation, Some(queue), 1_000)

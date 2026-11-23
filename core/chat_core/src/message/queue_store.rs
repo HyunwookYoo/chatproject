@@ -1,26 +1,22 @@
 //! Queue rows of the message store (M8, schema v5): this device's queues (`queue_own`, spec 6.2)
 //! and the queues other devices announced (`queue_peer`, spec 7.2). The `QueueRef` frames this
 //! device seals ride `push_delivery` as kind 2 (`FrameKind::QueueRef`), sent like the push
-//! handles' frames. Each `QueueDbOp` is one transaction; `store_peer_ref` runs inside the
-//! caller's.
+//! handles' frames. `Apply` and `Settle` write one transaction per queue (as push's `Seal`
+//! writes one per conversation), so a queue that fails holds up no other; `store_peer_ref` runs
+//! inside the caller's.
 use queue_wire::{QueueId, RETIRE_MS};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use zeroize::Zeroizing;
 
-use super::mls_group::{group_row, signer_of, sql};
-use super::mls_store::{Fault, finish, seal_one};
-use super::push_store::FrameKind;
+use super::mls_group::sql;
+use super::mls_store::{Fault, finish};
+use super::push_store::{FrameKind, Routing, recipients};
 use super::store::{Identity, MessageDbReply, bytes, integer, uint};
-use super::types::{ConversationId, MessageKey};
+use super::types::ConversationId;
 use crate::account::{InstallationId, PeerId, storage::schema::LocalAccount};
 use crate::mailbox::verdict::QueueMode;
-use crate::mls::{
-    MlsProvider,
-    kv::KvStore,
-    payload::{MAX_SERVER_URL, QueueRefBody, queue_ref_message},
-};
+use crate::mls::payload::{MAX_SERVER_URL, QueueRefBody, queue_ref_message};
 use crate::{CoreError, ErrorCode};
-use openmls_traits::OpenMlsProvider as _;
 
 type R<T> = Result<T, CoreError>;
 
@@ -32,8 +28,8 @@ pub(crate) enum QueueState {
     Retiring { delete_at_ms: u64 },
 }
 
-/// One `queue_own` row. For an `Active` queue `confirmed` says the server took its `CREATE` and
-/// its `QueueRef` is queued for the peer; for a `Retiring` one, that the server took it.
+/// One `queue_own` row. `confirmed`: the server took its `CREATE` and its `QueueRef` was queued
+/// for the peer, both while it was `Active` (one transaction, `confirm`).
 pub(crate) struct OwnQueue {
     pub id: QueueId,
     pub conversation: ConversationId,
@@ -65,9 +61,9 @@ pub(crate) enum QueueDbOp {
     Load,
     /// Whether this device has an `Active` queue the server took (`QueueStateView.using_queue`).
     Using,
-    /// The local half of a reconcile, in one transaction: `retire` goes `Retiring` (its
-    /// withdrawal sealed for each current device of the peer when `true`), then `new` rows are
-    /// written, and `forget` rows are dropped without a request. `devices`: each peer account's
+    /// The local half of a reconcile: `retire` goes `Retiring` (its withdrawal sealed for each
+    /// current device of the peer when `true`), then `new` rows are written, and `forget` rows
+    /// are dropped without a request. `devices`: each peer account's
     /// current devices; `wall` the time frames and states are stamped at, `now` the scheduler
     /// time their deliveries are due at.
     Apply {
@@ -102,12 +98,14 @@ impl QueueDbOp {
 pub(crate) enum QueueDbReply {
     Loaded(QueueView),
     Using(bool),
-    /// Withdrawals sealed.
+    /// Withdrawals sealed, and the `new` queues written: only those go to the server.
     Applied {
         withdrawn: u32,
+        written: Vec<QueueId>,
     },
     /// `QueueRef`s sealed, and created `Active` queues whose `QueueRef` could not be sealed yet
-    /// (no group or no known device of the peer): they stay unconfirmed for a later run.
+    /// (no group, no known device of the peer, or a fault in its conversation): they stay
+    /// unconfirmed for a later run.
     Settled {
         announced: u32,
         unsealed: u32,
@@ -139,52 +137,39 @@ pub(super) fn queue_op(
             wall,
             now,
         } => {
-            let tx = c.transaction().map_err(sql)?;
             let seal = Sealer {
-                identity,
-                local,
+                routing: Routing {
+                    identity,
+                    local,
+                    wall,
+                    now,
+                },
                 devices: &devices,
-                wall,
-                now,
             };
+            // One transaction per queue (as push seals one per conversation): a queue that
+            // fails is left as it was and planned again, and the others go on.
             let mut withdrawn = 0;
             for (id, withdraw) in retire {
-                let Some(conversation) = active_conversation(&tx, &id)? else {
-                    continue;
-                };
-                let at = wall.max(floor(&tx, conversation)?.saturating_add(1));
-                tx.execute(
-                    "UPDATE queue_own SET state=1,delete_at_ms=?2 WHERE queue_id=?1 AND state=0",
-                    params![id.as_slice(), integer(at.saturating_add(RETIRE_MS))?],
-                )
-                .map_err(sql)?;
-                if withdraw && seal.queue_ref(&tx, conversation, at, None)? {
+                if let Ok(true) = alone(c, fault, |tx| retire_one(tx, &seal, id, withdraw)) {
                     withdrawn += 1;
                 }
             }
-            for queue in new {
-                let at = wall.max(floor(&tx, queue.conversation)?.saturating_add(1));
-                tx.execute(
-                    "INSERT INTO queue_own VALUES(?1,?2,?3,?4,?5,0,NULL,0,0)",
-                    params![
-                        queue.id.as_slice(),
-                        queue.conversation.0.as_slice(),
-                        queue.recipient_secret.as_slice(),
-                        queue.sender_secret.as_slice(),
-                        integer(at)?
-                    ],
-                )
-                .map_err(sql)?;
-            }
+            let written = new
+                .into_iter()
+                .filter(|queue| alone(c, fault, |tx| insert(tx, queue, wall)).is_ok())
+                .map(|queue| queue.id)
+                .collect();
             for id in forget {
-                tx.execute(
-                    "DELETE FROM queue_own WHERE queue_id=?1",
-                    params![id.as_slice()],
-                )
-                .map_err(sql)?;
+                // Left for the next run when it fails.
+                let _ = alone(c, fault, |tx| {
+                    tx.execute(
+                        "DELETE FROM queue_own WHERE queue_id=?1",
+                        params![id.as_slice()],
+                    )
+                    .map_err(sql)
+                });
             }
-            finish(tx, fault)?;
-            QueueDbReply::Applied { withdrawn }
+            QueueDbReply::Applied { withdrawn, written }
         }
         QueueDbOp::Settle {
             created,
@@ -195,57 +180,28 @@ pub(super) fn queue_op(
             wall,
             now,
         } => {
-            let tx = c.transaction().map_err(sql)?;
             let seal = Sealer {
-                identity,
-                local,
+                routing: Routing {
+                    identity,
+                    local,
+                    wall,
+                    now,
+                },
                 devices: &devices,
-                wall,
-                now,
             };
             let (mut announced, mut unsealed) = (0, 0);
             for id in created {
-                let row = tx
-                    .query_row(
-                        "SELECT conversation,sender_secret,created_at_ms,state,server_confirmed FROM queue_own WHERE queue_id=?1",
-                        params![id.as_slice()],
-                        |r| {
-                            Ok((
-                                ConversationId(bytes(r, 0)?),
-                                Zeroizing::new(bytes::<32>(r, 1)?),
-                                uint(r, 2)?,
-                                r.get::<_, i64>(3)?,
-                                r.get::<_, bool>(4)?,
-                            ))
-                        },
-                    )
-                    .optional()
-                    .map_err(sql)?;
-                let Some((conversation, sender_secret, created_at_ms, state, confirmed)) = row
-                else {
-                    continue;
-                };
-                if confirmed {
-                    continue;
+                match alone(c, fault, |tx| confirm(tx, &seal, id, &server_url)) {
+                    Ok(None) => {}
+                    Ok(Some(true)) => announced += 1,
+                    // It stays unconfirmed, created and sealed again by a later run; the other
+                    // queues are confirmed meanwhile.
+                    Ok(Some(false)) | Err(_) => unsealed += 1,
                 }
-                if state == 0 {
-                    let body = QueueRefBody {
-                        server_url: server_url.clone(),
-                        queue_id: id,
-                        sender_secret: *sender_secret,
-                    };
-                    if !seal.queue_ref(&tx, conversation, created_at_ms, Some(body))? {
-                        unsealed += 1;
-                        continue;
-                    }
-                    announced += 1;
-                }
-                tx.execute(
-                    "UPDATE queue_own SET server_confirmed=1,last_seq=0 WHERE queue_id=?1",
-                    params![id.as_slice()],
-                )
-                .map_err(sql)?;
             }
+            // Plain deletes, no seal: one transaction, and its failure is the op's. Skipping one
+            // would leave a refused row that the actor, told nothing failed, re-creates at once.
+            let tx = c.transaction().map_err(sql)?;
             for id in refused {
                 tx.execute(
                     "DELETE FROM queue_own WHERE queue_id=?1 AND server_confirmed=0",
@@ -268,6 +224,93 @@ pub(super) fn queue_op(
         }
     };
     Ok(MessageDbReply::Queue(reply))
+}
+
+/// `f` in a transaction of its own: committed when it returns, rolled back when it fails.
+fn alone<T>(c: &mut Connection, fault: Fault, f: impl FnOnce(&Transaction<'_>) -> R<T>) -> R<T> {
+    let tx = c.transaction().map_err(sql)?;
+    let out = f(&tx)?;
+    finish(tx, fault)?;
+    Ok(out)
+}
+
+/// The `Active` queue `id` goes `Retiring`; its withdrawal is sealed when `withdraw`. Whether
+/// one was.
+fn retire_one(tx: &Transaction<'_>, seal: &Sealer<'_>, id: QueueId, withdraw: bool) -> R<bool> {
+    let Some(conversation) = active_conversation(tx, &id)? else {
+        return Ok(false);
+    };
+    let at = seal
+        .routing
+        .wall
+        .max(floor(tx, conversation)?.saturating_add(1));
+    tx.execute(
+        "UPDATE queue_own SET state=1,delete_at_ms=?2 WHERE queue_id=?1 AND state=0",
+        params![id.as_slice(), integer(at.saturating_add(RETIRE_MS))?],
+    )
+    .map_err(sql)?;
+    Ok(withdraw && seal.queue_ref(tx, conversation, at, None)?)
+}
+
+/// A new `Active` queue's row with its keys, unconfirmed, made at `wall` (or just after the
+/// conversation's last frame).
+fn insert(tx: &Transaction<'_>, queue: &NewQueue, wall: u64) -> R<()> {
+    let at = wall.max(floor(tx, queue.conversation)?.saturating_add(1));
+    tx.execute(
+        "INSERT INTO queue_own VALUES(?1,?2,?3,?4,?5,0,NULL,0,0)",
+        params![
+            queue.id.as_slice(),
+            queue.conversation.0.as_slice(),
+            queue.recipient_secret.as_slice(),
+            queue.sender_secret.as_slice(),
+            integer(at)?
+        ],
+    )
+    .map_err(sql)?;
+    Ok(())
+}
+
+/// The server took the `CREATE` of `id`: an unconfirmed `Active` queue gets its `QueueRef` for
+/// `server_url` sealed and is confirmed (its next `RECV` starts at seq 0). `None`: no such
+/// queue (dropped, or confirmed before); `Some(false)`: it cannot be sealed now and stays
+/// unconfirmed.
+fn confirm(
+    tx: &Transaction<'_>,
+    seal: &Sealer<'_>,
+    id: QueueId,
+    server_url: &str,
+) -> R<Option<bool>> {
+    let row = tx
+        .query_row(
+            "SELECT conversation,sender_secret,created_at_ms FROM queue_own WHERE queue_id=?1 AND state=0 AND server_confirmed=0",
+            params![id.as_slice()],
+            |r| {
+                Ok((
+                    ConversationId(bytes(r, 0)?),
+                    Zeroizing::new(bytes::<32>(r, 1)?),
+                    uint(r, 2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(sql)?;
+    let Some((conversation, sender_secret, created_at_ms)) = row else {
+        return Ok(None);
+    };
+    let body = QueueRefBody {
+        server_url: server_url.to_owned(),
+        queue_id: id,
+        sender_secret,
+    };
+    if !seal.queue_ref(tx, conversation, created_at_ms, Some(body))? {
+        return Ok(Some(false));
+    }
+    tx.execute(
+        "UPDATE queue_own SET server_confirmed=1,last_seq=0 WHERE queue_id=?1",
+        params![id.as_slice()],
+    )
+    .map_err(sql)?;
+    Ok(Some(true))
 }
 
 fn load(c: &Connection) -> R<QueueView> {
@@ -351,11 +394,9 @@ fn floor(tx: &Transaction<'_>, conversation: ConversationId) -> R<u64> {
 
 /// Seals this device's `QueueRef` frames for the conversations' peers.
 struct Sealer<'a> {
-    identity: Identity,
-    local: &'a LocalAccount,
+    routing: Routing<'a>,
+    /// Each peer account's current devices.
     devices: &'a [(PeerId, Vec<InstallationId>)],
-    wall: u64,
-    now: u64,
 }
 
 impl Sealer<'_> {
@@ -378,57 +419,12 @@ impl Sealer<'_> {
             )
             .optional()
             .map_err(sql)?;
-        let Some(recipients) = peer.and_then(|peer| {
-            self.devices
-                .iter()
-                .find(|(p, _)| p.0 == peer)
-                .map(|(_, r)| r)
-                .filter(|r| !r.is_empty())
-        }) else {
+        let Some(recipients) = peer.and_then(|peer| recipients(self.devices, peer)) else {
             return Ok(false);
         };
-        let Some(group) = group_row(tx, conversation)? else {
-            return Ok(false);
-        };
-        let provider = MlsProvider::new(KvStore::load_scope(tx, conversation.0)?);
-        let (signer, _) = signer_of(self.local);
-        let message = queue_ref_message(self.identity.installation, sent_at_ms, queue);
-        let key = MessageKey {
-            conversation,
-            sender: self.identity.peer,
-            installation: self.identity.installation,
-            id: message.msg_id,
-        };
-        let frame = match seal_one(
-            tx,
-            &provider,
-            &signer,
-            self.identity,
-            key,
-            &group.group_id,
-            &message,
-            self.wall,
-        ) {
-            Ok((_, frame)) => frame,
-            Err(error) if error.code == ErrorCode::InvalidMessage => return Ok(false),
-            Err(error) => return Err(error),
-        };
-        for recipient in recipients {
-            tx.execute(
-                "INSERT OR REPLACE INTO push_delivery VALUES(?1,?2,?3,?4,?5,0,?6,0)",
-                params![
-                    conversation.0.as_slice(),
-                    recipient.0.as_slice(),
-                    FrameKind::QueueRef.value(),
-                    message.msg_id.0.as_slice(),
-                    frame,
-                    integer(self.now)?
-                ],
-            )
-            .map_err(sql)?;
-        }
-        provider.storage().flush(tx, conversation.0)?;
-        Ok(true)
+        let message = queue_ref_message(self.routing.identity.installation, sent_at_ms, queue);
+        self.routing
+            .seal(tx, conversation, &message, FrameKind::QueueRef, recipients)
     }
 }
 
@@ -578,7 +574,7 @@ mod tests {
         QueueRefBody {
             server_url: URL.into(),
             queue_id: [n; 32],
-            sender_secret: [n.wrapping_add(1); 32],
+            sender_secret: [n.wrapping_add(1); 32].into(),
         }
     }
 

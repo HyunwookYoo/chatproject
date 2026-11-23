@@ -10,14 +10,19 @@
 //!   `Retiring` one past its `delete_at` is deleted at the server, or with the mode "never"
 //!   only dropped here.
 //! * The actor carries a plan out: the local half (new rows with their keys written before any
-//!   `CREATE`, retirements with their withdrawals sealed) is one transaction; the `CREATE` and
-//!   `DELETE` batches (at most `MAX_ITEMS` items a request) run in a spawned task, nothing waits
-//!   on them in a transaction or an actor turn, and their answers are stored by one more
-//!   transaction, which seals each created queue's `QueueRef`. The frames ride `push_delivery`
+//!   `CREATE`, retirements with their withdrawals sealed) is written one queue per transaction,
+//!   and only rows that were written go to the server; the `CREATE` and `DELETE` batches (at
+//!   most `MAX_ITEMS` items a request) run in a spawned task, nothing waits on them in a
+//!   transaction or an actor turn, and their answers are stored the same way, one transaction
+//!   confirming each created queue and sealing its `QueueRef`. The frames ride `push_delivery`
 //!   (kind 2), sent by the push handles' delivery loop.
 //! * It runs when what it reads changes: the queue address, the verdict, the mode, a device
 //!   list; when a timer is due (rotation, deletion); hourly for new conversations; and after a
-//!   failure, with the M4 back-off (1 s doubling to 5 min). Never two at once.
+//!   failed request, with the M4 back-off (1 s doubling to 5 min). Never two at once.
+//! * A queue whose `QueueRef` cannot be sealed, an item the server refused (`limited`, `bad`),
+//!   or answers that could not be stored wait for the hourly check: a lasting fault costs the
+//!   server one `CREATE` item an hour for each queue (its limit is 500 an hour), not one each
+//!   back-off step.
 //! * No address, or the mode "never": no request to the queue server of any kind.
 //! * Fetching (`RECV`, `ACK`) and putting messages into peers' queues (`SEND`) are not here yet.
 use super::*;
@@ -106,7 +111,10 @@ pub(crate) enum QueueEvent {
         refused: Vec<QueueId>,
         /// The server took their `DELETE`, or knew them no more.
         deleted: Vec<QueueId>,
-        /// Some request failed, or some item was `limited` or `bad`: tried again later.
+        /// A request failed (network, timeout, a status): tried again with the M4 back-off. Not
+        /// when the server answered some item `limited` or `bad`: then the next run waits for
+        /// the hourly check, the time the server's `CREATE` limit refills in, so a lasting
+        /// refusal costs it one item an hour for each queue, not one each back-off.
         failed: bool,
     },
 }
@@ -404,7 +412,9 @@ impl Manager {
         queue.check_at = now.saturating_add(crate::message::scheduler::retry_delay(queue.failures));
     }
 
-    fn queue_succeeded(&mut self) {
+    /// The next run waits for the hourly check: a run is done, or what is left of it would
+    /// only spend the server's `CREATE` limit sooner (see `QueueEvent::Answered.failed`).
+    fn queue_check_later(&mut self) {
         let now = self.schedule_now();
         let queue = &mut self.messages.queue;
         queue.failures = 0;
@@ -443,6 +453,8 @@ impl Manager {
         let mut new = Vec::new();
         let mut forget = Vec::new();
         let mut creates = Vec::new();
+        // The new queues' `CREATE`s, sent once their rows are written.
+        let mut fresh = Vec::new();
         let mut deletes = Vec::new();
         let row = |id: QueueId| view.own.iter().find(|q| q.id == id);
         for action in actions {
@@ -484,7 +496,7 @@ impl Manager {
                     &queue.sender_secret,
                     wall,
                 );
-                creates.push((queue.id, item));
+                fresh.push((queue.id, item));
                 new.push(queue);
             }
         }
@@ -498,17 +510,18 @@ impl Manager {
                 now: self.schedule_now(),
             };
             match self.queue_db(op, request).await {
-                Ok(QueueDbReply::Applied { withdrawn }) => {
+                Ok(QueueDbReply::Applied { withdrawn, written }) => {
                     if withdrawn > 0 {
                         self.push_deliver_soon();
                     }
+                    // No request goes for a row that is not there (its keys are written first).
+                    creates.extend(fresh.into_iter().filter(|(id, _)| written.contains(id)));
                 }
-                // Nothing was written: no request goes for rows that are not there.
                 _ => return self.queue_failed(),
             }
         }
         if creates.is_empty() && deletes.is_empty() {
-            return self.queue_succeeded();
+            return self.queue_check_later();
         }
         self.messages.queue.running = true;
         let mailbox = self.auth.send.clone();
@@ -524,19 +537,22 @@ impl Manager {
             };
             failed |= delete_failed;
             let mut event = (Vec::new(), Vec::new(), Vec::new());
+            // Some item answered `limited` or `bad` (see `QueueEvent::Answered.failed`).
+            let mut rejected = false;
             for (id, result) in created {
                 match result {
                     ItemResult::Ok => event.0.push(id),
                     ItemResult::Exists => event.1.push(id),
-                    _ => failed = true,
+                    _ => rejected = true,
                 }
             }
             for (id, result) in deleted {
                 match result {
                     ItemResult::Ok | ItemResult::Gone => event.2.push(id),
-                    _ => failed = true,
+                    _ => rejected = true,
                 }
             }
+            let failed = failed && !rejected;
             let (created, refused, deleted) = event;
             let _ = mailbox
                 .send(Input::Queue(QueueEvent::Answered {
@@ -584,14 +600,16 @@ impl Manager {
                         self.push_deliver_soon();
                     }
                 }
-                _ => return self.queue_failed(),
+                // The server holds the created queues already: they are asked for again at
+                // the hourly check, not at each back-off step.
+                _ => return self.queue_check_later(),
             }
             self.messages.queue.due |= again;
         }
         if failed {
             self.queue_failed();
         } else {
-            self.queue_succeeded();
+            self.queue_check_later();
         }
     }
 }

@@ -17,7 +17,10 @@ use super::types::{ConversationId, MessageId, MessageKey};
 use crate::account::{InstallationId, PeerId, storage::schema::LocalAccount};
 use crate::mailbox::wire::HandoffEntry;
 use crate::mls::{
-    MlsProvider, kv::KvStore, payload::push_handle_message, push_ct::strip_group_id,
+    MlsProvider,
+    kv::KvStore,
+    payload::{ChatMessage, push_handle_message},
+    push_ct::strip_group_id,
     wire::MlsFrame,
 };
 use crate::push::{PushStatus, ios_state};
@@ -725,6 +728,86 @@ fn store_issued(c: &mut Connection, issued: &Issued, fault: Fault) -> R<u64> {
     Ok(stored as u64)
 }
 
+/// The current devices of account `peer` in `devices` (each peer account's), `None` when none
+/// is known yet: a frame for them is sealed once one is (the ratchet does not move).
+pub(super) fn recipients(
+    devices: &[(PeerId, Vec<InstallationId>)],
+    peer: [u8; 32],
+) -> Option<&[InstallationId]> {
+    devices
+        .iter()
+        .find(|(p, _)| p.0 == peer)
+        .map(|(_, r)| r.as_slice())
+        .filter(|r| !r.is_empty())
+}
+
+/// Seals this device's routing frames (`PushHandle`, `QueueRef`): `wall` is the time they are
+/// sealed at, `now` the scheduler time their deliveries are due at.
+pub(super) struct Routing<'a> {
+    pub identity: Identity,
+    pub local: &'a LocalAccount,
+    pub wall: u64,
+    pub now: u64,
+}
+
+impl Routing<'_> {
+    /// Seals `message` in the conversation's group, in `tx`, and queues its frame of `kind`
+    /// for each of `recipients`: a newer frame of a kind replaces what is still queued of it
+    /// (plan 2). False when it cannot be sealed now (no group, or a group that cannot seal):
+    /// tried again with a later pass.
+    pub(super) fn seal(
+        &self,
+        tx: &Transaction<'_>,
+        conversation: ConversationId,
+        message: &ChatMessage,
+        kind: FrameKind,
+        recipients: &[InstallationId],
+    ) -> R<bool> {
+        let Some(group) = group_row(tx, conversation)? else {
+            return Ok(false);
+        };
+        let provider = MlsProvider::new(KvStore::load_scope(tx, conversation.0)?);
+        let (signer, _) = signer_of(self.local);
+        let key = MessageKey {
+            conversation,
+            sender: self.identity.peer,
+            installation: self.identity.installation,
+            id: message.msg_id,
+        };
+        let sealed = seal_one(
+            tx,
+            &provider,
+            &signer,
+            self.identity,
+            key,
+            &group.group_id,
+            message,
+            self.wall,
+        );
+        let frame = match sealed {
+            Ok((_, frame)) => frame,
+            Err(error) if error.code == ErrorCode::InvalidMessage => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        for recipient in recipients {
+            tx.execute(
+                "INSERT OR REPLACE INTO push_delivery VALUES(?1,?2,?3,?4,?5,0,?6,0)",
+                params![
+                    conversation.0.as_slice(),
+                    recipient.0.as_slice(),
+                    kind.value(),
+                    message.msg_id.0.as_slice(),
+                    frame,
+                    integer(self.now)?
+                ],
+            )
+            .map_err(sql)?;
+        }
+        provider.storage().flush(tx, conversation.0)?;
+        Ok(true)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn seal(
     c: &mut Connection,
@@ -752,16 +835,16 @@ fn seal(
         .collect::<Result<_, _>>()
         .map_err(sql)?
     };
+    let routing = Routing {
+        identity,
+        local,
+        wall,
+        now,
+    };
     let (mut announced, mut withdrawn) = (0, 0);
     for (conversation, peer, handle, issued_at_ms) in pending {
         let conversation = ConversationId(conversation);
-        // No device of the peer known yet: sealed once one is (the ratchet does not move).
-        let Some(recipients) = devices
-            .iter()
-            .find(|(p, _)| p.0 == peer)
-            .map(|(_, r)| r)
-            .filter(|r| !r.is_empty())
-        else {
+        let Some(recipients) = recipients(devices, peer) else {
             continue;
         };
         let Some(issued_at_ms) = issued_at_ms else {
@@ -769,45 +852,16 @@ fn seal(
         };
         let handle_sent = handle.is_some();
         let tx = c.transaction().map_err(sql)?;
-        let Some(group) = group_row(&tx, conversation)? else {
-            continue;
-        };
-        let provider = MlsProvider::new(KvStore::load_scope(&tx, conversation.0)?);
-        let (signer, _) = signer_of(local);
         let message =
             push_handle_message(identity.installation, issued_at_ms, handle.unwrap_or_default());
-        let key = MessageKey {
-            conversation,
-            sender: identity.peer,
-            installation: identity.installation,
-            id: message.msg_id,
-        };
-        let frame = match seal_one(&tx, &provider, &signer, identity, key, &group.group_id, &message, wall) {
-            Ok((_, frame)) => frame,
-            // A group that cannot seal now: tried again with the next pass.
-            Err(error) if error.code == ErrorCode::InvalidMessage => continue,
-            Err(error) => return Err(error),
-        };
-        // One frame per recipient: a newer one replaces what is still queued (plan 2).
-        for recipient in recipients {
-            tx.execute(
-                "INSERT OR REPLACE INTO push_delivery VALUES(?1,?2,1,?3,?4,0,?5,0)",
-                params![
-                    conversation.0.as_slice(),
-                    recipient.0.as_slice(),
-                    message.msg_id.0.as_slice(),
-                    frame,
-                    integer(now)?
-                ],
-            )
-            .map_err(sql)?;
+        if !routing.seal(&tx, conversation, &message, FrameKind::PushHandle, recipients)? {
+            continue;
         }
         tx.execute(
             "UPDATE push_tag SET announced=1 WHERE conversation=?1",
             params![conversation.0.as_slice()],
         )
         .map_err(sql)?;
-        provider.storage().flush(&tx, conversation.0)?;
         finish(tx, fault)?;
         if handle_sent {
             announced += 1;
