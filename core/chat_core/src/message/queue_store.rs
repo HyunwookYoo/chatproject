@@ -696,7 +696,6 @@ mod tests {
         assert!(!take(Some(body(3)), 2_000));
         assert!(take(None, 3_000));
         assert!(!take(Some(body(2)), 2_000));
-        drop(take);
         assert_eq!(row(&c), Some((None, 3_000)));
     }
 

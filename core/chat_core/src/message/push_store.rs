@@ -1432,27 +1432,27 @@ mod tests {
                 .map(Result::unwrap)
                 .collect()
         };
-        let no_fault = super::super::mls_store::NO_FAULT;
+        use super::super::mls_store::NO_FAULT;
         // The handle's msg_id under the other kind names no row.
         let wrong = (conv, to, FrameKind::QueueRef, handle_id);
         assert_eq!(
-            delivered(&mut c, wrong, Delivery::Acked, 5, no_fault).unwrap(),
+            delivered(&mut c, wrong, Delivery::Acked, 5, NO_FAULT).unwrap(),
             0
         );
         let queue = (conv, to, FrameKind::QueueRef, queue_id);
         assert_eq!(
-            delivered(&mut c, queue, Delivery::Retry, 5, no_fault).unwrap(),
+            delivered(&mut c, queue, Delivery::Retry, 5, NO_FAULT).unwrap(),
             1
         );
         assert_eq!(rows(&c), [(1, 0), (2, 1)]);
         assert_eq!(
-            delivered(&mut c, queue, Delivery::Acked, 5, no_fault).unwrap(),
+            delivered(&mut c, queue, Delivery::Acked, 5, NO_FAULT).unwrap(),
             1
         );
         assert_eq!(rows(&c), [(1, 0)]);
         let handle = (conv, to, FrameKind::PushHandle, handle_id);
         assert_eq!(
-            delivered(&mut c, handle, Delivery::Acked, 5, no_fault).unwrap(),
+            delivered(&mut c, handle, Delivery::Acked, 5, NO_FAULT).unwrap(),
             1
         );
         assert!(rows(&c).is_empty());
