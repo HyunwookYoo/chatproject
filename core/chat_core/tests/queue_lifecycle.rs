@@ -364,6 +364,42 @@ async fn foreign_queue_url_is_ignored() {
     );
 }
 
+/// Review I1: a `QueueRef` that reaches the device right after `queue_configure`, before the
+/// actor's next poll took the address (a frame pulled at start, or one in the same tick), is
+/// kept, not acknowledged and lost until the peer rotates.
+#[tokio::test]
+async fn queue_ref_right_after_configure_is_kept() {
+    let (mut a, b1, net, conv) = queue_accounts(&[A1]).await;
+    let a1 = a.remove(0);
+    let _server = queue_server(&net);
+    let b1_id = installation(&b1).await;
+    let body = chat_core::storage_fixture::QueueRefBody {
+        server_url: QUEUE_URL.into(),
+        queue_id: [7; 32],
+        sender_secret: [8; 32],
+    };
+    let ct = a1
+        .account
+        .storage_test_fixture()
+        .messages()
+        .await
+        .unwrap()
+        .mls_seal_queue_ref(conv, Some(body), NOW * 1_000)
+        .await
+        .unwrap();
+    configure(&b1, QUEUE_URL);
+    let frame = MlsFrame::App {
+        conversation: conv,
+        ciphertext: ct,
+    };
+    let reply = a1.account.mls_test_exchange(b1_id, frame).await.unwrap();
+    assert!(acked(&reply));
+    assert_eq!(
+        peer_queue(&b1, conv, &a1).await,
+        Some(Some((QUEUE_URL.to_owned(), [7; 32], [8; 32])))
+    );
+}
+
 /// Ruling R10 for queues: a newer `QueueRef` replaces the stored one, a late older frame
 /// (the device log, a hand-over) never brings back a replaced queue, and a withdrawal's
 /// tombstone stays against an older frame too.

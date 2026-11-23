@@ -45,18 +45,23 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 #[derive(Default)]
 pub(super) struct Shared {
     /// The latest `queue_configure` (the address it resolved to) and its version.
-    config: std::sync::Mutex<(u64, Option<String>)>,
+    config: std::sync::Mutex<(u64, Option<Arc<str>>)>,
 }
 
 impl Shared {
     fn set(&self, url: Option<String>) {
         let mut slot = self.config.lock().unwrap_or_else(|e| e.into_inner());
-        *slot = (slot.0.wrapping_add(1), url);
+        *slot = (slot.0.wrapping_add(1), url.map(Arc::from));
     }
     /// The address if it is newer than version `seen`.
-    fn newer(&self, seen: u64) -> Option<(u64, Option<String>)> {
+    fn newer(&self, seen: u64) -> Option<(u64, Option<Arc<str>>)> {
         let slot = self.config.lock().unwrap_or_else(|e| e.into_inner());
         (slot.0 != seen).then(|| slot.clone())
+    }
+    /// The latest address, taken by a poll or not.
+    fn url(&self) -> Option<Arc<str>> {
+        let slot = self.config.lock().unwrap_or_else(|e| e.into_inner());
+        slot.1.clone()
     }
 }
 
@@ -324,9 +329,12 @@ impl Manager {
         }
     }
 
-    /// The queue server a received `QueueRef` must name to be taken (`None`: none is).
+    /// The queue server a received `QueueRef` must name to be taken (`None`: none is): the
+    /// latest `queue_configure`, whether or not a poll took it yet. A frame can come before
+    /// that poll (one pulled earlier in the same tick, or at start), and is acknowledged
+    /// either way.
     pub(super) fn queue_url(&self) -> Option<Arc<str>> {
-        self.messages.queue.server.as_ref().map(|s| s.url.clone())
+        self.shared.queue.url()
     }
 
     /// What the queue reads changed (the mode): the next poll runs it.
@@ -349,10 +357,7 @@ impl Manager {
         };
         let server = url.and_then(|url| {
             let client = self.services.queue.clone().or_else(|| http_server(&url))?;
-            Some(Server {
-                url: Arc::from(url),
-                client,
-            })
+            Some(Server { url, client })
         });
         let queue = &mut self.messages.queue;
         queue.config_seen = version;
