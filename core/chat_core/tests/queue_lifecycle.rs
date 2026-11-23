@@ -317,6 +317,8 @@ async fn never_mode_sends_nothing() {
         peer_queue(&b1, conv, &a1).await.flatten().is_some()
             && queue_ref_deliveries(&a1).await == 0
     );
+    // From the switch on, no `CREATE` or `DELETE` of any kind.
+    let made = changes(&server, &a1).len();
     a1.account.set_queue_mode(QueueMode::Never).await.unwrap();
     settle!(
         [&a1, &b1],
@@ -330,6 +332,7 @@ async fn never_mode_sends_nothing() {
     settle!([&a1], tables(&a1).await.own.is_empty());
     quiet(&[&a1]).await;
     assert_eq!(server.calls_from(&a1).len(), calls);
+    assert_eq!(changes(&server, &a1).len(), made);
 }
 
 /// Review Focus 5: a peer announces a queue on another server. The device takes the frame

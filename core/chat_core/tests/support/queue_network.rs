@@ -9,7 +9,7 @@ include!("push_network.rs");
 use axum::extract::ConnectInfo;
 use chat_core::account::clock::Clock;
 use chat_core::account::{QueueMode, Verdict};
-use chat_core::queue::{QueueError, QueueFuture, QueueServer};
+use chat_core::queue::{QueueEntry, QueueError, QueueFuture, QueueServer};
 use chat_core::storage_fixture::{QueueOwnRow, QueuePeerRow, QueueTables};
 use queue_wire::{
     AckItem, CommandName, CreateItem, DeleteItem, ItemResult, QueueId, QueueRequest, QueueResponse,
@@ -55,6 +55,10 @@ struct FakeQueueServer {
     hold: tokio::sync::watch::Sender<bool>,
     /// While true, `ACK`s are lost on their way: the server never gets them.
     lose_acks: std::sync::atomic::AtomicBool,
+    /// While true, `RECV`s wait before the server reads them.
+    hold_recv: tokio::sync::watch::Sender<bool>,
+    /// While true, `ACK`s wait before the server reads them.
+    hold_acks: tokio::sync::watch::Sender<bool>,
 }
 
 impl FakeQueueServer {
@@ -77,6 +81,8 @@ impl FakeQueueServer {
             calls: Mutex::new(Vec::new()),
             hold: tokio::sync::watch::channel(false).0,
             lose_acks: Default::default(),
+            hold_recv: tokio::sync::watch::channel(false).0,
+            hold_acks: tokio::sync::watch::channel(false).0,
         })
     }
 
@@ -103,6 +109,14 @@ impl FakeQueueServer {
 
     fn hold(&self, held: bool) {
         self.hold.send_replace(held);
+    }
+
+    fn hold_recv(&self, held: bool) {
+        self.hold_recv.send_replace(held);
+    }
+
+    fn hold_acks(&self, held: bool) {
+        self.hold_acks.send_replace(held);
     }
 
     fn lose_acks(&self, lost: bool) {
@@ -155,6 +169,14 @@ impl FakeQueueServer {
         };
         if command == CommandName::Ack && self.lose_acks.load(Ordering::SeqCst) {
             return Err(QueueError::Network);
+        }
+        let hold = match command {
+            CommandName::Recv => Some(&self.hold_recv),
+            CommandName::Ack => Some(&self.hold_acks),
+            _ => None,
+        };
+        if let (Some(hold), Some(_)) = (hold, from) {
+            let _ = hold.subscribe().wait_for(|held| !*held).await;
         }
         let body = serde_json::to_vec(&QueueRequest { items }).unwrap();
         let mut request = Request::post(command.path())
@@ -423,6 +445,17 @@ async fn queue_ref_deliveries(f: &Fixture) -> usize {
         .count()
 }
 
+/// `QueueRef` frames (kind 2) still queued on `f` for `to`.
+async fn queue_ref_deliveries_to(f: &Fixture, to: &Fixture) -> usize {
+    let to = installation(to).await;
+    push_state(f)
+        .await
+        .deliveries
+        .iter()
+        .filter(|d| d.kind == 2 && d.recipient == to)
+        .count()
+}
+
 async fn verdict(f: &Fixture) -> Verdict {
     f.account.queue_state().await.unwrap().verdict
 }
@@ -441,25 +474,51 @@ async fn announced() -> (
     ConversationId,
     Arc<FakeQueueServer>,
 ) {
-    let (mut a, b1, net, conv) = queue_accounts(&[A1]).await;
+    announced_with(&[B1]).await
+}
+
+/// `announced`, with B's record listing `b_devices` (only B1 runs).
+async fn announced_with(
+    b_devices: &[u8],
+) -> (
+    Fixture,
+    Fixture,
+    Arc<Backend>,
+    ConversationId,
+    Arc<FakeQueueServer>,
+) {
+    let (mut a, b1, net, conv) =
+        accounts_with(&[A1], week_record(A, &[A1]), week_record(B, b_devices)).await;
     let a1 = a.remove(0);
     let server = queue_server(&net);
     configure(&a1, QUEUE_URL);
     configure(&b1, QUEUE_URL);
+    // Between the two devices that run (a device of B's record that never runs keeps its
+    // deliveries).
     settle!(
         [&a1, &b1],
         peer_queue(&b1, conv, &a1).await.flatten().is_some()
             && peer_queue(&a1, conv, &b1).await.flatten().is_some()
-            && queue_ref_deliveries(&a1).await == 0
-            && queue_ref_deliveries(&b1).await == 0
+            && queue_ref_deliveries_to(&a1, &b1).await == 0
+            && queue_ref_deliveries_to(&b1, &a1).await == 0
     );
     (a1, b1, net, conv, server)
 }
 
-/// The kind 17 `App` frame body of `from`'s text `key`, sealed now if no attempt sealed it yet
-/// (sealing a sealed row gives its ciphertext back): what a peer puts in a queue (Task 10 sends
-/// it from the core).
-async fn sealed_frame(from: &Fixture, key: MessageKey) -> Vec<u8> {
+/// The queue entry of `wire`, a frame exactly as `from` writes it to a device it reaches
+/// directly, naming `from` as its sender: what Task 10 puts in a queue.
+async fn entry_of(from: &Fixture, wire: Vec<u8>) -> Vec<u8> {
+    QueueEntry {
+        sender_peer: from.peer,
+        sender_install: installation(from).await,
+        frame: wire,
+    }
+    .encode()
+}
+
+/// The frame `from`'s attempts write for its text `key` (its outbox wire), sealed now if no
+/// attempt sealed it yet (sealing a sealed row gives its ciphertext back).
+async fn sealed_wire(from: &Fixture, key: MessageKey) -> Vec<u8> {
     from.account
         .storage_test_fixture()
         .messages()
@@ -469,11 +528,30 @@ async fn sealed_frame(from: &Fixture, key: MessageKey) -> Vec<u8> {
         .await
         .unwrap()
         .unwrap();
-    let (conversation, ciphertext) = mls_app_from_wire(&outbox(from, key).await.wire).unwrap();
-    MlsFrame::App {
-        conversation,
-        ciphertext,
-    }
-    .inner()
-    .to_vec()
+    outbox(from, key).await.wire
+}
+
+/// The queue entry of `from`'s text `key`.
+async fn text_entry(from: &Fixture, key: MessageKey) -> Vec<u8> {
+    let wire = sealed_wire(from, key).await;
+    entry_of(from, wire).await
+}
+
+/// The queue entry of the Commit (`kind` 1) or Welcome (2) `from` has queued for `to` at
+/// `epoch`: the frame its delivery writes.
+async fn delivery_entry(
+    from: &Fixture,
+    conv: ConversationId,
+    to: &Fixture,
+    kind: u8,
+    epoch: u64,
+) -> Vec<u8> {
+    let wire = from
+        .account
+        .storage_test_fixture()
+        .mls_delivery_frame(conv, installation(to).await, kind, epoch)
+        .await
+        .unwrap()
+        .expect("a queued delivery");
+    entry_of(from, wire).await
 }
