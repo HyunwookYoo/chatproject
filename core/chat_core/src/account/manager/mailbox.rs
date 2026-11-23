@@ -1488,7 +1488,12 @@ impl Manager {
             }
         }
         // Ruling 35: what an earlier run stored from a log and did not notify before it died,
-        // for holders no pull runs from now (a running one notifies it when it ends).
+        // for holders no pull runs from now (a running one notifies it when it ends). A queue
+        // fetch on its way runs under this device's own installation.
+        let fetching = self
+            .queue_fetching()
+            .then(|| self.local().map(|l| l.device.installation_id()).ok())
+            .flatten();
         let mailbox = &mut self.messages.mailbox;
         let at = *mailbox
             .restart_notify_at
@@ -1496,7 +1501,7 @@ impl Manager {
         if now >= at {
             let op = MailboxDbOp::TakeNotify {
                 holder: None,
-                running: mailbox.pulls.keys().copied().collect(),
+                running: mailbox.pulls.keys().copied().chain(fetching).collect(),
                 read: Vec::new(),
             };
             if let Ok(MailboxDbReply::Notify(items)) = self.mailbox_db(op, request).await {

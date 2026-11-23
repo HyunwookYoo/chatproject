@@ -299,8 +299,9 @@ pub(super) enum Via {
     /// A push (M7 spec 5.3): no device carried it, nobody waits for an answer, and nothing is
     /// sent to the sender (it learns of the delivery from its next direct attempt).
     Push,
-    /// An entry of one of this device's server queues (M8 spec 6.4): the same, and a text it
-    /// stores is notified when the fetch ends (`manager/queue.rs`).
+    /// An entry of one of this device's server queues (M8 spec 6.4), from the device it names
+    /// (`queue::QueueEntry`, a hint the frame's own checks bind): nobody waits for an answer,
+    /// and a text it stores is notified when the fetch ends (`manager/queue.rs`).
     Queue,
 }
 
@@ -2426,10 +2427,11 @@ impl Manager {
                     });
                 };
                 let ct_hash = sha256(&commit);
-                // Ruling 25: a logged Commit that cannot be vetted because the peer's record is
-                // not here is held and the record looked up (as for a missing device), so the
-                // log behind it goes on.
-                let logged = matches!(via, Via::Mailbox { .. }).then(|| commit.clone());
+                // Ruling 25: a logged (or queued) Commit that cannot be vetted because the
+                // peer's record is not here is held and the record looked up (as for a missing
+                // device), so the log or queue behind it goes on.
+                let logged =
+                    matches!(via, Via::Mailbox { .. } | Via::Queue).then(|| commit.clone());
                 let op = GroupOp::ApplyCommit {
                     peer,
                     sender_peer: sender,

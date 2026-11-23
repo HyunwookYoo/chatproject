@@ -1102,6 +1102,12 @@ impl Fixture {
         self.handle.0.test(TestOp::MessageFault(fault, tx)).await;
         rx.await.unwrap();
     }
+    /// `fault` for the received ciphertext this store opens after `skip` others.
+    pub async fn message_open_fault(&self, skip: usize, fault: CommitFault) {
+        let (tx, rx) = oneshot::channel();
+        self.handle.0.test(TestOp::MessageOpenFault(skip, fault, tx)).await;
+        rx.await.unwrap();
+    }
     pub async fn messages(&self) -> Result<Messages, CoreError> {
         use crate::account::storage::schema::AccountState;
         let stored = self.handle.load_account().await?.ok_or_else(|| {

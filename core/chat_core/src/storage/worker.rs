@@ -66,6 +66,9 @@ struct Worker {
     hook: Option<(usize, CommitAction)>,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     message_fault: Option<CommitFault>,
+    /// A fault for the received ciphertext opened after this many others.
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    open_fault: Option<(usize, CommitFault)>,
     #[cfg(all(feature="test-hooks",debug_assertions))]
     message_reply_pause: Option<(oneshot::Sender<()>,std::sync::mpsc::Receiver<()>)>,
     #[cfg(all(feature="test-hooks",debug_assertions))]
@@ -102,6 +105,15 @@ impl Worker {
         } else {
             None
         };
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        let fault = fault.or_else(|| match self.open_fault.as_mut() {
+            Some((0, _)) if op.opens_app() => self.open_fault.take().map(|(_, f)| f),
+            Some((skip, _)) if op.opens_app() => {
+                *skip -= 1;
+                None
+            }
+            _ => None,
+        });
         // A received MLS ciphertext learns its message only once opened; it moves the clock too.
         #[cfg(all(feature="test-hooks",debug_assertions))]
         let clock=if key.is_some() || op.opens_app() {self.message_clock.take()} else {None};
@@ -443,6 +455,8 @@ impl StorageHandle {
             hook: None,
             #[cfg(all(feature = "test-hooks", debug_assertions))]
             message_fault: None,
+            #[cfg(all(feature = "test-hooks", debug_assertions))]
+            open_fault: None,
             #[cfg(all(feature="test-hooks",debug_assertions))]
             message_clock: None,
             #[cfg(all(feature="test-hooks",debug_assertions))]
@@ -666,6 +680,10 @@ fn run(mut w: Worker, mut rx: mpsc::Receiver<Request>, fence: Arc<Mutex<Fence>>)
                     w.message_fault = Some(fault);
                     let _ = reply.send(());
                 }
+                TestOp::MessageOpenFault(skip, fault, reply) => {
+                    w.open_fault = Some((skip, fault));
+                    let _ = reply.send(());
+                }
                 TestOp::Pause(entered, release) => {
                     let _ = entered.send(());
                     let _ = release.recv();
@@ -717,6 +735,7 @@ pub(crate) enum TestOp {
     MessageCounts(oneshot::Sender<R<(i64, i64, i64, i64)>>),
     Message(messages::FixtureOp),
     MessageFault(CommitFault, oneshot::Sender<()>),
+    MessageOpenFault(usize, CommitFault, oneshot::Sender<()>),
     MessageReplyPause(oneshot::Sender<()>,std::sync::mpsc::Receiver<()>,oneshot::Sender<()>),
     MessageClock(Arc<crate::account::clock::FakeClock>,u64,oneshot::Sender<()>),
     Pause(oneshot::Sender<()>, std::sync::mpsc::Receiver<()>),

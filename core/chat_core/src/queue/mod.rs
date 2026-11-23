@@ -8,6 +8,9 @@ pub use queue_wire::{AckItem, CreateItem, DeleteItem, ItemResult, QueueId, RecvI
 
 use crate::{CoreError, ErrorCode};
 
+mod entry;
+pub use entry::QueueEntry;
+
 #[cfg(feature = "push-http")]
 mod client;
 #[cfg(feature = "push-http")]
