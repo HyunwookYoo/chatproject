@@ -299,6 +299,9 @@ pub(super) enum Via {
     /// A push (M7 spec 5.3): no device carried it, nobody waits for an answer, and nothing is
     /// sent to the sender (it learns of the delivery from its next direct attempt).
     Push,
+    /// An entry of one of this device's server queues (M8 spec 6.4): the same, and a text it
+    /// stores is notified when the fetch ends (`manager/queue.rs`).
+    Queue,
 }
 
 /// What opening one received application ciphertext did.
@@ -2676,7 +2679,7 @@ impl Manager {
     }
 
     /// `receive_app` of a ciphertext from `sender`'s account carried by its device `carrier`, or
-    /// by no device (`None`: a push, `Via::Push`); tells which text it carried too.
+    /// by no device (`None`: a push or a queue entry); tells which text it carried too.
     pub(super) async fn open_received(
         &mut self,
         sender: PeerId,
@@ -2700,8 +2703,10 @@ impl Manager {
             peer: sender,
             transport: carrier,
             allowed: self.current_installations(sender),
+            // A queue entry is marked under this device, for the notification at the fetch's end.
             pull: match via {
                 Via::Mailbox { holder, .. } => Some(*holder),
+                Via::Queue => Some(self.local()?.device.installation_id()),
                 Via::Direct(_) | Via::Push => None,
             },
             queue_url: self.queue_url(),
@@ -2749,7 +2754,7 @@ impl Manager {
             // message opened in), so it is not taken from the ciphertext but goes to the
             // plaintext hand-over (spec 6.3), not skipped.
             Ok(MessageDbReply::NotCurrent) => match via {
-                Via::Direct(_) | Via::Push => Ok(answer(None)),
+                Via::Direct(_) | Via::Push | Via::Queue => Ok(answer(None)),
                 Via::Mailbox { .. } => Ok(answer(Some(MlsReply::DecryptFailed {
                     class: CLASS_OTHER,
                     epoch: 0,
@@ -2760,10 +2765,12 @@ impl Manager {
                     self.move_epoch(conversation, peer, epoch, request).await?,
                 ))),
                 // No sender waits to seal it again in a new epoch: it is not opened here.
-                Via::Mailbox { .. } | Via::Push => Ok(answer(Some(MlsReply::DecryptFailed {
-                    class: CLASS_OUT_OF_ORDER,
-                    epoch,
-                }))),
+                Via::Mailbox { .. } | Via::Push | Via::Queue => {
+                    Ok(answer(Some(MlsReply::DecryptFailed {
+                        class: CLASS_OUT_OF_ORDER,
+                        epoch,
+                    })))
+                }
             },
             Ok(_) => Err(unavailable(ErrorCode::InvalidMessage)),
             // The MLS sender is not the authenticated device, or the message conflicts.

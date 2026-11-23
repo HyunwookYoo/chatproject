@@ -23,12 +23,22 @@ const HOUR_MS: u64 = 3_600_000;
 const DAY_MS: u64 = 24 * HOUR_MS;
 
 /// One request the server got: which core sent it (its clock, `None` for the test itself),
-/// the command, and the queue of each item.
+/// the command, the queue of each item, and for a `RECV` what it answered each item.
 #[derive(Clone)]
 struct Call {
     from: Option<usize>,
     command: CommandName,
     queues: Vec<QueueId>,
+    got: Vec<Got>,
+}
+
+/// What a `RECV` answered one queue: the seqs of its entries, or no entries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Got {
+    Entries(Vec<u64>),
+    Limited,
+    Gone,
+    Other,
 }
 
 struct FakeQueueServer {
@@ -43,6 +53,8 @@ struct FakeQueueServer {
     /// While true, answers to `CREATE` wait after the server stored them (the core may die
     /// before it hears back).
     hold: tokio::sync::watch::Sender<bool>,
+    /// While true, `ACK`s are lost on their way: the server never gets them.
+    lose_acks: std::sync::atomic::AtomicBool,
 }
 
 impl FakeQueueServer {
@@ -64,6 +76,7 @@ impl FakeQueueServer {
             turn: tokio::sync::Mutex::new(()),
             calls: Mutex::new(Vec::new()),
             hold: tokio::sync::watch::channel(false).0,
+            lose_acks: Default::default(),
         })
     }
 
@@ -92,6 +105,27 @@ impl FakeQueueServer {
         self.hold.send_replace(held);
     }
 
+    fn lose_acks(&self, lost: bool) {
+        self.lose_acks.store(lost, Ordering::SeqCst);
+    }
+
+    /// The `RECV`s `f` sent so far.
+    fn fetches(&self, f: &Fixture) -> Vec<Call> {
+        self.sent(f, CommandName::Recv)
+    }
+
+    /// How many entries the server holds in `queue` now (its own database: no `RECV`, which
+    /// would spend the cores' shared limit).
+    fn held(&self, queue: QueueId) -> usize {
+        let c = rusqlite::Connection::open(&self.db).unwrap();
+        c.query_row(
+            "SELECT count(*) FROM entry WHERE queue_id=?1",
+            [queue.as_slice()],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap() as usize
+    }
+
     /// The queue ids the server holds now (its own database).
     fn queues(&self) -> Vec<QueueId> {
         let c = rusqlite::Connection::open(&self.db).unwrap();
@@ -109,11 +143,19 @@ impl FakeQueueServer {
         queues: Vec<QueueId>,
         items: Vec<T>,
     ) -> Result<Vec<ItemResult>, QueueError> {
-        self.calls.lock().unwrap().push(Call {
-            from: from.map(|clock| Arc::as_ptr(clock) as usize),
-            command,
-            queues,
-        });
+        let index = {
+            let mut calls = self.calls.lock().unwrap();
+            calls.push(Call {
+                from: from.map(|clock| Arc::as_ptr(clock) as usize),
+                command,
+                queues,
+                got: Vec::new(),
+            });
+            calls.len() - 1
+        };
+        if command == CommandName::Ack && self.lose_acks.load(Ordering::SeqCst) {
+            return Err(QueueError::Network);
+        }
         let body = serde_json::to_vec(&QueueRequest { items }).unwrap();
         let mut request = Request::post(command.path())
             .header(header::CONTENT_TYPE, "application/json")
@@ -152,7 +194,38 @@ impl FakeQueueServer {
         }
         let response: QueueResponse =
             serde_json::from_slice(&body).map_err(|_| QueueError::Malformed)?;
+        if command == CommandName::Recv {
+            self.calls.lock().unwrap()[index].got = response
+                .results
+                .iter()
+                .map(|result| match result {
+                    ItemResult::Entries { entries } => {
+                        Got::Entries(entries.iter().map(|e| e.seq).collect())
+                    }
+                    ItemResult::Limited => Got::Limited,
+                    ItemResult::Gone => Got::Gone,
+                    _ => Got::Other,
+                })
+                .collect();
+        }
         Ok(response.results)
+    }
+
+    /// The test deletes a queue at the server with its recipient key, as if the server lost it.
+    async fn delete_as(&self, queue: QueueId, recipient_secret: &[u8; 32]) -> ItemResult {
+        let ts = self.now.load(Ordering::SeqCst);
+        let item = DeleteItem {
+            queue_id: BASE64URL_NOPAD.encode(&queue),
+            ts,
+            sig: BASE64URL_NOPAD.encode(&sign(
+                recipient_secret,
+                &signing_bytes(&Signed::Delete, &queue, ts),
+            )),
+        };
+        self.call(None, CommandName::Delete, vec![queue], vec![item])
+            .await
+            .unwrap()
+            .remove(0)
     }
 
     /// The test puts `ct` into a queue, as a peer holding its sender key would (Task 10 does it
@@ -357,4 +430,50 @@ async fn verdict(f: &Fixture) -> Verdict {
 /// `f` uses the queue server at `url`.
 fn configure(f: &Fixture, url: &str) {
     f.account.queue_configure(Some(url.into())).unwrap();
+}
+
+/// A1 and B1 with a conversation and a queue server, both configured with it; returns once
+/// each keeps the other's announced queue and neither has anything left to deliver.
+async fn announced() -> (
+    Fixture,
+    Fixture,
+    Arc<Backend>,
+    ConversationId,
+    Arc<FakeQueueServer>,
+) {
+    let (mut a, b1, net, conv) = queue_accounts(&[A1]).await;
+    let a1 = a.remove(0);
+    let server = queue_server(&net);
+    configure(&a1, QUEUE_URL);
+    configure(&b1, QUEUE_URL);
+    settle!(
+        [&a1, &b1],
+        peer_queue(&b1, conv, &a1).await.flatten().is_some()
+            && peer_queue(&a1, conv, &b1).await.flatten().is_some()
+            && queue_ref_deliveries(&a1).await == 0
+            && queue_ref_deliveries(&b1).await == 0
+    );
+    (a1, b1, net, conv, server)
+}
+
+/// The kind 17 `App` frame body of `from`'s text `key`, sealed now if no attempt sealed it yet
+/// (sealing a sealed row gives its ciphertext back): what a peer puts in a queue (Task 10 sends
+/// it from the core).
+async fn sealed_frame(from: &Fixture, key: MessageKey) -> Vec<u8> {
+    from.account
+        .storage_test_fixture()
+        .messages()
+        .await
+        .unwrap()
+        .mls_seal(key, NOW * 1000)
+        .await
+        .unwrap()
+        .unwrap();
+    let (conversation, ciphertext) = mls_app_from_wire(&outbox(from, key).await.wire).unwrap();
+    MlsFrame::App {
+        conversation,
+        ciphertext,
+    }
+    .inner()
+    .to_vec()
 }

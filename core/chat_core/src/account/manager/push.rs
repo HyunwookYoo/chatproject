@@ -1533,13 +1533,14 @@ impl Manager {
         Ok(Some((peer, told)))
     }
 
-    /// Dials `peer`'s devices without a session and syncs with my devices; the dials run in
-    /// spawned tasks.
+    /// Dials `peer`'s devices without a session, fetches this device's server queues (M8 spec
+    /// 6.4) and syncs with my devices; the dials and the fetch run in spawned tasks.
     async fn push_fetch_now(&mut self, peer: Option<PeerId>) -> Result<(), CoreError> {
         let request = self.ready()?;
         if let Some(peer) = peer {
             self.push_dial_devices(peer, request);
         }
+        self.queue_fetch_soon();
         self.mailbox_sync_now().await
     }
 
@@ -1551,8 +1552,9 @@ impl Manager {
         }
     }
 
-    /// The network is up after `push_messages_deleted`: syncs with my devices and dials every
-    /// contact's devices (spec 5.4, design 8.3).
+    /// The network is up after `push_messages_deleted`: syncs with my devices, dials every
+    /// contact's devices (spec 5.4, design 8.3) and fetches this device's server queues (M8
+    /// spec 11).
     async fn push_full_sync(&mut self, request: Request) {
         let Ok(local) = self.local() else {
             return;
@@ -1561,6 +1563,7 @@ impl Manager {
         for peer in peers {
             self.push_dial_devices(peer, request);
         }
+        self.queue_fetch_soon();
         let _ = self.mailbox_sync_now().await;
     }
 

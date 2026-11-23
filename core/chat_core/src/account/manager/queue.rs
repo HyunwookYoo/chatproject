@@ -24,18 +24,40 @@
 //!   server one `CREATE` item an hour for each queue (its limit is 500 an hour), not one each
 //!   back-off step.
 //! * No address, or the mode "never": no request to the queue server of any kind.
-//! * Fetching (`RECV`, `ACK`) and putting messages into peers' queues (`SEND`) are not here yet.
+//!
+//! Fetching (spec 6.4) is a second job beside it, never two runs at once:
+//!
+//! * A run starts at a network start, when a push's fetch or a full sync asks, at a new address,
+//!   and every `FETCH_EVERY_MS` (the M4 back-off after a failed request); its first step looks
+//!   whether the network is on and asks nothing while it is off.
+//! * Each round is one `RECV` (at most `MAX_ITEMS` items a request) for every `Active` queue the
+//!   server took and every `Retiring` one, from each queue's `last_seq`; queues the last answer
+//!   had no room for (`limited`) come first. The entries are taken in seq order through the
+//!   receive path (`Via::Queue`, one transaction each, `processed_ct` dropping what came another
+//!   way), and an `ACK` goes for what was taken. Only once the server took the `ACK` does
+//!   `last_seq` move, so what was stored and not acknowledged (a lost `ACK`, a crash) comes
+//!   again and is taken once. A queue that gave a page, or `limited`, is asked again in the next
+//!   round; a run ends when none did. Entries that hold no frame of the queue's conversation are
+//!   taken as nothing, so they never hold a queue up.
+//! * `gone`: an `Active` queue goes `Retiring` with no withdrawal and the reconcile makes a
+//!   fresh one; a `Retiring` one is dropped.
+//! * The texts a run stored are notified once it ends, in one event (marked when stored, so a
+//!   run that dies first is notified after a start, as a pull's are).
+//! * Putting messages into peers' queues (`SEND`) is not here yet.
+use super::mls::Via;
 use super::*;
 use crate::account::connection::Input;
 use crate::mailbox::verdict::{self, QueueMode, Verdict};
 use crate::message::{
-    queue_store::{NewQueue, OwnQueue, QueueDbOp, QueueDbReply, QueueState},
+    queue_store::{Fetchable, NewQueue, OwnQueue, QueueDbOp, QueueDbReply, QueueState},
     store::{MessageDbOp, MessageDbReply},
     types::ConversationId,
 };
-use crate::queue::{CreateItem, DeleteItem, ItemResult, QueueServer};
+use crate::mls::{group::MAX_MLS_MESSAGE_BYTES, wire::MlsFrame};
+use crate::queue::{AckItem, CreateItem, DeleteItem, ItemResult, QueueServer, RecvItem};
+use crate::{NetworkOp, NetworkReply, NetworkState};
 use queue_wire::{
-    BASE64URL_NOPAD, MAX_ITEMS, QueueId, RETIRE_MS, ROTATE_MS, Signed, public_key, sign,
+    BASE64URL_NOPAD, Entry, MAX_ITEMS, QueueId, RETIRE_MS, ROTATE_MS, Signed, public_key, sign,
     signing_bytes,
 };
 use zeroize::Zeroizing;
@@ -43,6 +65,8 @@ use zeroize::Zeroizing;
 /// How often the conversations are looked at for one without a queue while nothing else
 /// changes.
 const CHECK_MS: u64 = 3_600_000;
+/// How often this device fetches from its queues while its network is on (spec 6.4).
+const FETCH_EVERY_MS: u64 = 300_000;
 /// Outer bound of one queue server request, whatever the implementation bounds itself to.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -97,6 +121,43 @@ pub(crate) struct Runtime {
     wake_at: Option<u64>,
     /// Failed runs in a row, for the back-off.
     failures: u64,
+    fetch: Fetch,
+}
+
+/// Fetching from this device's queues (spec 6.4).
+#[derive(Default)]
+struct Fetch {
+    /// A fetch was asked for (a new address, a push's fetch, a full sync): the next poll starts
+    /// one, or the next after the run on its way.
+    asked: bool,
+    /// The network starts seen: a new one asks for a fetch.
+    starts: u64,
+    /// The run on its way.
+    run: Option<FetchRun>,
+    /// Scheduler time of the next fetch while nothing asks for one.
+    next_at: u64,
+    /// Runs in a row whose request failed, for the back-off.
+    failures: u64,
+    /// Queues an answer had no room for (`limited`): asked first in the next `RECV`.
+    first: Vec<QueueId>,
+}
+
+/// One fetch, a round at a time: a `RECV`, its entries taken, an `ACK` for what was taken.
+#[derive(Default)]
+struct FetchRun {
+    /// This round's queues, as the store had them when it began.
+    queues: Vec<Fetchable>,
+    /// Taken, waiting for their `ACK`: each queue and the seq it was taken up to.
+    taken: Vec<(QueueId, u64)>,
+    /// Asked again next round: a page taken whole (there may be more), or `limited`.
+    more: Vec<QueueId>,
+    /// Unknown at the server.
+    gone: Vec<QueueId>,
+    /// A request failed, or an entry or the cursors could not be stored: no next round, and
+    /// the next run after the back-off.
+    failed: bool,
+    /// An entry was taken: the texts stored are notified when the run ends.
+    took: bool,
 }
 
 /// A run's requests came back.
@@ -115,6 +176,20 @@ pub(crate) enum QueueEvent {
         /// when the server answered some item `limited` or `bad`: then the next run waits for
         /// the hourly check, the time the server's `CREATE` limit refills in, so a lasting
         /// refusal costs it one item an hour for each queue, not one each back-off.
+        failed: bool,
+    },
+    /// A fetch round's `RECV` answers, in its queues' order (fewer when a request `failed`);
+    /// `offline`: the network was off, nothing was asked.
+    Received {
+        ticket: u64,
+        answers: Vec<(QueueId, ItemResult)>,
+        failed: bool,
+        offline: bool,
+    },
+    /// Its `ACK` answers, in the taken queues' order (fewer when a request `failed`).
+    Acked {
+        ticket: u64,
+        answers: Vec<(QueueId, ItemResult)>,
         failed: bool,
     },
 }
@@ -246,6 +321,49 @@ fn create_item(id: &QueueId, recipient: &[u8; 32], sender: &[u8; 32], ts: u64) -
     }
 }
 
+/// A `RECV` of `queue` after its `last_seq`, signed by its recipient key at `ts`.
+fn recv_item(queue: &Fetchable, ts: u64) -> RecvItem {
+    let signed = Signed::Recv {
+        since_seq: queue.last_seq,
+    };
+    RecvItem {
+        queue_id: b64(&queue.id),
+        since_seq: queue.last_seq,
+        ts,
+        sig: b64(&sign(
+            &queue.recipient_secret,
+            &signing_bytes(&signed, &queue.id, ts),
+        )),
+    }
+}
+
+/// An `ACK` of `queue`'s entries up to `upto_seq`.
+fn ack_item(queue: &Fetchable, upto_seq: u64, ts: u64) -> AckItem {
+    let signed = Signed::Ack { upto_seq };
+    AckItem {
+        queue_id: b64(&queue.id),
+        upto_seq,
+        ts,
+        sig: b64(&sign(
+            &queue.recipient_secret,
+            &signing_bytes(&signed, &queue.id, ts),
+        )),
+    }
+}
+
+/// The application ciphertext a queue entry holds: the body of a kind 17 `App` frame of the
+/// queue's `conversation` (what a peer sends directly). Anything else is no message for it.
+fn entry_ciphertext(entry: &Entry, conversation: ConversationId) -> Option<Vec<u8>> {
+    let body = queue_wire::decode_ct(&entry.ct).ok()?;
+    match MlsFrame::decode(&body).ok()? {
+        MlsFrame::App {
+            conversation: id,
+            ciphertext,
+        } if id == conversation && ciphertext.len() <= MAX_MLS_MESSAGE_BYTES => Some(ciphertext),
+        _ => None,
+    }
+}
+
 fn delete_item(id: &QueueId, recipient: &[u8; 32], ts: u64) -> DeleteItem {
     DeleteItem {
         queue_id: b64(id),
@@ -371,6 +489,7 @@ impl Manager {
         queue.config_seen = version;
         queue.server = server;
         queue.due = true;
+        queue.fetch.asked = true;
     }
 
     /// One tick of queue upkeep, with the message scheduler's poll, after the verdict is worked
@@ -381,7 +500,11 @@ impl Manager {
             return;
         }
         self.queue_take_config();
-        if self.messages.queue.server.is_none() || self.messages.queue.running {
+        if self.messages.queue.server.is_none() {
+            return;
+        }
+        self.queue_fetch_poll(request).await;
+        if self.messages.queue.running {
             return;
         }
         let Some(verdict) = self.mailbox_verdict() else {
@@ -568,14 +691,27 @@ impl Manager {
     }
 
     pub(super) async fn queue_event(&mut self, event: QueueEvent) {
-        let QueueEvent::Answered {
-            ticket,
-            url,
-            created,
-            refused,
-            deleted,
-            failed,
-        } = event;
+        let (ticket, url, created, refused, deleted, failed) = match event {
+            QueueEvent::Answered {
+                ticket,
+                url,
+                created,
+                refused,
+                deleted,
+                failed,
+            } => (ticket, url, created, refused, deleted, failed),
+            QueueEvent::Received {
+                ticket,
+                answers,
+                failed,
+                offline,
+            } => return self.queue_received(ticket, answers, failed, offline).await,
+            QueueEvent::Acked {
+                ticket,
+                answers,
+                failed,
+            } => return self.queue_acked(ticket, answers, failed).await,
+        };
         self.messages.queue.running = false;
         let Some(request) = self.ready().ok().filter(|r| r.ticket == ticket) else {
             // The account was locked meanwhile: the rows say what is left.
@@ -610,6 +746,300 @@ impl Manager {
             self.queue_failed();
         } else {
             self.queue_check_later();
+        }
+    }
+
+    /// A push's fetch or a full sync asks for a fetch: the next poll starts one.
+    pub(super) fn queue_fetch_soon(&mut self) {
+        self.messages.queue.fetch.asked = true;
+    }
+
+    /// Starts a fetch when one was asked for, the network started again, or it is time.
+    async fn queue_fetch_poll(&mut self, request: Request) {
+        let starts = self.shared.network.starts();
+        let now = self.schedule_now();
+        let fetch = &mut self.messages.queue.fetch;
+        if fetch.starts != starts {
+            fetch.starts = starts;
+            fetch.asked = true;
+        }
+        if fetch.run.is_some() || !(fetch.asked || now >= fetch.next_at) {
+            return;
+        }
+        fetch.asked = false;
+        self.queue_fetch_round(None, false, request).await;
+    }
+
+    /// A round of a fetch: one `RECV` for every queue to ask (`only` these after the first
+    /// round), `limited` ones first, sent in a spawned task. With nothing to ask (no queue, or
+    /// the mode "never") the run ends with no request. The first round looks whether the
+    /// network is on first.
+    async fn queue_fetch_round(
+        &mut self,
+        only: Option<Vec<QueueId>>,
+        took: bool,
+        request: Request,
+    ) {
+        let Some(server) = self.messages.queue.server.clone() else {
+            return self.queue_fetch_end(took, false, request).await;
+        };
+        let (mode, mut queues) = match self.queue_db(QueueDbOp::Fetchable, request).await {
+            Ok(QueueDbReply::Fetchable { mode, queues }) => (mode, queues),
+            _ => return self.queue_fetch_end(took, true, request).await,
+        };
+        if let Some(only) = &only {
+            queues.retain(|q| only.contains(&q.id));
+        }
+        if mode == QueueMode::Never || queues.is_empty() {
+            return self.queue_fetch_end(took, false, request).await;
+        }
+        let first = &self.messages.queue.fetch.first;
+        queues.sort_by_key(|q| !first.contains(&q.id));
+        let wall = self.services.clock.wall_ms();
+        let items: Vec<(QueueId, RecvItem)> =
+            queues.iter().map(|q| (q.id, recv_item(q, wall))).collect();
+        self.messages.queue.fetch.run = Some(FetchRun {
+            queues,
+            took,
+            ..FetchRun::default()
+        });
+        let network = only.is_none().then(|| self.shared.network.clone());
+        let mailbox = self.auth.send.clone();
+        let ticket = request.ticket;
+        tokio::spawn(async move {
+            if let Some(network) = network {
+                let on = matches!(
+                    network.execute(NetworkOp::Info).await,
+                    Ok(NetworkReply::Info(info))
+                        if matches!(info.state, NetworkState::Online | NetworkState::Starting)
+                );
+                if !on {
+                    let _ = mailbox
+                        .send(Input::Queue(QueueEvent::Received {
+                            ticket,
+                            answers: Vec::new(),
+                            failed: false,
+                            offline: true,
+                        }))
+                        .await;
+                    return;
+                }
+            }
+            let client = server.client.clone();
+            let (answers, failed) = run_batches(batches(items), |items| client.recv(items)).await;
+            let _ = mailbox
+                .send(Input::Queue(QueueEvent::Received {
+                    ticket,
+                    answers,
+                    failed,
+                    offline: false,
+                }))
+                .await;
+        });
+    }
+
+    /// The run on its way, if `ticket` is still the account's: the account was locked
+    /// meanwhile otherwise, and it is fetched again once it is not.
+    fn queue_fetch_resume(&mut self, ticket: u64) -> Option<(FetchRun, Request)> {
+        let fetch = &mut self.messages.queue.fetch;
+        let run = fetch.run.take()?;
+        match self.ready().ok().filter(|r| r.ticket == ticket) {
+            Some(request) => Some((run, request)),
+            None => {
+                self.messages.queue.fetch.asked = true;
+                None
+            }
+        }
+    }
+
+    /// A round's `RECV` answers: each page is taken, and an `ACK` goes for what was.
+    async fn queue_received(
+        &mut self,
+        ticket: u64,
+        answers: Vec<(QueueId, ItemResult)>,
+        failed: bool,
+        offline: bool,
+    ) {
+        let Some((mut run, request)) = self.queue_fetch_resume(ticket) else {
+            return;
+        };
+        if offline {
+            return self.queue_fetch_end(run.took, false, request).await;
+        }
+        run.failed |= failed;
+        let answered: Vec<QueueId> = answers.iter().map(|(id, _)| *id).collect();
+        let mut limited = Vec::new();
+        for (id, result) in answers {
+            match result {
+                ItemResult::Entries { entries } if !entries.is_empty() => {
+                    let Some(queue) = run.queues.iter().find(|q| q.id == id) else {
+                        continue;
+                    };
+                    let (upto, whole) = self.queue_take(queue, entries, request).await;
+                    if let Some(upto) = upto {
+                        run.taken.push((id, upto));
+                        run.took = true;
+                    }
+                    // Asked again only past what it took now: a page of nothing new ends it.
+                    if !whole {
+                        run.failed = true;
+                    } else if upto.is_some() {
+                        run.more.push(id);
+                    }
+                }
+                ItemResult::Limited => {
+                    limited.push(id);
+                    run.more.push(id);
+                }
+                ItemResult::Gone => run.gone.push(id),
+                // No entries: nothing more there. `bad`: asked again at the next fetch.
+                _ => {}
+            }
+        }
+        let first = &mut self.messages.queue.fetch.first;
+        first.retain(|id| !answered.contains(id));
+        first.extend(limited);
+        if run.taken.is_empty() {
+            // A round that took nothing asks nothing more (`limited` for every queue it asked
+            // is no answer the server gives: the first item of a request always has room).
+            run.more.clear();
+            return self.queue_fetch_settle(run, Vec::new(), request).await;
+        }
+        let Some(server) = self.messages.queue.server.clone() else {
+            return self.queue_fetch_end(run.took, false, request).await;
+        };
+        let wall = self.services.clock.wall_ms();
+        let items: Vec<(QueueId, AckItem)> = run
+            .taken
+            .iter()
+            .filter_map(|(id, upto)| {
+                let queue = run.queues.iter().find(|q| q.id == *id)?;
+                Some((*id, ack_item(queue, *upto, wall)))
+            })
+            .collect();
+        self.messages.queue.fetch.run = Some(run);
+        let mailbox = self.auth.send.clone();
+        tokio::spawn(async move {
+            let client = server.client.clone();
+            let (answers, failed) = run_batches(batches(items), |items| client.ack(items)).await;
+            let _ = mailbox
+                .send(Input::Queue(QueueEvent::Acked {
+                    ticket,
+                    answers,
+                    failed,
+                }))
+                .await;
+        });
+    }
+
+    /// Takes a page of `queue`'s entries in seq order through the receive path: the seq it was
+    /// taken up to (`None`: none), and whether all of it was. An entry that could not be
+    /// stored stops it there; it and the rest come again.
+    async fn queue_take(
+        &mut self,
+        queue: &Fetchable,
+        entries: Vec<Entry>,
+        request: Request,
+    ) -> (Option<u64>, bool) {
+        let mut upto = None;
+        for entry in entries {
+            // A server answering out of order, or below the cursor, is not followed back.
+            if entry.seq <= upto.unwrap_or(queue.last_seq) {
+                continue;
+            }
+            if let Some(ciphertext) = entry_ciphertext(&entry, queue.conversation) {
+                let opened = self
+                    .open_received(
+                        queue.peer,
+                        None,
+                        queue.conversation,
+                        ciphertext,
+                        &Via::Queue,
+                        request,
+                    )
+                    .await;
+                if opened.is_err() {
+                    return (upto, false);
+                }
+            }
+            upto = Some(entry.seq);
+        }
+        (upto, true)
+    }
+
+    /// A round's `ACK` answers: the cursors of what the server took move.
+    async fn queue_acked(
+        &mut self,
+        ticket: u64,
+        answers: Vec<(QueueId, ItemResult)>,
+        failed: bool,
+    ) {
+        let Some((mut run, request)) = self.queue_fetch_resume(ticket) else {
+            return;
+        };
+        run.failed |= failed;
+        let mut acked = Vec::new();
+        for (id, result) in answers {
+            let upto = run
+                .taken
+                .iter()
+                .find(|(q, _)| *q == id)
+                .map(|(_, seq)| *seq);
+            match (result, upto) {
+                (ItemResult::Ok, Some(upto)) => acked.push((id, upto)),
+                (ItemResult::Gone, _) => run.gone.push(id),
+                // Not taken (`bad`): its entries come again at the next fetch, not now.
+                _ => run.more.retain(|q| *q != id),
+            }
+        }
+        self.queue_fetch_settle(run, acked, request).await;
+    }
+
+    /// Stores what a round's answers said (the cursors the server took, the queues it lost),
+    /// then goes on with the next round, or ends the run.
+    async fn queue_fetch_settle(
+        &mut self,
+        mut run: FetchRun,
+        acked: Vec<(QueueId, u64)>,
+        request: Request,
+    ) {
+        let gone = std::mem::take(&mut run.gone);
+        run.more.retain(|id| !gone.contains(id));
+        if !(acked.is_empty() && gone.is_empty()) {
+            let op = QueueDbOp::Fetched {
+                acked,
+                gone,
+                wall: self.services.clock.wall_ms(),
+            };
+            match self.queue_db(op, request).await {
+                // Their conversations get fresh queues from the reconcile.
+                Ok(QueueDbReply::Fetched { replaced }) => self.messages.queue.due |= replaced > 0,
+                _ => run.failed = true,
+            }
+        }
+        if run.failed || run.more.is_empty() {
+            return self.queue_fetch_end(run.took, run.failed, request).await;
+        }
+        self.queue_fetch_round(Some(run.more), run.took, request)
+            .await;
+    }
+
+    /// The run is over: the next one in `FETCH_EVERY_MS`, or after the back-off when it
+    /// `failed`; what it stored is notified.
+    async fn queue_fetch_end(&mut self, took: bool, failed: bool, request: Request) {
+        let now = self.schedule_now();
+        let fetch = &mut self.messages.queue.fetch;
+        fetch.run = None;
+        if failed {
+            fetch.failures = fetch.failures.saturating_add(1);
+            fetch.next_at =
+                now.saturating_add(crate::message::scheduler::retry_delay(fetch.failures));
+        } else {
+            fetch.failures = 0;
+            fetch.next_at = now.saturating_add(FETCH_EVERY_MS);
+        }
+        if took {
+            self.notify_fetched(request).await;
         }
     }
 }
@@ -826,6 +1256,86 @@ mod tests {
             assert_eq!(answers.len(), usize::from(conversations));
             assert_eq!(*server.0.lock().unwrap(), requests);
         }
+    }
+
+    #[test]
+    fn recv_and_ack_items_verify_under_the_recipient_key() {
+        let queue = Fetchable {
+            id: [4; 32],
+            conversation: conv(1),
+            peer: PeerId([2; 32]),
+            recipient_secret: Zeroizing::new([5; 32]),
+            last_seq: 77,
+        };
+        let sig = |s: &str| -> [u8; 64] {
+            BASE64URL_NOPAD
+                .decode(s.as_bytes())
+                .unwrap()
+                .try_into()
+                .unwrap()
+        };
+        let public = public_key(&[5; 32]);
+        let recv = recv_item(&queue, T);
+        assert_eq!(recv.since_seq, 77);
+        let signed = Signed::Recv { since_seq: 77 };
+        assert!(queue_wire::verify(
+            &public,
+            &signing_bytes(&signed, &queue.id, T),
+            &sig(&recv.sig)
+        ));
+        let ack = ack_item(&queue, 90, T);
+        assert_eq!(ack.upto_seq, 90);
+        let signed = Signed::Ack { upto_seq: 90 };
+        assert!(queue_wire::verify(
+            &public,
+            &signing_bytes(&signed, &queue.id, T),
+            &sig(&ack.sig)
+        ));
+    }
+
+    /// Only a kind 17 `App` frame body of the queue's conversation is a message; anything else
+    /// an entry may hold is none.
+    #[test]
+    fn an_entry_holds_an_app_frame_of_its_conversation_or_nothing() {
+        let entry = |body: &[u8]| Entry {
+            seq: 1,
+            ct: b64(body),
+            ts: T,
+        };
+        let app = |conversation, ciphertext: Vec<u8>| {
+            MlsFrame::App {
+                conversation,
+                ciphertext,
+            }
+            .inner()
+            .to_vec()
+        };
+        assert_eq!(
+            entry_ciphertext(&entry(&app(conv(1), vec![9; 40])), conv(1)),
+            Some(vec![9; 40])
+        );
+        // Another conversation's, another frame, the whole envelope, or no frame at all.
+        assert_eq!(
+            entry_ciphertext(&entry(&app(conv(2), vec![9; 40])), conv(1)),
+            None
+        );
+        let query = MlsFrame::GroupQuery {
+            conversation: conv(1),
+        };
+        assert_eq!(entry_ciphertext(&entry(&query.inner()), conv(1)), None);
+        let envelope = MlsFrame::App {
+            conversation: conv(1),
+            ciphertext: vec![9; 40],
+        }
+        .encode();
+        assert_eq!(entry_ciphertext(&entry(&envelope), conv(1)), None);
+        assert_eq!(entry_ciphertext(&entry(b"not a frame"), conv(1)), None);
+        let bad = Entry {
+            seq: 1,
+            ct: "*".into(),
+            ts: T,
+        };
+        assert_eq!(entry_ciphertext(&bad, conv(1)), None);
     }
 
     #[test]

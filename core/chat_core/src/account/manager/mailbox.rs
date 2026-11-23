@@ -2256,12 +2256,14 @@ impl Manager {
 
     /// A text from the other account was stored just now: notified at once when it came
     /// directly, with the rest of its pull when it came from another own device's log (the
-    /// storing transaction marked it for that, Ruling 35), and by the push's own processing
-    /// when a push brought it (`push_received`, which knows whether it was read already).
+    /// storing transaction marked it for that, Ruling 35), with the rest of its fetch when it came
+    /// from a server queue (marked the same way, under this device), and by the push's own
+    /// processing when a push brought it (`push_received`, which knows whether it was read
+    /// already).
     pub(super) async fn text_stored(&mut self, key: MessageKey, via: &Via, request: Request) {
         match via {
             Via::Direct(_) => self.notify(vec![key], Vec::new(), request).await,
-            Via::Push => {}
+            Via::Push | Via::Queue => {}
             Via::Mailbox { .. } => {
                 #[cfg(all(feature = "test-hooks", debug_assertions))]
                 {
@@ -2284,7 +2286,9 @@ impl Manager {
         request: Request,
     ) {
         match via {
-            Via::Direct(_) | Via::Push => self.notify(Vec::new(), vec![conversation], request).await,
+            Via::Direct(_) | Via::Push | Via::Queue => {
+                self.notify(Vec::new(), vec![conversation], request).await
+            }
             Via::Mailbox { holder, .. } => {
                 if let Some(pull) = self.messages.mailbox.pulls.get_mut(holder) {
                     pull.read.insert(conversation);
@@ -2346,6 +2350,23 @@ impl Manager {
         if done {
             // A read clear push (M7 spec 7) waits for a sync to end.
             self.push_pull_done();
+        }
+    }
+
+    /// The texts a fetch from this device's server queues stored (marked under this device,
+    /// like a pull's) are notified per conversation in one event (M8 spec 4: alerted once).
+    pub(super) async fn notify_fetched(&mut self, request: Request) {
+        let Ok(local) = self.local() else {
+            return;
+        };
+        let op = MailboxDbOp::TakeNotify {
+            holder: Some(local.device.installation_id()),
+            running: Vec::new(),
+            read: Vec::new(),
+        };
+        // A failure leaves the marks for the next fetch's end, or the next start.
+        if let Ok(MailboxDbReply::Notify(items)) = self.mailbox_db(op, request).await {
+            self.publish_notify(items);
         }
     }
 

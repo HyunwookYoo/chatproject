@@ -49,6 +49,18 @@ pub(crate) struct NewQueue {
     pub sender_secret: Zeroizing<[u8; 32]>,
 }
 
+/// A queue a fetch asks (spec 6.4): an `Active` one the server took, or a `Retiring` one.
+/// `last_seq` is the last entry the server took an `ACK` for, so a fetch asks for what comes
+/// after it: whatever was stored here but not acknowledged comes again (and is taken once).
+pub(crate) struct Fetchable {
+    pub id: QueueId,
+    pub conversation: ConversationId,
+    /// The conversation's peer account: what its entries are opened as coming from.
+    pub peer: PeerId,
+    pub recipient_secret: Zeroizing<[u8; 32]>,
+    pub last_seq: u64,
+}
+
 /// What a reconcile looks at.
 pub(crate) struct QueueView {
     pub mode: QueueMode,
@@ -87,11 +99,24 @@ pub(crate) enum QueueDbOp {
         wall: u64,
         now: u64,
     },
+    /// The mode and the queues a fetch asks, in conversation and creation order.
+    Fetchable,
+    /// What a fetch's `ACK`s and `RECV`s said, in one transaction: `acked` took an `ACK` up to
+    /// that seq (`last_seq` only rises), `gone` are unknown at the server. A `gone` `Active`
+    /// queue goes `Retiring` with no withdrawal (its frame time still counts for the next
+    /// one's), so the reconcile makes a fresh queue; a `gone` `Retiring` one is dropped. Its
+    /// `server_confirmed` and `last_seq` are never reset: the same id created again would be
+    /// announced at the same frame time, which peers drop as no newer.
+    Fetched {
+        acked: Vec<(QueueId, u64)>,
+        gone: Vec<QueueId>,
+        wall: u64,
+    },
 }
 
 impl QueueDbOp {
     pub(crate) fn writes(&self) -> bool {
-        !matches!(self, Self::Load | Self::Using)
+        !matches!(self, Self::Load | Self::Using | Self::Fetchable)
     }
 }
 
@@ -109,6 +134,14 @@ pub(crate) enum QueueDbReply {
     Settled {
         announced: u32,
         unsealed: u32,
+    },
+    Fetchable {
+        mode: QueueMode,
+        queues: Vec<Fetchable>,
+    },
+    /// `Active` queues that went `Retiring` because the server lost them: new ones are due.
+    Fetched {
+        replaced: u32,
     },
 }
 
@@ -222,6 +255,35 @@ pub(super) fn queue_op(
                 unsealed,
             }
         }
+        QueueDbOp::Fetchable => QueueDbReply::Fetchable {
+            mode: mode(c)?,
+            queues: fetchable(c)?,
+        },
+        QueueDbOp::Fetched { acked, gone, wall } => {
+            // Plain updates and deletes, no seal: one transaction for the whole fetch step.
+            let tx = c.transaction().map_err(sql)?;
+            for (id, seq) in acked {
+                tx.execute(
+                    "UPDATE queue_own SET last_seq=max(last_seq,?2) WHERE queue_id=?1",
+                    params![id.as_slice(), integer(seq)?],
+                )
+                .map_err(sql)?;
+            }
+            let mut replaced = 0;
+            for id in gone {
+                if retire(&tx, id, wall)?.is_some() {
+                    replaced += 1;
+                } else {
+                    tx.execute(
+                        "DELETE FROM queue_own WHERE queue_id=?1 AND state=1",
+                        params![id.as_slice()],
+                    )
+                    .map_err(sql)?;
+                }
+            }
+            finish(tx, fault)?;
+            QueueDbReply::Fetched { replaced }
+        }
     };
     Ok(MessageDbReply::Queue(reply))
 }
@@ -237,19 +299,26 @@ fn alone<T>(c: &mut Connection, fault: Fault, f: impl FnOnce(&Transaction<'_>) -
 /// The `Active` queue `id` goes `Retiring`; its withdrawal is sealed when `withdraw`. Whether
 /// one was.
 fn retire_one(tx: &Transaction<'_>, seal: &Sealer<'_>, id: QueueId, withdraw: bool) -> R<bool> {
-    let Some(conversation) = active_conversation(tx, &id)? else {
+    let Some((conversation, at)) = retire(tx, id, seal.routing.wall)? else {
         return Ok(false);
     };
-    let at = seal
-        .routing
-        .wall
-        .max(floor(tx, conversation)?.saturating_add(1));
+    Ok(withdraw && seal.queue_ref(tx, conversation, at, None)?)
+}
+
+/// The `Active` queue `id` goes `Retiring` at `wall` (or just after the conversation's last
+/// frame), to be deleted `RETIRE_MS` later: its conversation and that time, `None` when it is
+/// not `Active`.
+fn retire(tx: &Transaction<'_>, id: QueueId, wall: u64) -> R<Option<(ConversationId, u64)>> {
+    let Some(conversation) = active_conversation(tx, &id)? else {
+        return Ok(None);
+    };
+    let at = wall.max(floor(tx, conversation)?.saturating_add(1));
     tx.execute(
         "UPDATE queue_own SET state=1,delete_at_ms=?2 WHERE queue_id=?1 AND state=0",
         params![id.as_slice(), integer(at.saturating_add(RETIRE_MS))?],
     )
     .map_err(sql)?;
-    Ok(withdraw && seal.queue_ref(tx, conversation, at, None)?)
+    Ok(Some((conversation, at)))
 }
 
 /// A new `Active` queue's row with its keys, unconfirmed, made at `wall` (or just after the
@@ -313,18 +382,40 @@ fn confirm(
     Ok(Some(true))
 }
 
-fn load(c: &Connection) -> R<QueueView> {
+fn mode(c: &Connection) -> R<QueueMode> {
     let mode = c
         .query_row("SELECT mode FROM queue_local WHERE id=1", [], |r| {
             r.get::<_, i64>(0)
         })
         .map_err(sql)?;
-    let mode = match mode {
-        0 => QueueMode::Auto,
-        1 => QueueMode::Always,
-        2 => QueueMode::Never,
-        _ => return Err(CoreError::new(ErrorCode::StorageCorrupt, "queue_mode")),
-    };
+    match mode {
+        0 => Ok(QueueMode::Auto),
+        1 => Ok(QueueMode::Always),
+        2 => Ok(QueueMode::Never),
+        _ => Err(CoreError::new(ErrorCode::StorageCorrupt, "queue_mode")),
+    }
+}
+
+/// Every queue a fetch asks, with its conversation's peer, in one query.
+fn fetchable(c: &Connection) -> R<Vec<Fetchable>> {
+    c.prepare("SELECT q.queue_id,q.conversation,v.peer,q.recipient_secret,q.last_seq FROM queue_own q JOIN conversation v ON v.id=q.conversation WHERE q.state=1 OR q.server_confirmed=1 ORDER BY q.conversation,q.created_at_ms")
+        .map_err(sql)?
+        .query_map([], |r| {
+            Ok(Fetchable {
+                id: bytes(r, 0)?,
+                conversation: ConversationId(bytes(r, 1)?),
+                peer: PeerId(bytes(r, 2)?),
+                recipient_secret: Zeroizing::new(bytes(r, 3)?),
+                last_seq: uint(r, 4)?,
+            })
+        })
+        .map_err(sql)?
+        .collect::<Result<_, _>>()
+        .map_err(sql)
+}
+
+fn load(c: &Connection) -> R<QueueView> {
+    let mode = mode(c)?;
     let conversations = c
         .prepare("SELECT m.conversation FROM mls_conversation m JOIN conversation v ON v.id=m.conversation ORDER BY m.conversation")
         .map_err(sql)?

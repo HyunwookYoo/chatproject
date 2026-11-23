@@ -9,28 +9,13 @@ include!("support/queue_network.rs");
 
 use queue_wire::{RETIRE_MS, ROTATE_MS};
 
-/// A1 and B1 with a conversation and a queue server, both configured with it; returns once
-/// each keeps the other's announced queue and neither has anything left to deliver.
-async fn announced() -> (
-    Fixture,
-    Fixture,
-    Arc<Backend>,
-    ConversationId,
-    Arc<FakeQueueServer>,
-) {
-    let (mut a, b1, net, conv) = queue_accounts(&[A1]).await;
-    let a1 = a.remove(0);
-    let server = queue_server(&net);
-    configure(&a1, QUEUE_URL);
-    configure(&b1, QUEUE_URL);
-    settle!(
-        [&a1, &b1],
-        peer_queue(&b1, conv, &a1).await.flatten().is_some()
-            && peer_queue(&a1, conv, &b1).await.flatten().is_some()
-            && queue_ref_deliveries(&a1).await == 0
-            && queue_ref_deliveries(&b1).await == 0
-    );
-    (a1, b1, net, conv, server)
+/// The requests `f` sent that make or delete queues (not fetches).
+fn changes(server: &FakeQueueServer, f: &Fixture) -> Vec<Call> {
+    server
+        .calls_from(f)
+        .into_iter()
+        .filter(|c| c.command == CommandName::Create || c.command == CommandName::Delete)
+        .collect()
 }
 
 /// A2 becomes a qualified mailbox (uptime seeded over a week), and `a1` judges so.
@@ -81,8 +66,13 @@ async fn no_mailbox_creates_one_queue_per_conversation_and_announces() {
     assert_eq!(creates.len(), 1);
     assert_eq!(creates[0].queues, [queue.queue_id]);
     assert!(server.queues().contains(&queue.queue_id));
-    // Nothing but the one `CREATE`: no fetching or sending here yet.
-    assert_eq!(server.calls_from(&a1).len(), 1);
+    // Nothing but the one `CREATE` and fetches: no sending here yet.
+    assert!(
+        server
+            .calls_from(&a1)
+            .iter()
+            .all(|c| c.command == CommandName::Create || c.command == CommandName::Recv)
+    );
     assert!(a1.account.queue_state().await.unwrap().using_queue);
     // And the other way: B1 has no mailbox either, and A1 keeps B1's queue.
     assert!(peer_queue(&a1, conv, &b1).await.flatten().is_some());
@@ -134,6 +124,11 @@ async fn mailbox_recovery_withdraws_and_deletes_after_48h() {
     assert_eq!(deletes[0].queues, [queue.queue_id]);
     // The tombstone at the peer stays.
     assert_eq!(peer_queue(&b1, conv, &a1).await, Some(None));
+    // No queue left: the 5-minute fetch asks nothing (plan Task 9 "성능").
+    let fetches = server.fetches(&a1).len();
+    a1.clock.advance_monotonic_ms(301_000);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(server.fetches(&a1).len(), fetches);
 }
 
 /// Spec 6.3 rotation: a queue older than 7 days is replaced by a new one, announced to the
@@ -167,16 +162,16 @@ async fn rotation_after_7_days_keeps_old_until_retired() {
 }
 
 /// The job converges: run again (the mode set again, and after a restart) it adds no queue,
-/// no request and no frame.
+/// no `CREATE` or `DELETE` and no frame.
 #[tokio::test]
 async fn reconcile_twice_adds_nothing() {
     let (a1, b1, net, conv, server) = announced().await;
     let before = tables(&a1).await;
-    let calls = server.calls_from(&a1).len();
+    let calls = changes(&server, &a1).len();
     a1.account.set_queue_mode(QueueMode::Auto).await.unwrap();
     quiet(&[&a1, &b1]).await;
     assert_eq!(tables(&a1).await, before);
-    assert_eq!(server.calls_from(&a1).len(), calls);
+    assert_eq!(changes(&server, &a1).len(), calls);
     assert_eq!(queue_ref_deliveries(&a1).await, 0);
 
     let dir = stop(a1);
@@ -184,7 +179,7 @@ async fn reconcile_twice_adds_nothing() {
     configure(&a1, QUEUE_URL);
     quiet(&[&a1, &b1]).await;
     assert_eq!(tables(&a1).await.own, before.own);
-    assert!(server.calls_from(&a1).is_empty());
+    assert!(changes(&server, &a1).is_empty());
     assert_eq!(queue_ref_deliveries(&a1).await, 0);
     let _ = conv;
 }
@@ -276,12 +271,17 @@ async fn release_then_recreate_keeps_entries() {
     let retired = retiring(&a1).await;
     assert_eq!(retired.len(), 1);
     assert_eq!(retired[0].queue_id, first.queue_id);
-    assert_eq!(
-        server
-            .entries(first.queue_id, &first.recipient_secret)
-            .await,
-        Some(1)
-    );
+    // Still held there, or taken by A1's fetch of its `Retiring` queue (Task 9).
+    let held = server
+        .entries(first.queue_id, &first.recipient_secret)
+        .await;
+    let fetched = server.fetches(&a1).iter().any(|c| {
+        c.queues
+            .iter()
+            .zip(&c.got)
+            .any(|(q, got)| *q == first.queue_id && matches!(got, Got::Entries(e) if !e.is_empty()))
+    });
+    assert!(held == Some(1) || (held == Some(0) && fetched));
     assert!(server.sent(&a1, CommandName::Delete).is_empty());
     let created: Vec<QueueId> = server
         .sent(&a1, CommandName::Create)
@@ -317,12 +317,14 @@ async fn never_mode_sends_nothing() {
         peer_queue(&b1, conv, &a1).await.flatten().is_some()
             && queue_ref_deliveries(&a1).await == 0
     );
-    let calls = server.calls_from(&a1).len();
     a1.account.set_queue_mode(QueueMode::Never).await.unwrap();
     settle!(
         [&a1, &b1],
         peer_queue(&b1, conv, &a1).await == Some(None) && active(&a1).await.is_empty()
     );
+    // A fetch begun before "never" may still be on its way; none starts after.
+    quiet(&[&a1]).await;
+    let calls = server.calls_from(&a1).len();
     let delete_at = retiring(&a1).await[0].delete_at_ms.unwrap();
     a1.clock.set_unix_seconds(delete_at / 1_000 + 1);
     settle!([&a1], tables(&a1).await.own.is_empty());
