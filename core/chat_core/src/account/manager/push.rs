@@ -588,20 +588,9 @@ impl Manager {
         }))
     }
 
-    /// `push_first` for a text no device was reached for, sealed first: the push carries its
-    /// ciphertext. `None` while it cannot be sealed (no group yet); a later attempt decides.
-    pub(super) async fn push_first_unreached(
-        &mut self,
-        key: MessageKey,
-        peer: PeerId,
-        request: Request,
-    ) -> Option<Box<FirstAttempt>> {
-        let first = self.push_first(peer, Vec::new())?;
-        let seal = MessageDbOp::Seal(key, self.services.clock.wall_ms());
-        match self.message_db(seal, request).await {
-            Ok(MessageDbReply::Sealed { .. }) => Some(first),
-            _ => None,
-        }
+    /// Whether a push proxy is configured: texts no device was reached for are pushed.
+    pub(super) fn push_on(&self) -> bool {
+        self.messages.push.proxy.is_some()
     }
 
     /// Records a text attempt's outcome `op`, with its push decision in the same transaction

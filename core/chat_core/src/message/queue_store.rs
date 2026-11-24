@@ -4,21 +4,56 @@
 //! handles' frames. `Apply` and `Settle` write one transaction per queue (as push's `Seal`
 //! writes one per conversation), so a queue that fails holds up no other; `store_peer_ref` runs
 //! inside the caller's.
+//!
+//! Sending (spec 8): `queue_delivery` has a row per text and peer device whose queue holds it,
+//! until the server's expiry (`expires_at_ms`); while it lasts no `SEND` of that text goes to
+//! that device again. A text is this device's outbox row, or on a mailbox a text another of my
+//! devices handed off (`mailbox_handoff`); both are named by the message key. A row whose text
+//! is gone (delivered, cancelled, failed, handed on) or that expired is swept (`Sweep`).
 use queue_wire::{QueueId, RETIRE_MS};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use zeroize::Zeroizing;
 
-use super::mls_group::sql;
+use super::mailbox_store::STOPPED;
+use super::mls_group::{PENDING_LIMIT, sql};
 use super::mls_store::{Fault, finish};
 use super::push_store::{FrameKind, Routing, recipients};
 use super::store::{Identity, MessageDbReply, bytes, integer, uint};
-use super::types::ConversationId;
+use super::types::{ConversationId, MessageKey};
 use crate::account::{InstallationId, PeerId, storage::schema::LocalAccount};
 use crate::mailbox::verdict::QueueMode;
 use crate::mls::payload::{MAX_SERVER_URL, QueueRefBody, queue_ref_message};
+use crate::mls::wire::MlsFrame;
 use crate::{CoreError, ErrorCode};
 
 type R<T> = Result<T, CoreError>;
+
+/// Most `queue_delivery` rows one `Sweep` drops.
+pub(crate) const SWEEP_MAX: i64 = 256;
+
+/// A text an attempt did not get to every device of its peer (spec 8.1). `key` names it: this
+/// device's own text, or one another of my devices handed off to this mailbox.
+pub(crate) struct Unreached {
+    pub key: MessageKey,
+    /// The peer's current devices the attempt did not reach.
+    pub devices: Vec<InstallationId>,
+}
+
+/// One `SEND` request for one text (spec 8.1): every device it goes to.
+pub(crate) struct ToSend {
+    pub key: MessageKey,
+    pub targets: Vec<Target>,
+}
+
+/// One device's queue, and the frames that go into it, in order: the `Commit`s and `Welcome`s
+/// still queued for it (as a direct attempt carries them ahead), then the text. Each frame is
+/// the complete kind 17 envelope a direct send writes.
+pub(crate) struct Target {
+    pub installation: InstallationId,
+    pub queue_id: QueueId,
+    pub sender_secret: Zeroizing<[u8; 32]>,
+    pub frames: Vec<Vec<u8>>,
+}
 
 /// A queue's state (spec 6.2): `Active` (at most one per conversation), or `Retiring`, still
 /// fetched until `delete_at_ms` (wall) and then deleted at the server.
@@ -112,11 +147,36 @@ pub(crate) enum QueueDbOp {
         gone: Vec<QueueId>,
         wall: u64,
     },
+    /// The `SEND` of a text to the devices an attempt did not reach, read before the attempt's
+    /// outcome is stored (an acknowledged text's row goes with it). Nothing for a text no longer
+    /// waiting, with the mode "never", or for a device without a live queue on `server_url`, or
+    /// whose queue still holds the text at `wall`.
+    ToSend {
+        unreached: Unreached,
+        server_url: String,
+        wall: u64,
+    },
+    /// A text's `SEND` came back: the queues of `put` took every frame and hold the text until
+    /// `expires_at` (only while it still waits), `gone` are unknown at the server: not used
+    /// again until that device announces another queue.
+    Sent {
+        key: MessageKey,
+        put: Vec<(InstallationId, QueueId)>,
+        gone: Vec<(InstallationId, QueueId)>,
+        expires_at: u64,
+    },
+    /// Drops `queue_delivery` rows expired at `wall` or whose text is gone, `SWEEP_MAX` at most.
+    Sweep {
+        wall: u64,
+    },
 }
 
 impl QueueDbOp {
     pub(crate) fn writes(&self) -> bool {
-        !matches!(self, Self::Load | Self::Using | Self::Fetchable)
+        !matches!(
+            self,
+            Self::Load | Self::Using | Self::Fetchable | Self::ToSend { .. }
+        )
     }
 }
 
@@ -143,6 +203,10 @@ pub(crate) enum QueueDbReply {
     Fetched {
         replaced: u32,
     },
+    ToSend(Option<ToSend>),
+    Sent,
+    /// Rows dropped: `SWEEP_MAX` means there may be more.
+    Swept(i64),
 }
 
 pub(super) fn queue_op(
@@ -284,8 +348,175 @@ pub(super) fn queue_op(
             finish(tx, fault)?;
             QueueDbReply::Fetched { replaced }
         }
+        QueueDbOp::ToSend {
+            unreached,
+            server_url,
+            wall,
+        } => QueueDbReply::ToSend(to_send(c, identity, unreached, &server_url, wall)?),
+        QueueDbOp::Sent {
+            key,
+            put,
+            gone,
+            expires_at,
+        } => {
+            let tx = c.transaction().map_err(sql)?;
+            if text(&tx, identity, key)?.is_some() {
+                for (installation, queue_id) in put {
+                    tx.execute(
+                        "INSERT INTO queue_delivery VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(conversation,sender_peer,sender_install,msg_id,recipient_install) DO UPDATE SET queue_id=excluded.queue_id,expires_at_ms=excluded.expires_at_ms",
+                        params![
+                            key.conversation.0.as_slice(),
+                            key.sender.0.as_slice(),
+                            key.installation.0.as_slice(),
+                            key.id.0.as_slice(),
+                            installation.0.as_slice(),
+                            queue_id.as_slice(),
+                            integer(expires_at)?
+                        ],
+                    )
+                    .map_err(sql)?;
+                }
+            }
+            // Only the queue that answered: a newer one announced meanwhile stays live.
+            for (installation, queue_id) in gone {
+                tx.execute(
+                    "UPDATE queue_peer SET dead=1 WHERE conversation=?1 AND installation=?2 AND queue_id=?3",
+                    params![
+                        key.conversation.0.as_slice(),
+                        installation.0.as_slice(),
+                        queue_id.as_slice()
+                    ],
+                )
+                .map_err(sql)?;
+            }
+            finish(tx, fault)?;
+            QueueDbReply::Sent
+        }
+        QueueDbOp::Sweep { wall } => {
+            let tx = c.transaction().map_err(sql)?;
+            let swept = tx
+                .execute(
+                    "DELETE FROM queue_delivery WHERE rowid IN (SELECT d.rowid FROM queue_delivery d LEFT JOIN outbox o ON o.conversation=d.conversation AND o.sender_peer=d.sender_peer AND o.sender_install=d.sender_install AND o.msg_id=d.msg_id LEFT JOIN mailbox_handoff h ON h.origin_install=d.sender_install AND h.conversation=d.conversation AND h.msg_id=d.msg_id WHERE d.expires_at_ms<=?1 OR (o.msg_id IS NULL AND h.msg_id IS NULL) LIMIT ?2)",
+                    params![integer(wall)?, SWEEP_MAX],
+                )
+                .map_err(sql)?;
+            finish(tx, fault)?;
+            QueueDbReply::Swept(swept as i64)
+        }
     };
     Ok(MessageDbReply::Queue(reply))
+}
+
+/// The frame of text `key` while it still waits for delivery, as a direct attempt writes it:
+/// this device's own sealed outbox row, or the ciphertext another of my devices handed off to
+/// this mailbox (not one stopped because the peer could not open it).
+fn text(c: &Connection, identity: Identity, key: MessageKey) -> R<Option<Vec<u8>>> {
+    if key.sender != identity.peer {
+        return Ok(None);
+    }
+    if key.installation == identity.installation {
+        return c
+            .query_row(
+                "SELECT o.wire FROM outbox o JOIN message m USING(conversation,sender_peer,sender_install,msg_id) WHERE o.conversation=?1 AND o.sender_peer=?2 AND o.sender_install=?3 AND o.msg_id=?4 AND o.codec=2 AND m.delivered_at_ms IS NULL AND m.cancel_requested=0 AND m.outcome<>3",
+                params![
+                    key.conversation.0.as_slice(),
+                    key.sender.0.as_slice(),
+                    key.installation.0.as_slice(),
+                    key.id.0.as_slice()
+                ],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(sql);
+    }
+    let ciphertext: Option<Vec<u8>> = c
+        .query_row(
+            "SELECT ciphertext FROM mailbox_handoff WHERE origin_install=?1 AND conversation=?2 AND msg_id=?3 AND next_retry_at_ms<?4",
+            params![
+                key.installation.0.as_slice(),
+                key.conversation.0.as_slice(),
+                key.id.0.as_slice(),
+                STOPPED
+            ],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sql)?;
+    Ok(ciphertext.map(|ciphertext| {
+        MlsFrame::App {
+            conversation: key.conversation,
+            ciphertext,
+        }
+        .encode()
+        .to_vec()
+    }))
+}
+
+/// See `QueueDbOp::ToSend`. Three reads whatever the number of devices.
+fn to_send(
+    c: &Connection,
+    identity: Identity,
+    unreached: Unreached,
+    server_url: &str,
+    wall: u64,
+) -> R<Option<ToSend>> {
+    let Unreached { key, devices } = unreached;
+    if devices.is_empty() || mode(c)? == QueueMode::Never {
+        return Ok(None);
+    }
+    let Some(text) = text(c, identity, key)? else {
+        return Ok(None);
+    };
+    let mut targets: Vec<Target> = c
+        .prepare("SELECT p.installation,p.queue_id,p.sender_secret FROM queue_peer p WHERE p.conversation=?1 AND p.server_url=?2 AND p.queue_id IS NOT NULL AND p.dead=0 AND NOT EXISTS(SELECT 1 FROM queue_delivery d WHERE d.conversation=p.conversation AND d.sender_peer=?3 AND d.sender_install=?4 AND d.msg_id=?5 AND d.recipient_install=p.installation AND d.expires_at_ms>?6) ORDER BY p.installation")
+        .map_err(sql)?
+        .query_map(
+            params![
+                key.conversation.0.as_slice(),
+                server_url,
+                key.sender.0.as_slice(),
+                key.installation.0.as_slice(),
+                key.id.0.as_slice(),
+                integer(wall)?
+            ],
+            |r| {
+                Ok(Target {
+                    installation: InstallationId(bytes(r, 0)?),
+                    queue_id: bytes(r, 1)?,
+                    sender_secret: Zeroizing::new(bytes(r, 2)?),
+                    frames: Vec::new(),
+                })
+            },
+        )
+        .map_err(sql)?
+        .collect::<Result<_, _>>()
+        .map_err(sql)?;
+    targets.retain(|t| devices.contains(&t.installation));
+    if targets.is_empty() {
+        return Ok(None);
+    }
+    // The Commits and Welcomes each device still lacks, in the order a direct attempt carries
+    // them ahead (`pending_deliveries`), so the text never comes before its epoch's Commit.
+    let mut ahead = c
+        .prepare("SELECT recipient_install,body FROM mls_delivery WHERE conversation=?1 ORDER BY recipient_install,epoch,kind DESC")
+        .map_err(sql)?;
+    let rows = ahead
+        .query_map(params![key.conversation.0.as_slice()], |r| {
+            Ok((InstallationId(bytes(r, 0)?), r.get::<_, Vec<u8>>(1)?))
+        })
+        .map_err(sql)?;
+    for row in rows {
+        let (installation, body) = row.map_err(sql)?;
+        if let Some(target) = targets.iter_mut().find(|t| t.installation == installation)
+            && (target.frames.len() as i64) < PENDING_LIMIT
+        {
+            target.frames.push(body);
+        }
+    }
+    for target in &mut targets {
+        target.frames.push(text.clone());
+    }
+    Ok(Some(ToSend { key, targets }))
 }
 
 /// `f` in a transaction of its own: committed when it returns, rolled back when it fails.
@@ -588,6 +819,16 @@ pub struct QueuePeerRow {
     pub dead: bool,
 }
 
+/// One `queue_delivery` row, for fixture assertions.
+#[cfg(all(feature = "test-hooks", debug_assertions))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueDeliveryRow {
+    pub key: MessageKey,
+    pub recipient: InstallationId,
+    pub queue_id: QueueId,
+    pub expires_at_ms: u64,
+}
+
 /// What a fixture sees of the queue tables.
 #[cfg(all(feature = "test-hooks", debug_assertions))]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -596,6 +837,8 @@ pub struct QueueTables {
     pub own: Vec<QueueOwnRow>,
     /// By conversation and installation.
     pub peers: Vec<QueuePeerRow>,
+    /// By message key, then recipient.
+    pub deliveries: Vec<QueueDeliveryRow>,
 }
 
 #[cfg(all(feature = "test-hooks", debug_assertions))]
@@ -645,7 +888,30 @@ pub(super) fn fixture_state(c: &Connection) -> R<QueueTables> {
         .map_err(sql)?
         .collect::<Result<_, _>>()
         .map_err(sql)?;
-    Ok(QueueTables { own, peers })
+    let deliveries = c
+        .prepare("SELECT conversation,sender_peer,sender_install,msg_id,recipient_install,queue_id,expires_at_ms FROM queue_delivery ORDER BY conversation,sender_peer,sender_install,msg_id,recipient_install")
+        .map_err(sql)?
+        .query_map([], |r| {
+            Ok(QueueDeliveryRow {
+                key: MessageKey {
+                    conversation: ConversationId(bytes(r, 0)?),
+                    sender: PeerId(bytes(r, 1)?),
+                    installation: InstallationId(bytes(r, 2)?),
+                    id: super::types::MessageId(bytes(r, 3)?),
+                },
+                recipient: InstallationId(bytes(r, 4)?),
+                queue_id: bytes(r, 5)?,
+                expires_at_ms: uint(r, 6)?,
+            })
+        })
+        .map_err(sql)?
+        .collect::<Result<_, _>>()
+        .map_err(sql)?;
+    Ok(QueueTables {
+        own,
+        peers,
+        deliveries,
+    })
 }
 
 #[cfg(test)]

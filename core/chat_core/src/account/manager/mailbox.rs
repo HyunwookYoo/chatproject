@@ -1632,6 +1632,8 @@ impl Manager {
                 .min_by_key(|s| self.outdated_now(s.grant.installation));
             let Some(session) = session else {
                 self.dial_peer(entry.peer, now, request);
+                // M8 spec 8.2: no device of the peer reached, so into their queues.
+                self.queue_handed_off(key, entry.peer, &[], request).await;
                 let op = MailboxDbOp::HandoffResult {
                     origin,
                     conversation: entry.conversation,
@@ -1690,6 +1692,27 @@ impl Manager {
                 }))
                 .await;
         });
+    }
+
+    /// A text handed off to this mailbox goes into the queues of the devices of `peer` its
+    /// attempt did not reach, as its origin's own attempts put it (M8 spec 8.2).
+    async fn queue_handed_off(
+        &mut self,
+        (origin, conversation, msg_id): HandoffKey,
+        peer: PeerId,
+        reached: &[InstallationId],
+        request: Request,
+    ) {
+        let Ok(local) = self.local() else {
+            return;
+        };
+        let key = MessageKey {
+            conversation,
+            sender: local.keys.peer_id(),
+            installation: origin,
+            id: msg_id,
+        };
+        self.queue_put(key, peer, reached, request).await;
     }
 
     /// Dials the devices of `peer` (as its record here lists them) that have no session, unless
@@ -1756,6 +1779,18 @@ impl Manager {
             }
             _ => HandoffOutcome::Retry,
         };
+        // M8 spec 8.2: the peer's other devices get it in their queues, read before the result
+        // is stored (an acknowledged text's row goes with it).
+        let reached = match outcome {
+            HandoffOutcome::Acked { receiver } => Some(vec![receiver]),
+            HandoffOutcome::Retry => Some(Vec::new()),
+            HandoffOutcome::Stop { .. } => None,
+        };
+        if let Some(reached) = reached {
+            let key = (origin, conversation, msg_id);
+            self.queue_handed_off(key, grant.peer, &reached, request)
+                .await;
+        }
         let op = MailboxDbOp::HandoffResult {
             origin,
             conversation,

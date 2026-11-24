@@ -1626,7 +1626,7 @@ pub use crate::account::MessageMutation;
 pub use crate::mls::wire::{MlsFrame, MlsReply};
 pub use crate::mls::push_ct::{PushCtError, restore_group_id, strip_group_id};
 pub use crate::mls::payload::QueueRefBody;
-pub use crate::message::queue_store::{QueueOwnRow, QueuePeerRow, QueueTables};
+pub use crate::message::queue_store::{QueueDeliveryRow, QueueOwnRow, QueuePeerRow, QueueTables};
 pub use crate::message::push_store::{
     PushDeliveryRow, PushPeerRow, PushPeerState, PushState, PushTagRow,
 };

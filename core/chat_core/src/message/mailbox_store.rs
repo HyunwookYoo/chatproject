@@ -379,7 +379,7 @@ pub(crate) const HANDOFF_DUE_MAX: usize = 32;
 /// `mailbox_handoff.next_retry_at_ms` of a ciphertext the recipient could not open: never due
 /// again, kept so the same ciphertext handed over again is not tried again (until the origin
 /// hands over a new one, or the row is pruned).
-const STOPPED: i64 = i64::MAX;
+pub(super) const STOPPED: i64 = i64::MAX;
 
 pub struct MailboxPage {
     /// In `seq` order, as many as one `SyncResp` carries.

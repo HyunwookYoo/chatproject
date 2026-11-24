@@ -53,6 +53,13 @@ pub(crate) struct AttemptResult {
     /// The devices sent a copy of the acknowledged `App` frame (spec 5.3).
     pub copied: Vec<InstallationId>,
 }
+/// A text's attempt that went out, or tried to: the devices of its peer it reached. Its push
+/// (M7 spec 6.1) and its queues (M8 spec 8.1) decide from this one list, each on its own.
+pub(super) struct Reach {
+    pub key: MessageKey,
+    pub peer: PeerId,
+    pub reached: Vec<InstallationId>,
+}
 struct Pending {
     peer: PeerId,
     lease: SessionLease,
@@ -1248,9 +1255,13 @@ impl Manager {
                 | AttemptOutcome::Transient(_) => Some(Vec::new()),
                 _ => None,
             };
-            let mut first = reached
+            let mut reach = reached
                 .filter(|_| pending.receipt.is_none())
-                .and_then(|reached| self.push_first(pending.peer, reached));
+                .map(|reached| Reach {
+                    key: result.key,
+                    peer: pending.peer,
+                    reached,
+                });
             match result.outcome {
                 AttemptOutcome::Acked | AttemptOutcome::DecryptFailed(..) => {
                     self.speaks_mls(recipient);
@@ -1283,10 +1294,10 @@ impl Manager {
                     let block = if self.grant_authorized(&result.lease.session.grant) {
                         None
                     } else {
-                        first = None;
+                        reach = None;
                         Some(BlockReason::Account)
                     };
-                    self.outcome_db(
+                    self.attempt_db(
                         MessageDbOp::AttemptOutcome(
                             result.key,
                             block,
@@ -1299,7 +1310,7 @@ impl Manager {
                                     | AttemptOutcome::Acked
                             ),
                         ),
-                        first,
+                        reach,
                         request,
                     )
                     .await?;
@@ -1358,9 +1369,9 @@ impl Manager {
                             request,
                         )
                         .await?;
-                        self.outcome_db(
+                        self.attempt_db(
                             MessageDbOp::AttemptOutcome(result.key, None, None, false),
-                            first,
+                            reach,
                             request,
                         )
                         .await?;
@@ -1393,9 +1404,9 @@ impl Manager {
                 }
                 AttemptOutcome::Transient(code) => {
                     if pending.receipt.is_none() {
-                        self.outcome_db(
+                        self.attempt_db(
                             MessageDbOp::AttemptOutcome(result.key, None, None, false),
-                            first,
+                            reach,
                             request,
                         )
                         .await?;
@@ -1404,9 +1415,9 @@ impl Manager {
                 }
                 AttemptOutcome::Written => {
                     if pending.receipt.is_none() {
-                        self.outcome_db(
+                        self.attempt_db(
                             MessageDbOp::AttemptOutcome(result.key, None, None, true),
-                            first,
+                            reach,
                             request,
                         )
                         .await?;
@@ -1414,8 +1425,8 @@ impl Manager {
                     return Err(unavailable(ErrorCode::NetworkTimeout));
                 }
             };
-            // `first` is only ever given for a text's `MlsAcked` here.
-            self.outcome_db(op, first, request).await?;
+            // `reach` is only ever given for a text's `MlsAcked` here.
+            self.attempt_db(op, reach, request).await?;
             self.message_session(&result.lease.session.conn, request)?;
             Ok(())
         }
@@ -1993,6 +2004,41 @@ impl Manager {
             }
         }
     }
+    /// Records a text attempt's outcome `op`. With `reach` (an attempt that went out or tried
+    /// to), the devices of its peer it did not reach get the text in their queues (read before
+    /// the outcome is stored: an acknowledged text's row goes with it) and its push is decided,
+    /// each on its own from the same list (M8 spec 8.1).
+    pub(super) async fn attempt_db(
+        &mut self,
+        op: MessageDbOp,
+        reach: Option<Reach>,
+        request: Request,
+    ) -> Result<MessageDbReply, CoreError> {
+        let Some(Reach { key, peer, reached }) = reach else {
+            return self.message_db(op, request).await;
+        };
+        self.queue_put(key, peer, &reached, request).await;
+        let first = self.push_first(peer, reached);
+        self.outcome_db(op, first, request).await
+    }
+
+    /// The `Reach` of a text no device of `peer` was reached for, sealed first so its push and
+    /// its queue entries carry the ciphertext. `None` with neither configured, or while it
+    /// cannot be sealed (no group yet): a later attempt decides.
+    async fn unreached(&mut self, key: MessageKey, peer: PeerId, request: Request) -> Option<Reach> {
+        if !(self.push_on() || self.queue_on()) {
+            return None;
+        }
+        let seal = MessageDbOp::Seal(key, self.services.clock.wall_ms());
+        match self.message_db(seal, request).await {
+            Ok(MessageDbReply::Sealed { .. }) => Some(Reach {
+                key,
+                peer,
+                reached: Vec::new(),
+            }),
+            _ => None,
+        }
+    }
     /// The job could not start: no device of `peer` was reached, or it may not go to it.
     async fn scheduling_failure(
         &mut self,
@@ -2018,13 +2064,14 @@ impl Manager {
             .await?;
         } else {
             let now = self.messages.scheduler.as_ref().unwrap().now_ms();
-            // A text no device of the peer was reached for decides its push now (M7 spec 6.1).
-            let first = if receipt {
+            // A text no device of the peer was reached for decides its push (M7 spec 6.1) and
+            // its queues (M8 spec 8.1) now.
+            let reach = if receipt {
                 None
             } else {
-                self.push_first_unreached(key, peer, request).await
+                self.unreached(key, peer, request).await
             };
-            self.outcome_db(MessageDbOp::Defer(key, receipt, now), first, request)
+            self.attempt_db(MessageDbOp::Defer(key, receipt, now), reach, request)
                 .await?;
         }
         Ok(())
