@@ -494,9 +494,11 @@ fn receipt(c: &Connection, identity: Identity, key: MessageKey) -> R<Option<Vec<
 }
 
 /// See `QueueDbOp::ToSend`. Six reads whatever the number of devices and conversations: the
-/// mode, the text or receipt, the targets, the frames their queues hold, and the `mls_delivery`
+/// mode, the targets, the text or receipt, the frames their queues hold, and the `mls_delivery`
 /// and `push_delivery` frames queued for them. A message's read covers its conversation
-/// only; the standing one every conversation (a range over the whole id space).
+/// only; the standing one every conversation (a range over the whole id space). With no live
+/// queue to put into (most conversations), it stops after the second, small read (review
+/// minor 5).
 fn to_send(
     c: &Connection,
     identity: Identity,
@@ -508,34 +510,19 @@ fn to_send(
         return Ok(None);
     }
     // The conversations read, the devices kept (all when `None`) and left out, and the
-    // message's own frame.
-    let (range, only, but, last) = match unreached {
+    // message whose frame goes last.
+    let (range, only, but, message) = match unreached {
         Unreached::Message {
             key,
-            receipt: is_receipt,
+            receipt,
             devices,
         } => {
-            let frame = if is_receipt {
-                receipt(c, identity, key)?
-            } else {
-                text(c, identity, key)?
-            };
-            let Some(frame) = frame else {
-                return Ok(None);
-            };
-            // A receipt is sealed here; a text by its origin (this device, or the device that
-            // handed it off to this mailbox).
-            let sealer = if is_receipt {
-                identity.installation
-            } else {
-                key.installation
-            };
             let conversation = key.conversation.0;
             (
                 (conversation, conversation),
                 Some(devices),
                 Vec::new(),
-                Some((sealer, frame)),
+                Some((key, receipt)),
             )
         }
         Unreached::Standing { reached } => (([0; 32], [0xff; 32]), None, reached, None),
@@ -563,6 +550,19 @@ fn to_send(
     if targets.is_empty() {
         return Ok(None);
     }
+    let last = match message {
+        Some((key, true)) => match receipt(c, identity, key)? {
+            // Sealed here.
+            Some(frame) => Some((identity.installation, frame)),
+            None => return Ok(None),
+        },
+        Some((key, false)) => match text(c, identity, key)? {
+            // Sealed by its origin: this device, or the one that handed it off to this mailbox.
+            Some(frame) => Some((key.installation, frame)),
+            None => return Ok(None),
+        },
+        None => None,
+    };
     // What each queue holds now: a row for the device's present queue that has not expired.
     let held: BTreeSet<(InstallationId, [u8; 32])> = c
         .prepare("SELECT d.recipient_install,d.frame_hash FROM queue_delivery d JOIN queue_peer p ON p.installation=d.recipient_install AND p.queue_id=d.queue_id WHERE p.conversation BETWEEN ?1 AND ?2 AND d.expires_at_ms>?3")
