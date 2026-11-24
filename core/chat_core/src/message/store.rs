@@ -60,6 +60,9 @@ pub(crate) enum MessageDbOp {
     Enqueue(PeerId, MessageId, String, u64),
     /// Codec 3 row -> MLS ciphertext (codec 2), `processed_ct` for the own ciphertext.
     Seal(MessageKey, u64),
+    /// Seals the receipt this device owes for a received MLS message, if no attempt did yet
+    /// (now): its sender's queue can then carry it (M8 spec 8.1).
+    SealReceipt(MessageKey, u64),
     /// Seals every codec 3 row of the conversation, in lamport order.
     SealPending(ConversationId, u64),
     /// Holds every own text of the conversation that waits for a group (codec 3): `Blocked`
@@ -598,6 +601,7 @@ pub(crate) fn execute(
             Ok(MessageDbReply::Message(view))
         }
         MessageDbOp::Seal(key, now) => super::mls_store::seal(c, identity, local, key, now, mls_fault!(fault)),
+        MessageDbOp::SealReceipt(key, now) => super::mls_store::seal_owed_receipt(c, identity, local, key, now, mls_fault!(fault)),
         MessageDbOp::SealPending(id, now) => super::mls_store::seal_pending(c, identity, local, id, now, mls_fault!(fault)),
         MessageDbOp::BlockPending(id, reason) => super::mls_store::block_pending(c, identity, id, reason, mls_fault!(fault)),
         MessageDbOp::Reencrypt(key, now, counted) => super::mls_store::reencrypt(c, identity, local, key, now, counted, mls_fault!(fault)),
@@ -1332,7 +1336,7 @@ impl MessageDbOp {
                 id: *id,
             }),
             Self::Receive(t, _, _, _) => Some(t.key),
-            Self::Seal(k, _) | Self::Reencrypt(k, _, _) | Self::MarkWaitingPeerUpdate(k, _) => Some(*k),
+            Self::Seal(k, _) | Self::SealReceipt(k, _) | Self::Reencrypt(k, _, _) | Self::MarkWaitingPeerUpdate(k, _) => Some(*k),
             Self::MlsAcked(k, _, _) | Self::ResealReceipt(k) => Some(*k),
             #[cfg(all(feature="test-hooks",debug_assertions))]
             Self::RejectedPrepare(k,_,_,_) => Some(*k),

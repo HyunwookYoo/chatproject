@@ -1,77 +1,114 @@
-//! Putting texts into peers' queues (spec 8):
+//! Putting frames into the queues of devices no direct send reaches (spec 8):
 //!
-//! * A text's attempt that went out or tried to (the list its push decides from) names the
-//!   devices of the peer it did not reach. Each of them with a live queue on this device's
-//!   server (`queue_peer`) that does not hold the text yet (`queue_delivery`) gets it, in one
-//!   `SEND` for all of them: the `Commit`s and `Welcome`s it still lacks, then the text, each
-//!   the frame a direct attempt writes (`QueueEntry`, naming this device). It is read before the
-//!   attempt's outcome is stored, since an acknowledged text's row goes with it. A mailbox does
-//!   the same for the texts my other devices handed off to it.
-//! * Every frame taken: `queue_delivery` holds the text for that device until the server drops
-//!   it (`ENTRY_TTL_MS`). The outbox keeps trying directly as before, and the first of its
-//!   attempts after that time puts the text in again, as the outbox has it then (so a
-//!   re-encrypted text goes in anew). Once delivered, the text is gone and so is the `SEND`.
-//! * `gone`: that queue is dead until the device announces another. `full`, `limited`, `bad` or
-//!   no answer: nothing is noted, so the text's next attempt tries again (the outbox back-off).
-//!   One `SEND` per text at a time.
-//! * Rows whose text is gone or that expired are swept hourly, a bounded batch at a time.
+//! * Any frame a direct send would write to a device goes into that device's queue while no
+//!   direct send reaches it: texts, receipts, `Commit`s, `Welcome`s, `PushHandle`s and
+//!   `QueueRef`s, each the frame the direct send keeps (`queue_store`), as an entry naming the
+//!   device that sealed it (`QueueEntry`: this device, or a handed-off text's origin, so the
+//!   origin's copy and its mailbox's are the same entry and the server keeps one). A device
+//!   with a live queue on this device's server (`queue_peer`) gets them, a peer's device or
+//!   another of mine (spec 7.1: my other devices send in the conversation too).
+//! * Two triggers, one path (`queue_send`):
+//!   * A text's or receipt's attempt that went out or tried to names the devices it did not
+//!     reach (`queue_put`): for a text the peer's current devices, and my other current devices
+//!     I have no session with (one I have gets my texts from my log, M6, or a copy, 5.3); for
+//!     a receipt the device that sent the message. Read before the attempt's outcome is stored,
+//!     since an acknowledged text's row goes with it. The frames those devices still lack in
+//!     the conversation go ahead of it. A mailbox does the same for the texts handed off to it.
+//!   * The standing pass (`queue_standing`), every `STANDING_EVERY_MS` and at once when
+//!     routing frames were sealed: every device without a session gets the `Commit`s,
+//!     `Welcome`s, `PushHandle`s and `QueueRef`s still queued for it, in every conversation, so
+//!     those go in with no text after them (a rotated queue reaches a peer that is off).
+//! * Each trigger is one `SEND` request for every device and frame. A device's frames stay
+//!   together and in order; one whose frames would take the request past `MAX_ITEMS` or
+//!   `MAX_BODY` waits for the next trigger (the standing pass comes again at the next poll).
+//!   Each request starts one device further on, so a device whose frames fill it never keeps
+//!   the others out.
+//! * Each frame the server took: `queue_delivery` holds it for that device's queue until the
+//!   server drops it (`ENTRY_TTL_MS`); the next trigger after that puts it in again if it still
+//!   waits (a re-encrypted text is a new frame). `gone`: that queue is dead until the device
+//!   announces another. `full`, `limited`, `bad` or no answer: nothing is noted, so the next
+//!   trigger tries again (the outbox back-off, or the standing pass).
+//! * One `SEND` per text or receipt at a time, and one standing pass.
+//! * Rows that expired are swept hourly, a bounded batch at a time.
 //! * No address, or the mode "never": no `SEND`.
 
 use super::*;
+use super::super::messages::Reach;
+use crate::message::queue_store::{Queued, frame_hash};
 
 /// The JSON of one `SEND` item around its base64 `ct` (the queue id, signature, time, keys),
 /// with room to spare; and around all the items.
 const SEND_ITEM_JSON: usize = 256;
 const SEND_BODY_JSON: usize = 64;
+/// How often the standing pass runs while nothing asks for it sooner: the outbox's longest gap
+/// between two attempts of a text.
+const STANDING_EVERY_MS: u64 = 300_000;
 
-/// Putting texts into peers' queues (spec 8).
+/// Putting frames into other devices' queues (spec 8).
 #[derive(Default)]
 pub(super) struct Put {
-    /// Texts whose `SEND` is on its way: no second one until it answers.
-    sending: BTreeSet<MessageKey>,
+    /// What a `SEND` is on its way for: a text's or receipt's key, `None` the standing pass. No
+    /// second one for it until it answers.
+    sending: BTreeSet<Option<MessageKey>>,
     /// The scheduler time `queue_delivery` is swept next.
     sweep_at: u64,
+    /// The scheduler time the standing pass runs next.
+    standing_at: u64,
+    /// `SEND` requests made: each starts its devices one further on.
+    turn: usize,
 }
 
-/// The items of one `SEND` (spec 8.1, 9.2), with the device and queue of each: every frame of
-/// each target in order, as an entry naming this device (`me`), signed with that queue's sender
-/// key at `ts`. A target whose items would take the request past `MAX_ITEMS` or `MAX_BODY` is
-/// left out whole (its frames must stay in order), for the text's next attempt.
+/// The items of one `SEND` (spec 8.1, 9.2), with what each puts where: every frame of each
+/// target in order, as an entry of my account (`me`) naming its sealer, signed with that
+/// queue's sender key at `ts`. Targets go from the one at `start` (in turn) round to the one
+/// before it; one whose items would take the request past `MAX_ITEMS` or `MAX_BODY` is left out
+/// whole (its frames must stay in order). `false`: one was left out.
 fn send_items(
     send: ToSend,
-    me: (PeerId, InstallationId),
+    me: PeerId,
     ts: u64,
-) -> (Vec<(InstallationId, QueueId)>, Vec<SendItem>) {
-    let (mut ids, mut items) = (Vec::new(), Vec::new());
+    start: usize,
+) -> (Vec<Queued>, Vec<SendItem>, bool) {
+    let mut targets = send.targets;
+    let first = start % targets.len().max(1);
+    targets.rotate_left(first);
+    let (mut queued, mut items, mut all) = (Vec::new(), Vec::new(), true);
     let mut body = SEND_BODY_JSON;
-    for target in send.targets {
-        let cts: Vec<Vec<u8>> = target
+    for target in targets {
+        let cts: Vec<([u8; 32], Vec<u8>)> = target
             .frames
             .into_iter()
-            .map(|frame| {
-                QueueEntry {
-                    sender_peer: me.0,
-                    sender_install: me.1,
+            .map(|(sealer, frame)| {
+                let hash = frame_hash(&frame);
+                let entry = QueueEntry {
+                    sender_peer: me,
+                    sender_install: sealer,
                     frame,
-                }
-                .encode()
+                };
+                (hash, entry.encode())
             })
             .collect();
         let size: usize = cts
             .iter()
-            .map(|ct| ct.len().div_ceil(3) * 4 + SEND_ITEM_JSON)
+            .map(|(_, ct)| ct.len().div_ceil(3) * 4 + SEND_ITEM_JSON)
             .sum();
         if items.len() + cts.len() > MAX_ITEMS || body + size > MAX_BODY {
+            all = false;
             continue;
         }
         body += size;
-        for ct in cts {
+        for (frame_hash, ct) in cts {
             let signed = Signed::Send { ct: &ct };
             let sig = sign(
                 &target.sender_secret,
                 &signing_bytes(&signed, &target.queue_id, ts),
             );
-            ids.push((target.installation, target.queue_id));
+            queued.push(Queued {
+                conversation: target.conversation,
+                installation: target.installation,
+                queue_id: target.queue_id,
+                frame_hash,
+            });
             items.push(SendItem {
                 queue_id: b64(&target.queue_id),
                 ct: b64(&ct),
@@ -80,79 +117,141 @@ fn send_items(
             });
         }
     }
-    (ids, items)
+    (queued, items, all)
 }
 
-/// Devices with the queue each was sent to.
-type Targets = Vec<(InstallationId, QueueId)>;
-
-/// What a `SEND` came to for each device: `put`, every frame of it taken (`ok`); `gone`, its
-/// queue unknown at the server. Neither: `full`, `limited`, `bad`, or no answer.
-fn sent_outcome(items: &[(InstallationId, QueueId)], answers: &[ItemResult]) -> (Targets, Targets) {
-    let (mut put, mut gone) = (Vec::new(), Vec::new());
-    let mut targets: Vec<(InstallationId, QueueId)> = items.to_vec();
-    targets.dedup();
-    for target in targets {
-        let results: Vec<Option<&ItemResult>> = items
-            .iter()
-            .enumerate()
-            .filter(|(_, item)| **item == target)
-            .map(|(at, _)| answers.get(at))
-            .collect();
-        if results.iter().any(|r| matches!(r, Some(ItemResult::Gone))) {
-            gone.push(target);
-        } else if results.iter().all(|r| matches!(r, Some(ItemResult::Ok))) {
-            put.push(target);
+/// What a `SEND` came to: `taken`, the frames answered `ok`; `gone`, each queue answered
+/// `gone`, once. `full`, `limited`, `bad`, or no answer (a failed request): neither.
+fn sent_outcome(items: &[Queued], answers: &[ItemResult]) -> (Vec<Queued>, Vec<Queued>) {
+    let (mut taken, mut gone) = (Vec::new(), Vec::<Queued>::new());
+    for (item, answer) in items.iter().zip(answers) {
+        match answer {
+            ItemResult::Ok => taken.push(*item),
+            ItemResult::Gone
+                if !gone
+                    .iter()
+                    .any(|g| (g.installation, g.queue_id) == (item.installation, item.queue_id)) =>
+            {
+                gone.push(*item)
+            }
+            _ => {}
         }
     }
-    (put, gone)
+    (taken, gone)
 }
 
 impl Manager {
-    /// Whether a queue server address is configured: texts are put into peers' queues.
+    /// Whether a queue server address is configured: frames are put into other devices' queues.
     pub(in crate::account::manager) fn queue_on(&self) -> bool {
         self.messages.queue.server.is_some()
     }
 
-    /// Spec 8.1: puts text `key` into the queues of the devices of `peer` its attempt did not
-    /// reach (all but `reached`), one `SEND` in a spawned task. Call it before the attempt's
-    /// outcome is stored. Nothing without an address, or while a `SEND` of it is on its way.
-    pub(in crate::account::manager) async fn queue_put(
-        &mut self,
-        key: MessageKey,
-        peer: PeerId,
-        reached: &[InstallationId],
-        request: Request,
-    ) {
-        let Some(server) = self.messages.queue.server.clone() else {
+    /// Spec 8.1: the attempt of text or receipt `reach.key` did not reach every device; those
+    /// it should have and did not (see the module doc) get it in their queues, with what they
+    /// lack ahead of it. Call it before the attempt's outcome is stored. Nothing without an
+    /// address, or while a `SEND` of it is on its way.
+    pub(in crate::account::manager) async fn queue_put(&mut self, reach: &Reach, request: Request) {
+        if !self.queue_on() {
             return;
-        };
+        }
         let Ok(local) = self.local() else {
             return;
         };
-        let me = (local.keys.peer_id(), local.device.installation_id());
-        if self.messages.queue.put.sending.contains(&key) {
+        let (own, me) = (local.keys.peer_id(), local.device.installation_id());
+        let devices: Vec<InstallationId> = if reach.receipt {
+            vec![reach.key.installation]
+        } else {
+            let near: Vec<InstallationId> = self
+                .mls_sessions()
+                .into_iter()
+                .filter(|s| s.grant.peer == own)
+                .map(|s| s.grant.installation)
+                .collect();
+            let mine = self
+                .current_installations(own)
+                .into_iter()
+                .filter(|i| *i != me && *i != reach.key.installation && !near.contains(i));
+            self.current_installations(reach.peer)
+                .into_iter()
+                .chain(mine)
+                .collect()
+        };
+        let unreached = Unreached::Message {
+            key: reach.key,
+            receipt: reach.receipt,
+            devices: devices
+                .into_iter()
+                .filter(|i| !reach.reached.contains(i))
+                .collect(),
+        };
+        self.queue_send(Some(reach.key), unreached, request).await;
+    }
+
+    /// Routing frames were sealed: the standing pass runs at the next poll.
+    pub(in crate::account::manager) fn queue_standing_soon(&mut self) {
+        self.messages.queue.put.standing_at = 0;
+    }
+
+    /// The standing pass, when it is due: what is still queued for each device without a
+    /// session goes into its queue. At the next poll again when a device was left out.
+    pub(super) async fn queue_standing(&mut self, request: Request) {
+        let now = self.schedule_now();
+        let put = &self.messages.queue.put;
+        if self.messages.queue.server.is_none()
+            || now < put.standing_at
+            || put.sending.contains(&None)
+        {
             return;
         }
-        let devices: Vec<InstallationId> = self
-            .current_installations(peer)
+        let reached = self
+            .mls_sessions()
             .into_iter()
-            .filter(|i| !reached.contains(i))
+            .map(|s| s.grant.installation)
             .collect();
+        let all = self
+            .queue_send(None, Unreached::Standing { reached }, request)
+            .await;
+        self.messages.queue.put.standing_at = if all {
+            now.saturating_add(STANDING_EVERY_MS)
+        } else {
+            now
+        };
+    }
+
+    /// One `SEND` of what `unreached` lacks, in a spawned task; `what` names it (`Put.sending`).
+    /// `false`: a device was left out for later.
+    async fn queue_send(
+        &mut self,
+        what: Option<MessageKey>,
+        unreached: Unreached,
+        request: Request,
+    ) -> bool {
+        let Some(server) = self.messages.queue.server.clone() else {
+            return true;
+        };
+        let Ok(me) = self.local().map(|local| local.keys.peer_id()) else {
+            return true;
+        };
+        if self.messages.queue.put.sending.contains(&what) {
+            return true;
+        }
         let wall = self.services.clock.wall_ms();
         let op = QueueDbOp::ToSend {
-            unreached: Unreached { key, devices },
+            unreached,
             server_url: server.url.to_string(),
             wall,
         };
         let Ok(QueueDbReply::ToSend(Some(send))) = self.queue_db(op, request).await else {
-            return;
+            return true;
         };
-        let (items, sends) = send_items(send, me, wall);
+        let put = &mut self.messages.queue.put;
+        let (items, sends, all) = send_items(send, me, wall, put.turn);
         if sends.is_empty() {
-            return;
+            // Nothing fits even alone: no sooner pass would change that.
+            return true;
         }
-        self.messages.queue.put.sending.insert(key);
+        put.turn = put.turn.wrapping_add(1);
+        put.sending.insert(what);
         let mailbox = self.auth.send.clone();
         let ticket = request.ticket;
         tokio::spawn(async move {
@@ -165,46 +264,45 @@ impl Manager {
             let _ = mailbox
                 .send(Input::Queue(QueueEvent::Sent {
                     ticket,
-                    key,
+                    what,
                     items,
                     answers,
                     ts: wall,
                 }))
                 .await;
         });
+        all
     }
 
-    /// A text's `SEND` came back: the queues that took it hold it until the server drops it,
-    /// and a queue the server does not know is dead. Anything else is left to the text's next
-    /// attempt.
+    /// A `SEND` came back: the queues that took a frame hold it until the server drops it, and
+    /// a queue the server does not know is dead. Anything else is left to the next trigger.
     pub(super) async fn queue_sent(
         &mut self,
         ticket: u64,
-        key: MessageKey,
-        items: Vec<(InstallationId, QueueId)>,
+        what: Option<MessageKey>,
+        items: Vec<Queued>,
         answers: Vec<ItemResult>,
         ts: u64,
     ) {
-        self.messages.queue.put.sending.remove(&key);
+        self.messages.queue.put.sending.remove(&what);
         let Some(request) = self.ready().ok().filter(|r| r.ticket == ticket) else {
             return;
         };
-        let (put, gone) = sent_outcome(&items, &answers);
-        if put.is_empty() && gone.is_empty() {
+        let (taken, gone) = sent_outcome(&items, &answers);
+        if taken.is_empty() && gone.is_empty() {
             return;
         }
         let op = QueueDbOp::Sent {
-            key,
-            put,
+            taken,
             gone,
             expires_at: ts.saturating_add(ENTRY_TTL_MS),
         };
-        // Not stored: the text is put in again at its next attempt.
+        // Not stored: the frames go in again at the next trigger.
         let _ = self.queue_db(op, request).await;
     }
 
-    /// Drops `queue_delivery` rows that expired or whose text is gone, hourly (at once again
-    /// while a batch came back full).
+    /// Drops `queue_delivery` rows that expired, hourly (at once again while a batch came back
+    /// full).
     pub(super) async fn queue_sweep(&mut self, request: Request) {
         let now = self.schedule_now();
         if now < self.messages.queue.put.sweep_at {
@@ -233,89 +331,134 @@ mod tests {
 
     fn target(n: u8, frames: Vec<Vec<u8>>) -> crate::message::queue_store::Target {
         crate::message::queue_store::Target {
+            conversation: conv(1),
             installation: InstallationId([n; 32]),
             queue_id: [n; 32],
             sender_secret: Zeroizing::new([n; 32]),
-            frames,
+            frames: frames
+                .into_iter()
+                .map(|frame| (InstallationId([8; 32]), frame))
+                .collect(),
         }
     }
 
-    fn to_send(targets: Vec<crate::message::queue_store::Target>) -> ToSend {
-        ToSend {
-            key: MessageKey {
-                conversation: conv(1),
-                sender: PeerId([9; 32]),
-                installation: InstallationId([8; 32]),
-                id: crate::message::types::MessageId([7; 16]),
-            },
-            targets,
+    fn at(n: u8, frame: &[u8]) -> Queued {
+        Queued {
+            conversation: conv(1),
+            installation: InstallationId([n; 32]),
+            queue_id: [n; 32],
+            frame_hash: frame_hash(frame),
         }
     }
 
     #[test]
     fn send_items_keep_each_devices_frames_in_order_signed_by_its_queue() {
-        let me = (PeerId([9; 32]), InstallationId([8; 32]));
-        let send = to_send(vec![
-            target(1, vec![b"commit".to_vec(), b"text".to_vec()]),
-            target(2, vec![b"text".to_vec()]),
-        ]);
-        let (ids, items) = send_items(send, me, T);
-        let one = (InstallationId([1; 32]), [1; 32]);
-        let two = (InstallationId([2; 32]), [2; 32]);
-        assert_eq!(ids, [one, one, two]);
-        let frames: Vec<Vec<u8>> = items
+        let me = PeerId([9; 32]);
+        let mut sealed_elsewhere = target(1, vec![b"commit".to_vec()]);
+        sealed_elsewhere
+            .frames
+            .push((InstallationId([7; 32]), b"text".to_vec()));
+        let send = ToSend {
+            targets: vec![sealed_elsewhere, target(2, vec![b"text".to_vec()])],
+        };
+        let (queued, items, all) = send_items(send, me, T, 0);
+        assert!(all);
+        assert_eq!(queued, [at(1, b"commit"), at(1, b"text"), at(2, b"text")]);
+        let entries: Vec<(InstallationId, Vec<u8>)> = items
             .iter()
-            .zip(&ids)
-            .map(|(item, (_, queue))| {
-                assert_eq!(item.queue_id, b64(queue));
+            .zip(&queued)
+            .map(|(item, q)| {
+                assert_eq!(item.queue_id, b64(&q.queue_id));
                 assert_eq!(item.ts, T);
                 let ct = queue_wire::decode_ct(&item.ct).unwrap();
                 let sig: [u8; 64] = queue_wire::decode_array(&item.sig).unwrap();
                 assert!(queue_wire::verify(
-                    &public_key(queue),
-                    &signing_bytes(&Signed::Send { ct: &ct }, queue, T),
+                    &public_key(&q.queue_id),
+                    &signing_bytes(&Signed::Send { ct: &ct }, &q.queue_id, T),
                     &sig
                 ));
                 let entry = QueueEntry::decode(&ct).unwrap();
-                assert_eq!((entry.sender_peer, entry.sender_install), me);
-                entry.frame
+                assert_eq!(entry.sender_peer, me);
+                (entry.sender_install, entry.frame)
             })
             .collect();
-        assert_eq!(frames, [b"commit".to_vec(), b"text".to_vec(), b"text".to_vec()]);
+        // Each entry names the frame's sealer.
+        let (mine, origin) = (InstallationId([8; 32]), InstallationId([7; 32]));
+        assert_eq!(
+            entries,
+            [
+                (mine, b"commit".to_vec()),
+                (origin, b"text".to_vec()),
+                (mine, b"text".to_vec())
+            ]
+        );
     }
 
     #[test]
     fn send_items_leave_out_a_device_whose_frames_do_not_fit() {
-        let me = (PeerId([9; 32]), InstallationId([8; 32]));
+        let me = PeerId([9; 32]);
         // Nine frames at the frame limit fill most of one request; a second such device does
         // not fit after it, a small one does.
         let big = vec![vec![0xAB; 61_440]; 9];
-        let send = to_send(vec![
-            target(1, big.clone()),
-            target(2, big),
-            target(3, vec![b"text".to_vec()]),
-        ]);
-        let (ids, items) = send_items(send, me, T);
-        let devices: Vec<u8> = ids.iter().map(|(i, _)| i.0[0]).collect();
+        let send = ToSend {
+            targets: vec![
+                target(1, big.clone()),
+                target(2, big),
+                target(3, vec![b"text".to_vec()]),
+            ],
+        };
+        let (queued, items, all) = send_items(send, me, T, 0);
+        assert!(!all);
+        let devices: Vec<u8> = queued.iter().map(|q| q.installation.0[0]).collect();
         assert_eq!(devices, [1, 1, 1, 1, 1, 1, 1, 1, 1, 3]);
         let body = serde_json::to_vec(&queue_wire::QueueRequest { items }).unwrap();
         assert!(body.len() <= MAX_BODY, "{}", body.len());
     }
 
+    /// Review minor 2: the next request starts one device further on, so the device left out
+    /// behind a large one goes first and fits.
     #[test]
-    fn sent_outcome_puts_a_device_only_when_every_frame_was_taken() {
-        let at = |n: u8| (InstallationId([n; 32]), [n; 32]);
-        let items = [at(1), at(1), at(2), at(3), at(4), at(5), at(5)];
+    fn send_items_start_one_device_further_on_each_request() {
+        let me = PeerId([9; 32]);
+        let send = |start| {
+            let big = vec![vec![0xAB; 61_440]; 9];
+            let send = ToSend {
+                targets: vec![target(1, big.clone()), target(2, big)],
+            };
+            let (queued, _, _) = send_items(send, me, T, start);
+            let mut devices: Vec<u8> = queued.iter().map(|q| q.installation.0[0]).collect();
+            devices.dedup();
+            devices
+        };
+        assert_eq!(send(0), [1]);
+        assert_eq!(send(1), [2]);
+        assert_eq!(send(2), [1]);
+    }
+
+    #[test]
+    fn sent_outcome_takes_each_frame_answered_ok() {
+        let items = [
+            at(1, b"commit"),
+            at(1, b"text"),
+            at(2, b"a"),
+            at(2, b"b"),
+            at(3, b"text"),
+            at(4, b"text"),
+            at(5, b"text"),
+        ];
         let answers = [
             ItemResult::Ok,
             ItemResult::Ok,
             ItemResult::Gone,
+            ItemResult::Gone,
             ItemResult::Full,
             ItemResult::Limited,
             ItemResult::Bad,
-            ItemResult::Ok,
         ];
-        assert_eq!(sent_outcome(&items, &answers), (vec![at(1)], vec![at(2)]));
+        assert_eq!(
+            sent_outcome(&items, &answers),
+            (vec![at(1, b"commit"), at(1, b"text")], vec![at(2, b"a")])
+        );
         // No answer (the request failed): neither.
         assert_eq!(sent_outcome(&items, &[]), (vec![], vec![]));
     }

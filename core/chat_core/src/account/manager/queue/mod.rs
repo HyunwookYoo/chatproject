@@ -4,7 +4,7 @@
 //! * `reconcile`: one job compares what the verdict wants with the queues this device has and
 //!   makes them agree.
 //! * `fetch`: takes what this device's queues hold (spec 6.4).
-//! * `put`: puts frames into the queues of devices a direct send did not reach (spec 8).
+//! * `put`: puts frames into the queues of devices no direct send reaches (spec 8).
 //! * No address, or the mode "never": no request to the queue server of any kind.
 
 mod fetch;
@@ -21,8 +21,8 @@ use crate::mailbox::PAGE_MAX_ENTRIES;
 use crate::mailbox::verdict::{self, QueueMode, Verdict};
 use crate::message::{
     queue_store::{
-        Fetchable, NewQueue, OwnQueue, QueueDbOp, QueueDbReply, QueueState, SWEEP_MAX, ToSend,
-        Unreached,
+        Fetchable, NewQueue, OwnQueue, QueueDbOp, QueueDbReply, QueueState, Queued, SWEEP_MAX,
+        ToSend, Unreached,
     },
     store::{MessageDbOp, MessageDbReply},
     types::{ConversationId, MessageKey},
@@ -164,12 +164,13 @@ pub(crate) enum QueueEvent {
         answers: Vec<(QueueId, ItemResult)>,
         failed: bool,
     },
-    /// A text's `SEND` came back: the device and queue of each item, and the answers in the
-    /// same order (none when the request failed). `ts`: the time its items were signed at.
+    /// A `SEND` came back, for a text's or receipt's attempt (`what`) or the standing pass
+    /// (`None`): what each item put where, and the answers in the same order (none when the
+    /// request failed). `ts`: the time its items were signed at.
     Sent {
         ticket: u64,
-        key: MessageKey,
-        items: Vec<(InstallationId, QueueId)>,
+        what: Option<MessageKey>,
+        items: Vec<Queued>,
         answers: Vec<ItemResult>,
         ts: u64,
     },
@@ -303,6 +304,7 @@ impl Manager {
         }
         self.queue_take_config();
         self.queue_sweep(request).await;
+        self.queue_standing(request).await;
         // A run on its way goes on even if the address changed: it ends where it began.
         self.queue_fetch_poll(request).await;
         if self.messages.queue.server.is_none() || self.messages.queue.running {
@@ -354,11 +356,11 @@ impl Manager {
             } => self.queue_acked(ticket, answers, failed).await,
             QueueEvent::Sent {
                 ticket,
-                key,
+                what,
                 items,
                 answers,
                 ts,
-            } => self.queue_sent(ticket, key, items, answers, ts).await,
+            } => self.queue_sent(ticket, what, items, answers, ts).await,
         }
     }
 }

@@ -36,16 +36,14 @@ CREATE TABLE queue_peer (
     PRIMARY KEY(conversation, installation),
     CHECK((server_url IS NULL) = (queue_id IS NULL) AND (sender_secret IS NULL) = (queue_id IS NULL))
 ) STRICT;
--- 큐에 넣은 보낸 메시지: 상대 기기마다, 큐 보관이 끝나면(expires_at_ms) 다시 넣는다 (spec 8.2)
+-- 큐에 넣은 frame: 받는 기기와 frame 해시마다. 그 기기의 큐(queue_id)가 보관하는 동안(expires_at_ms까지)
+-- 다시 넣지 않는다. 보관이 끝나도 아직 보낼 frame이면 다시 넣는다 (spec 8.2)
 CREATE TABLE queue_delivery (
-    conversation BLOB NOT NULL CHECK(length(conversation)=32),
-    sender_peer BLOB NOT NULL CHECK(length(sender_peer)=32),
-    sender_install BLOB NOT NULL CHECK(length(sender_install)=32),
-    msg_id BLOB NOT NULL CHECK(length(msg_id)=16),
     recipient_install BLOB NOT NULL CHECK(length(recipient_install)=32),
+    frame_hash BLOB NOT NULL CHECK(length(frame_hash)=32),
     queue_id BLOB NOT NULL CHECK(length(queue_id)=32),
     expires_at_ms INTEGER NOT NULL CHECK(expires_at_ms>=0),
-    PRIMARY KEY(conversation,sender_peer,sender_install,msg_id,recipient_install)
+    PRIMARY KEY(recipient_install,frame_hash)
 ) STRICT;
 CREATE INDEX queue_delivery_due ON queue_delivery(expires_at_ms);
 ALTER TABLE mailbox_device ADD COLUMN qualified INTEGER NOT NULL DEFAULT 0 CHECK(qualified IN (0,1));

@@ -524,6 +524,8 @@ impl Manager {
     /// poll.
     pub(super) fn push_deliver_soon(&mut self) {
         self.messages.push.delivery_at = None;
+        // Devices no session reaches get them in their queues (M8 spec 8).
+        self.queue_standing_soon();
     }
 
     /// Reads `push_local` again. A changed own-device handle reaches my other devices with the

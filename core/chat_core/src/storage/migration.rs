@@ -1016,7 +1016,7 @@ mod tests {
             ("SELECT queue_id FROM queue_own WHERE conversation=?1 AND state=0", "queue_own_"),
             ("SELECT queue_id FROM queue_own WHERE conversation=?1 AND state=1", "queue_own_conversation"),
             ("SELECT queue_id FROM queue_peer WHERE conversation=?1 AND installation=?2", "sqlite_autoindex_queue_peer_1"),
-            ("SELECT msg_id FROM queue_delivery WHERE expires_at_ms<=?1", "queue_delivery_due"),
+            ("SELECT frame_hash FROM queue_delivery WHERE expires_at_ms<=?1", "queue_delivery_due"),
             (
                 "SELECT attempts FROM push_delivery WHERE conversation=?1 AND recipient_install=?2 AND kind=1 AND msg_id=?3",
                 "sqlite_autoindex_push_delivery_1",

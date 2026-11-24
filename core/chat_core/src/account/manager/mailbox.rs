@@ -1712,7 +1712,13 @@ impl Manager {
             installation: origin,
             id: msg_id,
         };
-        self.queue_put(key, peer, reached, request).await;
+        let reach = super::messages::Reach {
+            key,
+            peer,
+            receipt: false,
+            reached: reached.to_vec(),
+        };
+        self.queue_put(&reach, request).await;
     }
 
     /// Dials the devices of `peer` (as its record here lists them) that have no session, unless

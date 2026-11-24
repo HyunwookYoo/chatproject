@@ -560,39 +560,88 @@ pub(super) fn prepare_receipt(
         return Err(invalid());
     }
     schedule_retry(&tx, key, true, now)?;
-    let cache = params![
-        key.conversation.0.as_slice(),
-        key.sender.0.as_slice(),
-        key.installation.0.as_slice(),
-        key.id.0.as_slice(),
-        kind as i64
-    ];
-    // Sealed by an earlier attempt: the same ciphertext goes out again (spec 5.3).
-    let sealed: Option<Vec<u8>> = tx
-        .query_row(
-            "SELECT wire FROM mls_receipt WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4 AND kind=?5",
-            cache,
-            |r| r.get(0),
-        )
-        .optional()
-        .map_err(sql)?;
-    let frame = match sealed {
-        Some(frame) => frame,
-        None => seal_receipt(
-            &tx,
-            identity,
-            local,
-            key,
-            &group.group_id,
-            receipt.kind,
-            wall,
-        )?,
-    };
+    let frame = sealed_receipt(&tx, identity, local, key, &group.group_id, receipt.kind, wall)?;
     finish(tx, fault)?;
     Ok(MessageDbReply::Prepared(
         zeroize::Zeroizing::new(frame),
         Some(receipt),
     ))
+}
+
+/// The receipt this device owes for received message `key` (its job's highest kind), sealed now
+/// if no attempt sealed it yet, so a queue can carry it while no device of the message's sender
+/// is reached (M8 spec 8.1); its attempts then send this same frame. Nothing for a message that
+/// did not come over MLS or has no open job; `NeedGroup` without a group, as `prepare_receipt`.
+pub(super) fn seal_owed_receipt(
+    c: &mut Connection,
+    identity: Identity,
+    local: &LocalAccount,
+    key: MessageKey,
+    wall: u64,
+    fault: Fault,
+) -> R<MessageDbReply> {
+    target(c, identity, key, true)?;
+    let tx = c.transaction().map_err(sql)?;
+    if !received_over_mls(&tx, key)? {
+        return Ok(MessageDbReply::Done);
+    }
+    let kind: Option<u64> = tx
+        .query_row(
+            "SELECT kind FROM receipt_job WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4 AND recipient_install=?5 ORDER BY kind DESC LIMIT 1",
+            params![key.conversation.0.as_slice(), key.sender.0.as_slice(), key.installation.0.as_slice(), key.id.0.as_slice(), identity.installation.0.as_slice()],
+            |r| uint(r, 0),
+        )
+        .optional()
+        .map_err(sql)?;
+    let Some(kind) = kind else {
+        return Ok(MessageDbReply::Done);
+    };
+    let Some(group) = group_row(&tx, key.conversation)? else {
+        return Ok(MessageDbReply::NeedGroup(key.conversation));
+    };
+    let kind = if kind == 2 {
+        ReceiptKind::Read
+    } else {
+        ReceiptKind::Delivered
+    };
+    sealed_receipt(&tx, identity, local, key, &group.group_id, kind, wall)?;
+    finish(tx, fault)?;
+    Ok(MessageDbReply::Done)
+}
+
+/// Receipt `kind` for received message `key` as its attempts send it: sealed by an earlier
+/// attempt (the same ciphertext goes out again, spec 5.3), or sealed now.
+fn sealed_receipt(
+    tx: &Transaction<'_>,
+    identity: Identity,
+    local: &LocalAccount,
+    key: MessageKey,
+    group_id: &[u8],
+    kind: ReceiptKind,
+    wall: u64,
+) -> R<Vec<u8>> {
+    let number: i64 = match kind {
+        ReceiptKind::Delivered => 1,
+        ReceiptKind::Read => 2,
+    };
+    let sealed: Option<Vec<u8>> = tx
+        .query_row(
+            "SELECT wire FROM mls_receipt WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4 AND kind=?5",
+            params![
+                key.conversation.0.as_slice(),
+                key.sender.0.as_slice(),
+                key.installation.0.as_slice(),
+                key.id.0.as_slice(),
+                number
+            ],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sql)?;
+    match sealed {
+        Some(frame) => Ok(frame),
+        None => seal_receipt(tx, identity, local, key, group_id, kind, wall),
+    }
 }
 
 /// Final review I2: the `Read` receipt for received message `key` that `mark_read` just made
