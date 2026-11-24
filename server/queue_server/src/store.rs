@@ -49,7 +49,10 @@ const INSERT_QUEUE: &str = "INSERT INTO queue (id, recipient_pub, sender_pub, la
 const TOUCH: &str = "UPDATE queue SET last_used_ms = max(last_used_ms, ?2) WHERE id = ?1";
 /// The next seq, which is also the queue's new last use: see [`Tx::send`].
 const NEXT_SEQ: &str = "UPDATE queue SET last_used_ms = max(?2, last_used_ms + 1) WHERE id = ?1 RETURNING last_used_ms";
-const HAS_ENTRY: &str = "SELECT 1 FROM entry WHERE queue_id = ?1 AND ct_hash = ?2";
+/// A SEND of a ciphertext the queue holds renews its hold from now (spec 9.3): its sender put
+/// it in again because its own copy of the hold ran out.
+const RENEW_ENTRY: &str =
+    "UPDATE entry SET received_ms = max(received_ms, ?3) WHERE queue_id = ?1 AND ct_hash = ?2";
 const HAS_ACKED: &str =
     "SELECT 1 FROM acked WHERE queue_id = ?1 AND ct_hash = ?2 AND drop_at_ms > ?3";
 const COUNT_ENTRIES: &str = "SELECT count(*) FROM entry WHERE queue_id = ?1";
@@ -78,7 +81,7 @@ const STATEMENTS: [&str; 18] = [
     INSERT_QUEUE,
     TOUCH,
     NEXT_SEQ,
-    HAS_ENTRY,
+    RENEW_ENTRY,
     HAS_ACKED,
     COUNT_ENTRIES,
     USED_BYTES,
@@ -307,7 +310,8 @@ impl Tx<'_> {
         Ok(())
     }
 
-    /// Stores `ct` once per queue. A queue's seq is a millisecond stamp that
+    /// Stores `ct` once per queue; a `ct` it holds is held from `now` again, under the same seq.
+    /// A queue's seq is a millisecond stamp that
     /// only rises: `max(now, last_used_ms + 1)`, kept as the new
     /// `last_used_ms`. Since `last_used_ms` never falls, a drained queue or a
     /// clock stepping back still gives a seq above every one handed out.
@@ -321,8 +325,9 @@ impl Tx<'_> {
         let hash: [u8; 32] = Sha256::digest(ct).into();
         let stored = self
             .0
-            .prepare_cached(HAS_ENTRY)?
-            .exists(params![id, hash])?;
+            .prepare_cached(RENEW_ENTRY)?
+            .execute(params![id, hash, int(now)])?
+            > 0;
         let acked = self
             .0
             .prepare_cached(HAS_ACKED)?

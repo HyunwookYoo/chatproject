@@ -226,9 +226,11 @@ async fn queued_text_stays_sent_until_receipt() {
     assert_eq!(texts_from(&a1, conv, b1.peer).await.len(), 1);
 }
 
-/// Spec 8.2: A1 is off for more than a day. The server drops the entry after 24 h; B1's next
-/// attempt puts the text in again, as its outbox has it now. A1 comes on and stores it once,
-/// and B1 sees it delivered.
+/// Spec 8.2 (Task 10 review C1): A1 is off for more than a day. B1's hold of its copy ends
+/// after 24 h, and its next attempt (within minutes) puts the text in again, before the
+/// server's hourly sweep dropped the old entry. The server holds it 24 h from that `SEND`, so
+/// after the sweep that follows, A1 comes on (B1 off) about 25 h after the first `SEND` and
+/// still stores it, once.
 #[tokio::test]
 async fn expired_queue_copy_is_sent_again_and_stored_once() {
     let (a1, b1, _net, conv, server) = announced().await;
@@ -239,20 +241,20 @@ async fn expired_queue_copy_is_sent_again_and_stored_once() {
     quiet(&[&b1]).await;
     assert_eq!(server.sends(&b1).len(), 1);
 
-    let day = ENTRY_TTL_MS / 1000 + 3_600;
+    let day = ENTRY_TTL_MS / 1000 + 120;
     b1.clock.advance_seconds(day).unwrap();
     a1.clock.advance_seconds(day).unwrap();
-    server.sweep(b1.clock.unix_seconds() * 1000).await;
-    assert_eq!(server.held(queue.queue_id), 0);
-    settle!(
-        [&b1],
-        server.sends(&b1).len() == 2 && server.held(queue.queue_id) == 1
-    );
-    let entries = entries_in(&server, queue.queue_id);
-    assert_eq!(entries[0].frame, outbox(&b1, key).await.wire);
+    settle!([&b1], server.sends(&b1).len() == 2);
     quiet(&[&b1]).await;
     assert_eq!(server.sends(&b1).len(), 2);
+    let entries = entries_in(&server, queue.queue_id);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].frame, outbox(&b1, key).await.wire);
 
+    // The server's next hourly sweep, an hour after the first entry's 24 h ran out.
+    b1.clock.advance_seconds(3_600).unwrap();
+    a1.clock.advance_seconds(3_600).unwrap();
+    server.sweep(a1.clock.unix_seconds() * 1000).await;
     let b_peer = b1.peer;
     let _b1 = stop(b1);
     online(&a1).await;

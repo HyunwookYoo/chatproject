@@ -577,6 +577,31 @@ async fn entries_expire_after_24h() {
     assert_eq!(s.rows("entry"), 1);
 }
 
+/// Spec 9.3: a SEND of a ciphertext the queue still holds (its sender put it in again after
+/// its own 24 h) holds it 24 h from that SEND, though the hourly sweep had not run yet. Same
+/// entry, same seq: the receiver never took it.
+#[tokio::test]
+async fn duplicate_send_renews_the_hold() {
+    let s = start(Limits::default());
+    let q = Q::new(1);
+    s.create(&q).await;
+    assert_eq!(s.send(&q, b"kept").await, ItemResult::Ok);
+    let seq = s.entries(&q, 0).await[0].seq;
+
+    let again = T0 + ENTRY_TTL_MS + 2 * 60_000;
+    s.set_now(again);
+    assert_eq!(s.send(&q, b"kept").await, ItemResult::Ok);
+    s.set_now(T0 + ENTRY_TTL_MS + 50 * 60_000);
+    sweep(&s.store, s.now()).await.unwrap();
+    let entries = s.entries(&q, 0).await;
+    assert_eq!(cts(&entries), vec![b"kept".to_vec()]);
+    assert_eq!(entries[0].seq, seq);
+
+    s.set_now(again + ENTRY_TTL_MS);
+    sweep(&s.store, s.now()).await.unwrap();
+    assert_eq!(s.rows("entry"), 0);
+}
+
 #[tokio::test]
 async fn queue_unused_30_days_is_deleted() {
     let s = start(Limits::default());
