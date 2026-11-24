@@ -104,9 +104,24 @@ async fn put(server: &FakeQueueServer, queue: &QueueOwnRow, ct: &[u8]) {
     );
 }
 
-/// `from` sends text `n` to `to`'s account while it cannot reach it, and the test puts the
-/// frame it sealed in `queue` (Task 10 will do that in the core).
+/// `from` sends text `n` to `to`'s account while it cannot reach it; its attempt puts the
+/// frame it sealed into `queue` (Task 10). Returns once the server holds it.
 async fn queued_text(
+    from: &Fixture,
+    to: &Fixture,
+    server: &FakeQueueServer,
+    queue: &QueueOwnRow,
+    n: u8,
+) -> MessageKey {
+    let key = send(from, to, n, &format!("queued {n}")).await.key;
+    let entry = text_entry(from, key).await;
+    settle!([from], server.stored(queue.queue_id).contains(&entry));
+    key
+}
+
+/// `from` sends text `n` with its attempts held (no `SEND`), and the test puts the frame it
+/// sealed in `queue`: for tests that choose when, or in what order, entries arrive.
+async fn put_text(
     from: &Fixture,
     to: &Fixture,
     server: &FakeQueueServer,
@@ -264,12 +279,16 @@ async fn mailbox_sync_and_queue_same_ciphertext_store_once() {
     );
     let queue = active(&a1).await.remove(0);
     off(&a1, &[&a2, &b1]).await;
-    // Sealed before any attempt: once A2 has it, B1 keeps no copy.
+    // Sealed before any attempt: once A2 has it, B1 keeps no copy. A2 acknowledges it, and
+    // B1 puts it into the queue of A1, which that attempt did not reach.
     b1.account.message_test_hold_scheduler(true).await.unwrap();
     let key = send(&b1, &a1, 1, "both ways").await.key;
-    put(&server, &queue, &text_entry(&b1, key).await).await;
+    let entry = text_entry(&b1, key).await;
     b1.account.message_test_hold_scheduler(false).await.unwrap();
-    settle!([&a2, &b1], message(&a2, key).await.is_some());
+    settle!(
+        [&a2, &b1],
+        message(&a2, key).await.is_some() && server.stored(queue.queue_id).contains(&entry)
+    );
     let b_peer = b1.peer;
     let _b1 = stop(b1);
 
@@ -304,6 +323,8 @@ async fn push_wake_fetches_queue_too() {
     let tag = own_tag(&a1, conv).await;
     let queue = active(&a1).await.remove(0);
     off(&a1, &[&b1]).await;
+    // No attempt, so no `SEND`: the entry comes only when the test puts it.
+    b1.account.message_test_hold_scheduler(true).await.unwrap();
     let key = send(&b1, &a1, 1, "woken").await.key;
     let frame = text_entry(&b1, key).await;
     let _b1 = stop(b1);
@@ -336,6 +357,7 @@ async fn on_deleted_messages_fetches_queue() {
     let (a1, b1, _net, _conv, server) = announced().await;
     let queue = active(&a1).await.remove(0);
     off(&a1, &[&b1]).await;
+    b1.account.message_test_hold_scheduler(true).await.unwrap();
     let key = send(&b1, &a1, 1, "dropped push").await.key;
     let frame = text_entry(&b1, key).await;
     let _b1 = stop(b1);
@@ -542,9 +564,11 @@ async fn epoch_change_then_texts_arrive_from_the_queue() {
     off(&a1, &[&b1]).await;
     let epoch = adds_b2(&b1, &a1, conv).await;
     assert!(epoch > was);
-    put(&server, &queue, &delivery_entry(&b1, conv, &a1, 1, epoch).await).await;
+    // B1's attempts put the Commit A1 lacks ahead of each text.
     let k1 = queued_text(&b1, &a1, &server, &queue, 1).await;
     let k2 = queued_text(&b1, &a1, &server, &queue, 2).await;
+    let commit = delivery_entry(&b1, conv, &a1, 1, epoch).await;
+    assert_eq!(server.stored(queue.queue_id)[0], commit);
     let b_peer = b1.peer;
     let _b1 = stop(b1);
     let before = notify_events(&a1).len();
@@ -581,7 +605,9 @@ async fn text_ahead_of_its_commit_is_held_until_the_commit_comes() {
     off(&a1, &[&b1]).await;
     let epoch = adds_b2(&b1, &a1, conv).await;
     let commit = delivery_entry(&b1, conv, &a1, 1, epoch).await;
-    let key = queued_text(&b1, &a1, &server, &queue, 1).await;
+    // B1's own `SEND` puts the Commit ahead of the text: held here to test the wrong order.
+    b1.account.message_test_hold_scheduler(true).await.unwrap();
+    let key = put_text(&b1, &a1, &server, &queue, 1).await;
     let b_peer = b1.peer;
     let _b1 = stop(b1);
 
@@ -684,6 +710,7 @@ async fn entry_that_fails_to_store_is_not_acknowledged() {
     let (a1, b1, _net, _conv, server) = announced().await;
     let queue = active(&a1).await.remove(0);
     off(&a1, &[&b1]).await;
+    b1.account.message_test_hold_scheduler(true).await.unwrap();
     let k1 = send(&b1, &a1, 1, "first").await.key;
     let k2 = send(&b1, &a1, 2, "second").await.key;
     let (e1, e2) = (text_entry(&b1, k1).await, text_entry(&b1, k2).await);
@@ -796,7 +823,7 @@ async fn large_answer_is_taken_64_a_turn() {
     b1.account.message_test_hold_scheduler(true).await.unwrap();
     let mut last = None;
     for n in 0..150u8 {
-        last = Some(queued_text(&b1, &a1, &server, &queue, n).await);
+        last = Some(put_text(&b1, &a1, &server, &queue, n).await);
     }
     let last = last.unwrap();
     let _b1 = stop(b1);

@@ -43,6 +43,8 @@ enum Got {
 
 struct FakeQueueServer {
     app: axum::Router,
+    /// The router's store, for its hourly sweep.
+    store: queue_server::Store,
     db: std::path::PathBuf,
     _dir: tempfile::TempDir,
     /// The server's clock (ms), set to the asking core's wall clock for each request.
@@ -67,13 +69,14 @@ impl FakeQueueServer {
         let db = dir.path().join("queue.db");
         let store = queue_server::Store::open(&db).unwrap();
         let now = Arc::new(AtomicU64::new(NOW * 1_000));
-        let mut state = queue_server::AppState::new(store);
+        let mut state = queue_server::AppState::new(store.clone());
         state.limits = limits;
         let clock = now.clone();
         state.clock = Arc::new(move || clock.load(Ordering::SeqCst));
         state.log = Arc::new(|_: &str| {});
         Arc::new(Self {
             app: queue_server::router(state),
+            store,
             db,
             _dir: dir,
             now,
@@ -138,6 +141,28 @@ impl FakeQueueServer {
             |r| r.get::<_, i64>(0),
         )
         .unwrap() as usize
+    }
+
+    /// The entries `queue` holds now, in seq order (its own database).
+    fn stored(&self, queue: QueueId) -> Vec<Vec<u8>> {
+        let c = rusqlite::Connection::open(&self.db).unwrap();
+        let mut q = c
+            .prepare("SELECT ct FROM entry WHERE queue_id=?1 ORDER BY seq")
+            .unwrap();
+        q.query_map([queue.as_slice()], |r| r.get::<_, Vec<u8>>(0))
+            .unwrap()
+            .map(|ct| ct.unwrap())
+            .collect()
+    }
+
+    /// The server's own sweep at `now_ms`: what has been held longer than `ENTRY_TTL_MS` goes.
+    async fn sweep(&self, now_ms: u64) {
+        queue_server::sweep(&self.store, now_ms).await.unwrap();
+    }
+
+    /// The `SEND`s `f` sent so far.
+    fn sends(&self, f: &Fixture) -> Vec<Call> {
+        self.sent(f, CommandName::Send)
     }
 
     /// The queue ids the server holds now (its own database).
