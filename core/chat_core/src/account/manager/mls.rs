@@ -2712,6 +2712,7 @@ impl Manager {
                 Via::Direct(_) | Via::Push => None,
             },
             queue_url: self.queue_url(),
+            delivered_receipt: matches!(via, Via::Queue),
         };
         let op = MessageDbOp::OpenApp(
             open,

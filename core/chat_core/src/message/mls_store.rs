@@ -887,6 +887,8 @@ fn decrypt_failed(class: u8, epoch: u64) -> MessageDbReply {
 /// * an undecodable plaintext or unknown content still advances the ratchet and is
 ///   acknowledged, so its sender stops retrying;
 /// * a `Receipt` is applied to this device's sent messages and acknowledged;
+/// * a new text from the other account that a queue entry brought (`delivered_receipt`) gets
+///   a `Delivered` receipt job: no `Ack` tells its sender (M8 spec 3);
 /// * a text M4 would refuse advances the ratchet but stores nothing and is `Rejected` (the
 ///   sender gives the message up, as for an M4 `Reject`);
 /// * the same message id again (a re-encrypted resend) stores nothing new;
@@ -1098,6 +1100,22 @@ pub(super) fn open_app(
     // pull's end; marked here so that a device dying first still notifies it.
     if let (Stored::New, Some(key), false, Some(holder)) = (&stored, text, own, from.pull) {
         super::mailbox_store::mark_notify(&tx, key, holder)?;
+    }
+    // M8 spec 3: a text from the other account taken from a queue is `Delivered` once its
+    // sender hears so from this device: a receipt job, due now. Taken again (any path), it is
+    // no longer new, so it never gets a second one.
+    if let (Stored::New, Some(key), false, true) = (&stored, text, own, from.delivered_receipt) {
+        tx.execute(
+            "INSERT OR IGNORE INTO receipt_job VALUES(?1,?2,?3,?4,?5,1,0,0)",
+            params![
+                key.conversation.0.as_slice(),
+                key.sender.0.as_slice(),
+                key.installation.0.as_slice(),
+                key.id.0.as_slice(),
+                identity.installation.0.as_slice()
+            ],
+        )
+        .map_err(sql)?;
     }
     if !own {
         tx.execute(
@@ -1893,6 +1911,7 @@ mod tests {
             allowed: vec![b1.installation_id(), b2.installation_id()],
             pull: None,
             queue_url: None,
+            delivered_receipt: false,
         };
         let reply = open(&mut b1_connection, own, ciphertext);
         assert!(matches!(
@@ -1924,6 +1943,7 @@ mod tests {
             allowed: vec![a1.installation_id()],
             pull: None,
             queue_url: None,
+            delivered_receipt: false,
         };
         let reply = open(&mut b1_connection, peer, ciphertext);
         assert!(matches!(
@@ -2042,6 +2062,7 @@ mod tests {
                     allowed: vec![a_device.installation_id()],
                     pull: None,
                     queue_url: None,
+                    delivered_receipt: false,
                 },
                 conversation,
                 ciphertext.clone(),

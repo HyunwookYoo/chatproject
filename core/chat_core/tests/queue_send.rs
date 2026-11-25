@@ -585,9 +585,9 @@ async fn commit_with_no_text_after_it_goes_into_the_queue() {
     );
 }
 
-/// Review I1: A1 takes B1's text from its queue while B1 is off and reads it. A1's `Read`
-/// receipt (an MLS text's only receipt: its delivery is the direct `Ack`) goes into B1's queue,
-/// and B1, coming on while A1 is off, sees the text read.
+/// Review I1: A1 takes B1's text from its queue while B1 is off and reads it. Its `Delivered`
+/// receipt and then its `Read` receipt go into B1's queue, and B1, coming on while A1 is off,
+/// sees the text read.
 #[tokio::test]
 async fn receipt_goes_into_the_senders_queue() {
     let (a1, b1, _net, conv, server) = announced().await;
@@ -601,17 +601,18 @@ async fn receipt_goes_into_the_senders_queue() {
     off(&b1, &[]).await;
 
     online(&a1).await;
-    settle!([&a1], message(&a1, key).await.is_some());
+    settle!(
+        [&a1],
+        message(&a1, key).await.is_some() && server.held(qb) == 1
+    );
     a1.account
         .messages()
         .mark_read(conv, vec![key])
         .await
         .unwrap();
-    settle!([&a1], server.held(qb) == 1);
-    assert_eq!(
-        entries_in(&server, qb)[0].sender_install,
-        installation(&a1).await
-    );
+    settle!([&a1], server.held(qb) == 2);
+    let a1_id = installation(&a1).await;
+    assert!(entries_in(&server, qb).iter().all(|e| e.sender_install == a1_id));
     off(&a1, &[]).await;
 
     online(&b1).await;
@@ -781,4 +782,116 @@ async fn standing_pass_that_stores_nothing_waits_its_period() {
         assert!(tokio::time::Instant::now() < deadline, "held {}", held());
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// The `SEND` items `from` put into `queue`.
+fn items_into(server: &FakeQueueServer, from: &Fixture, queue: QueueId) -> usize {
+    server
+        .sends(from)
+        .iter()
+        .map(|c| c.queues.iter().filter(|q| **q == queue).count())
+        .sum()
+}
+
+/// Fix2 I4 (spec 3: "받는 기기가 실제로 받으면 `전달됨`"): A1 takes B1's text from its queue
+/// while B1 is off, and its `Delivered` receipt goes into B1's queue. A1 goes off; B1 comes on,
+/// never meeting A1, and shows the text delivered (not read). B1 then puts it in no more, even
+/// after its 24 h hold.
+#[tokio::test]
+async fn queue_taken_text_is_delivered_without_meeting_and_not_put_again() {
+    let (a1, b1, _net, conv, server) = announced().await;
+    let (qa, qb) = (
+        active(&a1).await.remove(0).queue_id,
+        active(&b1).await.remove(0).queue_id,
+    );
+    off(&a1, &[&b1]).await;
+    let key = send(&b1, &a1, 1, "taken from the queue").await.key;
+    settle!([&b1], server.held(qa) == 1);
+    off(&b1, &[]).await;
+
+    online(&a1).await;
+    settle!(
+        [&a1],
+        message(&a1, key).await.is_some() && server.held(qb) == 1
+    );
+    assert_eq!(entries_in(&server, qb)[0].sender_install, installation(&a1).await);
+    off(&a1, &[]).await;
+
+    online(&b1).await;
+    settle!(
+        [&b1],
+        delivery(&b1, key).await == DeliveryState::Delivered && server.held(qb) == 0
+    );
+    assert_eq!(texts_from(&a1, conv, b1.peer).await.len(), 1);
+    let sends = server.sends(&b1).len();
+    b1.clock
+        .advance_seconds(ENTRY_TTL_MS / 1000 + 3_600)
+        .unwrap();
+    quiet(&[&b1]).await;
+    assert_eq!(server.sends(&b1).len(), sends);
+    assert_eq!(server.held(qa), 0);
+    assert_eq!(delivery(&b1, key).await, DeliveryState::Delivered);
+}
+
+/// Fix2 I4: the text reaches A1 from its queue first (one `Delivered` receipt, into B1's queue
+/// while B1 is off), then directly when the two meet (a duplicate: acknowledged, no second
+/// receipt). Each copy is stored once and A1 puts one receipt into B1's queue.
+#[tokio::test]
+async fn text_from_the_queue_then_directly_gets_one_receipt() {
+    let (a1, b1, _net, conv, server) = announced().await;
+    let (qa, qb) = (
+        active(&a1).await.remove(0).queue_id,
+        active(&b1).await.remove(0).queue_id,
+    );
+    off(&a1, &[&b1]).await;
+    let key = send(&b1, &a1, 1, "both ways").await.key;
+    settle!([&b1], server.held(qa) == 1);
+    off(&b1, &[]).await;
+
+    online(&a1).await;
+    settle!(
+        [&a1],
+        message(&a1, key).await.is_some() && server.held(qb) == 1
+    );
+    // B1 comes on and its outbox retry reaches A1 directly.
+    online(&b1).await;
+    link(&a1, &b1).await;
+    settle!(
+        [&a1, &b1],
+        delivery(&b1, key).await == DeliveryState::Delivered
+            && server.held(qb) == 0
+            && receipt_jobs(&a1).await == 0
+    );
+    quiet(&[&a1, &b1]).await;
+    assert_eq!(items_into(&server, &a1, qb), 1);
+    assert_eq!(receipt_jobs(&a1).await, 0);
+    assert_eq!(texts_from(&a1, conv, b1.peer).await.len(), 1);
+}
+
+/// Fix2 I4: the text reaches A1 directly first (its `Ack` is the delivery), and the queue's
+/// copy comes after it: a duplicate, so no receipt job and nothing into B1's queue.
+#[tokio::test]
+async fn text_taken_directly_gets_no_receipt_for_its_queue_copy() {
+    let (a1, b1, _net, conv, server) = announced().await;
+    let (qa, qb) = (
+        active(&a1).await.remove(0).queue_id,
+        active(&b1).await.remove(0).queue_id,
+    );
+    off(&a1, &[&b1]).await;
+    let key = send(&b1, &a1, 1, "direct first").await.key;
+    settle!([&b1], server.held(qa) == 1);
+    server.hold_recv(true);
+    online(&a1).await;
+    link(&a1, &b1).await;
+    settle!(
+        [&a1, &b1],
+        delivery(&b1, key).await == DeliveryState::Delivered
+    );
+    off(&b1, &[&a1]).await;
+    server.hold_recv(false);
+    settle!([&a1], server.held(qa) == 0);
+    quiet(&[&a1]).await;
+    assert_eq!(receipt_jobs(&a1).await, 0);
+    assert_eq!(items_into(&server, &a1, qb), 0);
+    assert_eq!(texts_from(&a1, conv, b1.peer).await.len(), 1);
 }

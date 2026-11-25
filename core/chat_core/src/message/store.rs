@@ -34,6 +34,10 @@ pub(crate) struct OpenFrom {
     /// The queue server this device uses (`None`: none): a received `QueueRef` is taken only
     /// on it (M8 spec 7.2).
     pub queue_url: Option<std::sync::Arc<str>>,
+    /// A queue entry (M8 spec 3): no `Ack` tells its sender, so a text from the other account
+    /// stored just now gets a `Delivered` receipt job, sent like a `Read` receipt (directly, or
+    /// into the sender's queue).
+    pub delivered_receipt: bool,
 }
 pub(crate) enum MessageDbOp {
     Observed(Box<MessageDbOp>),

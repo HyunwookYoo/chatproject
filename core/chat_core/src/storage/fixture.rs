@@ -269,7 +269,7 @@ impl Messages {
         ciphertext: Vec<u8>,
         now: u64,
     ) -> Result<crate::mls::wire::MlsReply, CoreError> {
-        let from = crate::message::store::OpenFrom { peer: sender, transport: Some(transport), allowed, pull, queue_url: None };
+        let from = crate::message::store::OpenFrom { peer: sender, transport: Some(transport), allowed, pull, queue_url: None, delivered_receipt: false };
         self.mls_open(from, conversation, ciphertext, now).await
     }
     /// `mls_open_app` on a device whose queue server is `queue_url`: a `QueueRef` on it is
@@ -289,6 +289,7 @@ impl Messages {
             allowed: vec![installation],
             pull: None,
             queue_url: Some(queue_url.into()),
+            delivered_receipt: false,
         };
         self.mls_open(from, conversation, ciphertext, now).await
     }
