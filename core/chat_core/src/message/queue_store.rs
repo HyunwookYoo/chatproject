@@ -379,6 +379,7 @@ pub(super) fn queue_op(
             wall,
         } => QueueDbReply::ToSend(to_send(c, identity, unreached, &server_url, wall)?),
         QueueDbOp::Sent { taken, gone, ts } => {
+            // A later answer of an older `SEND` never shortens the hold the same queue has.
             let expires_at = ts.saturating_add(ENTRY_TTL_MS);
             let tx = c.transaction().map_err(sql)?;
             tx.execute(
@@ -388,7 +389,7 @@ pub(super) fn queue_op(
             .map_err(sql)?;
             for q in taken {
                 tx.execute(
-                    "INSERT INTO queue_delivery VALUES(?1,?2,?3,?4) ON CONFLICT(recipient_install,frame_hash) DO UPDATE SET queue_id=excluded.queue_id,expires_at_ms=excluded.expires_at_ms",
+                    "INSERT INTO queue_delivery VALUES(?1,?2,?3,?4) ON CONFLICT(recipient_install,frame_hash) DO UPDATE SET queue_id=excluded.queue_id,expires_at_ms=CASE WHEN queue_id=excluded.queue_id THEN max(expires_at_ms,excluded.expires_at_ms) ELSE excluded.expires_at_ms END",
                     params![
                         q.installation.0.as_slice(),
                         q.frame_hash.as_slice(),

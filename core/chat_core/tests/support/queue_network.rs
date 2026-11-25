@@ -61,6 +61,8 @@ struct FakeQueueServer {
     hold_recv: tokio::sync::watch::Sender<bool>,
     /// While true, `ACK`s wait before the server reads them.
     hold_acks: tokio::sync::watch::Sender<bool>,
+    /// While true, `SEND`s wait before the server reads them.
+    hold_sends: tokio::sync::watch::Sender<bool>,
 }
 
 impl FakeQueueServer {
@@ -86,6 +88,7 @@ impl FakeQueueServer {
             lose_acks: Default::default(),
             hold_recv: tokio::sync::watch::channel(false).0,
             hold_acks: tokio::sync::watch::channel(false).0,
+            hold_sends: tokio::sync::watch::channel(false).0,
         })
     }
 
@@ -120,6 +123,10 @@ impl FakeQueueServer {
 
     fn hold_acks(&self, held: bool) {
         self.hold_acks.send_replace(held);
+    }
+
+    fn hold_sends(&self, held: bool) {
+        self.hold_sends.send_replace(held);
     }
 
     fn lose_acks(&self, lost: bool) {
@@ -198,6 +205,7 @@ impl FakeQueueServer {
         let hold = match command {
             CommandName::Recv => Some(&self.hold_recv),
             CommandName::Ack => Some(&self.hold_acks),
+            CommandName::Send => Some(&self.hold_sends),
             _ => None,
         };
         if let (Some(hold), Some(_)) = (hold, from) {

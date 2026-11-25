@@ -563,6 +563,27 @@ async fn commit_goes_into_the_queue_ahead_of_the_text() {
     assert_eq!(texts_from(&a1, conv, b_peer).await.len(), 2);
 }
 
+/// Review minor 4 (fix2): two texts in a burst both lack the same Commit. While the first
+/// `SEND` (Commit, text) is on its way, the second carries its text only: the Commit is sent
+/// to A1's queue once, so it spends one of the queue's `SEND` tokens, not two.
+#[tokio::test]
+async fn commit_on_its_way_is_not_sent_again_in_a_burst() {
+    let (a1, b1, _net, conv, server) = announced_with(&[B1, B2]).await;
+    let queue = active(&a1).await.remove(0);
+    off(&a1, &[&b1]).await;
+    adds_b2(&b1, &a1, conv).await;
+    server.hold_sends(true);
+    send(&b1, &a1, 1, "first").await;
+    settle!([&b1], items_into(&server, &b1, queue.queue_id) == 2);
+    send(&b1, &a1, 2, "second").await;
+    settle!([&b1], items_into(&server, &b1, queue.queue_id) >= 3);
+    server.hold_sends(false);
+    settle!([&b1], server.held(queue.queue_id) == 3);
+    quiet(&[&b1]).await;
+    assert_eq!(items_into(&server, &b1, queue.queue_id), 3);
+    assert_eq!(server.held(queue.queue_id), 3);
+}
+
 /// Review I1: a Commit with no text after it goes into the queue of the device it is queued
 /// for by the standing pass. A1 comes on while B1 is off and takes the new epoch.
 #[tokio::test]

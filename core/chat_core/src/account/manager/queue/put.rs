@@ -30,7 +30,9 @@
 //!   waits (a re-encrypted text is a new frame). `gone`: that queue is dead until the device
 //!   announces another. `full`, `limited`, `bad` or no answer: nothing is noted, so the next
 //!   trigger tries again (the outbox back-off, or the standing pass).
-//! * One `SEND` per text or receipt at a time, and one standing pass.
+//! * One `SEND` per text or receipt at a time, and one standing pass. A frame a `SEND` on its
+//!   way carries goes in no other request for that device until it answers (two texts in a
+//!   burst both lacking a `Commit` carry it once), and then goes again only if it was not taken.
 //! * Rows that expired go in the transaction that notes the next `SEND`, so with no address
 //!   nothing ever writes them.
 //! * No address, or the mode "never": no `SEND`.
@@ -60,18 +62,22 @@ pub(super) struct Put {
     standing_rest: bool,
     /// `SEND` requests made: each starts its devices one further on.
     turn: usize,
+    /// The frames of the `SEND`s on their way, by device: no other request carries them.
+    flying: BTreeSet<(InstallationId, [u8; 32])>,
 }
 
 /// The items of one `SEND` (spec 8.1, 9.2), with what each puts where: every frame of each
-/// target in order, as an entry of my account (`me`) naming its sealer, signed with that
-/// queue's sender key at `ts`. Targets go from the one at `start` (in turn) round to the one
-/// before it; one whose items would take the request past `MAX_ITEMS` or `MAX_BODY` is left out
-/// whole (its frames must stay in order). `false`: one was left out.
+/// target in order but those a request on its way carries to it (`flying`), as an entry of my
+/// account (`me`) naming its sealer, signed with that queue's sender key at `ts`. Targets go
+/// from the one at `start` (in turn) round to the one before it; one whose items would take the
+/// request past `MAX_ITEMS` or `MAX_BODY` is left out whole (its frames must stay in order).
+/// `false`: one was left out.
 fn send_items(
     send: ToSend,
     me: PeerId,
     ts: u64,
     start: usize,
+    flying: &BTreeSet<(InstallationId, [u8; 32])>,
 ) -> (Vec<Queued>, Vec<SendItem>, bool) {
     let mut targets = send.targets;
     let first = start % targets.len().max(1);
@@ -82,8 +88,9 @@ fn send_items(
         let cts: Vec<([u8; 32], Vec<u8>)> = target
             .frames
             .into_iter()
-            .map(|(sealer, frame)| {
-                let hash = frame_hash(&frame);
+            .map(|(sealer, frame)| (frame_hash(&frame), sealer, frame))
+            .filter(|(hash, ..)| !flying.contains(&(target.installation, *hash)))
+            .map(|(hash, sealer, frame)| {
                 let entry = QueueEntry {
                     sender_peer: me,
                     sender_install: sealer,
@@ -248,13 +255,15 @@ impl Manager {
             return true;
         };
         let put = &mut self.messages.queue.put;
-        let (items, sends, all) = send_items(send, me, wall, put.turn);
+        let (items, sends, all) = send_items(send, me, wall, put.turn, &put.flying);
         if sends.is_empty() {
-            // Nothing fits even alone: no sooner pass would change that.
+            // Nothing fits even alone, or all is on its way: no sooner pass would change that.
             return true;
         }
         put.turn = put.turn.wrapping_add(1);
         put.sending.insert(what);
+        put.flying
+            .extend(items.iter().map(|q| (q.installation, q.frame_hash)));
         let mailbox = self.auth.send.clone();
         let ticket = request.ticket;
         tokio::spawn(async move {
@@ -289,7 +298,11 @@ impl Manager {
         answers: Vec<ItemResult>,
         ts: u64,
     ) {
-        self.messages.queue.put.sending.remove(&what);
+        let put = &mut self.messages.queue.put;
+        put.sending.remove(&what);
+        for q in &items {
+            put.flying.remove(&(q.installation, q.frame_hash));
+        }
         let Some(request) = self.ready().ok().filter(|r| r.ticket == ticket) else {
             return;
         };
@@ -350,7 +363,7 @@ mod tests {
         let send = ToSend {
             targets: vec![sealed_elsewhere, target(2, vec![b"text".to_vec()])],
         };
-        let (queued, items, all) = send_items(send, me, T, 0);
+        let (queued, items, all) = send_items(send, me, T, 0, &BTreeSet::new());
         assert!(all);
         assert_eq!(queued, [at(1, b"commit"), at(1, b"text"), at(2, b"text")]);
         let entries: Vec<(InstallationId, Vec<u8>)> = items
@@ -396,7 +409,7 @@ mod tests {
                 target(3, vec![b"text".to_vec()]),
             ],
         };
-        let (queued, items, all) = send_items(send, me, T, 0);
+        let (queued, items, all) = send_items(send, me, T, 0, &BTreeSet::new());
         assert!(!all);
         let devices: Vec<u8> = queued.iter().map(|q| q.installation.0[0]).collect();
         assert_eq!(devices, [1, 1, 1, 1, 1, 1, 1, 1, 1, 3]);
@@ -414,7 +427,7 @@ mod tests {
             let send = ToSend {
                 targets: vec![target(1, big.clone()), target(2, big)],
             };
-            let (queued, _, _) = send_items(send, me, T, start);
+            let (queued, _, _) = send_items(send, me, T, start, &BTreeSet::new());
             let mut devices: Vec<u8> = queued.iter().map(|q| q.installation.0[0]).collect();
             devices.dedup();
             devices
@@ -422,6 +435,24 @@ mod tests {
         assert_eq!(send(0), [1]);
         assert_eq!(send(1), [2]);
         assert_eq!(send(2), [1]);
+    }
+
+    /// Review minor 4: a frame a request on its way carries to a device stays out of the next
+    /// one for that device; the device's other frames, and another device's copy, go.
+    #[test]
+    fn send_items_leave_out_frames_on_their_way() {
+        let me = PeerId([9; 32]);
+        let send = ToSend {
+            targets: vec![
+                target(1, vec![b"commit".to_vec(), b"text".to_vec()]),
+                target(2, vec![b"commit".to_vec()]),
+            ],
+        };
+        let flying = BTreeSet::from([(InstallationId([1; 32]), frame_hash(b"commit"))]);
+        let (queued, items, all) = send_items(send, me, T, 0, &flying);
+        assert!(all);
+        assert_eq!(queued, [at(1, b"text"), at(2, b"commit")]);
+        assert_eq!(items.len(), 2);
     }
 
     #[test]
