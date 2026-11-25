@@ -12,9 +12,10 @@
 //! `PushHandle` and `QueueRef` frames of `push_delivery`. `queue_delivery` has a row per device
 //! and frame hash while that device's queue holds the frame (until `expires_at_ms`, the
 //! server's 24 h); while it lasts, and the device's queue is still that one, the frame does not
-//! go in again. Expired rows are swept (`Sweep`); a frame that no longer waits is never read
-//! again, so its row needs no other delete.
-use queue_wire::{QueueId, RETIRE_MS};
+//! go in again. Expired rows go in the `Sent` transaction, which only a configured address
+//! ever runs; a frame that no longer waits is never read again, so its row needs no other
+//! delete.
+use queue_wire::{ENTRY_TTL_MS, QueueId, RETIRE_MS};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -34,8 +35,9 @@ use crate::{CoreError, ErrorCode};
 
 type R<T> = Result<T, CoreError>;
 
-/// Most `queue_delivery` rows one `Sweep` drops.
-pub(crate) const SWEEP_MAX: i64 = 256;
+/// Most expired `queue_delivery` rows one `Sent` drops: more than one `SEND` writes
+/// (`MAX_ITEMS`), so every `Sent` leaves fewer expired rows than it found.
+const EXPIRED_MAX: i64 = 256;
 
 /// The devices a `SEND` is for (spec 8.1): those no direct send reaches now.
 pub(crate) enum Unreached {
@@ -185,17 +187,14 @@ pub(crate) enum QueueDbOp {
         server_url: String,
         wall: u64,
     },
-    /// A `SEND` came back: the queues of `taken` hold those frames until `expires_at`; the
-    /// queues of `gone` are unknown at the server: not used again until that device announces
-    /// another queue.
+    /// A `SEND` signed at `ts` came back: the queues of `taken` hold those frames until the
+    /// server drops them (`ts` + `ENTRY_TTL_MS`); the queues of `gone` are unknown at the
+    /// server: not used again until that device announces another queue. Rows expired at `ts`
+    /// go, `EXPIRED_MAX` at most.
     Sent {
         taken: Vec<Queued>,
         gone: Vec<Queued>,
-        expires_at: u64,
-    },
-    /// Drops `queue_delivery` rows expired at `wall`, `SWEEP_MAX` at most.
-    Sweep {
-        wall: u64,
+        ts: u64,
     },
 }
 
@@ -233,8 +232,6 @@ pub(crate) enum QueueDbReply {
     },
     ToSend(Option<ToSend>),
     Sent,
-    /// Rows dropped: `SWEEP_MAX` means there may be more.
-    Swept(i64),
 }
 
 pub(super) fn queue_op(
@@ -381,12 +378,14 @@ pub(super) fn queue_op(
             server_url,
             wall,
         } => QueueDbReply::ToSend(to_send(c, identity, unreached, &server_url, wall)?),
-        QueueDbOp::Sent {
-            taken,
-            gone,
-            expires_at,
-        } => {
+        QueueDbOp::Sent { taken, gone, ts } => {
+            let expires_at = ts.saturating_add(ENTRY_TTL_MS);
             let tx = c.transaction().map_err(sql)?;
+            tx.execute(
+                "DELETE FROM queue_delivery WHERE rowid IN (SELECT rowid FROM queue_delivery WHERE expires_at_ms<=?1 LIMIT ?2)",
+                params![integer(ts)?, EXPIRED_MAX],
+            )
+            .map_err(sql)?;
             for q in taken {
                 tx.execute(
                     "INSERT INTO queue_delivery VALUES(?1,?2,?3,?4) ON CONFLICT(recipient_install,frame_hash) DO UPDATE SET queue_id=excluded.queue_id,expires_at_ms=excluded.expires_at_ms",
@@ -413,17 +412,6 @@ pub(super) fn queue_op(
             }
             finish(tx, fault)?;
             QueueDbReply::Sent
-        }
-        QueueDbOp::Sweep { wall } => {
-            let tx = c.transaction().map_err(sql)?;
-            let swept = tx
-                .execute(
-                    "DELETE FROM queue_delivery WHERE rowid IN (SELECT rowid FROM queue_delivery WHERE expires_at_ms<=?1 LIMIT ?2)",
-                    params![integer(wall)?, SWEEP_MAX],
-                )
-                .map_err(sql)?;
-            finish(tx, fault)?;
-            QueueDbReply::Swept(swept as i64)
         }
     };
     Ok(MessageDbReply::Queue(reply))

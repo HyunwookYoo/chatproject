@@ -720,6 +720,35 @@ async fn uncertain_prebyte_attempt_reconciles_before_retry_without_sending() {
     );
 }
 
+/// M8: with no queue address configured, the queue upkeep opens no transaction on the message
+/// DB, so a one-shot fault armed before ten polls is still there for the attempt (Task 10 fix2
+/// I2: the `queue_delivery` sweep ran with no address).
+#[tokio::test]
+async fn polls_with_no_queue_configured_leave_an_armed_fault_to_the_attempt() {
+    // Ten polls, the scheduler a second further on at each: no hourly job comes due.
+    async fn polls(f: &Fixture) {
+        for _ in 0..10 {
+            f.clock.advance_monotonic_ms(1_000);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+    let (a, b, _) = manual_pair().await;
+    contacts(&a, &b).await;
+    contacts(&b, &a).await;
+    a.account.connect_account(b.peer).await.unwrap();
+    let m = enqueue(&a, &b).await;
+    // The M6 and M7 prunes run at the first poll after start: let them pass first.
+    polls(&a).await;
+    a.account
+        .storage_test_fixture()
+        .message_fault(chat_core::storage_fixture::CommitFault::AfterCommit)
+        .await;
+    polls(&a).await;
+    assert!(
+        matches!(a.account.message_test_attempt(m.key,false,MessageMutation::None).await,Err(e) if e.code==ErrorCode::StorageUncertain)
+    );
+}
+
 #[tokio::test]
 async fn fenced_successful_prepare_releases_only_never_launched_job_on_restore() {
     for before_reply in [true, false] {

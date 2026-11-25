@@ -21,8 +21,8 @@ use crate::mailbox::PAGE_MAX_ENTRIES;
 use crate::mailbox::verdict::{self, QueueMode, Verdict};
 use crate::message::{
     queue_store::{
-        Fetchable, NewQueue, OwnQueue, QueueDbOp, QueueDbReply, QueueState, Queued, SWEEP_MAX,
-        ToSend, Unreached,
+        Fetchable, NewQueue, OwnQueue, QueueDbOp, QueueDbReply, QueueState, Queued, ToSend,
+        Unreached,
     },
     store::{MessageDbOp, MessageDbReply},
     types::{ConversationId, MessageKey},
@@ -37,7 +37,7 @@ use crate::queue::{
 use std::collections::{BTreeSet, VecDeque};
 use crate::{NetworkOp, NetworkReply, NetworkState};
 use queue_wire::{
-    BASE64URL_NOPAD, ENTRY_TTL_MS, Entry, MAX_BODY, MAX_ITEMS, QueueId, RETIRE_MS, ROTATE_MS,
+    BASE64URL_NOPAD, Entry, MAX_BODY, MAX_ITEMS, QueueId, RETIRE_MS, ROTATE_MS,
     Signed, public_key, sign, signing_bytes,
 };
 use zeroize::Zeroizing;
@@ -303,7 +303,6 @@ impl Manager {
             return;
         }
         self.queue_take_config();
-        self.queue_sweep(request).await;
         self.queue_standing(request).await;
         // A run on its way goes on even if the address changed: it ends where it began.
         self.queue_fetch_poll(request).await;

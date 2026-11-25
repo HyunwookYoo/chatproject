@@ -29,7 +29,8 @@
 //!   announces another. `full`, `limited`, `bad` or no answer: nothing is noted, so the next
 //!   trigger tries again (the outbox back-off, or the standing pass).
 //! * One `SEND` per text or receipt at a time, and one standing pass.
-//! * Rows that expired are swept hourly, a bounded batch at a time.
+//! * Rows that expired go in the transaction that notes the next `SEND`, so with no address
+//!   nothing ever writes them.
 //! * No address, or the mode "never": no `SEND`.
 
 use super::*;
@@ -50,8 +51,6 @@ pub(super) struct Put {
     /// What a `SEND` is on its way for: a text's or receipt's key, `None` the standing pass. No
     /// second one for it until it answers.
     sending: BTreeSet<Option<MessageKey>>,
-    /// The scheduler time `queue_delivery` is swept next.
-    sweep_at: u64,
     /// The scheduler time the standing pass runs next.
     standing_at: u64,
     /// `SEND` requests made: each starts its devices one further on.
@@ -292,30 +291,9 @@ impl Manager {
         if taken.is_empty() && gone.is_empty() {
             return;
         }
-        let op = QueueDbOp::Sent {
-            taken,
-            gone,
-            expires_at: ts.saturating_add(ENTRY_TTL_MS),
-        };
+        let op = QueueDbOp::Sent { taken, gone, ts };
         // Not stored: the frames go in again at the next trigger.
         let _ = self.queue_db(op, request).await;
-    }
-
-    /// Drops `queue_delivery` rows that expired, hourly (at once again while a batch came back
-    /// full).
-    pub(super) async fn queue_sweep(&mut self, request: Request) {
-        let now = self.schedule_now();
-        if now < self.messages.queue.put.sweep_at {
-            return;
-        }
-        let op = QueueDbOp::Sweep {
-            wall: self.services.clock.wall_ms(),
-        };
-        let more = matches!(
-            self.queue_db(op, request).await,
-            Ok(QueueDbReply::Swept(n)) if n >= SWEEP_MAX
-        );
-        self.messages.queue.put.sweep_at = if more { now } else { now.saturating_add(CHECK_MS) };
     }
 }
 
