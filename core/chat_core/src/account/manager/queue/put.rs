@@ -20,7 +20,9 @@
 //!     those go in with no text after them (a rotated queue reaches a peer that is off).
 //! * Each trigger is one `SEND` request for every device and frame. A device's frames stay
 //!   together and in order; one whose frames would take the request past `MAX_ITEMS` or
-//!   `MAX_BODY` waits for the next trigger (the standing pass comes again at the next poll).
+//!   `MAX_BODY` waits for the next trigger (the standing pass comes again at the next poll
+//!   when its request stored something, else at its period, so a server that takes nothing
+//!   gets one request per `STANDING_EVERY_MS`).
 //!   Each request starts one device further on, so a device whose frames fill it never keeps
 //!   the others out.
 //! * Each frame the server took: `queue_delivery` holds it for that device's queue until the
@@ -53,6 +55,9 @@ pub(super) struct Put {
     sending: BTreeSet<Option<MessageKey>>,
     /// The scheduler time the standing pass runs next.
     standing_at: u64,
+    /// The last standing request left a device out: the pass comes again at once if that
+    /// request stored something.
+    standing_rest: bool,
     /// `SEND` requests made: each starts its devices one further on.
     turn: usize,
 }
@@ -192,7 +197,8 @@ impl Manager {
     }
 
     /// The standing pass, when it is due: what is still queued for each device without a
-    /// session goes into its queue. At the next poll again when a device was left out.
+    /// session goes into its queue. Again after `STANDING_EVERY_MS`, or at once when a device
+    /// was left out and the request stored something (`queue_sent`).
     pub(super) async fn queue_standing(&mut self, request: Request) {
         let now = self.schedule_now();
         let put = &self.messages.queue.put;
@@ -210,11 +216,9 @@ impl Manager {
         let all = self
             .queue_send(None, Unreached::Standing { reached }, request)
             .await;
-        self.messages.queue.put.standing_at = if all {
-            now.saturating_add(STANDING_EVERY_MS)
-        } else {
-            now
-        };
+        let put = &mut self.messages.queue.put;
+        put.standing_at = now.saturating_add(STANDING_EVERY_MS);
+        put.standing_rest = !all;
     }
 
     /// One `SEND` of what `unreached` lacks, in a spawned task; `what` names it (`Put.sending`).
@@ -274,7 +278,9 @@ impl Manager {
     }
 
     /// A `SEND` came back: the queues that took a frame hold it until the server drops it, and
-    /// a queue the server does not know is dead. Anything else is left to the next trigger.
+    /// a queue the server does not know is dead. Anything else is left to the next trigger. A
+    /// standing request that left a device out and stored something runs the pass again at the
+    /// next poll.
     pub(super) async fn queue_sent(
         &mut self,
         ticket: u64,
@@ -291,9 +297,14 @@ impl Manager {
         if taken.is_empty() && gone.is_empty() {
             return;
         }
+        let stored = !taken.is_empty();
         let op = QueueDbOp::Sent { taken, gone, ts };
         // Not stored: the frames go in again at the next trigger.
-        let _ = self.queue_db(op, request).await;
+        let noted = self.queue_db(op, request).await.is_ok();
+        let put = &mut self.messages.queue.put;
+        if what.is_none() && put.standing_rest && stored && noted {
+            put.standing_at = 0;
+        }
     }
 }
 

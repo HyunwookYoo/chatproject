@@ -713,3 +713,68 @@ async fn origin_and_mailbox_put_one_entry() {
         key.installation
     );
 }
+
+/// Fix2 I3: the standing pass's request leaves a device out (two devices' `Commit`s together
+/// pass `MAX_BODY`) and the server takes nothing (`limited`: every queue's burst is spent).
+/// The pass does not come again at once: over 20 minutes B1 makes one standing `SEND` per
+/// `STANDING_EVERY_MS` (5 min), not one a poll. Once the server takes them, it does.
+#[tokio::test]
+async fn standing_pass_that_stores_nothing_waits_its_period() {
+    let (a1, a2, b1, conv, server) = two_queued_devices().await;
+    let queues = [active(&a1).await.remove(0), active(&a2).await.remove(0)];
+    off(&a1, &[&b1, &a2]).await;
+    off(&a2, &[&b1]).await;
+    for queue in &queues {
+        for n in 0..20u32 {
+            assert_eq!(
+                server
+                    .send_as(queue.queue_id, &queue.sender_secret, &n.to_be_bytes())
+                    .await,
+                ItemResult::Ok
+            );
+        }
+    }
+    // Eight Commits of 60 KiB for each device: one device's fit in a request, both do not.
+    let fixture = b1.account.storage_test_fixture();
+    for (d, f) in [&a1, &a2].into_iter().enumerate() {
+        let to = installation(f).await;
+        for epoch in 0..8u64 {
+            let body = vec![(d * 8) as u8 + epoch as u8; 61_440];
+            fixture
+                .mls_set_delivery(conv, to, 1, 100 + epoch, Some((body, NOW * 1000 + DAY_MS)))
+                .await
+                .unwrap();
+        }
+    }
+    let before = server.sends(&b1).len();
+    b1.clock.advance_monotonic_ms(300_000);
+    settle!([&b1], server.sends(&b1).len() > before);
+    for _ in 0..60 {
+        b1.clock.advance_monotonic_ms(20_000);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let sends = server.sends(&b1)[before..].to_vec();
+    assert!(
+        (4..=6).contains(&sends.len()),
+        "{} standing SENDs in 20 min",
+        sends.len()
+    );
+    // Each request carried one device's eight Commits.
+    assert!(sends.iter().all(|s| s.queues.len() == 8));
+    let held = || server.held(queues[0].queue_id) + server.held(queues[1].queue_id);
+    assert_eq!(held(), 40);
+
+    // The limit refills: the next pass stores one device's Commits and, having left the other
+    // out, comes again at once (no scheduler time passes) for the other's.
+    b1.clock.advance_seconds(60).unwrap();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    if held() == 40 {
+        // The minute did not bring the pass round: one period does, once.
+        b1.clock.advance_monotonic_ms(300_000);
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while held() < 56 {
+        assert!(tokio::time::Instant::now() < deadline, "held {}", held());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
