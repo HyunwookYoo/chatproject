@@ -256,10 +256,14 @@ async fn expired_queue_copy_is_sent_again_and_stored_once() {
     let b_peer = b1.peer;
     let _b1 = stop(b1);
     online(&a1).await;
+    // The alert comes at the end of the fetch run, after the server took its `ACK`.
     settle!(
         [&a1],
-        message(&a1, key).await.is_some() && server.held(queue.queue_id) == 0
+        message(&a1, key).await.is_some()
+            && server.held(queue.queue_id) == 0
+            && alerts(&a1, conv).len() == 1
     );
+    quiet(&[&a1]).await;
     assert_eq!(texts_from(&a1, conv, b_peer).await.len(), 1);
     assert_eq!(alerts(&a1, conv).len(), 1);
 }

@@ -202,11 +202,13 @@ async fn lost_ack_is_resent_and_deduped() {
     server.lose_acks(true);
 
     online(&a1).await;
+    // The alert comes at the end of the fetch run, after its `ACK` was sent.
     settle!(
         [&a1],
-        message(&a1, key).await.is_some() && !server.sent(&a1, CommandName::Ack).is_empty()
+        message(&a1, key).await.is_some()
+            && !server.sent(&a1, CommandName::Ack).is_empty()
+            && alerts(&a1, conv).len() == 1
     );
-    assert_eq!(alerts(&a1, conv).len(), 1);
     assert_eq!(active(&a1).await[0].last_seq, 0);
     let dir = stop(a1);
     assert_eq!(held(&server, &queue).await, 1);
@@ -215,6 +217,8 @@ async fn lost_ack_is_resent_and_deduped() {
     let a1 = start(dir, net.clone()).await;
     configure(&a1, QUEUE_URL);
     settle!([&a1], held(&server, &queue).await == 0);
+    // Past the end of that run, whose alert would come after the `ACK`.
+    quiet(&[&a1]).await;
     let again = server.fetches(&a1);
     assert!(again.iter().any(|c| {
         c.got
@@ -256,7 +260,12 @@ async fn push_and_queue_same_ciphertext_alert_once() {
     );
     assert!(message(&a1, key).await.is_some());
     online(&a1).await;
-    settle!([&a1], held(&server, &queue).await == 0);
+    // A second alert would come at the end of the fetch run, after the `ACK`.
+    settle!(
+        [&a1],
+        held(&server, &queue).await == 0 && alerts(&a1, conv).len() == 1
+    );
+    quiet(&[&a1]).await;
     assert_eq!(texts_from(&a1, conv, b_peer).await.len(), 1);
     assert_eq!(alerts(&a1, conv).len(), 1);
     assert!(!server.sent(&a1, CommandName::Ack).is_empty());
@@ -295,12 +304,15 @@ async fn mailbox_sync_and_queue_same_ciphertext_store_once() {
     online(&a1).await;
     link(&a1, &a2).await;
     a1.account.mailbox_sync_now().await.unwrap();
+    // The alert comes at the end of the fetch run or the sync, after the `ACK`.
     settle!(
         [&a1, &a2],
         message(&a1, key).await.is_some()
             && held(&server, &queue).await == 0
             && caught_up(&a1, &a2).await
+            && alerts(&a1, conv).len() == 1
     );
+    quiet(&[&a1, &a2]).await;
     assert_eq!(texts_from(&a1, conv, b_peer).await.len(), 1);
     assert_eq!(alerts(&a1, conv).len(), 1);
 }
