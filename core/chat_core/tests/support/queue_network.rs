@@ -478,6 +478,14 @@ async fn queue_ref_deliveries(f: &Fixture) -> usize {
         .count()
 }
 
+/// `f`'s queue is confirmed and every `QueueRef` it sealed was delivered. A setup that takes a
+/// device off waits for this on every device with a queue: a `QueueRef` still on its way to the
+/// device that goes off goes into its queue too, beside what the test counts there.
+async fn announced_by(f: &Fixture) -> bool {
+    active(f).await.first().is_some_and(|q| q.server_confirmed)
+        && queue_ref_deliveries(f).await == 0
+}
+
 /// `QueueRef` frames (kind 2) still queued on `f` for `to`.
 async fn queue_ref_deliveries_to(f: &Fixture, to: &Fixture) -> usize {
     let to = installation(to).await;

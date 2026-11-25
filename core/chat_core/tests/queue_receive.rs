@@ -284,7 +284,9 @@ async fn mailbox_sync_and_queue_same_ciphertext_store_once() {
     settle!(
         [&a1, &a2, &b1],
         peer_queue(&b1, conv, &a1).await.flatten().is_some()
-            && queue_ref_deliveries(&a1).await == 0
+            && announced_by(&a1).await
+            && announced_by(&a2).await
+            && announced_by(&b1).await
     );
     let queue = active(&a1).await.remove(0);
     off(&a1, &[&a2, &b1]).await;
@@ -688,8 +690,7 @@ async fn own_device_text_from_the_queue_is_stored() {
     }
     settle!(
         [&a1, &a2, &b1],
-        active(&a1).await.first().is_some_and(|q| q.server_confirmed)
-            && queue_ref_deliveries(&a1).await == 0
+        announced_by(&a1).await && announced_by(&a2).await && announced_by(&b1).await
     );
     let queue = active(&a1).await.remove(0);
     off(&a1, &[&a2, &b1]).await;
@@ -828,7 +829,8 @@ async fn large_answer_is_taken_64_a_turn() {
     settle!(
         [&a1, &b1],
         peer_queue(&b1, conv, &a1).await.flatten().is_some()
-            && queue_ref_deliveries(&a1).await == 0
+            && announced_by(&a1).await
+            && announced_by(&b1).await
     );
     let queue = active(&a1).await.remove(0);
     off(&a1, &[&b1]).await;

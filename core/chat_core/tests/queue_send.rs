@@ -119,8 +119,9 @@ async fn two_queued_devices() -> (
         [&a1, &a2, &b1],
         peer_queue(&b1, conv, &a1).await.flatten().is_some()
             && peer_queue(&b1, conv, &a2).await.flatten().is_some()
-            && queue_ref_deliveries(&a1).await == 0
-            && queue_ref_deliveries(&a2).await == 0
+            && announced_by(&a1).await
+            && announced_by(&a2).await
+            && announced_by(&b1).await
     );
     (a1, a2, b1, conv, server)
 }
@@ -395,7 +396,8 @@ async fn handed_off_entry_is_queued_by_mailbox() {
     settle!(
         [&a1, &a2, &b1],
         peer_queue(&a2, conv, &b1).await.flatten().is_some()
-            && queue_ref_deliveries(&b1).await == 0
+            && announced_by(&a2).await
+            && announced_by(&b1).await
     );
     let queue = active(&b1).await.remove(0);
     a2.account.set_mailbox(true).await.unwrap();
@@ -718,7 +720,9 @@ async fn origin_and_mailbox_put_one_entry() {
         [&a1, &a2, &b1],
         peer_queue(&a1, conv, &b1).await.flatten().is_some()
             && peer_queue(&a2, conv, &b1).await.flatten().is_some()
-            && queue_ref_deliveries(&b1).await == 0
+            && announced_by(&a1).await
+            && announced_by(&a2).await
+            && announced_by(&b1).await
     );
     let queue = active(&b1).await.remove(0);
     a2.account.set_mailbox(true).await.unwrap();
