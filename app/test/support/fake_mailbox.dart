@@ -18,10 +18,10 @@ class FakeMailboxClient implements MailboxClient {
     uptime7DPermille: 0,
   );
   final modes = <QueueMode>[];
-
-  /// Called with the mode each `queueSetMode` sets (a core that answers with events).
-  void Function(QueueMode)? onMode;
   r.ErrorCode? failure;
+
+  /// Fails `queueState` only.
+  r.ErrorCode? queueStateFailure;
   Completer<void>? backgroundWait;
   final sets = <bool>[];
   int states = 0, marks = 0, foregrounds = 0, backgrounds = 0, starts = 0;
@@ -80,6 +80,9 @@ class FakeMailboxClient implements MailboxClient {
   @override
   Future<QueueStateView> queueState() async {
     _check();
+    if (queueStateFailure case final code?) {
+      throw r.CoreError(code: code, detail: 'fixture failure');
+    }
     return queue;
   }
 
@@ -93,7 +96,6 @@ class FakeMailboxClient implements MailboxClient {
       usingQueue: queue.usingQueue,
       uptime7DPermille: queue.uptime7DPermille,
     );
-    onMode?.call(mode);
   }
 }
 

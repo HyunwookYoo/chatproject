@@ -312,6 +312,42 @@ void main() {
       expect(find.textContaining('오프라인 메시지 설정을 바꾸지 못했어요'), findsOneWidget);
     }, variant: TargetPlatformVariant.only(TargetPlatform.android));
 
+    testWidgets('a failed read shows the choice without a value', (
+      tester,
+    ) async {
+      final client = FakeMailboxClient()
+        ..firstLinkShown = true
+        ..queueStateFailure = ErrorCode.busy;
+      await _settings(tester, client, FakeMailboxPlatform());
+      for (final label in _choices.values) {
+        expect(find.text(label), findsOneWidget);
+      }
+      expect(_chosen(tester), isNull);
+      expect(find.textContaining('메일박스 있음'), findsNothing);
+      expect(find.textContaining('메일박스 없음'), findsNothing);
+      // Once a read works, the screen has its value.
+      client.queueStateFailure = null;
+      await tester.ensureVisible(find.text(_choices[QueueMode.always]!));
+      await tester.tap(find.text(_choices[QueueMode.always]!));
+      await tester.pumpAndSettle();
+      expect(_chosen(tester), QueueMode.always);
+      expect(find.text('메일박스 없음'), findsOneWidget);
+    }, variant: TargetPlatformVariant.only(TargetPlatform.iOS));
+
+    testWidgets('a choice the core took shows though the read after it fails', (
+      tester,
+    ) async {
+      final client = FakeMailboxClient()..firstLinkShown = true;
+      await _settings(tester, client, FakeMailboxPlatform());
+      client.queueStateFailure = ErrorCode.busy;
+      await tester.ensureVisible(find.text(_choices[QueueMode.never]!));
+      await tester.tap(find.text(_choices[QueueMode.never]!));
+      await tester.pumpAndSettle();
+      expect(client.modes, [QueueMode.never]);
+      expect(_chosen(tester), QueueMode.never);
+      expect(find.textContaining('오프라인 메시지 설정을 바꾸지 못했어요'), findsNothing);
+    }, variant: TargetPlatformVariant.only(TargetPlatform.android));
+
     for (final (verdict, enabled, platform, text) in [
       (
         Verdict.hasMailbox,

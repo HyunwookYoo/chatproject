@@ -4,6 +4,7 @@ import 'package:chat_app/account/account_model.dart';
 import 'package:chat_app/core_client.dart';
 import 'package:chat_app/src/rust/api/account.dart' as account;
 import 'package:chat_app/src/rust/api/chat.dart' as rust;
+import 'package:chat_app/src/rust/api/queue.dart' as queue;
 import 'package:chat_app/src/rust/frb_generated.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:integration_test/integration_test.dart';
@@ -45,6 +46,13 @@ void main() {
         true,
       );
       expect(view.publicPeerId != null, true);
+      // M8: the queue state and mode through the real core and FRB codec.
+      final offline = await queue.queueState();
+      expect(offline.mode, queue.QueueMode.auto);
+      expect(offline.verdict, queue.Verdict.noMailbox);
+      expect(offline.usingQueue, false);
+      await queue.queueSetMode(mode: queue.QueueMode.always);
+      expect((await queue.queueState()).mode, queue.QueueMode.always);
       final invite = await core.account.createInvite('공개 초대 만료 시험');
       final preview = await core.account.parseInvite(
         invite,

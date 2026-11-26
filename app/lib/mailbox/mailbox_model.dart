@@ -146,6 +146,15 @@ class MailboxModel extends ChangeNotifier {
       _failed(failure, _queueError);
       return;
     }
+    // The core took it: shown even if the read after it fails.
+    if (queue case final old?) {
+      queue = QueueStateView(
+        mode: mode,
+        verdict: old.verdict,
+        usingQueue: old.usingQueue,
+        uptime7DPermille: old.uptime7DPermille,
+      );
+    }
     await _readQueue();
   });
 
