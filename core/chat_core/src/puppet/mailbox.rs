@@ -1,5 +1,6 @@
 //! Local Debug actions on the existing account's own-device sync (M6): what the app's mailbox
-//! setting and lifecycle hooks call, and the sync counters for the multi-device scenario.
+//! setting and lifecycle hooks call, and the sync counters for the multi-device scenario; the
+//! uptime hook for the M8 verdict (m8 step 4).
 use super::account::SecretJson;
 use crate::{AccountHandle, CoreError, ErrorCode};
 use serde::Deserialize;
@@ -18,6 +19,9 @@ enum Action {
     Background {},
     State {},
     TestCounters {},
+    /// `permille` of the 7-day window up, recorded since `recorded_ms` ago (M8 spec 10 ④:
+    /// `clock_advance` would count the skipped time as down).
+    TestSeedUptime { permille: u32, recorded_ms: u64 },
 }
 
 pub async fn execute(
@@ -57,6 +61,15 @@ pub async fn execute(
                 "notifications": counters.notifications,
                 "notified": counters.notified,
             })
+        }
+        Action::TestSeedUptime {
+            permille,
+            recorded_ms,
+        } => {
+            handle
+                .mailbox_test_seed_uptime(permille, recorded_ms)
+                .await?;
+            Value::Null
         }
     })
 }

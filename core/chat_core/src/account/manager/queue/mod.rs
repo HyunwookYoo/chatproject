@@ -62,6 +62,22 @@ pub(super) struct Shared {
     /// How many entries each turn of a fetch took, in order.
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     takes: std::sync::Mutex<Vec<usize>>,
+    /// What the server answered this core's requests, counted (e2e m8).
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    counts: std::sync::Mutex<QueueCounts>,
+}
+
+/// Since this core started (e2e m8): `CREATE` items the server took, `SEND` requests that
+/// came back for a text's or receipt's attempt and for the standing pass, entries the fetches
+/// took and `ACK` items the server took. Counts only.
+#[cfg(all(feature = "test-hooks", debug_assertions))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QueueCounts {
+    pub created: u64,
+    pub sends_message: u64,
+    pub sends_standing: u64,
+    pub fetched: u64,
+    pub acked: u64,
 }
 
 impl Shared {
@@ -92,6 +108,22 @@ impl Shared {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(entries);
+    }
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    fn count(&self, event: &QueueEvent) {
+        let ok = |answers: &mut dyn Iterator<Item = &ItemResult>| {
+            answers.filter(|a| matches!(a, ItemResult::Ok)).count() as u64
+        };
+        let mut counts = self.counts.lock().unwrap_or_else(|e| e.into_inner());
+        match event {
+            QueueEvent::Answered { created, .. } => counts.created += created.len() as u64,
+            QueueEvent::Sent { what: Some(_), .. } => counts.sends_message += 1,
+            QueueEvent::Sent { what: None, .. } => counts.sends_standing += 1,
+            QueueEvent::Acked { answers, .. } => {
+                counts.acked += ok(&mut answers.iter().map(|(_, a)| a));
+            }
+            QueueEvent::Received { .. } => {}
+        }
     }
 }
 
@@ -271,6 +303,21 @@ impl AccountHandle {
             .unwrap_or_else(|e| e.into_inner())
             .clone()
     }
+    /// What the server answered this core's queue requests, and the entries its fetches took.
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    pub fn queue_test_counts(&self) -> QueueCounts {
+        let queue = &self.shared.queue;
+        let fetched = queue
+            .takes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .sum::<usize>() as u64;
+        QueueCounts {
+            fetched,
+            ..*queue.counts.lock().unwrap_or_else(|e| e.into_inner())
+        }
+    }
 }
 
 #[cfg(feature = "push-http")]
@@ -408,6 +455,8 @@ impl Manager {
     }
 
     pub(super) async fn queue_event(&mut self, event: QueueEvent) {
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        self.shared.queue.count(&event);
         match event {
             QueueEvent::Answered {
                 ticket,
