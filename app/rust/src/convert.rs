@@ -128,6 +128,7 @@ impl From<chat_core::CoreEvent> for ChatEvent {
                 direct_peers: s.direct_peers,
                 mailbox_ok: s.mailbox_ok,
                 using_queue: s.using_queue,
+                has_mailbox: s.has_mailbox,
             },
             chat_core::CoreEvent::Error { code, detail } => Self::Error { code: code.into(), detail },
             chat_core::CoreEvent::NetworkChanged(info) => Self::NetworkChanged { info: info.into() },
@@ -393,10 +394,21 @@ mod tests {
             direct_peers: 2,
             mailbox_ok: true,
             using_queue: true,
+            has_mailbox: false,
         });
         assert_eq!(
             ChatEvent::from(event),
-            ChatEvent::ConnectionState { direct_peers: 2, mailbox_ok: true, using_queue: true }
+            ChatEvent::ConnectionState { direct_peers: 2, mailbox_ok: true, using_queue: true, has_mailbox: false }
+        );
+        let event = chat_core::CoreEvent::ConnectionState(chat_core::ConnectionSnapshot {
+            direct_peers: 0,
+            mailbox_ok: false,
+            using_queue: false,
+            has_mailbox: true,
+        });
+        assert_eq!(
+            ChatEvent::from(event),
+            ChatEvent::ConnectionState { direct_peers: 0, mailbox_ok: false, using_queue: false, has_mailbox: true }
         );
     }
 

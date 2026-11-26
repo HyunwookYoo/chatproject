@@ -2259,6 +2259,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           directPeers: dco_decode_u_32(raw[1]),
           mailboxOk: dco_decode_bool(raw[2]),
           usingQueue: dco_decode_bool(raw[3]),
+          hasMailbox: dco_decode_bool(raw[4]),
         );
       case 6:
         return ChatEvent_Error(
@@ -3188,10 +3189,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
         var var_directPeers = sse_decode_u_32(deserializer);
         var var_mailboxOk = sse_decode_bool(deserializer);
         var var_usingQueue = sse_decode_bool(deserializer);
+        var var_hasMailbox = sse_decode_bool(deserializer);
         return ChatEvent_ConnectionState(
           directPeers: var_directPeers,
           mailboxOk: var_mailboxOk,
           usingQueue: var_usingQueue,
+          hasMailbox: var_hasMailbox,
         );
       case 6:
         var var_code = sse_decode_error_code(deserializer);
@@ -4334,11 +4337,13 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
         directPeers: final directPeers,
         mailboxOk: final mailboxOk,
         usingQueue: final usingQueue,
+        hasMailbox: final hasMailbox,
       ):
         sse_encode_i_32(5, serializer);
         sse_encode_u_32(directPeers, serializer);
         sse_encode_bool(mailboxOk, serializer);
         sse_encode_bool(usingQueue, serializer);
+        sse_encode_bool(hasMailbox, serializer);
       case ChatEvent_Error(code: final code, detail: final detail):
         sse_encode_i_32(6, serializer);
         sse_encode_error_code(code, serializer);

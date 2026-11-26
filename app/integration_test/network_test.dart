@@ -46,6 +46,7 @@ void main() {
     expect(state.directPeers, 0);
     expect(state.mailboxOk, isFalse);
     expect(state.usingQueue, isFalse);
+    expect(state.hasMailbox, isFalse);
     expect((await coreStart(dataDir: dataDir.path)).instanceId, core.instanceId);
   });
 

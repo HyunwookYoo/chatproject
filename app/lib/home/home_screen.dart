@@ -148,7 +148,9 @@ class _HomeScreenState extends State<HomeScreen> {
                 ),
                 child: Text(_status, style: const TextStyle(fontSize: 14, color: AppColors.textSecondary)),
               ),
-              if (_connection?.usingQueue ?? false) ...[
+              // Spec 4: with a mailbox there is no card, though this device may use a
+              // queue ("항상 서버 사용").
+              if (_connection case ChatEvent_ConnectionState(usingQueue: true, hasMailbox: false)) ...[
                 const SizedBox(height: 8),
                 Container(
                   width: double.infinity,

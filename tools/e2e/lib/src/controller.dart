@@ -364,6 +364,7 @@ class Controller {
             'direct_peers': final int peers,
             'mailbox_ok': final bool mailbox,
             'using_queue': final bool queue,
+            'has_mailbox': final bool hasMailbox,
           }
           when peers >= 0:
         return {
@@ -371,6 +372,7 @@ class Controller {
           'direct_peers': peers,
           'mailbox_ok': mailbox,
           'using_queue': queue,
+          'has_mailbox': hasMailbox,
         };
       default:
         return null;

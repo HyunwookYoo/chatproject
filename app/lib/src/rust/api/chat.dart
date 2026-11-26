@@ -76,8 +76,12 @@ sealed class ChatEvent with _$ChatEvent {
     required int directPeers,
     required bool mailboxOk,
 
-    /// This device uses a server queue (M8 spec 4: the home card).
+    /// This device uses a server queue (M8 spec 4).
     required bool usingQueue,
+
+    /// The account has a qualified mailbox (M8 spec 5.1). The home card shows while
+    /// `using_queue` and not `has_mailbox` (spec 4).
+    required bool hasMailbox,
   }) = ChatEvent_ConnectionState;
   const factory ChatEvent.error({
     required ErrorCode code,

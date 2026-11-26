@@ -46,7 +46,7 @@ void main() {
 
   testWidgets('shows the connection state from the event stream', (tester) async {
     final core = await pumpHome(tester);
-    core.controller.add(const ChatEvent.connectionState(directPeers: 2, mailboxOk: false, usingQueue: false));
+    core.controller.add(const ChatEvent.connectionState(directPeers: 2, mailboxOk: false, usingQueue: false, hasMailbox: false));
     // The event is delivered in a microtask after pump() has checked for a scheduled frame,
     // so pump until settled to build the frame its setState schedules.
     await tester.pumpAndSettle();
@@ -59,13 +59,28 @@ void main() {
     const card = '메일박스 없음 · 서버가 대신 받아 둬요';
     final core = await pumpHome(tester);
     expect(find.text(card), findsNothing);
-    core.controller.add(const ChatEvent.connectionState(directPeers: 1, mailboxOk: false, usingQueue: true));
+    core.controller.add(const ChatEvent.connectionState(directPeers: 1, mailboxOk: false, usingQueue: true, hasMailbox: false));
     await tester.pumpAndSettle();
     expect(find.text(card), findsOneWidget);
     expect(find.text('직접 연결 1'), findsOneWidget);
-    core.controller.add(const ChatEvent.connectionState(directPeers: 1, mailboxOk: false, usingQueue: false));
+    core.controller.add(const ChatEvent.connectionState(directPeers: 1, mailboxOk: false, usingQueue: false, hasMailbox: false));
     await tester.pumpAndSettle();
     expect(find.text(card), findsNothing);
+  });
+
+  // M8 spec 4 "메일박스가 있으면 지금처럼 카드가 없다": with "항상 서버 사용" and a
+  // qualified mailbox the device uses a queue, but the card would say there is no mailbox.
+  testWidgets('no queue card beside a qualified mailbox ("항상 서버 사용")', (tester) async {
+    const card = '메일박스 없음 · 서버가 대신 받아 둬요';
+    final core = await pumpHome(tester);
+    core.controller.add(const ChatEvent.connectionState(directPeers: 1, mailboxOk: true, usingQueue: true, hasMailbox: true));
+    await tester.pumpAndSettle();
+    expect(find.text('직접 연결 1'), findsOneWidget);
+    expect(find.text(card), findsNothing);
+    // The mailbox stops qualifying: the card shows.
+    core.controller.add(const ChatEvent.connectionState(directPeers: 1, mailboxOk: true, usingQueue: true, hasMailbox: false));
+    await tester.pumpAndSettle();
+    expect(find.text(card), findsOneWidget);
   });
 
   testWidgets('shows why the core did not start', (tester) async {
@@ -86,8 +101,8 @@ void main() {
   });
 
   test('connection labels', () {
-    expect(connectionLabel(const ChatEvent_ConnectionState(directPeers: 0, mailboxOk: false, usingQueue: false)), '연결 없음');
-    expect(connectionLabel(const ChatEvent_ConnectionState(directPeers: 0, mailboxOk: true, usingQueue: false)), '메일박스 연결됨');
+    expect(connectionLabel(const ChatEvent_ConnectionState(directPeers: 0, mailboxOk: false, usingQueue: false, hasMailbox: false)), '연결 없음');
+    expect(connectionLabel(const ChatEvent_ConnectionState(directPeers: 0, mailboxOk: true, usingQueue: false, hasMailbox: false)), '메일박스 연결됨');
   });
 
   test('theme takes its colors from the tokens', () {

@@ -74,6 +74,8 @@ async fn no_mailbox_creates_one_queue_per_conversation_and_announces() {
             .all(|c| c.command == CommandName::Create || c.command == CommandName::Recv)
     );
     assert!(a1.account.queue_state().await.unwrap().using_queue);
+    // Spec 4: the home card shows (a queue, no mailbox).
+    settle!([&a1], connection(&a1).is_some_and(|s| s.using_queue && !s.has_mailbox));
     // And the other way: B1 has no mailbox either, and A1 keeps B1's queue.
     assert!(peer_queue(&a1, conv, &b1).await.flatten().is_some());
 }
@@ -159,6 +161,14 @@ async fn rotation_after_7_days_keeps_old_until_retired() {
     assert_eq!(server.sent(&a1, CommandName::Create).len(), 2);
     let b1_row = peer_row(&b1, conv, installation(&a1).await).await.unwrap();
     assert_eq!(b1_row.sent_at_ms, new.created_at_ms);
+}
+
+/// `f`'s latest `ConnectionState`.
+fn connection(f: &Fixture) -> Option<chat_core::ConnectionSnapshot> {
+    f.events.0.lock().unwrap().iter().rev().find_map(|event| match event {
+        CoreEvent::ConnectionState(snapshot) => Some(*snapshot),
+        _ => None,
+    })
 }
 
 /// The `using_queue` words of `f`'s `ConnectionState` events so far, changes only.
@@ -440,6 +450,8 @@ async fn always_mode_makes_a_queue_beside_a_qualified_mailbox() {
     );
     assert_eq!(server.sent(&a1, CommandName::Create).len(), 1);
     assert!(a1.account.queue_state().await.unwrap().using_queue);
+    // Spec 4: with a mailbox there is no home card, though this device uses a queue.
+    settle!([&a1], connection(&a1).is_some_and(|s| s.using_queue && s.has_mailbox));
 }
 
 /// Review M1: the server refuses every `CREATE` item (`limited`) for good. The device asks

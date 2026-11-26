@@ -2397,10 +2397,12 @@ impl SseDecode for crate::api::chat::ChatEvent {
                 let mut var_directPeers = <u32>::sse_decode(deserializer);
                 let mut var_mailboxOk = <bool>::sse_decode(deserializer);
                 let mut var_usingQueue = <bool>::sse_decode(deserializer);
+                let mut var_hasMailbox = <bool>::sse_decode(deserializer);
                 return crate::api::chat::ChatEvent::ConnectionState {
                     direct_peers: var_directPeers,
                     mailbox_ok: var_mailboxOk,
                     using_queue: var_usingQueue,
+                    has_mailbox: var_hasMailbox,
                 };
             }
             6 => {
@@ -3737,11 +3739,13 @@ impl flutter_rust_bridge::IntoDart for crate::api::chat::ChatEvent {
                 direct_peers,
                 mailbox_ok,
                 using_queue,
+                has_mailbox,
             } => [
                 5.into_dart(),
                 direct_peers.into_into_dart().into_dart(),
                 mailbox_ok.into_into_dart().into_dart(),
                 using_queue.into_into_dart().into_dart(),
+                has_mailbox.into_into_dart().into_dart(),
             ]
             .into_dart(),
             crate::api::chat::ChatEvent::Error { code, detail } => [
@@ -4871,11 +4875,13 @@ impl SseEncode for crate::api::chat::ChatEvent {
                 direct_peers,
                 mailbox_ok,
                 using_queue,
+                has_mailbox,
             } => {
                 <i32>::sse_encode(5, serializer);
                 <u32>::sse_encode(direct_peers, serializer);
                 <bool>::sse_encode(mailbox_ok, serializer);
                 <bool>::sse_encode(using_queue, serializer);
+                <bool>::sse_encode(has_mailbox, serializer);
             }
             crate::api::chat::ChatEvent::Error { code, detail } => {
                 <i32>::sse_encode(6, serializer);

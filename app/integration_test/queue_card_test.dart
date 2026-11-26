@@ -23,7 +23,7 @@ const _card = '메일박스 없음 · 서버가 대신 받아 둬요';
 class _Core implements CoreClient {
   final stream = StreamController<ChatEvent>.broadcast();
   void using(bool using) => stream.add(
-    ChatEvent.connectionState(directPeers: 0, mailboxOk: false, usingQueue: using),
+    ChatEvent.connectionState(directPeers: 0, mailboxOk: false, usingQueue: using, hasMailbox: false),
   );
   @override
   String get version => 'integration';

@@ -7,11 +7,12 @@ import '../frb_generated.dart';
 import 'chat.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `configure_opened`, `handle`
+// These functions are ignored because they are not marked as `pub`: `handle`
 // These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `clone`, `clone`, `clone`, `eq`, `eq`, `eq`, `fmt`, `fmt`, `fmt`
 
-/// Debug `--queue-url`, before the account opens: the address it is opened with. An account
-/// open already takes it now. Release builds take only this build's address (`InvalidConfig`).
+/// Debug `--queue-url`, best before the account opens: the address it opens with instead of
+/// this build's (`CHATPROJECT_QUEUE_URL`, which every open takes with no call). An account open
+/// already takes it now. Release builds take only this build's address (`InvalidConfig`).
 Future<void> queueConfigure({String? serverUrl}) =>
     RustLib.instance.api.crateApiQueueQueueConfigure(serverUrl: serverUrl);
 

@@ -1015,6 +1015,8 @@ impl Manager {
             at: wall,
         };
         self.mailbox_db(op, request).await?;
+        self.bus
+            .set_has_mailbox(matches!(verdict, Verdict::HasMailbox { .. }));
         let mailbox = &mut self.messages.mailbox;
         mailbox.qualified = Some(qualified);
         mailbox.verdict = Some(verdict);
@@ -1381,6 +1383,7 @@ impl Manager {
     pub(super) async fn poll_mailbox(&mut self) {
         let (Ok(request), Ok(local)) = (self.ready(), self.local()) else {
             self.bus.set_mailbox_ok(false);
+            self.bus.set_has_mailbox(false);
             return;
         };
         if self.messages.mailbox.halted() || self.messages.mailbox.held() {
