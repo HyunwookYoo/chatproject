@@ -243,7 +243,8 @@ class Controller {
               op.startsWith('account_local_') ||
               op.startsWith('message_local_') ||
               op.startsWith('mailbox_local_') ||
-              op.startsWith('push_local_')) {
+              op.startsWith('push_local_') ||
+              op.startsWith('queue_local_')) {
             return jsonEncode({
               'type': 'result',
               'id': safe['id'],
@@ -455,6 +456,7 @@ class Controller {
                     'message_local_',
                     'mailbox_local_',
                     'push_local_',
+                    'queue_local_',
                   ].any(
                     (prefix) =>
                         participant._operations[record.id]?.startsWith(

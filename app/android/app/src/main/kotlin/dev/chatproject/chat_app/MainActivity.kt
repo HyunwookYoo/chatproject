@@ -84,12 +84,17 @@ class MainActivity : FlutterActivity() {
             // so Dart gets it too, not only the core Kotlin starts in this process.
             val pushUrl = intent.getStringExtra("chat_push_url")
             if (pushUrl != null) NativeCore.debugPushUrl = pushUrl
-            if (controlUrl != null || name != null || dataDir != null || pushUrl != null) {
+            // The e2e queue server (M8): Dart hands it to the core before the account opens.
+            val queueUrl = intent.getStringExtra("chat_queue_url")
+            if (controlUrl != null || name != null || dataDir != null || pushUrl != null ||
+                queueUrl != null
+            ) {
                 return (args ?: emptyList()) + buildList {
                     if (controlUrl != null) addAll(listOf("--control-url", controlUrl))
                     if (name != null) addAll(listOf("--name", name))
                     if (dataDir != null) addAll(listOf("--data-dir", dataDir))
                     if (pushUrl != null) addAll(listOf("--push-url", pushUrl))
+                    if (queueUrl != null) addAll(listOf("--queue-url", queueUrl))
                 }
             }
         }

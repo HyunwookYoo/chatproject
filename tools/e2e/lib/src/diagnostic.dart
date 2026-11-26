@@ -232,7 +232,7 @@ void noteWait(String name, int ms) {
 }
 
 final _scenarioOp = RegExp(
-  r'^(?:account|message|mailbox|push)_local_[a-z_]{1,48}$',
+  r'^(?:account|message|mailbox|push|queue)_local_[a-z_]{1,48}$',
 );
 
 /// The [waitsLimit] slowest waits whose name is a listed failure text, a listed
