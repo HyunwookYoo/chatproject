@@ -30,6 +30,10 @@ enum Role {
         /// are), once the controller's configuration is in place.
         #[arg(long)]
         account: bool,
+        /// The queue server the account opens with (the e2e harness's local one); without it,
+        /// this build's (`CHATPROJECT_QUEUE_URL`), none in a harness build.
+        #[arg(long)]
+        queue_url: Option<String>,
     },
 }
 
@@ -115,8 +119,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             name,
             data_dir,
             account,
+            queue_url,
         } => {
             let slot = CoreSlot::new();
+            if queue_url.is_some() {
+                slot.queue_configure(queue_url)?;
+            }
             slot.start(CoreConfig { data_dir }, &EventBus::new())?;
             // Core construction is stopped; the hook receives Local configuration
             // before a controller may issue network_start.

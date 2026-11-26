@@ -411,7 +411,7 @@ async fn hooked_pair_exchanges_utf8_and_actual_core_selects_relay_without_direct
     stop(&mut b_child).await;
 
     // `--account` (the M6 scenario's B1): the account in the data directory is open, with the
-    // controller's local records.
+    // controller's local records, and with `--queue-url` (the m8 harness's queue server).
     let cd = tempfile::tempdir().unwrap();
     let mut c_child = node()
         .args([
@@ -423,6 +423,8 @@ async fn hooked_pair_exchanges_utf8_and_actual_core_selects_relay_without_direct
             "--data-dir",
             cd.path().to_str().unwrap(),
             "--account",
+            "--queue-url",
+            "http://127.0.0.1:8788",
         ])
         .spawn()
         .unwrap();
@@ -477,6 +479,18 @@ async fn help_succeeds_and_puppet_requires_name_and_absolute_data_dir() {
             "node",
             "--data-dir",
             "relative",
+        ],
+        // A queue address the core does not take.
+        vec![
+            "puppet",
+            "--control-url",
+            "ws://127.0.0.1:47000",
+            "--name",
+            "node",
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+            "--queue-url",
+            "ftp://queue.example",
         ],
     ] {
         let output = tokio::time::timeout(Duration::from_secs(5), node().args(args).output())

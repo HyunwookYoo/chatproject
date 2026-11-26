@@ -503,7 +503,7 @@ async fn verdict(f: &Fixture) -> Verdict {
 
 /// `f` uses the queue server at `url`.
 fn configure(f: &Fixture, url: &str) {
-    f.account.queue_configure(Some(url.into())).unwrap();
+    f.slot.queue_configure(Some(url.into())).unwrap();
 }
 
 /// A1 and B1 with a conversation and a queue server, both configured with it; returns once

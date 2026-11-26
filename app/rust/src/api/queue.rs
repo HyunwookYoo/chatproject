@@ -1,8 +1,6 @@
 //! The server queue as the Flutter app shows it (M8 spec 4): the "오프라인 메시지" setting, the
-//! mailbox verdict, and the queue server address the account is opened with. Whether this
-//! device uses a queue right now also comes as `ChatEvent::ConnectionState { using_queue }`.
-use std::sync::Mutex;
-
+//! mailbox verdict, and the debug queue server address. Whether this device uses a queue right
+//! now also comes as `ChatEvent::ConnectionState { using_queue }`.
 use chat_core::account::AccountHandle;
 
 use super::chat::CoreError;
@@ -36,30 +34,17 @@ pub struct QueueStateView {
     pub uptime_7d_permille: u32,
 }
 
-/// The debug address Dart gave (`--queue-url`); `None` takes this build's
-/// (`CHATPROJECT_QUEUE_URL`).
-static GIVEN: Mutex<Option<String>> = Mutex::new(None);
-
-/// Configures a just opened account with the address, before its actor takes any frame (a
-/// `QueueRef` taken before would be refused). Every path that opens the account calls it.
-pub(crate) fn configure_opened(account: &AccountHandle) -> Result<(), chat_core::CoreError> {
-    let given = GIVEN.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    account.queue_configure(given)
-}
-
 fn handle() -> Result<AccountHandle, CoreError> {
     crate::global::CORE.account().map_err(Into::into)
 }
 
-/// Debug `--queue-url`, before the account opens: the address it is opened with. An account
-/// open already takes it now. Release builds take only this build's address (`InvalidConfig`).
+/// Debug `--queue-url`, best before the account opens: the address it opens with instead of
+/// this build's (`CHATPROJECT_QUEUE_URL`, which every open takes with no call). An account open
+/// already takes it now. Release builds take only this build's address (`InvalidConfig`).
 pub fn queue_configure(server_url: Option<String>) -> Result<(), CoreError> {
-    chat_core::queue::queue_url(server_url.as_deref()).map_err(CoreError::from)?;
-    *GIVEN.lock().unwrap_or_else(|e| e.into_inner()) = server_url;
-    match crate::global::CORE.account() {
-        Ok(account) => configure_opened(&account).map_err(Into::into),
-        Err(_) => Ok(()),
-    }
+    crate::global::CORE
+        .queue_configure(server_url)
+        .map_err(Into::into)
 }
 
 pub async fn queue_state() -> Result<QueueStateView, CoreError> {

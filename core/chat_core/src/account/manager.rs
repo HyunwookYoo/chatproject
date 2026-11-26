@@ -264,7 +264,8 @@ struct Shared {
     /// The latest `push_configure`, taken by the actor at its next poll, and the network a
     /// received push started (M7).
     push: push::Shared,
-    /// The latest `queue_configure`, taken by the actor at its next poll (M8).
+    /// The queue server address the account opened with, or the latest `queue_configure`,
+    /// taken by the actor at its next poll (M8).
     queue: queue::Shared,
 }
 #[derive(Clone)]
@@ -303,6 +304,7 @@ impl AccountHandle {
         network: NetworkHandle,
         mut services: AccountServices,
         bus: crate::EventBus,
+        queue_url: Option<String>,
     ) -> Result<Self, CoreError> {
         network.begin_account();
         let ticket = network.block();
@@ -329,7 +331,7 @@ impl AccountHandle {
             requests,
             status: AtomicU64::new(ticket << 2),
             push: Default::default(),
-            queue: Default::default(),
+            queue: queue::Shared::new(queue_url),
         });
         let (commands, input) = mpsc::channel(32);
         let auth = super::connection::Runtime::default();
@@ -2033,7 +2035,7 @@ mod tests {
         // The actor runs on this test's single thread, so it answers Retry only once the test
         // yields: the first poll below is pending however a loaded runner schedules threads.
         let runtime = tokio::runtime::Handle::current();
-        let account = AccountHandle::open(&runtime, dir.path(), protector.clone(), slot.network().unwrap(), offline_services(), bus).unwrap();
+        let account = AccountHandle::open(&runtime, dir.path(), protector.clone(), slot.network().unwrap(), offline_services(), bus, None).unwrap();
         account.prepare_candidate().await.unwrap();
         account.request_suspend(); account.snapshot().await.unwrap();
         protector.0.store(1, Ordering::SeqCst);
@@ -2153,6 +2155,27 @@ mod tests {
                 assert_eq!(&snapshot, published, "one revision must identify exactly one public projection");
             }
         }
+    }
+
+    /// M8: the account opens with the queue address given before it opened (the debug
+    /// `--queue-url`), with no call after the open; one given later reaches the open account; a
+    /// refused one changes nothing; `None` goes back to this build's.
+    #[tokio::test]
+    async fn the_account_opens_with_the_given_queue_url_and_takes_a_later_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let slot = CoreSlot::new();
+        slot.queue_configure(Some("http://127.0.0.1:8788".into())).unwrap();
+        slot.start(CoreConfig { data_dir: dir.path().into() }, &EventBus::new()).unwrap();
+        slot.network().unwrap().configure_local(None).await.unwrap();
+        let account = slot.open_account_with_services(Arc::new(Protector), offline_services()).unwrap();
+        let url = || account.shared.queue.url().map(|url| url.to_string());
+        assert_eq!(url().as_deref(), Some("http://127.0.0.1:8788"));
+        slot.queue_configure(Some("http://127.0.0.1:9".into())).unwrap();
+        assert_eq!(url().as_deref(), Some("http://127.0.0.1:9"));
+        assert_eq!(slot.queue_configure(Some("ftp://queue.example".into())).unwrap_err().code, ErrorCode::InvalidConfig);
+        assert_eq!(url().as_deref(), Some("http://127.0.0.1:9"));
+        slot.queue_configure(None).unwrap();
+        assert_eq!(url(), crate::queue::queue_url(None).unwrap());
     }
 
     #[tokio::test]

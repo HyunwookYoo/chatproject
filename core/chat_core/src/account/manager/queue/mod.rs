@@ -61,6 +61,13 @@ pub(super) struct Shared {
 }
 
 impl Shared {
+    /// With the address the account opens with: the actor takes it at its first poll, and a
+    /// `QueueRef` taken before that is judged by it (`Manager::queue_url`).
+    pub(super) fn new(url: Option<String>) -> Self {
+        let shared = Self::default();
+        shared.set(url);
+        shared
+    }
     fn set(&self, url: Option<String>) {
         let mut slot = self.config.lock().unwrap_or_else(|e| e.into_inner());
         *slot = (slot.0.wrapping_add(1), url.map(Arc::from));
@@ -71,7 +78,7 @@ impl Shared {
         (slot.0 != seen).then(|| slot.clone())
     }
     /// The latest address, taken by a poll or not.
-    fn url(&self) -> Option<Arc<str>> {
+    pub(super) fn url(&self) -> Option<Arc<str>> {
         let slot = self.config.lock().unwrap_or_else(|e| e.into_inner());
         slot.1.clone()
     }
@@ -217,11 +224,11 @@ fn batches<T>(items: Vec<(QueueId, T)>) -> Vec<(Vec<QueueId>, Vec<T>)> {
 }
 
 impl AccountHandle {
-    /// Tells the core the queue server address (at every start; spec 7.2): `None` takes this
+    /// A new queue server address (`CoreSlot::queue_configure`, spec 7.2): `None` takes this
     /// build's. Release builds take only this build's `https://` address, debug builds also a
     /// given one (`http://` too). Without one the queue is off: no request of any kind. The
     /// actor takes it at its next poll.
-    pub fn queue_configure(&self, server_url: Option<String>) -> Result<(), CoreError> {
+    pub(crate) fn queue_configure(&self, server_url: Option<String>) -> Result<(), CoreError> {
         let url = crate::queue::queue_url(server_url.as_deref())?;
         self.shared.queue.set(url);
         Ok(())

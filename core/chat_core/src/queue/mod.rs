@@ -67,6 +67,17 @@ pub fn queue_url(given: Option<&str>) -> Result<Option<String>, CoreError> {
     resolve(given, !cfg!(debug_assertions), BUILD_URL)
 }
 
+/// The address an account opens with: `given` (the debug `--queue-url`, taken by `queue_url`
+/// when it was given) or this build's. One this build may not use leaves the queue off, so it
+/// never fails the open.
+pub(crate) fn open_url(given: Option<&str>) -> Option<String> {
+    opening(given, !cfg!(debug_assertions), BUILD_URL)
+}
+
+fn opening(given: Option<&str>, release: bool, build: Option<&str>) -> Option<String> {
+    resolve(given, release, build).ok().flatten()
+}
+
 fn resolve(
     given: Option<&str>,
     release: bool,
@@ -112,6 +123,22 @@ mod tests {
         assert_eq!(resolve(None, true, None).unwrap(), None);
         assert!(resolve(None, true, Some("http://queue.example")).is_err());
         assert!(resolve(Some("https://queue.example"), true, None).is_err());
+    }
+
+    #[test]
+    fn an_account_opens_with_the_build_url_unless_one_was_given() {
+        let build = Some("https://queue.example");
+        for release in [true, false] {
+            assert_eq!(opening(None, release, build).as_deref(), build);
+            assert_eq!(opening(None, release, None), None);
+        }
+        assert_eq!(
+            opening(Some("http://127.0.0.1:8788"), false, build).as_deref(),
+            Some("http://127.0.0.1:8788")
+        );
+        // A build address this build may not use: the queue is off, and the open goes on.
+        assert_eq!(opening(None, true, Some("http://queue.example")), None);
+        assert_eq!(opening(None, false, Some("queue.example")), None);
     }
 
     #[test]

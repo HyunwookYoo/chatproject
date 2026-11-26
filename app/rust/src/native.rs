@@ -174,11 +174,7 @@ fn start_in(
     let info = slot.start(CoreConfig { data_dir: PathBuf::from(storage_root) }, bus)?;
     let (account, opened) = match slot.account() {
         Ok(account) => (account, false),
-        Err(_) => {
-            let account = slot.open_account(provider(&info.data_dir)?)?;
-            crate::api::queue::configure_opened(&account)?;
-            (account, true)
-        }
+        Err(_) => (slot.open_account(provider(&info.data_dir)?)?, true),
     };
     if opened || explicit {
         account.push_configure(PushConfig { proxy_url, platform: Some(platform), snapshot_dir: None })?;

@@ -452,7 +452,7 @@ async fn queue_on_another_server_or_no_address_sends_nothing() {
     assert!(peer_queue(&b1, conv, &a1).await.flatten().is_some());
     assert!(server.sends(&b1).is_empty());
 
-    b1.account.queue_configure(None).unwrap();
+    b1.slot.queue_configure(None).unwrap();
     let k2 = send(&b1, &a1, 2, "nowhere").await.key;
     settle!([&b1], outbox(&b1, k2).await.attempts >= 2);
     quiet(&[&b1]).await;
