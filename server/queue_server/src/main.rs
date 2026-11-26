@@ -15,6 +15,19 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    #[cfg(feature = "harness-counts")]
+    if harness_counts() {
+        return match queue_server::held_counts(&config.db) {
+            Ok(entries) => {
+                println!("{}", queue_server::counts_line(&entries));
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("queue_server: cannot read QUEUE_DB: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let store = match Store::open(&config.db) {
         Ok(store) => store,
         Err(e) => {
@@ -35,4 +48,15 @@ async fn main() -> ExitCode {
     tokio::spawn(run_sweeper(store, state.clock.clone(), state.log.clone()));
     serve(listener, router(state), serve_limits()).await;
     ExitCode::SUCCESS
+}
+
+/// `--harness-counts` (debug builds with the `harness-counts` feature): print the counts of
+/// `QUEUE_DB` and exit, serving nothing.
+#[cfg(feature = "harness-counts")]
+fn harness_counts() -> bool {
+    let mut args = std::env::args().skip(1);
+    matches!(
+        (args.next().as_deref(), args.next()),
+        (Some("--harness-counts"), None)
+    )
 }

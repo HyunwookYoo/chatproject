@@ -4,6 +4,8 @@
 mod app;
 mod command;
 mod config;
+#[cfg(feature = "harness-counts")]
+mod harness;
 mod limit;
 mod log;
 mod store;
@@ -11,6 +13,8 @@ mod sweep;
 
 pub use app::{AppState, Clock, router};
 pub use config::{Config, ConfigError};
+#[cfg(feature = "harness-counts")]
+pub use harness::{counts_line, held_counts};
 pub use limit::{Limits, MAX_CONNECTIONS, serve_limits};
 pub use log::{LogSink, stderr_sink};
 pub use store::{Store, StoreError, SweepCounts};

@@ -4,6 +4,15 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+[features]
+# Debug builds only (a compile error otherwise): `queue_server --harness-counts` prints how many
+# queues `QUEUE_DB` holds and the entries each holds, for the m8 end-to-end scenario.
+harness-counts = []
+
+[[test]]
+name = "harness_counts"
+required-features = ["harness-counts"]
+
 [dependencies]
 queue_wire = { path = "../../core/queue_wire" }
 http_guard = { path = "../http_guard" }
