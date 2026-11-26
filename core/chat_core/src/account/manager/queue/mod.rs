@@ -107,6 +107,9 @@ pub(crate) struct Runtime {
     devices: Option<[u8; 32]>,
     /// Wall time the next rotation or deletion is due.
     wake_at: Option<u64>,
+    /// Whether this device uses a queue, as last read (`None`: a queue write since, read again
+    /// at the next poll and published as `ConnectionSnapshot::using_queue`).
+    using: Option<bool>,
     /// The next run while nothing changes: hourly, or after a failure the back-off.
     check: Backoff,
     fetch: Fetch,
@@ -252,6 +255,9 @@ impl Manager {
         op: QueueDbOp,
         request: Request,
     ) -> Result<QueueDbReply, CoreError> {
+        if op.writes() {
+            self.messages.queue.using = None;
+        }
         match self.message_db(MessageDbOp::Queue(op), request).await? {
             MessageDbReply::Queue(reply) => Ok(reply),
             _ => Err(unavailable(ErrorCode::InvalidMessage)),
@@ -271,7 +277,7 @@ impl Manager {
         self.messages.queue.due = true;
     }
 
-    /// Whether this device has an `Active` queue the server took (spec 4: the home card).
+    /// Whether this device uses a queue (spec 4: the home card; `QueueDbOp::Using`).
     pub(super) async fn queue_using(&mut self, request: Request) -> Result<bool, CoreError> {
         match self.queue_db(QueueDbOp::Using, request).await? {
             QueueDbReply::Using(using) => Ok(using),
@@ -298,10 +304,32 @@ impl Manager {
     /// One tick of queue upkeep, with the message scheduler's poll, after the verdict is worked
     /// out (`poll_mailbox`). Cheap unless a run is due.
     pub(super) async fn poll_queue(&mut self) {
-        let Ok(request) = self.ready() else { return };
+        let Ok(request) = self.ready() else {
+            self.bus.set_using_queue(false);
+            return;
+        };
         if self.local().is_err() {
+            self.bus.set_using_queue(false);
             return;
         }
+        self.queue_upkeep(request).await;
+        self.queue_tell_using(request).await;
+    }
+
+    /// Publishes whether this device uses a queue, read again after a queue write. Read after
+    /// the run of this poll, so a run that replaces a queue publishes no gap between the two.
+    async fn queue_tell_using(&mut self, request: Request) {
+        if self.messages.queue.using.is_none() {
+            let Ok(using) = self.queue_using(request).await else {
+                return;
+            };
+            self.messages.queue.using = Some(using);
+        }
+        self.bus
+            .set_using_queue(self.messages.queue.using == Some(true));
+    }
+
+    async fn queue_upkeep(&mut self, request: Request) {
         self.queue_take_config();
         self.queue_standing(request).await;
         // A run on its way goes on even if the address changed: it ends where it began.

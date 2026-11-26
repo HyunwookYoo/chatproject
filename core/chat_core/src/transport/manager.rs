@@ -1893,7 +1893,7 @@ mod tests {
             Some(CoreEvent::ConnectionState(ConnectionSnapshot {
                 direct_peers: 1,
                 mailbox_ok: false,
-                queue_ok: None
+                using_queue: false
             }))
         ));
     }

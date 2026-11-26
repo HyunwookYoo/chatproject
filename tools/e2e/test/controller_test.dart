@@ -539,7 +539,7 @@ void main() {
         'kind': 'connection_state',
         'direct_peers': 1,
         'mailbox_ok': false,
-        'queue_ok': null,
+        'using_queue': true,
       },
       {'kind': 'error', 'code': 'TransportFailed', 'detail': 'fixture failure'},
       {

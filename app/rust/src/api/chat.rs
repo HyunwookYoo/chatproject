@@ -141,7 +141,8 @@ pub enum ChatEvent {
     ConnectionState {
         direct_peers: u32,
         mailbox_ok: bool,
-        queue_ok: Option<bool>,
+        /// This device uses a server queue (M8 spec 4: the home card).
+        using_queue: bool,
     },
     Error {
         code: ErrorCode,

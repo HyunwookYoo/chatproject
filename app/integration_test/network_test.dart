@@ -45,7 +45,7 @@ void main() {
     final state = event as ChatEvent_ConnectionState;
     expect(state.directPeers, 0);
     expect(state.mailboxOk, isFalse);
-    expect(state.queueOk, isNull);
+    expect(state.usingQueue, isFalse);
     expect((await coreStart(dataDir: dataDir.path)).instanceId, core.instanceId);
   });
 

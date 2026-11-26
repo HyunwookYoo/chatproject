@@ -161,6 +161,50 @@ async fn rotation_after_7_days_keeps_old_until_retired() {
     assert_eq!(b1_row.sent_at_ms, new.created_at_ms);
 }
 
+/// The `using_queue` words of `f`'s `ConnectionState` events so far, changes only.
+fn using_words(f: &Fixture) -> Vec<bool> {
+    let mut words: Vec<bool> = Vec::new();
+    for event in f.events.0.lock().unwrap().iter() {
+        if let CoreEvent::ConnectionState(snapshot) = event
+            && words.last() != Some(&snapshot.using_queue)
+        {
+            words.push(snapshot.using_queue);
+        }
+    }
+    words
+}
+
+/// Spec 4, the home card (Task 11): while a rotation waits for the server to take the new
+/// queue, the old one is still held and fetched, and peers still put into it, so the device
+/// still uses a queue: no gap in `using_queue` that would hide the card for a moment. The
+/// actor publishes it with the connection state, and the mode "never" takes it away.
+#[tokio::test]
+async fn rotation_keeps_using_queue_until_the_new_one_is_taken() {
+    let (a1, b1, _net, _conv, server) = announced().await;
+    assert!(a1.account.queue_state().await.unwrap().using_queue);
+    settle!([&a1, &b1], using_words(&a1) == [false, true]);
+    let old = active(&a1).await.remove(0);
+    server.hold(true);
+    a1.clock
+        .set_unix_seconds((old.created_at_ms + ROTATE_MS) / 1_000 + 1);
+    settle!([&a1, &b1], {
+        let now = active(&a1).await;
+        now.len() == 1
+            && now[0].queue_id != old.queue_id
+            && !now[0].server_confirmed
+            && server.queues().contains(&now[0].queue_id)
+    });
+    assert!(a1.account.queue_state().await.unwrap().using_queue);
+    server.hold(false);
+    settle!([&a1, &b1], announced_by(&a1).await);
+    assert!(a1.account.queue_state().await.unwrap().using_queue);
+    assert_eq!(using_words(&a1), [false, true]);
+
+    a1.account.set_queue_mode(QueueMode::Never).await.unwrap();
+    settle!([&a1, &b1], using_words(&a1) == [false, true, false]);
+    assert!(!a1.account.queue_state().await.unwrap().using_queue);
+}
+
 /// The job converges: run again (the mode set again, and after a restart) it adds no queue,
 /// no `CREATE` or `DELETE` and no frame.
 #[tokio::test]

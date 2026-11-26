@@ -8,6 +8,7 @@ import 'api/chat.dart';
 import 'api/mailbox.dart';
 import 'api/message.dart';
 import 'api/push.dart';
+import 'api/queue.dart';
 import 'dart:async';
 import 'dart:convert';
 import 'dart:ffi' as ffi;
@@ -48,9 +49,6 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   BlockReason dco_decode_box_autoadd_block_reason(dynamic raw);
-
-  @protected
-  bool dco_decode_box_autoadd_bool(dynamic raw);
 
   @protected
   ConversationCursor dco_decode_box_autoadd_conversation_cursor(dynamic raw);
@@ -206,9 +204,6 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   BlockReason? dco_decode_opt_box_autoadd_block_reason(dynamic raw);
 
   @protected
-  bool? dco_decode_opt_box_autoadd_bool(dynamic raw);
-
-  @protected
   ConversationCursor? dco_decode_opt_box_autoadd_conversation_cursor(
     dynamic raw,
   );
@@ -283,6 +278,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   PushStatusView dco_decode_push_status_view(dynamic raw);
 
   @protected
+  QueueMode dco_decode_queue_mode(dynamic raw);
+
+  @protected
+  QueueStateView dco_decode_queue_state_view(dynamic raw);
+
+  @protected
   RecordView dco_decode_record_view(dynamic raw);
 
   @protected
@@ -308,6 +309,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void dco_decode_unit(dynamic raw);
+
+  @protected
+  Verdict dco_decode_verdict(dynamic raw);
 
   @protected
   AnyhowException sse_decode_AnyhowException(SseDeserializer deserializer);
@@ -337,9 +341,6 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   BlockReason sse_decode_box_autoadd_block_reason(SseDeserializer deserializer);
-
-  @protected
-  bool sse_decode_box_autoadd_bool(SseDeserializer deserializer);
 
   @protected
   ConversationCursor sse_decode_box_autoadd_conversation_cursor(
@@ -517,9 +518,6 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
-  bool? sse_decode_opt_box_autoadd_bool(SseDeserializer deserializer);
-
-  @protected
   ConversationCursor? sse_decode_opt_box_autoadd_conversation_cursor(
     SseDeserializer deserializer,
   );
@@ -606,6 +604,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   PushStatusView sse_decode_push_status_view(SseDeserializer deserializer);
 
   @protected
+  QueueMode sse_decode_queue_mode(SseDeserializer deserializer);
+
+  @protected
+  QueueStateView sse_decode_queue_state_view(SseDeserializer deserializer);
+
+  @protected
   RecordView sse_decode_record_view(SseDeserializer deserializer);
 
   @protected
@@ -631,6 +635,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_decode_unit(SseDeserializer deserializer);
+
+  @protected
+  Verdict sse_decode_verdict(SseDeserializer deserializer);
 
   @protected
   void sse_encode_AnyhowException(
@@ -667,9 +674,6 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
     BlockReason self,
     SseSerializer serializer,
   );
-
-  @protected
-  void sse_encode_box_autoadd_bool(bool self, SseSerializer serializer);
 
   @protected
   void sse_encode_box_autoadd_conversation_cursor(
@@ -909,9 +913,6 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
-  void sse_encode_opt_box_autoadd_bool(bool? self, SseSerializer serializer);
-
-  @protected
   void sse_encode_opt_box_autoadd_conversation_cursor(
     ConversationCursor? self,
     SseSerializer serializer,
@@ -1023,6 +1024,15 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_queue_mode(QueueMode self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_queue_state_view(
+    QueueStateView self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_record_view(RecordView self, SseSerializer serializer);
 
   @protected
@@ -1057,6 +1067,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_unit(void self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_verdict(Verdict self, SseSerializer serializer);
 }
 
 // Section: wire_class

@@ -189,9 +189,11 @@ pub async fn open_account() -> Result<(), CoreError> {
         let protector = crate::platform_keys::provider(&info.data_dir).map_err(CoreError::from)?;
         #[cfg(all(feature = "test-hooks", debug_assertions))]
         if storage_fixture::enabled() {
-            return storage_fixture::open(protector);
+            storage_fixture::open(protector)?;
+            return super::queue::configure_opened(&handle()?).map_err(Into::into);
         }
-        crate::global::CORE.open_account(protector).map(|_| ()).map_err(Into::into)
+        let account = crate::global::CORE.open_account(protector).map_err(CoreError::from)?;
+        super::queue::configure_opened(&account).map_err(Into::into)
     }).await.map_err(|_| CoreError {
         code: super::chat::ErrorCode::NotAvailable,
         detail: "Account open unavailable".into(),

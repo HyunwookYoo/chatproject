@@ -75,7 +75,9 @@ sealed class ChatEvent with _$ChatEvent {
   const factory ChatEvent.connectionState({
     required int directPeers,
     required bool mailboxOk,
-    bool? queueOk,
+
+    /// This device uses a server queue (M8 spec 4: the home card).
+    required bool usingQueue,
   }) = ChatEvent_ConnectionState;
   const factory ChatEvent.error({
     required ErrorCode code,

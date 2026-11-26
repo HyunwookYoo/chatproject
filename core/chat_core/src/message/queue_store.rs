@@ -137,7 +137,10 @@ pub(crate) struct QueueView {
 
 pub(crate) enum QueueDbOp {
     Load,
-    /// Whether this device has an `Active` queue the server took (`QueueStateView.using_queue`).
+    /// Whether this device uses a queue (`QueueStateView.using_queue`): it has an `Active` queue
+    /// the server took, or one going `Retiring` while the server has not yet taken the `Active`
+    /// one that replaces it (a rotation, or a queue the server lost): the old one is still
+    /// fetched and peers still put into it until the new `QueueRef` reaches them.
     Using,
     /// The local half of a reconcile: `retire` goes `Retiring` (its withdrawal sealed for each
     /// current device of the peer when `true`), then `new` rows are written, and `forget` rows
@@ -245,7 +248,7 @@ pub(super) fn queue_op(
         QueueDbOp::Load => QueueDbReply::Loaded(load(c)?),
         QueueDbOp::Using => QueueDbReply::Using(
             c.query_row(
-                "SELECT EXISTS(SELECT 1 FROM queue_own WHERE state=0 AND server_confirmed=1)",
+                "SELECT EXISTS(SELECT 1 FROM queue_own o WHERE o.server_confirmed=1 AND (o.state=0                  OR EXISTS(SELECT 1 FROM queue_own a WHERE a.conversation=o.conversation                  AND a.state=0 AND a.server_confirmed=0)))",
                 [],
                 |r| r.get(0),
             )

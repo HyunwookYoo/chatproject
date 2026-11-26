@@ -12,12 +12,14 @@ pub struct ConnectionSnapshot {
     /// A ready session with another of my devices that announced itself as a mailbox (M6). The
     /// account actor owns it (`EventBus::set_mailbox_ok`); every snapshot published carries it.
     pub mailbox_ok: bool,
-    /// `None` while this user has no server queue.
-    pub queue_ok: Option<bool>,
+    /// This device uses a server queue (M8 spec 4, `QueueStateView::using_queue`): the server
+    /// holds what peers could not deliver while it is off. The account actor owns it
+    /// (`EventBus::set_using_queue`) as it owns `mailbox_ok`.
+    pub using_queue: bool,
 }
 
 impl ConnectionSnapshot {
-    pub const OFFLINE: Self = Self { direct_peers: 0, mailbox_ok: false, queue_ok: None };
+    pub const OFFLINE: Self = Self { direct_peers: 0, mailbox_ok: false, using_queue: false };
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,6 +85,7 @@ struct BusState {
     last_connection: Option<ConnectionSnapshot>,
     last_account: Option<CoreEvent>,
     mailbox_ok: bool,
+    using_queue: bool,
 }
 
 impl EventBus {
@@ -111,11 +114,21 @@ impl EventBus {
     /// under one lock: the transport publishes from its own task, and a snapshot it replaced
     /// must not be sent again (or kept for late subscribers).
     pub(crate) fn set_mailbox_ok(&self, ok: bool) {
+        self.set_actor_word(|state| &mut state.mailbox_ok, ok);
+    }
+
+    /// The account actor's word on `using_queue`, published and carried like `mailbox_ok`.
+    pub(crate) fn set_using_queue(&self, using: bool) {
+        self.set_actor_word(|state| &mut state.using_queue, using);
+    }
+
+    fn set_actor_word(&self, field: fn(&mut BusState) -> &mut bool, value: bool) {
         let mut state = self.state.lock().expect("event bus lock poisoned");
-        if state.mailbox_ok == ok {
+        let slot = field(&mut state);
+        if *slot == value {
             return;
         }
-        state.mailbox_ok = ok;
+        *slot = value;
         let snapshot = state.last_connection.unwrap_or(ConnectionSnapshot::OFFLINE);
         Self::publish_locked(&mut state, CoreEvent::ConnectionState(snapshot));
     }
@@ -123,6 +136,7 @@ impl EventBus {
     fn publish_locked(state: &mut BusState, mut event: CoreEvent) {
         if let CoreEvent::ConnectionState(snapshot) = &mut event {
             snapshot.mailbox_ok = state.mailbox_ok;
+            snapshot.using_queue = state.using_queue;
             state.last_connection = Some(*snapshot);
         }
         if matches!(&event, CoreEvent::AccountChanged { .. }) {
@@ -249,9 +263,35 @@ mod tests {
         bus.publish(state(3));
         bus.set_mailbox_ok(false);
         let ok = |direct_peers, mailbox_ok| {
-            CoreEvent::ConnectionState(ConnectionSnapshot { direct_peers, mailbox_ok, queue_ok: None })
+            CoreEvent::ConnectionState(ConnectionSnapshot { direct_peers, mailbox_ok, using_queue: false })
         };
         assert_eq!(sink.events(), vec![ok(2, false), ok(2, true), ok(3, true), ok(3, false)]);
+    }
+
+    #[test]
+    fn using_queue_is_published_and_carried_beside_mailbox_ok() {
+        let bus = EventBus::new();
+        let sink = Arc::new(RecordingSink::default());
+        bus.subscribe(sink.clone());
+        bus.publish(state(1));
+        bus.set_using_queue(true);
+        bus.set_using_queue(true);
+        bus.set_mailbox_ok(true);
+        bus.publish(state(2));
+        bus.set_using_queue(false);
+        let snapshot = |direct_peers, mailbox_ok, using_queue| {
+            CoreEvent::ConnectionState(ConnectionSnapshot { direct_peers, mailbox_ok, using_queue })
+        };
+        assert_eq!(
+            sink.events(),
+            vec![
+                snapshot(1, false, false),
+                snapshot(1, false, true),
+                snapshot(1, true, true),
+                snapshot(2, true, true),
+                snapshot(2, true, false),
+            ]
+        );
     }
 
     /// The transport publishes from its own task while the account actor sets `mailbox_ok`: a
@@ -296,7 +336,7 @@ mod tests {
             vec![CoreEvent::ConnectionState(ConnectionSnapshot {
                 direct_peers: LAST,
                 mailbox_ok: ok,
-                queue_ok: None
+                using_queue: false
             })]
         );
     }

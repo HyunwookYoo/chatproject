@@ -46,7 +46,7 @@ void main() {
 
   testWidgets('shows the connection state from the event stream', (tester) async {
     final core = await pumpHome(tester);
-    core.controller.add(const ChatEvent.connectionState(directPeers: 2, mailboxOk: false));
+    core.controller.add(const ChatEvent.connectionState(directPeers: 2, mailboxOk: false, usingQueue: false));
     // The event is delivered in a microtask after pump() has checked for a scheduled frame,
     // so pump until settled to build the frame its setState schedules.
     await tester.pumpAndSettle();
@@ -71,12 +71,8 @@ void main() {
   });
 
   test('connection labels', () {
-    expect(connectionLabel(const ChatEvent_ConnectionState(directPeers: 0, mailboxOk: false)), '연결 없음');
-    expect(connectionLabel(const ChatEvent_ConnectionState(directPeers: 0, mailboxOk: true)), '메일박스 연결됨');
-    expect(
-      connectionLabel(const ChatEvent_ConnectionState(directPeers: 0, mailboxOk: false, queueOk: true)),
-      '서버 큐 사용 중',
-    );
+    expect(connectionLabel(const ChatEvent_ConnectionState(directPeers: 0, mailboxOk: false, usingQueue: false)), '연결 없음');
+    expect(connectionLabel(const ChatEvent_ConnectionState(directPeers: 0, mailboxOk: true, usingQueue: false)), '메일박스 연결됨');
   });
 
   test('theme takes its colors from the tokens', () {

@@ -363,14 +363,14 @@ class Controller {
             'kind': 'connection_state',
             'direct_peers': final int peers,
             'mailbox_ok': final bool mailbox,
-            'queue_ok': final bool? queue,
+            'using_queue': final bool queue,
           }
           when peers >= 0:
         return {
           'kind': 'connection_state',
           'direct_peers': peers,
           'mailbox_ok': mailbox,
-          'queue_ok': queue,
+          'using_queue': queue,
         };
       default:
         return null;

@@ -16,7 +16,6 @@ import '../theme/tokens.dart';
 String connectionLabel(ChatEvent_ConnectionState state) {
   if (state.directPeers > 0) return '직접 연결 ${state.directPeers}';
   if (state.mailboxOk) return '메일박스 연결됨';
-  if (state.queueOk ?? false) return '서버 큐 사용 중';
   return '연결 없음';
 }
 

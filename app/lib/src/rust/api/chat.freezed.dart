@@ -230,7 +230,7 @@ extension ChatEventPatterns on ChatEvent {
     TResult Function(String peerId, String installationId, bool ready)?
     accountAuthChanged,
     TResult Function(String peerId)? accountCacheUsed,
-    TResult Function(int directPeers, bool mailboxOk, bool? queueOk)?
+    TResult Function(int directPeers, bool mailboxOk, bool usingQueue)?
     connectionState,
     TResult Function(ErrorCode code, String detail)? error,
     TResult Function(NetworkInfo info)? networkChanged,
@@ -264,7 +264,7 @@ extension ChatEventPatterns on ChatEvent {
         return connectionState(
           _that.directPeers,
           _that.mailboxOk,
-          _that.queueOk,
+          _that.usingQueue,
         );
       case ChatEvent_Error() when error != null:
         return error(_that.code, _that.detail);
@@ -309,7 +309,7 @@ extension ChatEventPatterns on ChatEvent {
     required TResult Function(String peerId, String installationId, bool ready)
     accountAuthChanged,
     required TResult Function(String peerId) accountCacheUsed,
-    required TResult Function(int directPeers, bool mailboxOk, bool? queueOk)
+    required TResult Function(int directPeers, bool mailboxOk, bool usingQueue)
     connectionState,
     required TResult Function(ErrorCode code, String detail) error,
     required TResult Function(NetworkInfo info) networkChanged,
@@ -342,7 +342,7 @@ extension ChatEventPatterns on ChatEvent {
         return connectionState(
           _that.directPeers,
           _that.mailboxOk,
-          _that.queueOk,
+          _that.usingQueue,
         );
       case ChatEvent_Error():
         return error(_that.code, _that.detail);
@@ -383,7 +383,7 @@ extension ChatEventPatterns on ChatEvent {
     TResult? Function(String peerId, String installationId, bool ready)?
     accountAuthChanged,
     TResult? Function(String peerId)? accountCacheUsed,
-    TResult? Function(int directPeers, bool mailboxOk, bool? queueOk)?
+    TResult? Function(int directPeers, bool mailboxOk, bool usingQueue)?
     connectionState,
     TResult? Function(ErrorCode code, String detail)? error,
     TResult? Function(NetworkInfo info)? networkChanged,
@@ -416,7 +416,7 @@ extension ChatEventPatterns on ChatEvent {
         return connectionState(
           _that.directPeers,
           _that.mailboxOk,
-          _that.queueOk,
+          _that.usingQueue,
         );
       case ChatEvent_Error() when error != null:
         return error(_that.code, _that.detail);
@@ -864,12 +864,14 @@ class ChatEvent_ConnectionState extends ChatEvent {
   const ChatEvent_ConnectionState({
     required this.directPeers,
     required this.mailboxOk,
-    this.queueOk,
+    required this.usingQueue,
   }) : super._();
 
   final int directPeers;
   final bool mailboxOk;
-  final bool? queueOk;
+
+  /// This device uses a server queue (M8 spec 4: the home card).
+  final bool usingQueue;
 
   /// Create a copy of ChatEvent
   /// with the given fields replaced by the non-null parameter values.
@@ -890,15 +892,17 @@ class ChatEvent_ConnectionState extends ChatEvent {
                 other.directPeers == directPeers) &&
             (identical(other.mailboxOk, mailboxOk) ||
                 other.mailboxOk == mailboxOk) &&
-            (identical(other.queueOk, queueOk) || other.queueOk == queueOk));
+            (identical(other.usingQueue, usingQueue) ||
+                other.usingQueue == usingQueue));
   }
 
   @override
-  int get hashCode => Object.hash(runtimeType, directPeers, mailboxOk, queueOk);
+  int get hashCode =>
+      Object.hash(runtimeType, directPeers, mailboxOk, usingQueue);
 
   @override
   String toString() {
-    return 'ChatEvent.connectionState(directPeers: $directPeers, mailboxOk: $mailboxOk, queueOk: $queueOk)';
+    return 'ChatEvent.connectionState(directPeers: $directPeers, mailboxOk: $mailboxOk, usingQueue: $usingQueue)';
   }
 }
 
@@ -910,7 +914,7 @@ abstract mixin class $ChatEvent_ConnectionStateCopyWith<$Res>
     $Res Function(ChatEvent_ConnectionState) _then,
   ) = _$ChatEvent_ConnectionStateCopyWithImpl;
   @useResult
-  $Res call({int directPeers, bool mailboxOk, bool? queueOk});
+  $Res call({int directPeers, bool mailboxOk, bool usingQueue});
 }
 
 /// @nodoc
@@ -927,7 +931,7 @@ class _$ChatEvent_ConnectionStateCopyWithImpl<$Res>
   $Res call({
     Object? directPeers = null,
     Object? mailboxOk = null,
-    Object? queueOk = freezed,
+    Object? usingQueue = null,
   }) {
     return _then(
       ChatEvent_ConnectionState(
@@ -939,10 +943,10 @@ class _$ChatEvent_ConnectionStateCopyWithImpl<$Res>
             ? _self.mailboxOk
             : mailboxOk // ignore: cast_nullable_to_non_nullable
                   as bool,
-        queueOk: freezed == queueOk
-            ? _self.queueOk
-            : queueOk // ignore: cast_nullable_to_non_nullable
-                  as bool?,
+        usingQueue: null == usingQueue
+            ? _self.usingQueue
+            : usingQueue // ignore: cast_nullable_to_non_nullable
+                  as bool,
       ),
     );
   }
