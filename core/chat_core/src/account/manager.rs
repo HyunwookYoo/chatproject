@@ -2011,7 +2011,7 @@ mod tests {
         )
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn explicit_retry_reloads_failed_foreground_without_overriding_suspend() {
         use std::sync::atomic::AtomicU8;
         struct Flaky(AtomicU8);
@@ -2026,11 +2026,14 @@ mod tests {
             }
             fn delete(&self, _: StoreId) -> Result<(), CoreError> { Ok(()) }
         }
-        let dir = tempfile::tempdir().unwrap(); let slot = CoreSlot::new();
-        slot.start(CoreConfig { data_dir: dir.path().into() }, &EventBus::new()).unwrap();
+        let dir = tempfile::tempdir().unwrap(); let slot = CoreSlot::new(); let bus = EventBus::new();
+        slot.start(CoreConfig { data_dir: dir.path().into() }, &bus).unwrap();
         slot.network().unwrap().configure_local(None).await.unwrap();
         let protector = Arc::new(Flaky(AtomicU8::new(0)));
-        let account = slot.open_account_with_services(protector.clone(), offline_services()).unwrap();
+        // The actor runs on this test's single thread, so it answers Retry only once the test
+        // yields: the first poll below is pending however a loaded runner schedules threads.
+        let runtime = tokio::runtime::Handle::current();
+        let account = AccountHandle::open(&runtime, dir.path(), protector.clone(), slot.network().unwrap(), offline_services(), bus).unwrap();
         account.prepare_candidate().await.unwrap();
         account.request_suspend(); account.snapshot().await.unwrap();
         protector.0.store(1, Ordering::SeqCst);
