@@ -6,6 +6,9 @@
 //! * `fetch`: takes what this device's queues hold (spec 6.4).
 //! * `put`: puts frames into the queues of devices no direct send reaches (spec 8).
 //! * No address, or the mode "never": no request to the queue server of any kind.
+//! * A request the server refused (`QueueError::refused`, such as a 404 before `/q/*` is routed
+//!   to it): no request of any job goes to it until the hourly check (`Runtime::quiet_until`),
+//!   so a site without a queue server costs one request an hour, not one each back-off step.
 
 mod fetch;
 mod put;
@@ -32,7 +35,8 @@ use crate::mls::{
     wire::{MlsFrame, MlsReply},
 };
 use crate::queue::{
-    AckItem, CreateItem, DeleteItem, ItemResult, QueueEntry, QueueServer, RecvItem, SendItem,
+    AckItem, CreateItem, DeleteItem, ItemResult, QueueEntry, QueueError, QueueServer, RecvItem,
+    SendItem,
 };
 use std::collections::{BTreeSet, VecDeque};
 use crate::{NetworkOp, NetworkReply, NetworkState};
@@ -119,6 +123,9 @@ pub(crate) struct Runtime {
     using: Option<bool>,
     /// The next run while nothing changes: hourly, or after a failure the back-off.
     check: Backoff,
+    /// The scheduler time before which no request goes to the server: it refused one, and
+    /// asking again before the hourly check gets the same answer. A new address clears it.
+    quiet_until: u64,
     fetch: Fetch,
     put: Put,
 }
@@ -151,14 +158,17 @@ pub(crate) enum QueueEvent {
         /// The server took their `CREATE`.
         created: Vec<QueueId>,
         /// Their id is another queue's there (`exists`).
-        refused: Vec<QueueId>,
+        exists: Vec<QueueId>,
         /// The server took their `DELETE`, or knew them no more.
         deleted: Vec<QueueId>,
         /// A request failed (network, timeout, a status): tried again with the M4 back-off. Not
-        /// when the server answered some item `limited` or `bad`: then the next run waits for
-        /// the hourly check, the time the server's `CREATE` limit refills in, so a lasting
-        /// refusal costs it one item an hour for each queue, not one each back-off.
+        /// when the server answered some item `limited` or `bad`, or refused the request: then
+        /// the next run waits for the hourly check, the time the server's `CREATE` limit refills
+        /// in, so a lasting refusal costs it one item an hour for each queue, not one each
+        /// back-off.
         failed: bool,
+        /// The server refused a request (`QueueError::refused`).
+        refused: bool,
     },
     /// A fetch round's `RECV` answers, in its queues' order (fewer when a request `failed`);
     /// `offline`: the network was off, nothing was asked.
@@ -166,6 +176,8 @@ pub(crate) enum QueueEvent {
         ticket: u64,
         answers: Vec<(QueueId, ItemResult)>,
         failed: bool,
+        /// The server refused the request (`QueueError::refused`).
+        refused: bool,
         offline: bool,
     },
     /// Its `ACK` answers, in the taken queues' order (fewer when a request `failed`).
@@ -173,16 +185,20 @@ pub(crate) enum QueueEvent {
         ticket: u64,
         answers: Vec<(QueueId, ItemResult)>,
         failed: bool,
+        refused: bool,
     },
     /// A `SEND` came back, for a text's or receipt's attempt (`what`) or the standing pass
     /// (`None`): what each item put where, and the answers in the same order (none when the
-    /// request failed). `ts`: the time its items were signed at.
+    /// request failed). `ts`: the time its items were signed at. `refused`: the server at `url`
+    /// refused the request (`QueueError::refused`).
     Sent {
         ticket: u64,
         what: Option<MessageKey>,
         items: Vec<Queued>,
         answers: Vec<ItemResult>,
         ts: u64,
+        url: Arc<str>,
+        refused: bool,
     },
 }
 
@@ -190,22 +206,33 @@ fn b64(bytes: &[u8]) -> String {
     BASE64URL_NOPAD.encode(bytes)
 }
 
+/// One request of a run, bounded by `REQUEST_TIMEOUT`: one result per item, or why not.
+async fn ask(
+    call: crate::queue::QueueFuture,
+    items: usize,
+) -> Result<Vec<ItemResult>, QueueError> {
+    match tokio::time::timeout(REQUEST_TIMEOUT, call).await {
+        Ok(Ok(results)) if results.len() == items => Ok(results),
+        Ok(Ok(_)) => Err(QueueError::Malformed),
+        Ok(Err(error)) => Err(error),
+        Err(_) => Err(QueueError::Timeout),
+    }
+}
+
 /// One batch of requests of a run: `calls` (each with its items' queue ids, at most
-/// `MAX_ITEMS`) one after another, stopping at the first that fails.
+/// `MAX_ITEMS`) one after another, stopping at the first that fails, with its error.
 async fn run_batches<T: Send + 'static>(
     calls: Vec<(Vec<QueueId>, Vec<T>)>,
     send: impl Fn(Vec<T>) -> crate::queue::QueueFuture,
-) -> (Vec<(QueueId, ItemResult)>, bool) {
+) -> (Vec<(QueueId, ItemResult)>, Option<QueueError>) {
     let mut answers = Vec::new();
     for (ids, items) in calls {
-        match tokio::time::timeout(REQUEST_TIMEOUT, send(items)).await {
-            Ok(Ok(results)) if results.len() == ids.len() => {
-                answers.extend(ids.into_iter().zip(results));
-            }
-            _ => return (answers, true),
+        match ask(send(items), ids.len()).await {
+            Ok(results) => answers.extend(ids.into_iter().zip(results)),
+            Err(error) => return (answers, Some(error)),
         }
     }
-    (answers, false)
+    (answers, None)
 }
 
 /// `items` (with the queue id of each) cut into requests of at most `MAX_ITEMS`.
@@ -284,6 +311,21 @@ impl Manager {
         self.messages.queue.due = true;
     }
 
+    /// The server at `url` refused a request: if it is still the configured one, no request of
+    /// any job goes to it until the hourly check.
+    fn queue_refused(&mut self, url: &str) {
+        let now = self.schedule_now();
+        let queue = &mut self.messages.queue;
+        if queue.server.as_ref().is_some_and(|s| &*s.url == url) {
+            queue.quiet_until = now.saturating_add(CHECK_MS);
+        }
+    }
+
+    /// No request goes to the server now: it refused one less than an hour ago.
+    fn queue_quiet(&self) -> bool {
+        self.schedule_now() < self.messages.queue.quiet_until
+    }
+
     /// Whether this device uses a queue (spec 4: the home card; `QueueDbOp::Using`).
     pub(super) async fn queue_using(&mut self, request: Request) -> Result<bool, CoreError> {
         match self.queue_db(QueueDbOp::Using, request).await? {
@@ -304,6 +346,7 @@ impl Manager {
         let queue = &mut self.messages.queue;
         queue.config_seen = version;
         queue.server = server;
+        queue.quiet_until = 0;
         queue.due = true;
         self.queue_fetch_soon();
     }
@@ -370,31 +413,54 @@ impl Manager {
                 ticket,
                 url,
                 created,
-                refused,
+                exists,
                 deleted,
                 failed,
+                refused,
             } => {
-                self.queue_answered(ticket, url, created, refused, deleted, failed)
+                if refused {
+                    self.queue_refused(&url);
+                }
+                self.queue_answered(ticket, url, created, exists, deleted, failed)
                     .await
             }
             QueueEvent::Received {
                 ticket,
                 answers,
                 failed,
+                refused,
                 offline,
-            } => self.queue_received(ticket, answers, failed, offline).await,
+            } => {
+                if refused {
+                    self.queue_fetch_refused();
+                }
+                self.queue_received(ticket, answers, failed, offline).await
+            }
             QueueEvent::Acked {
                 ticket,
                 answers,
                 failed,
-            } => self.queue_acked(ticket, answers, failed).await,
+                refused,
+            } => {
+                if refused {
+                    self.queue_fetch_refused();
+                }
+                self.queue_acked(ticket, answers, failed).await
+            }
             QueueEvent::Sent {
                 ticket,
                 what,
                 items,
                 answers,
                 ts,
-            } => self.queue_sent(ticket, what, items, answers, ts).await,
+                url,
+                refused,
+            } => {
+                if refused {
+                    self.queue_refused(&url);
+                }
+                self.queue_sent(ticket, what, items, answers, ts).await
+            }
         }
     }
 }

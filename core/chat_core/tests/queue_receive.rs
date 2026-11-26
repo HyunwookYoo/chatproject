@@ -411,6 +411,34 @@ async fn five_minute_poll_while_online() {
     assert_eq!(server.fetches(&a1).len(), n);
 }
 
+/// Task 11 review Minor 1: the site stops serving the queue and answers every request 404. The
+/// device asks again at the hourly check, not at each step of the back-off, and nothing else
+/// meanwhile; once the site serves the queue again, that fetch takes what the queue holds.
+#[tokio::test]
+async fn refused_fetch_waits_for_the_hourly_check() {
+    let (a1, _b1, _net, _conv, server) = announced().await;
+    let queue = active(&a1).await.remove(0);
+    periodic(&server, &a1).await;
+    server.refuse(404);
+    let n = server.calls_from(&a1).len();
+    a1.clock.advance_monotonic_ms(FETCH_EVERY_MS + 1_000);
+    within!(10, server.calls_from(&a1).len() == n + 1);
+    // 50 minutes of scheduler time: the M4 back-off (1 s doubling to 5 min) would have asked
+    // about 15 times by then.
+    for _ in 0..100 {
+        a1.clock.advance_monotonic_ms(30_000);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(server.calls_from(&a1).len(), n + 1);
+    server.refuse(0);
+    put(&server, &queue, b"not a frame").await;
+    for _ in 0..30 {
+        a1.clock.advance_monotonic_ms(30_000);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    within!(10, held(&server, &queue).await == 0);
+}
+
 /// Global Constraints: with the mode "never" no fetch goes out, though a `Retiring` queue is
 /// still there with something in it: not at a network start, a full sync or the 5 minutes.
 #[tokio::test]

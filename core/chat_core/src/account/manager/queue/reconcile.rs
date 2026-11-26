@@ -18,9 +18,9 @@
 //!   list; when a timer is due (rotation, deletion); hourly for new conversations; and after a
 //!   failed request, with the M4 back-off (1 s doubling to 5 min). Never two at once.
 //! * A queue whose `QueueRef` cannot be sealed, an item the server refused (`limited`, `bad`),
-//!   or answers that could not be stored wait for the hourly check: a lasting fault costs the
-//!   server one `CREATE` item an hour for each queue (its limit is 500 an hour), not one each
-//!   back-off step.
+//!   a request it refused (`QueueError::refused`), or answers that could not be stored wait for
+//!   the hourly check: a lasting fault costs the server one `CREATE` item an hour for each
+//!   queue (its limit is 500 an hour), not one each back-off step.
 //! * No address, or the mode "never": no request to the queue server of any kind.
 
 use super::*;
@@ -288,19 +288,29 @@ impl Manager {
         if creates.is_empty() && deletes.is_empty() {
             return self.queue_check_later();
         }
+        if self.queue_quiet() {
+            // The server refused a request: the rows wait for the hourly check.
+            let now = self.schedule_now();
+            let queue = &mut self.messages.queue;
+            queue.check.ok(now, queue.quiet_until.saturating_sub(now));
+            return;
+        }
         self.messages.queue.running = true;
         let mailbox = self.auth.send.clone();
         let ticket = request.ticket;
         let (creates, deletes) = (batches(creates), batches(deletes));
         tokio::spawn(async move {
             let client = server.client.clone();
-            let (created, mut failed) = run_batches(creates, |items| client.create(items)).await;
-            let (deleted, delete_failed) = if failed {
-                (Vec::new(), true)
+            let (created, mut failure) = run_batches(creates, |items| client.create(items)).await;
+            let deleted = if failure.is_some() {
+                Vec::new()
             } else {
-                run_batches(deletes, |items| client.delete(items)).await
+                let (deleted, delete_failure) =
+                    run_batches(deletes, |items| client.delete(items)).await;
+                failure = delete_failure;
+                deleted
             };
-            failed |= delete_failed;
+            let refused = failure.is_some_and(|f| f.refused());
             let mut event = (Vec::new(), Vec::new(), Vec::new());
             // Some item answered `limited` or `bad` (see `QueueEvent::Answered.failed`).
             let mut rejected = false;
@@ -317,16 +327,17 @@ impl Manager {
                     _ => rejected = true,
                 }
             }
-            let failed = failed && !rejected;
-            let (created, refused, deleted) = event;
+            let failed = failure.is_some() && !rejected && !refused;
+            let (created, exists, deleted) = event;
             let _ = mailbox
                 .send(Input::Queue(QueueEvent::Answered {
                     ticket,
                     url: server.url,
                     created,
-                    refused,
+                    exists,
                     deleted,
                     failed,
+                    refused,
                 }))
                 .await;
         });
@@ -572,8 +583,8 @@ mod tests {
                 })
                 .collect();
             let server = Counting(std::sync::Mutex::new(Vec::new()));
-            let (answers, failed) = run_batches(batches(items), |items| server.create(items)).await;
-            assert!(!failed);
+            let (answers, failure) = run_batches(batches(items), |items| server.create(items)).await;
+            assert_eq!(failure, None);
             assert_eq!(answers.len(), usize::from(conversations));
             assert_eq!(*server.0.lock().unwrap(), requests);
         }

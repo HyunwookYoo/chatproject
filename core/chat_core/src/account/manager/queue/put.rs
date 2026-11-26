@@ -35,7 +35,8 @@
 //!   burst both lacking a `Commit` carry it once), and then goes again only if it was not taken.
 //! * Rows that expired go in the transaction that notes the next `SEND`, so with no address
 //!   nothing ever writes them.
-//! * No address, or the mode "never": no `SEND`.
+//! * No address, the mode "never", or a server that refused a request less than an hour ago
+//!   (`Runtime::quiet_until`): no `SEND`.
 
 use super::*;
 use super::super::messages::Reach;
@@ -239,6 +240,9 @@ impl Manager {
         let Some(server) = self.messages.queue.server.clone() else {
             return true;
         };
+        if self.queue_quiet() {
+            return true;
+        }
         let Ok(me) = self.local().map(|local| local.keys.peer_id()) else {
             return true;
         };
@@ -267,11 +271,9 @@ impl Manager {
         let mailbox = self.auth.send.clone();
         let ticket = request.ticket;
         tokio::spawn(async move {
-            let answers = match tokio::time::timeout(REQUEST_TIMEOUT, server.client.send(sends))
-                .await
-            {
-                Ok(Ok(answers)) if answers.len() == items.len() => answers,
-                _ => Vec::new(),
+            let (answers, refused) = match ask(server.client.send(sends), items.len()).await {
+                Ok(answers) => (answers, false),
+                Err(error) => (Vec::new(), error.refused()),
             };
             let _ = mailbox
                 .send(Input::Queue(QueueEvent::Sent {
@@ -280,6 +282,8 @@ impl Manager {
                     items,
                     answers,
                     ts: wall,
+                    url: server.url,
+                    refused,
                 }))
                 .await;
         });

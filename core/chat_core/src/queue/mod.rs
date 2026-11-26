@@ -42,6 +42,15 @@ impl fmt::Display for QueueError {
 
 impl std::error::Error for QueueError {}
 
+impl QueueError {
+    /// The server refused the request itself: a 4xx other than 408 (timeout) and 429 (too
+    /// many), such as the 404 of a site that does not route `/q/*` to a queue server yet. Asking
+    /// again soon gets the same answer.
+    pub fn refused(&self) -> bool {
+        matches!(self, QueueError::Status(code) if (400..500).contains(code) && !matches!(code, 408 | 429))
+    }
+}
+
 /// One request of a queue server call: one result per item, in the items' order.
 pub type QueueFuture = BoxFuture<'static, Result<Vec<ItemResult>, QueueError>>;
 
@@ -123,6 +132,19 @@ mod tests {
         assert_eq!(resolve(None, true, None).unwrap(), None);
         assert!(resolve(None, true, Some("http://queue.example")).is_err());
         assert!(resolve(Some("https://queue.example"), true, None).is_err());
+    }
+
+    #[test]
+    fn only_a_lasting_4xx_is_refused() {
+        for code in [400, 401, 403, 404, 405, 410, 413, 499] {
+            assert!(QueueError::Status(code).refused(), "{code}");
+        }
+        for code in [408, 429, 500, 502, 503, 399, 200] {
+            assert!(!QueueError::Status(code).refused(), "{code}");
+        }
+        for error in [QueueError::Network, QueueError::Timeout, QueueError::Malformed] {
+            assert!(!error.refused());
+        }
     }
 
     #[test]

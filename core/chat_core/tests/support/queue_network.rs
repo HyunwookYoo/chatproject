@@ -63,6 +63,9 @@ struct FakeQueueServer {
     hold_acks: tokio::sync::watch::Sender<bool>,
     /// While true, `SEND`s wait before the server reads them.
     hold_sends: tokio::sync::watch::Sender<bool>,
+    /// While not 0, every core's request is answered with this HTTP status (a site that does
+    /// not route `/q/*` to a queue server answers 404).
+    refuse: std::sync::atomic::AtomicU16,
 }
 
 impl FakeQueueServer {
@@ -89,6 +92,7 @@ impl FakeQueueServer {
             hold_recv: tokio::sync::watch::channel(false).0,
             hold_acks: tokio::sync::watch::channel(false).0,
             hold_sends: tokio::sync::watch::channel(false).0,
+            refuse: Default::default(),
         })
     }
 
@@ -127,6 +131,11 @@ impl FakeQueueServer {
 
     fn hold_sends(&self, held: bool) {
         self.hold_sends.send_replace(held);
+    }
+
+    /// Answers every core's request with HTTP `status` from now on; 0 answers them again.
+    fn refuse(&self, status: u16) {
+        self.refuse.store(status, Ordering::SeqCst);
     }
 
     fn lose_acks(&self, lost: bool) {
@@ -201,6 +210,10 @@ impl FakeQueueServer {
         };
         if command == CommandName::Ack && self.lose_acks.load(Ordering::SeqCst) {
             return Err(QueueError::Network);
+        }
+        let refuse = self.refuse.load(Ordering::SeqCst);
+        if refuse != 0 && from.is_some() {
+            return Err(QueueError::Status(refuse));
         }
         let hold = match command {
             CommandName::Recv => Some(&self.hold_recv),

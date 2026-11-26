@@ -481,6 +481,38 @@ async fn refused_create_waits_for_the_hourly_check() {
     assert_eq!(named, [mine[0].queue_id, mine[0].queue_id]);
 }
 
+/// Task 11 review Minor 1: the site answers every request 404 (`/q/*` not routed to a queue
+/// server yet). The device asks again at the hourly check, not at each step of the back-off.
+#[tokio::test]
+async fn site_without_a_queue_server_is_asked_once_an_hour() {
+    let (mut a, _b1, net, _conv) = queue_accounts(&[A1]).await;
+    let a1 = a.remove(0);
+    let server = queue_server(&net);
+    server.refuse(404);
+    configure(&a1, QUEUE_URL);
+    settle!([&a1], !server.sent(&a1, CommandName::Create).is_empty());
+    // 50 minutes of scheduler time: the M4 back-off (1 s doubling to 5 min) would have asked
+    // about 15 times by then.
+    for _ in 0..100 {
+        a1.clock.advance_monotonic_ms(30_000);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(server.calls_from(&a1).len(), 1);
+    for _ in 0..30 {
+        a1.clock.advance_monotonic_ms(30_000);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    settle!([&a1], server.sent(&a1, CommandName::Create).len() == 2);
+    // Once the site serves the queue, the next hourly check creates it.
+    server.refuse(0);
+    for _ in 0..130 {
+        a1.clock.advance_monotonic_ms(30_000);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    settle!([&a1], active(&a1).await.first().is_some_and(|q| q.server_confirmed));
+    assert_eq!(server.sent(&a1, CommandName::Create).len(), 3);
+}
+
 /// Review I1: a `QueueRef` that reaches the device right after `queue_configure`, before the
 /// actor's next poll took the address (a frame pulled at start, or one in the same tick), is
 /// kept, not acknowledged and lost until the peer rotates.

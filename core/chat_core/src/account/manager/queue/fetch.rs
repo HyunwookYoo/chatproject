@@ -1,8 +1,9 @@
 //! Fetching from this device's queues (spec 6.4), never two runs at once:
 //!
 //! * A run starts at a network start, when a push's fetch or a full sync asks, at a new address,
-//!   and every `FETCH_EVERY_MS` (the M4 back-off after a failed request); its first step looks
-//!   whether the network is on and asks nothing while it is off.
+//!   and every `FETCH_EVERY_MS` (the M4 back-off after a failed request), but not while the
+//!   server refuses requests (`Runtime::quiet_until`); its first step looks whether the network
+//!   is on and asks nothing while it is off.
 //! * Each round is one `RECV` (at most `MAX_ITEMS` items a request) for every `Active` queue the
 //!   server took and every `Retiring` one, after what the run read of each (its `last_seq` at
 //!   first); queues the last answer had no room for (`limited`) come first. The run keeps the
@@ -220,6 +221,7 @@ impl Manager {
     pub(super) async fn queue_fetch_poll(&mut self, request: Request) {
         let starts = self.shared.network.starts();
         let now = self.schedule_now();
+        let quiet = self.queue_quiet();
         let queue = &mut self.messages.queue;
         let fetch = &mut queue.fetch;
         if fetch.starts != starts {
@@ -239,7 +241,7 @@ impl Manager {
         let Some(server) = queue.server.clone() else {
             return;
         };
-        if !(fetch.asked || now >= fetch.next.at) {
+        if quiet || !(fetch.asked || now >= fetch.next.at) {
             return;
         }
         fetch.asked = false;
@@ -311,6 +313,7 @@ impl Manager {
                             ticket,
                             answers: Vec::new(),
                             failed: false,
+                            refused: false,
                             offline: true,
                         }))
                         .await;
@@ -318,16 +321,25 @@ impl Manager {
                 }
             }
             let client = server.client.clone();
-            let (answers, failed) = run_batches(batches(items), |items| client.recv(items)).await;
+            let (answers, failure) = run_batches(batches(items), |items| client.recv(items)).await;
             let _ = mailbox
                 .send(Input::Queue(QueueEvent::Received {
                     ticket,
                     answers,
-                    failed,
+                    failed: failure.is_some(),
+                    refused: failure.is_some_and(|f| f.refused()),
                     offline: false,
                 }))
                 .await;
         });
+    }
+
+    /// The server of the run on its way refused a request.
+    pub(super) fn queue_fetch_refused(&mut self) {
+        let url = self.messages.queue.fetch.run.as_ref().map(|run| run.server.url.clone());
+        if let Some(url) = url {
+            self.queue_refused(&url);
+        }
     }
 
     /// The request of the run on its way, when `ticket` and `step` are its own (an answer of
@@ -598,12 +610,13 @@ impl Manager {
         let ticket = request.ticket;
         tokio::spawn(async move {
             let client = server.client.clone();
-            let (answers, failed) = run_batches(batches(items), |items| client.ack(items)).await;
+            let (answers, failure) = run_batches(batches(items), |items| client.ack(items)).await;
             let _ = mailbox
                 .send(Input::Queue(QueueEvent::Acked {
                     ticket,
                     answers,
-                    failed,
+                    failed: failure.is_some(),
+                    refused: failure.is_some_and(|f| f.refused()),
                 }))
                 .await;
         });

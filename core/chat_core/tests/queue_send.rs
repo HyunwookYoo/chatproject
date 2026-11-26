@@ -383,6 +383,29 @@ async fn limited_falls_back_to_outbox_retry() {
     assert_eq!(server.sends(&b1).len(), sends);
 }
 
+/// Task 11 review Minor 1: the site answers every request 404 (`/q/*` not routed to a queue
+/// server). B1's attempts go on, but B1 asks the server once (the text's first `SEND`, or its
+/// own fetch if that came first) and nothing more until the hourly check; once the site serves
+/// the queue, the text goes in.
+#[tokio::test]
+async fn refused_send_waits_for_the_hourly_check() {
+    let (a1, b1, _net, _conv, server) = announced().await;
+    let queue = active(&a1).await.remove(0);
+    off(&a1, &[&b1]).await;
+    server.refuse(404);
+    let n = server.calls_from(&b1).len();
+    let key = send(&b1, &a1, 1, "refused").await.key;
+    settle!([&b1], outbox(&b1, key).await.attempts >= 4);
+    quiet(&[&b1]).await;
+    assert_eq!(server.calls_from(&b1).len(), n + 1);
+    server.refuse(0);
+    for _ in 0..130 {
+        b1.clock.advance_monotonic_ms(30_000);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    settle!([&b1], server.held(queue.queue_id) == 1);
+}
+
 /// Spec 8.2: A1 hands its text off to its mailbox A2 and goes off; B1 is off. A2's attempts
 /// reach no device of B, so A2 puts the text into B1's queue, naming A1, which sealed it. B1
 /// comes on and stores it once. (A1 has no queue address, so only A2 puts anything in.)
