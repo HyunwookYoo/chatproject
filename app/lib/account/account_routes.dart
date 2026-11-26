@@ -440,8 +440,7 @@ class _AccountRoutesState extends State<AccountRoutes>
     crossAxisAlignment: CrossAxisAlignment.stretch,
     children: [
       TextButton(onPressed: _devices, child: const Text('내 기기')),
-      if (widget.mailbox case final MailboxModel mailbox
-          when MailboxModel.supported)
+      if (widget.mailbox case final MailboxModel mailbox)
         TextButton(
           onPressed: () => _mailboxSettings(mailbox),
           child: const Text('메일박스'),

@@ -53,6 +53,21 @@ void main() {
     expect(find.text('직접 연결 2'), findsOneWidget);
   });
 
+  // M8 spec 4: the card shows while this device uses a server queue, and
+  // goes with it (a mailbox qualified, or "서버 사용 안 함").
+  testWidgets('the queue card follows using_queue', (tester) async {
+    const card = '메일박스 없음 · 서버가 대신 받아 둬요';
+    final core = await pumpHome(tester);
+    expect(find.text(card), findsNothing);
+    core.controller.add(const ChatEvent.connectionState(directPeers: 1, mailboxOk: false, usingQueue: true));
+    await tester.pumpAndSettle();
+    expect(find.text(card), findsOneWidget);
+    expect(find.text('직접 연결 1'), findsOneWidget);
+    core.controller.add(const ChatEvent.connectionState(directPeers: 1, mailboxOk: false, usingQueue: false));
+    await tester.pumpAndSettle();
+    expect(find.text(card), findsNothing);
+  });
+
   testWidgets('shows why the core did not start', (tester) async {
     await pumpHome(tester, startError: const CoreError(code: ErrorCode.invalidConfig, detail: 'no folder'));
     await tester.pump();

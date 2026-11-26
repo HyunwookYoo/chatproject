@@ -199,6 +199,8 @@ void main() {
       '--name=probe',
       '--push-url',
       '--push-url=http://10.0.2.2:8080',
+      '--queue-url',
+      '--queue-url=http://10.0.2.2:8788',
     ]) {
       expect(
         () => startupDataDir([flag], releaseMode: true),
@@ -229,6 +231,48 @@ void main() {
       'https://push.test',
     );
     expect(() => startupPushUrl(['--push-url']), throwsFormatException);
+  });
+
+  test("--queue-url overrides the build's queue server in debug", () {
+    expect(startupQueueUrl([]), isNull);
+    expect(
+      startupQueueUrl(['--queue-url', 'http://127.0.0.1:8788']),
+      'http://127.0.0.1:8788',
+    );
+    expect(
+      startupQueueUrl(['--queue-url=https://queue.test']),
+      'https://queue.test',
+    );
+    expect(() => startupQueueUrl(['--queue-url']), throwsFormatException);
+  });
+
+  // Task 8 fix I1: a QueueRef taken before the first queue_configure is
+  // refused, so the address reaches the core before the account opens.
+  test('--queue-url is configured before the account opens', () async {
+    final calls = <String>[];
+    final core = FakeNetworkClient();
+    final account = _OpenRecordingAccount(calls);
+    final app = await bootstrap(
+      ['--queue-url=http://127.0.0.1:8788'],
+      initializeRust: () async {},
+      createClient: (_) => core,
+      createAccountClient: (_) => account,
+      configureQueue: (url) async => calls.add('queue $url'),
+    );
+    expect(app, isA<AccountGate>());
+    expect(calls, ['queue http://127.0.0.1:8788', 'open']);
+
+    calls.clear();
+    await bootstrap(
+      [],
+      initializeRust: () async {},
+      createClient: (_) => core,
+      createAccountClient: (_) => account,
+      configureQueue: (url) async => calls.add('queue $url'),
+    );
+    expect(calls, ['open'], reason: "the build's address needs no call");
+    await account.controller.close();
+    await core.controller.close();
   });
 
   test(
@@ -272,4 +316,11 @@ class OrderedClient extends FakeNetworkClient {
     calls.add('network');
     return super.startNetwork();
   }
+}
+
+class _OpenRecordingAccount extends FakeAccountClient {
+  _OpenRecordingAccount(this.calls);
+  final List<String> calls;
+  @override
+  Future<void> openAccount() async => calls.add('open');
 }

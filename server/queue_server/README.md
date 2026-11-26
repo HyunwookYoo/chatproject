@@ -134,6 +134,10 @@ routes `/q/create` and the rest as they are. Caddy replaces any client-sent
 reaches the server around Caddy. Leave Caddy's access log off: it would record
 client IPs.
 
+The apps take the site's address at build time, without `/q`, which the core
+adds: `CHATPROJECT_QUEUE_URL=https://push.example.com`. Release builds use only
+that address, over `https://`; debug builds also take `--queue-url <url>`.
+
 ## Commands
 
 `POST /q/create`, `/q/send`, `/q/recv`, `/q/ack`, `/q/delete`. Body

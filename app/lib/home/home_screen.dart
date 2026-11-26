@@ -148,6 +148,21 @@ class _HomeScreenState extends State<HomeScreen> {
                 ),
                 child: Text(_status, style: const TextStyle(fontSize: 14, color: AppColors.textSecondary)),
               ),
+              if (_connection?.usingQueue ?? false) ...[
+                const SizedBox(height: 8),
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+                  decoration: const BoxDecoration(
+                    color: AppColors.surface,
+                    borderRadius: BorderRadius.all(Radius.circular(16)),
+                  ),
+                  child: const Text(
+                    '메일박스 없음 · 서버가 대신 받아 둬요',
+                    style: TextStyle(fontSize: 14, color: AppColors.textSecondary),
+                  ),
+                ),
+              ],
               Expanded(
                 child: _messages != null && widget.onOpenConversation != null
                     ? ConversationListScreen(

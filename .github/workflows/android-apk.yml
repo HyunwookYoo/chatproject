@@ -24,6 +24,9 @@ env:
   CARGOKIT_TOOLCHAIN: 1.92.0
   # Read by the Rust build (option_env! in app/rust/src/native.rs); server/push_proxy/README.md.
   CHATPROJECT_PUSH_URL: https://chatproject-push.duckdns.org
+  # The same site: Caddy routes /q/* to the queue server (option_env! in
+  # core/chat_core/src/queue/mod.rs); server/queue_server/README.md.
+  CHATPROJECT_QUEUE_URL: https://chatproject-push.duckdns.org
 
 jobs:
   apk:
