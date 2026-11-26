@@ -552,9 +552,11 @@ async fn uncertain_receiver_commit_sends_no_success_and_reconciles_original_key(
     contacts(&b, &a).await;
     a.account.connect_account(b.peer).await.unwrap();
     let m = enqueue(&a, &b).await;
+    // Keyed: B's push prune, due when the connect changed the device lists it knows, may come
+    // first and would take an unkeyed fault.
     b.account
         .storage_test_fixture()
-        .message_fault(chat_core::storage_fixture::CommitFault::AfterCommit)
+        .message_key_fault(m.key, chat_core::storage_fixture::CommitFault::AfterCommit)
         .await;
     assert!(
         a.account
@@ -686,9 +688,11 @@ async fn uncertain_prebyte_attempt_reconciles_before_retry_without_sending() {
     contacts(&b, &a).await;
     a.account.connect_account(b.peer).await.unwrap();
     let m = enqueue(&a, &b).await;
+    // Keyed: A's push prune, due when the connect changed the device lists it knows, may come
+    // first and would take an unkeyed fault.
     a.account
         .storage_test_fixture()
-        .message_fault(chat_core::storage_fixture::CommitFault::AfterCommit)
+        .message_key_fault(m.key, chat_core::storage_fixture::CommitFault::AfterCommit)
         .await;
     assert!(
         matches!(a.account.message_test_attempt(m.key,false,MessageMutation::None).await,Err(e) if e.code==ErrorCode::StorageUncertain)

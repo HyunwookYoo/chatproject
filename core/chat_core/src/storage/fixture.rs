@@ -1100,7 +1100,14 @@ impl Fixture {
 
     pub async fn message_fault(&self, fault: CommitFault) {
         let (tx, rx) = oneshot::channel();
-        self.handle.0.test(TestOp::MessageFault(fault, tx)).await;
+        self.handle.0.test(TestOp::MessageFault(fault, None, tx)).await;
+        rx.await.unwrap();
+    }
+    /// `fault` for the next faultable operation on message `key`: upkeep that writes other rows
+    /// meanwhile (a prune after a device list changed) does not take it.
+    pub async fn message_key_fault(&self, key: MessageKey, fault: CommitFault) {
+        let (tx, rx) = oneshot::channel();
+        self.handle.0.test(TestOp::MessageFault(fault, Some(key), tx)).await;
         rx.await.unwrap();
     }
     /// `fault` for the received ciphertext this store opens after `skip` others.
