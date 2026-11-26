@@ -108,6 +108,7 @@ async fn queue_actions_answer_values_only_and_reject_unknown_input() {
             "peer_dead",
             "peer_live",
             "peer_withdrawn",
+            "refs_pending",
             "sends_message",
             "sends_standing",
         ]
@@ -117,6 +118,7 @@ async fn queue_actions_answer_values_only_and_reject_unknown_input() {
     assert_eq!(counts["created"], 1, "one CREATE taken: {counts}");
     assert_eq!(counts["peer_live"], 1, "B1's QueueRef: {counts}");
     assert_eq!(counts["peer_withdrawn"], 0, "{counts}");
+    assert_eq!(counts["refs_pending"], 0, "announced: {counts}");
 
     // Narrowed to one device: B1's QueueRef is there, A1 keeps none of its own.
     let b1_id = installation(&b1).await;

@@ -28,7 +28,8 @@ enum Action {
         mode: Mode,
     },
     State {},
-    /// With `peer`, the `peer_*` counts are of that device's `QueueRef`s only.
+    /// With `peer`, the `peer_*` counts are of that device's `QueueRef`s only, and
+    /// `refs_pending` of the frames to it.
     TestCounts {
         #[serde(default)]
         peer: Option<InstallationId>,
@@ -75,7 +76,9 @@ pub async fn execute(
             })
         }
         Action::TestCounts { peer } => {
-            let tables = handle.storage_test_fixture().queue_tables().await?;
+            let fixture = handle.storage_test_fixture();
+            let tables = fixture.queue_tables().await?;
+            let deliveries = fixture.push_state().await?.deliveries;
             let counts = handle.queue_test_counts();
             let n = |count: usize| u64::try_from(count).unwrap_or(u64::MAX);
             let peers: Vec<_> = tables
@@ -95,6 +98,11 @@ pub async fn execute(
                 "peer_live": n(peers.iter().filter(|p| p.queue.is_some() && !p.dead).count()),
                 "peer_withdrawn": n(peers.iter().filter(|p| p.queue.is_none()).count()),
                 "peer_dead": n(peers.iter().filter(|p| p.queue.is_some() && p.dead).count()),
+                // This device's `QueueRef` frames still on their way (to `peer`).
+                "refs_pending": n(deliveries
+                    .iter()
+                    .filter(|d| d.kind == 2 && peer.is_none_or(|id| d.recipient == id))
+                    .count()),
                 // Since this core started.
                 "created": counts.created,
                 "sends_message": counts.sends_message,
