@@ -248,7 +248,7 @@ pub(super) fn queue_op(
         QueueDbOp::Load => QueueDbReply::Loaded(load(c)?),
         QueueDbOp::Using => QueueDbReply::Using(
             c.query_row(
-                "SELECT EXISTS(SELECT 1 FROM queue_own o WHERE o.server_confirmed=1 AND (o.state=0                  OR EXISTS(SELECT 1 FROM queue_own a WHERE a.conversation=o.conversation                  AND a.state=0 AND a.server_confirmed=0)))",
+                "SELECT EXISTS(SELECT 1 FROM queue_own o WHERE o.server_confirmed=1 AND (o.state=0 OR EXISTS(SELECT 1 FROM queue_own a WHERE a.conversation=o.conversation AND a.state=0 AND a.server_confirmed=0)))",
                 [],
                 |r| r.get(0),
             )
