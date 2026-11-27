@@ -127,7 +127,16 @@ Future<void> runQueueScenario(
     return p.call(op, args, timeout: timeout);
   }
 
-  // On a deadline: each side's network state and the server's last read, as fixed buckets.
+  Future<QueueServerCounts> held() async {
+    final read = await server();
+    queueStats
+      ..touch()
+      ..serverQueues = read.queues
+      ..serverEntries = read.held;
+    return read;
+  }
+
+  // On a deadline: each side's network state and what the server holds now, as fixed buckets.
   Future<void> noteFacts() async {
     for (final (side, p) in [('phone', a1), ('other', a2), ('node', b1)]) {
       Object? state;
@@ -147,6 +156,10 @@ Future<void> runQueueScenario(
           ? state as String
           : 'unknown';
     }
+    // A fresh read; the last one, if any, is from before the step that timed out.
+    try {
+      await held().timeout(const Duration(seconds: 10));
+    } catch (_) {}
     failureFacts['m8_server_queues'] = factBucket(
       queueStats.serverQueues,
       'q',
@@ -337,14 +350,6 @@ Future<void> runQueueScenario(
       object(await call(p, 'queue_local_test_counts', {'peer': ?peer}));
   Future<Map<String, Object?>> alerts(Participant p) async =>
       object(await call(p, 'mailbox_local_test_counters'));
-  Future<QueueServerCounts> held() async {
-    final read = await server();
-    queueStats
-      ..touch()
-      ..serverQueues = read.queues
-      ..serverEntries = read.held;
-    return read;
-  }
 
   Future<void> stopped(Participant p, String side) async {
     await until(
