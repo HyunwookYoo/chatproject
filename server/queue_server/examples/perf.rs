@@ -50,6 +50,7 @@ fn fill(addr: &str, queues: usize, per_queue: usize, ct_bytes: usize) {
 
     let start = Instant::now();
     let mut not_ok = 0usize;
+    let mut batch = 0;
     for round in 0..per_queue {
         for chunk in (0..queues as u32).collect::<Vec<_>>().chunks(MAX_ITEMS) {
             let now = common::now_ms();
@@ -62,7 +63,8 @@ fn fill(addr: &str, queues: usize, per_queue: usize, ct_bytes: usize) {
                     Q::new(n).send(&ct, now)
                 })
                 .collect();
-            let results = post(addr, CommandName::Send, items, None);
+            let results = post(addr, CommandName::Send, items, Some(&client(2, batch)));
+            batch += 1;
             not_ok += results.iter().filter(|r| **r != ItemResult::Ok).count();
         }
     }

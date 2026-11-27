@@ -35,6 +35,10 @@ pub struct Limits {
     /// `SEND` items per queue.
     pub send_per_minute: u32,
     pub send_burst: u32,
+    /// `SEND` ciphertext bytes per client, per hour, in all its queues: what one client can
+    /// hold of `max_bytes`. Over it: `limited`.
+    pub send_bytes_per_hour: u32,
+    pub send_bytes_burst: u32,
     /// `RECV` requests per client; `ACK` requests have their own bucket of
     /// the same size. Over it: 429 before the body is read.
     pub recv_per_minute: u32,
@@ -58,6 +62,8 @@ impl Default for Limits {
             create_burst: 200,
             send_per_minute: 60,
             send_burst: 20,
+            send_bytes_per_hour: 4 << 20,
+            send_bytes_burst: 32 << 20,
             recv_per_minute: 120,
             recv_burst: 120,
             delete_per_minute: 10,
@@ -71,6 +77,7 @@ impl Default for Limits {
 pub(crate) struct Limiter {
     creates: Mutex<Buckets<IpAddr>>,
     sends: Mutex<Buckets<QueueId>>,
+    send_bytes: Mutex<Buckets<IpAddr>>,
     recvs: Mutex<Buckets<IpAddr>>,
     acks: Mutex<Buckets<IpAddr>>,
     deletes: Mutex<Buckets<IpAddr>>,
@@ -84,6 +91,10 @@ impl Limiter {
                 limits.create_burst,
             )),
             sends: Mutex::new(Buckets::new(limits.send_per_minute, limits.send_burst)),
+            send_bytes: Mutex::new(Buckets::per_hour(
+                limits.send_bytes_per_hour,
+                limits.send_bytes_burst,
+            )),
             recvs: Mutex::new(Buckets::new(limits.recv_per_minute, limits.recv_burst)),
             acks: Mutex::new(Buckets::new(limits.recv_per_minute, limits.recv_burst)),
             deletes: Mutex::new(Buckets::new(limits.delete_per_minute, limits.delete_burst)),
@@ -96,6 +107,13 @@ impl Limiter {
 
     pub(crate) fn allow_send(&self, queue: &QueueId, now_ms: u64) -> bool {
         take(&self.sends, *queue, now_ms)
+    }
+
+    pub(crate) fn allow_send_bytes(&self, ip: IpAddr, bytes: usize, now_ms: u64) -> bool {
+        self.send_bytes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take_n(client_key(ip), bytes as u64, now_ms)
     }
 
     pub(crate) fn allow_recv(&self, ip: IpAddr, now_ms: u64) -> bool {

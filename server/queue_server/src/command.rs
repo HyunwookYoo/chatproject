@@ -135,6 +135,14 @@ impl Command for Send {
         if !ctx.limiter.allow_send(&self.head.id, ctx.now) {
             return Ok(ItemResult::Limited);
         }
+        // One client cannot hold the whole cap: its bytes come from one bucket for all its
+        // queues, whether this ct is new to the queue or renews one it holds.
+        if !ctx
+            .limiter
+            .allow_send_bytes(ctx.client, self.ct.len(), ctx.now)
+        {
+            return Ok(ItemResult::Limited);
+        }
         if !self
             .head
             .signed_by(&keys.sender_pub, &Signed::Send { ct: &self.ct })

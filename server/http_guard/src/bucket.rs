@@ -45,6 +45,11 @@ impl<K: Hash + Eq> Buckets<K> {
 
     /// Takes one token from `key`'s bucket; `false` if it is empty.
     pub fn take(&mut self, key: K, now_ms: u64) -> bool {
+        self.take_n(key, 1, now_ms)
+    }
+
+    /// Takes `n` tokens from `key`'s bucket, or none; `false` if it holds fewer.
+    pub fn take_n(&mut self, key: K, n: u64, now_ms: u64) -> bool {
         self.sweep(now_ms);
         let (unit, rate, capacity) = (self.unit, self.rate, self.capacity);
         let b = self.map.entry(key).or_insert(Bucket {
@@ -53,8 +58,9 @@ impl<K: Hash + Eq> Buckets<K> {
         });
         b.units = refilled(b, now_ms, rate, capacity);
         b.at_ms = b.at_ms.max(now_ms);
-        if b.units >= unit {
-            b.units -= unit;
+        let cost = n.saturating_mul(unit);
+        if b.units >= cost {
+            b.units -= cost;
             true
         } else {
             false
@@ -109,6 +115,20 @@ mod tests {
         assert!(b.take(0u8, 3_601_000));
         assert!(b.take(0u8, 3_601_000));
         assert!(!b.take(0u8, 3_601_000));
+    }
+
+    #[test]
+    fn take_n_takes_all_or_nothing() {
+        let mut b = Buckets::per_hour(3_600, 10);
+        assert!(b.take_n(0u8, 7, 0));
+        assert!(!b.take_n(0u8, 4, 0));
+        assert!(b.take_n(0u8, 3, 0));
+        assert!(!b.take(0u8, 0));
+        // One token a second: four seconds pay for four.
+        assert!(!b.take_n(0u8, 4, 3_999));
+        assert!(b.take_n(0u8, 4, 4_000));
+        assert!(!b.take_n(0u8, 11, 3_600_000));
+        assert!(b.take_n(0u8, 10, 3_600_000));
     }
 
     #[test]

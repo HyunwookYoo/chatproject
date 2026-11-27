@@ -988,6 +988,56 @@ async fn delete_rate_limit_per_client() {
     assert_eq!(status, StatusCode::OK);
 }
 
+/// Final review I2: one client's `SEND`s may store 32 MiB at once and 4 MiB an hour after
+/// that, in any number of its queues, so filling the 2 GiB cap takes many clients. Past it the
+/// client's items are `limited`; another client is served, and the bucket refills.
+#[tokio::test]
+async fn send_bytes_per_client() {
+    let s = start(unlimited_sends());
+    let queues: Vec<Q> = (0..3).map(Q::new).collect();
+    let now = s.now();
+    s.post(
+        CommandName::Create,
+        queues.iter().map(|q| q.create(now)).collect(),
+    )
+    .await;
+    let a = Some("203.0.113.5");
+    // 512 entries of 64 KiB: 32 MiB, over 2 queues (256 each).
+    let items: Vec<SendItem> = (0..512u32)
+        .map(|n| {
+            let mut ct = vec![0x5a; MAX_CT];
+            ct[..4].copy_from_slice(&n.to_be_bytes());
+            queues[n as usize / 256].send(&ct, now)
+        })
+        .collect();
+    for chunk in items.chunks(8) {
+        let results = s.post_from(a, CommandName::Send, chunk.to_vec()).await;
+        assert!(results.iter().all(|r| *r == ItemResult::Ok));
+    }
+    let one_more = |s: &Server, ct: &[u8]| queues[2].send(ct, s.now());
+    assert_eq!(
+        one(s.post_from(a, CommandName::Send, vec![one_more(&s, b"over")]).await),
+        ItemResult::Limited
+    );
+    assert_eq!(
+        one(s
+            .post_from(Some("203.0.113.6"), CommandName::Send, vec![one_more(&s, b"other")])
+            .await),
+        ItemResult::Ok
+    );
+    // 4 MiB an hour is 64 KiB in 56.25 s.
+    s.set_now(now + 56_250);
+    let full = one_more(&s, &vec![0x5b; MAX_CT]);
+    assert_eq!(
+        one(s.post_from(a, CommandName::Send, vec![full.clone()]).await),
+        ItemResult::Ok
+    );
+    assert_eq!(
+        one(s.post_from(a, CommandName::Send, vec![one_more(&s, b"again")]).await),
+        ItemResult::Limited
+    );
+}
+
 #[tokio::test]
 async fn recv_answer_fits_max_body_and_the_rest_is_limited() {
     let s = start(unlimited_sends());
