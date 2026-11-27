@@ -650,6 +650,134 @@ async fn text_on_a_replaced_duplicate_session_still_arrives() {
     a.execute(NetworkOp::Stop).await.unwrap();
     raw.close().await;
 }
+/// A raw peer whose id is larger than `a`'s, with two sessions to `a`: `kept`, which `a`
+/// dialed and keeps, and `refused`, which the peer dialed back and `a` refuses.
+struct RefusedPair {
+    raw: iroh::Endpoint,
+    kept: iroh::endpoint::Connection,
+    kept_send: iroh::endpoint::SendStream,
+    refused: iroh::endpoint::Connection,
+    refused_send: iroh::endpoint::SendStream,
+    _recvs: [iroh::endpoint::RecvStream; 2],
+}
+async fn refused_pair(a: &NetworkHandle, ai: &NetworkInfo) -> RefusedPair {
+    use chat_core::transport::frame::{ALPN, MAGIC};
+    let aid = ai
+        .endpoint_id
+        .clone()
+        .unwrap()
+        .parse::<iroh::EndpointId>()
+        .unwrap();
+    // The peer's id is the larger, so the session `a` dials is the one both keep.
+    let raw = loop {
+        let raw = raw_endpoint(ALPN).await;
+        if raw.id() > aid {
+            break raw;
+        }
+        raw.close().await;
+    };
+    let a_dials = async {
+        a.execute(NetworkOp::Connect {
+            target: raw_ticket(&raw),
+        })
+        .await
+        .unwrap()
+    };
+    let raw_accepts = async {
+        let conn = raw.accept().await.unwrap().await.unwrap();
+        let mut send = conn.open_uni().await.unwrap();
+        send.write_all(MAGIC).await.unwrap();
+        let mut recv = conn.accept_uni().await.unwrap();
+        recv.read_exact(&mut [0; 4]).await.unwrap();
+        (conn, send, recv)
+    };
+    let (_, (kept, kept_send, kept_recv)) = tokio::join!(a_dials, raw_accepts);
+    let target = ai
+        .ticket
+        .clone()
+        .unwrap()
+        .parse::<iroh_tickets::endpoint::EndpointTicket>()
+        .unwrap();
+    let refused = raw
+        .connect(target.endpoint_addr().clone(), ALPN)
+        .await
+        .unwrap();
+    let mut refused_send = refused.open_uni().await.unwrap();
+    refused_send.write_all(MAGIC).await.unwrap();
+    let mut refused_recv = refused.accept_uni().await.unwrap();
+    refused_recv.read_exact(&mut [0; 4]).await.unwrap();
+    RefusedPair {
+        raw,
+        kept,
+        kept_send,
+        refused,
+        refused_send,
+        _recvs: [kept_recv, refused_recv],
+    }
+}
+/// The other key order: `a` already holds the session it should keep, so it refuses the
+/// peer's dial. The peer took that dial as its current session, so a text on it still arrives.
+#[tokio::test]
+async fn text_on_a_refused_duplicate_session_still_arrives() {
+    use chat_core::transport::frame::write_text;
+    let (a, mut ar, _) = network();
+    let ai = online(&a).await;
+    let mut pair = refused_pair(&a, &ai).await;
+    write_text(&mut pair.refused_send, "거절된 연결").await.unwrap();
+    received(&mut ar, "거절된 연결").await;
+    // The refused session closes after its grace; `a` keeps its own dial (it has a connect time).
+    tokio::time::timeout(Duration::from_secs(8), pair.refused.closed())
+        .await
+        .unwrap();
+    let peer = info(&a).await.peers.remove(0);
+    assert_eq!(peer.phase, PeerPhase::Connected);
+    assert!(peer.connect_ms.is_some());
+    assert!(pair.kept.close_reason().is_none());
+    write_text(&mut pair.kept_send, "유지").await.unwrap();
+    received(&mut ar, "유지").await;
+    a.execute(NetworkOp::Stop).await.unwrap();
+    pair.raw.close().await;
+}
+/// Disconnect ends a retired session at once: a text written on it afterwards is dropped.
+#[tokio::test]
+async fn disconnect_drops_text_on_a_retired_session() {
+    use chat_core::transport::frame::{ALPN, MAGIC, write_text};
+    let (a, mut ar, _) = network();
+    let ai = online(&a).await;
+    let mut pair = refused_pair(&a, &ai).await;
+    let rid = pair.raw.id().to_string();
+    write_text(&mut pair.refused_send, "끊기 전").await.unwrap();
+    received(&mut ar, "끊기 전").await;
+    a.execute(NetworkOp::Disconnect {
+        peer_id: rid.clone(),
+    })
+    .await
+    .unwrap();
+    let _ = write_text(&mut pair.refused_send, "끊은 뒤").await;
+    tokio::time::timeout(Duration::from_secs(1), pair.refused.closed())
+        .await
+        .unwrap();
+    // A fresh session's text is the next one published, so "끊은 뒤" never was.
+    let target = ai
+        .ticket
+        .unwrap()
+        .parse::<iroh_tickets::endpoint::EndpointTicket>()
+        .unwrap();
+    let fresh = pair
+        .raw
+        .connect(target.endpoint_addr().clone(), ALPN)
+        .await
+        .unwrap();
+    let mut fresh_send = fresh.open_uni().await.unwrap();
+    fresh_send.write_all(MAGIC).await.unwrap();
+    let mut fresh_recv = fresh.accept_uni().await.unwrap();
+    fresh_recv.read_exact(&mut [0; 4]).await.unwrap();
+    wait_connected(&a, &rid).await;
+    write_text(&mut fresh_send, "새 연결").await.unwrap();
+    received(&mut ar, "새 연결").await;
+    a.execute(NetworkOp::Stop).await.unwrap();
+    pair.raw.close().await;
+}
 #[tokio::test]
 async fn incoming_preparation_is_bounded_and_stop_joins_idle_readers() {
     let (a, _, _) = network();
