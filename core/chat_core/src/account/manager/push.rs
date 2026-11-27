@@ -61,7 +61,7 @@ use crate::message::{
     types::{ConversationId, MessageId, MessageKey},
 };
 use crate::mls::{
-    group::MAX_MLS_MESSAGE_BYTES,
+    group::{CLASS_NO_GROUP, MAX_MLS_MESSAGE_BYTES},
     push_ct::{PushCtError, restore_group_id},
     wire::MlsReply,
 };
@@ -1735,6 +1735,21 @@ async fn end_network_use(shared: &super::Shared) {
     }
 }
 
+/// What a routing frame's (`PushHandle`, `QueueRef`) delivery attempt's answer means for its
+/// queued row: a Commit's (`delivery_outcome`), except that a recipient without the group yet is
+/// tried again. Unlike a text, the frame goes with no `Welcome` ahead of it, and the group's own
+/// delivery may not have brought one yet (E2E m8: a slow phone); dropped, it would be lost until
+/// the next frame, a queue's 7 days on.
+fn routing_outcome(result: &Result<MlsReply, ErrorCode>) -> Delivery {
+    match result {
+        Ok(MlsReply::DecryptFailed {
+            class: CLASS_NO_GROUP,
+            ..
+        }) => Delivery::Retry,
+        result => super::mls::delivery_outcome(result),
+    }
+}
+
 /// Sends one queued frame (a kind 17 `App`) and reports how it ended.
 fn push_launch(
     session: Session,
@@ -1743,7 +1758,7 @@ fn push_launch(
     ticket: u64,
 ) {
     tokio::spawn(async move {
-        let outcome = super::mls::delivery_outcome(&super::mls::exchange(&session, &row.wire).await);
+        let outcome = routing_outcome(&super::mls::exchange(&session, &row.wire).await);
         let _ = mailbox
             .send(Input::Push(PushEvent::Delivered {
                 ticket,
