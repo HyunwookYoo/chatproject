@@ -589,6 +589,67 @@ async fn lone_connection_from_larger_id_is_kept() {
     b.execute(NetworkOp::Stop).await.unwrap();
 }
 
+/// Two sessions to one peer: the one the smaller id dialed replaces the other. A text the
+/// peer writes on the replaced session before it switched too still arrives.
+#[tokio::test]
+async fn text_on_a_replaced_duplicate_session_still_arrives() {
+    use chat_core::transport::frame::{ALPN, MAGIC, write_text};
+    let (a, mut ar, _) = network();
+    let ai = online(&a).await;
+    let aid = ai.endpoint_id.clone().unwrap();
+    // The peer's id is the smaller, so the session it dials is the one both keep.
+    let raw = loop {
+        let raw = raw_endpoint(ALPN).await;
+        if raw.id().to_string() < aid {
+            break raw;
+        }
+        raw.close().await;
+    };
+    let rid = raw.id().to_string();
+    let a_dials = async {
+        a.execute(NetworkOp::Connect { target: raw_ticket(&raw) }).await.unwrap()
+    };
+    let raw_accepts = async {
+        let conn = raw.accept().await.unwrap().await.unwrap();
+        let mut send = conn.open_uni().await.unwrap();
+        send.write_all(MAGIC).await.unwrap();
+        let mut recv = conn.accept_uni().await.unwrap();
+        recv.read_exact(&mut [0; 4]).await.unwrap();
+        (conn, send, recv)
+    };
+    let (_, (old, mut old_send, _old_recv)) = tokio::join!(a_dials, raw_accepts);
+    assert!(info(&a).await.peers[0].connect_ms.is_some());
+    let target = ai
+        .ticket
+        .unwrap()
+        .parse::<iroh_tickets::endpoint::EndpointTicket>()
+        .unwrap();
+    let new = raw.connect(target.endpoint_addr().clone(), ALPN).await.unwrap();
+    let mut new_send = new.open_uni().await.unwrap();
+    new_send.write_all(MAGIC).await.unwrap();
+    let mut new_recv = new.accept_uni().await.unwrap();
+    new_recv.read_exact(&mut [0; 4]).await.unwrap();
+    // a switched: its session to the peer is the incoming one now (no connect time).
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while info(&a).await.peers.iter().any(|p| p.peer_id == rid && p.connect_ms.is_some()) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    // The peer has not switched yet: it still writes on the old session.
+    let _ = write_text(&mut old_send, "교체 직전").await;
+    received(&mut ar, "교체 직전").await;
+    write_text(&mut new_send, "교체 후").await.unwrap();
+    received(&mut ar, "교체 후").await;
+    // The retired session closes after its grace; the kept one stays up.
+    tokio::time::timeout(Duration::from_secs(8), old.closed()).await.unwrap();
+    assert_eq!(info(&a).await.peers[0].phase, PeerPhase::Connected);
+    write_text(&mut new_send, "유지").await.unwrap();
+    received(&mut ar, "유지").await;
+    a.execute(NetworkOp::Stop).await.unwrap();
+    raw.close().await;
+}
 #[tokio::test]
 async fn incoming_preparation_is_bounded_and_stop_joins_idle_readers() {
     let (a, _, _) = network();
