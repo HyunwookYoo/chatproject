@@ -141,8 +141,8 @@ pub(crate) struct Runtime {
     server: Option<Server>,
     /// A run's requests are on their way.
     running: bool,
-    /// Run at the next poll: what it reads changed (address, mode, device list), or a run asked
-    /// for another.
+    /// Run at the next poll: what it reads changed (address, mode, device list, a conversation
+    /// got its group), or a run asked for another.
     due: bool,
     /// The verdict the last run planned for.
     planned: Option<Verdict>,
@@ -353,7 +353,7 @@ impl Manager {
         self.shared.queue.url()
     }
 
-    /// What the queue reads changed (the mode): the next poll runs it.
+    /// What the queue reads changed (the mode, a conversation's group): the next poll runs it.
     pub(super) fn queue_changed(&mut self) {
         self.messages.queue.due = true;
     }

@@ -15,8 +15,9 @@
 //!   confirming each created queue and sealing its `QueueRef`. The frames ride `push_delivery`
 //!   (kind 2), sent by the push handles' delivery loop.
 //! * It runs when what it reads changes: the queue address, the verdict, the mode, a device
-//!   list; when a timer is due (rotation, deletion); hourly for new conversations; and after a
-//!   failed request, with the M4 back-off (1 s doubling to 5 min). Never two at once.
+//!   list, a conversation that got its group (created or joined); when a timer is due
+//!   (rotation, deletion); hourly; and after a failed request, with the M4 back-off (1 s
+//!   doubling to 5 min). Never two at once.
 //! * A queue whose `QueueRef` cannot be sealed, an item the server refused (`limited`, `bad`),
 //!   a request it refused (`QueueError::refused`), or answers that could not be stored wait for
 //!   the hourly check: a lasting fault costs the server one `CREATE` item an hour for each

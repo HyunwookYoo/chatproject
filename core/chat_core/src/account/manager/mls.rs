@@ -1348,6 +1348,8 @@ impl Manager {
         mls.wanted.remove(&conversation);
         mls.rejoins.remove(&conversation);
         mls.sync.insert(conversation, (peer, 0));
+        // A conversation with a group gets its queue at the next poll (spec 6.3).
+        self.queue_changed();
         // Rows that backed off while waiting for the group become due at this time.
         let now = self.schedule_now();
         let _ = self
