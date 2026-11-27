@@ -206,6 +206,36 @@ void main() {
       await fixture.close();
     }
   });
+  // Run 45843490338: the deadline came before any server read, so the facts
+  // said `unknown` for a server that held no queue.
+  test('no queue made notes what the server holds now', () async {
+    final fixture = QueueFixture()..fault = 'no_queue';
+    await fixture.start();
+    failureFacts.clear();
+    try {
+      await expectLater(
+        run(fixture, timeout: const Duration(seconds: 1)),
+        throwsA(
+          isA<ScenarioDeadline>().having(
+            (e) => e.message,
+            'text',
+            'Queue scenario deadline: using_queue',
+          ),
+        ),
+      );
+      expect(failureFacts, {
+        'm8_network_phone': 'Online',
+        'm8_network_other': 'Online',
+        'm8_network_node': 'Online',
+        'm8_server_queues': 'q0',
+        'm8_server_entries': 'e0',
+      });
+      expect(safeFacts(failureFacts, loadSafeFacts()), failureFacts);
+    } finally {
+      failureFacts.clear();
+      await fixture.close();
+    }
+  });
   for (final (fault, code) in [
     ('delivered_early', 'Queue scenario: sent_not_delivered'),
     ('duplicate', 'Queue scenario: phone_once'),
@@ -280,6 +310,7 @@ class QueueFixture {
   bool get judged => mailbox && seeded && online['other']!;
 
   Future<QueueServerCounts> server() async {
+    if (fault == 'no_queue') return QueueServerCounts(0, []);
     final entries = [for (final q in queue.values) q.length]
       ..sort((a, b) => b.compareTo(a));
     if (fault == 'deleted_early' && judged) entries.removeLast();
@@ -434,7 +465,7 @@ class QueueFixture {
         return {
           'mode': 'auto',
           'has_mailbox': has,
-          'using_queue': !has,
+          'using_queue': !has && fault != 'no_queue',
           'uptime_7d_permille': name == 'other' && seeded ? 950 : 0,
         };
       case 'queue_local_test_counts':
