@@ -282,6 +282,61 @@ async fn queue_ref_ahead_of_the_welcome_is_sent_again() {
     );
 }
 
+/// The same race on my own devices: A2 makes the group and its queue while its `Welcome` for
+/// A1 waits, and A1 reads A2's log (where the `QueueRef` is) before it has joined, so it cannot
+/// open the frame there. A2 sends the `QueueRef` to A1 as it does to a peer, again once A1 has
+/// joined, so A1 keeps A2's queue.
+#[tokio::test]
+async fn own_queue_ref_ahead_of_the_welcome_is_sent_again() {
+    let (ra, rb) = (week_record(A, &[A1, A2]), week_record(B, &[B1]));
+    let net = backend(&[(A, ra.clone()), (B, rb.clone())]);
+    let _server = queue_server(&net);
+    let a1 = device(A, A1, &ra, &net).await;
+    let a2 = device(A, A2, &ra, &net).await;
+    let b1 = device(B, B1, &rb, &net).await;
+    for f in [&a1, &a2, &b1] {
+        configure(f, QUEUE_URL);
+    }
+    link(&a1, &a2).await;
+    link(&a1, &b1).await;
+    link(&a2, &b1).await;
+    for x in [&a1, &a2] {
+        befriend(x, &b1).await;
+    }
+    befriend(&b1, &a1).await;
+    for x in [&a1, &a2] {
+        x.account.connect_account(b1.peer).await.unwrap();
+    }
+    let conv = conversation(&b1, &a1).await;
+    conversation(&a1, &b1).await;
+    conversation(&a2, &b1).await;
+    a2.account.mailbox_sync_now().await.unwrap();
+    settle!(
+        [&a1, &a2, &b1],
+        own_session(&a1, &a2).await && own_session(&a2, &a1).await
+    );
+    quiet(&[&a1, &a2, &b1]).await;
+
+    // A2's `Welcome`s wait; its queue is made and its `QueueRef` sealed (and logged) meanwhile.
+    a2.account.mls_test_hold_delivery(true).await.unwrap();
+    ensure(&a2, b1.peer).await;
+    settle!(
+        [&a1, &a2, &b1],
+        active(&a2).await.first().is_some_and(|q| q.server_confirmed)
+    );
+    a1.account.mailbox_sync_now().await.unwrap();
+    settle!([&a1, &a2, &b1], caught_up(&a1, &a2).await);
+    assert_eq!(state(&a1, conv).await.group_epoch, None);
+
+    a2.account.mls_test_hold_delivery(false).await.unwrap();
+    settle!([&a1, &a2, &b1], agreed(&a1, &a2, conv).await);
+    settle!(
+        [&a1, &a2, &b1],
+        peer_queue(&a1, conv, &a2).await.flatten().is_some()
+            && queue_ref_deliveries_to(&a2, &a1).await == 0
+    );
+}
+
 /// The job converges: run again (the mode set again, and after a restart) it adds no queue,
 /// no `CREATE` or `DELETE` and no frame.
 #[tokio::test]
