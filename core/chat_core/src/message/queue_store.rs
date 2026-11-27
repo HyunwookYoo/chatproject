@@ -218,13 +218,10 @@ pub(crate) enum QueueDbReply {
         withdrawn: u32,
         written: Vec<QueueId>,
     },
-    /// `QueueRef`s sealed, and created `Active` queues whose `QueueRef` could not be sealed yet
-    /// (no group, no known device of the peer, or a fault in its conversation): they stay
-    /// unconfirmed for a later run.
-    Settled {
-        announced: u32,
-        unsealed: u32,
-    },
+    /// `QueueRef`s sealed. A created `Active` queue whose `QueueRef` could not be sealed yet (no
+    /// group, no known device of the peer, or a fault in its conversation) stays unconfirmed
+    /// for a later run.
+    Settled { announced: u32 },
     Fetchable {
         mode: QueueMode,
         queues: Vec<Fetchable>,
@@ -314,14 +311,12 @@ pub(super) fn queue_op(
                 },
                 devices: &devices,
             };
-            let (mut announced, mut unsealed) = (0, 0);
+            let mut announced = 0;
             for id in created {
-                match alone(c, fault, |tx| confirm(tx, &seal, id, &server_url)) {
-                    Ok(None) => {}
-                    Ok(Some(true)) => announced += 1,
-                    // It stays unconfirmed, created and sealed again by a later run; the other
-                    // queues are confirmed meanwhile.
-                    Ok(Some(false)) | Err(_) => unsealed += 1,
+                // Not sealed (`Some(false)`, or a failure): it stays unconfirmed, created and
+                // sealed again by a later run; the other queues are confirmed meanwhile.
+                if let Ok(Some(true)) = alone(c, fault, |tx| confirm(tx, &seal, id, &server_url)) {
+                    announced += 1;
                 }
             }
             // Plain deletes, no seal: one transaction, and its failure is the op's. Skipping one
@@ -342,10 +337,7 @@ pub(super) fn queue_op(
                 .map_err(sql)?;
             }
             finish(tx, fault)?;
-            QueueDbReply::Settled {
-                announced,
-                unsealed,
-            }
+            QueueDbReply::Settled { announced }
         }
         QueueDbOp::Fetchable => QueueDbReply::Fetchable {
             mode: mode(c)?,

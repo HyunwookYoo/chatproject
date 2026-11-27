@@ -76,7 +76,7 @@ pub struct QueueStateView {
     pub verdict: Verdict,
     /// Whether this device uses a server queue: it has an `Active` queue the server took, or
     /// one it still fetches while the server has yet to take its replacement (the table of
-    /// spec 5.3 says what is wanted; `manager/queue.rs` makes it so). Also published as
+    /// spec 5.3 says what is wanted; `manager/queue/` makes it so). Also published as
     /// `ConnectionSnapshot::using_queue`.
     pub using_queue: bool,
     /// Time up as a mailbox within the last 7 days, per mille of them.

@@ -645,7 +645,7 @@ async fn newer_queue_ref_frame_wins_and_tombstone_stays() {
 
 /// Plan "성능": a device turning on makes every conversation's queue with one `CREATE`
 /// request (up to `MAX_ITEMS` items; 100 conversations is `create_batches_100_conversations_in_
-/// one_request` in `manager/queue.rs`).
+/// one_request` in `manager/queue/reconcile.rs`).
 #[tokio::test]
 async fn create_batches_every_conversation_in_one_request() {
     const C: u8 = 3;

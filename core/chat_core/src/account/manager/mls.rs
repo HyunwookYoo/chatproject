@@ -301,7 +301,7 @@ pub(super) enum Via {
     Push,
     /// An entry of one of this device's server queues (M8 spec 6.4), from the device it names
     /// (`queue::QueueEntry`, a hint the frame's own checks bind): nobody waits for an answer,
-    /// and a text it stores is notified when the fetch ends (`manager/queue.rs`).
+    /// and a text it stores is notified when the fetch ends (`manager/queue/fetch.rs`).
     Queue,
 }
 

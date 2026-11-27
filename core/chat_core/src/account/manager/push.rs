@@ -19,7 +19,7 @@
 //!   session, one frame per recipient at a time, a recipient without one dialed at most every
 //!   `DIAL_RETRY_MS`, back-off 1 s doubling to 5 min. A mailbox handoff (M6 spec 7) carries the
 //!   queue too; its `Delivered` note empties the rows of that frame. The `QueueRef` frames of
-//!   this device's server queues (M8, `manager/queue.rs`) are rows of their own kind in the same
+//!   this device's server queues (M8, `manager/queue/`) are rows of their own kind in the same
 //!   table, sent, acknowledged and handed off the same way.
 //! * Push off: every conversation that had a handle gets a withdrawal (an empty handle), the
 //!   token and handles are dropped, and no proxy request is made until push is on again.

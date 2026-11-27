@@ -952,7 +952,7 @@ impl Manager {
     }
 
     /// The verdict as last worked out (`None`: not yet since it last had to be worked out
-    /// again), for the queues (`manager/queue.rs`) to follow.
+    /// again), for the queues (`manager/queue/`) to follow.
     pub(super) fn mailbox_verdict(&self) -> Option<Verdict> {
         self.messages.mailbox.verdict
     }

@@ -373,7 +373,7 @@ impl Manager {
                 now: self.schedule_now(),
             };
             match self.queue_db(op, request).await {
-                Ok(QueueDbReply::Settled { announced, .. }) => {
+                Ok(QueueDbReply::Settled { announced }) => {
                     if announced > 0 {
                         self.push_deliver_soon();
                     }
