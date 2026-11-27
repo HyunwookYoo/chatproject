@@ -569,6 +569,50 @@ async fn welcome_to_member_without_session_dials_it() {
     assert!(sent_to(&b1, ia2, "welcome").await >= 1);
 }
 
+/// e2e m6 (run 46037571545): B1 made the group with A1 alone, A1 added A2, and A1 went off
+/// before A2's Welcome left it (A1 cannot reach A2 here). B1's next text reaches A2 anyway:
+/// A2 asks B1 for the group it has no Welcome for, instead of waiting for A1.
+#[tokio::test]
+async fn a_member_whose_welcome_is_stuck_on_an_off_device_gets_the_text() {
+    let (a1, a2, b1, _net, conv) = three_with(&[B1], false).await;
+    let (ia1, ia2) = (installation(&a1).await, installation(&a2).await);
+    let key_package = a2
+        .account
+        .storage_test_fixture()
+        .messages()
+        .await
+        .unwrap()
+        .mls_key_package()
+        .await
+        .unwrap();
+    let epoch = a1
+        .account
+        .storage_test_fixture()
+        .messages()
+        .await
+        .unwrap()
+        .mls_commit(conv, b1.peer, vec![key_package], vec![], NOW * 1000)
+        .await
+        .unwrap()
+        .expect("an own Commit");
+    settle!(
+        [&a1, &b1],
+        state(&b1, conv).await.group_epoch == Some(epoch)
+    );
+    assert!(state(&b1, conv).await.members.contains(&ia2));
+    let welcome = |(to, kind, _): &(_, u8, u64)| *to == ia2 && *kind == 2;
+    assert!(state(&a1, conv).await.deliveries.iter().any(welcome));
+    drop(a1);
+    b1.account.mls_test_close_session(ia1).await.unwrap();
+    a2.account.connect_account(b1.peer).await.unwrap();
+    let sent = send(&b1, &a2, 1, "to the device added last").await;
+    settle!(
+        [&a2, &b1],
+        message(&a2, sent.key).await.is_some()
+            && delivery(&b1, sent.key).await == DeliveryState::Delivered
+    );
+}
+
 /// A1 revoked A2 and still has a delivery queued for it: A2 is never dialed. A delivery queued
 /// for B's device B2 (in B's record, never online) is, so the dialing itself runs.
 #[tokio::test]
