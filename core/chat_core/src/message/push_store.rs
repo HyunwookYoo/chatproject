@@ -255,6 +255,13 @@ pub(crate) enum PushDbOp {
         outcome: Delivery,
         now: u64,
     },
+    /// `recipient` has the conversation's group now (its `Welcome` was acknowledged): its frames
+    /// there are due at `now` (scheduler time), the back-off started over. Replies `Count`.
+    Joined {
+        conversation: ConversationId,
+        recipient: InstallationId,
+        now: u64,
+    },
     /// The queued frames of both kinds for a mailbox (M6 spec 7), one per conversation and
     /// frame; marked handed off.
     HandOff,
@@ -462,6 +469,11 @@ pub(super) fn push_op(
             now,
             fault,
         )?),
+        PushDbOp::Joined {
+            conversation,
+            recipient,
+            now,
+        } => PushDbReply::Count(joined(c, conversation, recipient, now, fault)?),
         PushDbOp::HandOff => PushDbReply::Handoff(hand_off(c, fault)?),
         PushDbOp::Prune { own, peers } => {
             prune(c, &own, &peers, fault)?;
@@ -928,6 +940,30 @@ fn delivered(
             }
         }
     };
+    finish(tx, fault)?;
+    Ok(changed as u64)
+}
+
+/// A "no group" answer before the join grew the row's wait (`delivered`, up to 5 min); the
+/// recipient has the group now, so nothing is gained by waiting it out. Returns the rows changed.
+fn joined(
+    c: &mut Connection,
+    conversation: ConversationId,
+    recipient: InstallationId,
+    now: u64,
+    fault: Fault,
+) -> R<u64> {
+    let tx = c.transaction().map_err(sql)?;
+    let changed = tx
+        .execute(
+            "UPDATE push_delivery SET attempts=0,next_retry_at_ms=min(next_retry_at_ms,?3) WHERE conversation=?1 AND recipient_install=?2 AND kind IN (1,2)",
+            params![
+                conversation.0.as_slice(),
+                recipient.0.as_slice(),
+                integer(now)?
+            ],
+        )
+        .map_err(sql)?;
     finish(tx, fault)?;
     Ok(changed as u64)
 }

@@ -282,6 +282,62 @@ async fn queue_ref_ahead_of_the_welcome_is_sent_again() {
     );
 }
 
+/// How often `f` has tried its `QueueRef` at `to` without a result that ends the row.
+async fn queue_ref_tries(f: &Fixture, to: &Fixture) -> u64 {
+    let to = installation(to).await;
+    push_state(f)
+        .await
+        .deliveries
+        .iter()
+        .find(|d| d.kind == 2 && d.recipient == to)
+        .map_or(0, |d| d.attempts)
+}
+
+/// Post-final review m4: while A1 has no group, each "no group" answer doubles B1's wait before
+/// it tries the `QueueRef` again, up to 5 minutes. A1 joining (B1's `Welcome` acknowledged)
+/// makes it go at once, so a slow join does not add the grown wait on top (E2E m8 gives step 1
+/// 60 s).
+#[tokio::test]
+async fn queue_ref_goes_once_its_recipient_joins_not_after_the_back_off() {
+    let (ra, rb) = (week_record(A, &[A1]), week_record(B, &[B1]));
+    let net = backend(&[(A, ra.clone()), (B, rb.clone())]);
+    let _server = queue_server(&net);
+    let a1 = device(A, A1, &ra, &net).await;
+    let b1 = device(B, B1, &rb, &net).await;
+    configure(&a1, QUEUE_URL);
+    configure(&b1, QUEUE_URL);
+    link(&a1, &b1).await;
+    befriend(&a1, &b1).await;
+    befriend(&b1, &a1).await;
+    a1.account.connect_account(b1.peer).await.unwrap();
+    let conv = conversation(&b1, &a1).await;
+    conversation(&a1, &b1).await;
+    quiet(&[&a1, &b1]).await;
+
+    b1.account.mls_test_hold_delivery(true).await.unwrap();
+    ensure(&b1, a1.peer).await;
+    // Eight "no group" answers: 1 + 2 + ... + 64 s, and the next try 128 s after the last.
+    settle!([&a1, &b1], queue_ref_tries(&b1, &a1).await >= 8);
+    assert_eq!(state(&a1, conv).await.group_epoch, None);
+
+    b1.account.mls_test_hold_delivery(false).await.unwrap();
+    for _ in 0..20 {
+        if peer_queue(&a1, conv, &b1).await.flatten().is_some() {
+            break;
+        }
+        for d in [&a1, &b1] {
+            d.clock.advance_monotonic_ms(1_000);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        peer_queue(&a1, conv, &b1).await.flatten().is_some(),
+        "A1 holds no queue of B1's 20 s after the Welcome was let go (A1 at epoch {:?}, {} tries)",
+        state(&a1, conv).await.group_epoch,
+        queue_ref_tries(&b1, &a1).await
+    );
+}
+
 /// The same race on my own devices: A2 makes the group and its queue while its `Welcome` for
 /// A1 waits, and A1 reads A2's log (where the `QueueRef` is) before it has joined, so it cannot
 /// open the frame there. A2 sends the `QueueRef` to A1 as it does to a peer, again once A1 has

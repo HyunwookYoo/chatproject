@@ -26,7 +26,7 @@ use crate::account::{
     connection::{Input, Session},
 };
 use crate::message::mls_group::{
-    Committed, Delivery, DueDelivery, GroupOp, GroupReply, Outcome, OwnWelcome,
+    Committed, DELIVER_WELCOME, Delivery, DueDelivery, GroupOp, GroupReply, Outcome, OwnWelcome,
 };
 use crate::message::store::{MessageDbOp, MessageDbReply, OpenFrom, conversation_id};
 use crate::message::types::{BlockReason, ConversationId, MessageKey};
@@ -792,15 +792,42 @@ impl Manager {
         request: Request,
     ) -> Result<(), CoreError> {
         for (delivery, outcome) in deliveries {
-            let now = self.schedule_now();
-            let op = GroupOp::Delivered {
-                recipient: delivery.recipient,
-                kind: delivery.kind,
-                epoch: delivery.epoch,
+            self.delivery_done(
+                delivery.conversation,
+                delivery.recipient,
+                delivery.kind,
+                delivery.epoch,
                 outcome,
-                now,
-            };
-            self.group_db(delivery.conversation, op, request).await?;
+                request,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Records how a queued Commit or Welcome ended. An acknowledged `Welcome` means the
+    /// recipient has the group now: the routing frames it could not open before go at once.
+    async fn delivery_done(
+        &mut self,
+        conversation: ConversationId,
+        recipient: InstallationId,
+        kind: u8,
+        epoch: u64,
+        outcome: Delivery,
+        request: Request,
+    ) -> Result<(), CoreError> {
+        let joined = kind == DELIVER_WELCOME && matches!(outcome, Delivery::Acked);
+        let now = self.schedule_now();
+        let op = GroupOp::Delivered {
+            recipient,
+            kind,
+            epoch,
+            outcome,
+            now,
+        };
+        self.group_db(conversation, op, request).await?;
+        if joined {
+            self.push_joined(conversation, recipient, request).await?;
         }
         Ok(())
     }
@@ -2228,15 +2255,8 @@ impl Manager {
                 epoch,
             } => {
                 let outcome = delivery_outcome(&result);
-                let now = self.schedule_now();
-                let op = GroupOp::Delivered {
-                    recipient,
-                    kind,
-                    epoch,
-                    outcome,
-                    now,
-                };
-                self.group_db(conversation, op, request).await.map(|_| ())
+                self.delivery_done(conversation, recipient, kind, epoch, outcome, request)
+                    .await
             }
             Task::Lookup { .. } | Task::Dial => Ok(()),
         }

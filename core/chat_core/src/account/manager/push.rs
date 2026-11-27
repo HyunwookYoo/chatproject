@@ -522,6 +522,25 @@ impl Manager {
 
     /// New frames were queued in `push_delivery` (the queues' `QueueRef`s): read at the next
     /// poll.
+    /// `recipient` joined the conversation's group: its routing frames there go now, not after
+    /// the back-off its "no group" answers grew (`routing_outcome`).
+    pub(super) async fn push_joined(
+        &mut self,
+        conversation: ConversationId,
+        recipient: InstallationId,
+        request: Request,
+    ) -> Result<(), CoreError> {
+        let op = PushDbOp::Joined {
+            conversation,
+            recipient,
+            now: self.schedule_now(),
+        };
+        if let PushDbReply::Count(1..) = self.push_db(op, request).await? {
+            self.push_deliver_soon();
+        }
+        Ok(())
+    }
+
     pub(super) fn push_deliver_soon(&mut self) {
         self.messages.push.delivery_at = None;
         // Devices no session reaches get them in their queues (M8 spec 8).
