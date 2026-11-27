@@ -117,6 +117,16 @@ The push proxy's site, with `/q/*` routed here. `/etc/caddy/Caddyfile`, with
 `push.example.com` pointing at the server and ports 80 and 443 open:
 
 ```caddy
+{
+	servers {
+		timeouts {
+			# A request, body included, must arrive within 30 s of its start. The apps give a
+			# whole request 10 s, so this cuts only uploads no app would finish, and it bounds
+			# how long a held /q/* body stays in Caddy's memory.
+			read_body 30s
+		}
+	}
+}
 push.example.com {
 	handle /q/* {
 		# 1 MiB is a full legal request (queue_wire::MAX_BODY), with room to spare: a smaller
@@ -146,6 +156,33 @@ server, so slow uploads cannot hold the server's 128 connections. Caddy replaces
 `QUEUE_TRUST_PROXY=1` relies on; keep `QUEUE_LISTEN` on `127.0.0.1` so nothing
 reaches the server around Caddy. Leave Caddy's access log off: it would record
 client IPs.
+
+`read_body` is a global option, so it covers the push routes too. Their
+requests are small, and every app request ends at 10 s on the client side, so
+30 s cuts nothing an app would finish. A full 1 MiB `SEND` still passes at
+about 280 kbit/s of uplink. Without it a client that stops before the last
+byte of its body holds up to 1152 KiB of Caddy's memory for as long as it
+keeps the connection open.
+
+Caddy gets a memory bound of its own, as the queue server has, in
+`/etc/systemd/system/caddy.service.d/memory.conf`:
+
+```ini
+[Service]
+# Caddy holds each /q/* upload until its body ends (up to 1152 KiB for up to 30 s, see the
+# Caddyfile). Past this bound only Caddy is killed, and systemd starts it again.
+MemoryMax=256M
+MemorySwapMax=0
+Restart=on-failure
+RestartSec=2
+```
+
+Within 30 s a client can still make Caddy hold as many 1152 KiB bodies as its
+bandwidth carries. Past 256 MiB the kernel kills Caddy alone, not the queue
+server, the push proxy or sshd, and systemd starts it again in 2 s. Each such
+kill drops every open connection, push included, so an attack that keeps it up
+stops both services for its length. It cannot take the data or the rest of the
+VM.
 
 The apps take the site's address at build time, without `/q`, which the core
 adds: `CHATPROJECT_QUEUE_URL=https://push.example.com`. Release builds use only

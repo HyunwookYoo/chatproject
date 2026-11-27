@@ -140,6 +140,16 @@ MemoryDenyWriteExecute=true
 [Install]
 WantedBy=multi-user.target
 EOF
+install -d -m 0755 /etc/systemd/system/caddy.service.d
+cat > /etc/systemd/system/caddy.service.d/memory.conf <<'EOF'
+[Service]
+# Caddy holds each /q/* upload until its body ends (up to 1152 KiB for up to 30 s, see the
+# Caddyfile). Past this bound only Caddy is killed, and systemd starts it again.
+MemoryMax=256M
+MemorySwapMax=0
+Restart=on-failure
+RestartSec=2
+EOF
 systemctl daemon-reload
 for unit in push_proxy queue_server; do
   systemctl enable "$unit" >/dev/null
@@ -150,6 +160,16 @@ echo "== Caddy: validate the new Caddyfile, then replace the old one"
 new=$(mktemp /etc/caddy/Caddyfile.XXXXXX)
 chmod 0644 "$new"
 cat > "$new" <<EOF
+{
+	servers {
+		timeouts {
+			# A request, body included, must arrive within 30 s of its start. The apps give a
+			# whole request 10 s, so this cuts only uploads no app would finish, and it bounds
+			# how long a held /q/* body stays in Caddy's memory.
+			read_body 30s
+		}
+	}
+}
 $DOMAIN {
 	handle /q/* {
 		# 1 MiB is a full legal request (queue_wire::MAX_BODY), with room to spare: a smaller
