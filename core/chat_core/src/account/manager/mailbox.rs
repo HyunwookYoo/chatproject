@@ -1151,10 +1151,12 @@ impl Manager {
         // M7: a text handed over before its first attempt had a result is pushed now; the
         // mailbox never pushes (spec 6.1).
         self.push_handed_off(&entries, request).await;
-        // M7: the queued `PushHandle` frames go along (one per conversation and frame).
+        // M7: the queued `PushHandle` frames go along (one per conversation and frame), and
+        // M8 `QueueRef`s, but not those only my own devices still wait for.
+        let own = self.current_installations(self.local()?.keys.peer_id());
         if let MessageDbReply::Push(crate::message::push_store::PushDbReply::Handoff(push)) = self
             .message_db(
-                MessageDbOp::Push(crate::message::push_store::PushDbOp::HandOff),
+                MessageDbOp::Push(crate::message::push_store::PushDbOp::HandOff { own }),
                 request,
             )
             .await?

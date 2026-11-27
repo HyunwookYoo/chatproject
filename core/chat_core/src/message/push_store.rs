@@ -263,8 +263,9 @@ pub(crate) enum PushDbOp {
         now: u64,
     },
     /// The queued frames of both kinds for a mailbox (M6 spec 7), one per conversation and
-    /// frame; marked handed off.
-    HandOff,
+    /// frame; marked handed off. Only frames queued for a device of the peer account: a mailbox
+    /// delivers to that account alone, so a row of one of my devices (`own`) is no reason.
+    HandOff { own: Vec<InstallationId> },
     /// Drops what revoked or unlisted devices announced and what is queued for them: `own` are
     /// this account's other current devices, `peers` each known account's current ones.
     Prune {
@@ -474,7 +475,7 @@ pub(super) fn push_op(
             recipient,
             now,
         } => PushDbReply::Count(joined(c, conversation, recipient, now, fault)?),
-        PushDbOp::HandOff => PushDbReply::Handoff(hand_off(c, fault)?),
+        PushDbOp::HandOff { own } => PushDbReply::Handoff(hand_off(c, &own, fault)?),
         PushDbOp::Prune { own, peers } => {
             prune(c, &own, &peers, fault)?;
             // A state not sealed for want of a known device may be sealed now.
@@ -1009,21 +1010,26 @@ fn due(c: &Connection, now: u64, recipients: &[InstallationId]) -> R<PushDbReply
 /// A queued frame as `hand_off` reads it: conversation, peer account, msg_id, frame.
 type QueuedFrame = ([u8; 32], [u8; 32], [u8; 16], Vec<u8>);
 
-fn hand_off(c: &mut Connection, fault: Fault) -> R<Vec<HandoffEntry>> {
+fn hand_off(c: &mut Connection, own: &[InstallationId], fault: Fault) -> R<Vec<HandoffEntry>> {
     let tx = c.transaction().map_err(sql)?;
+    let mine = vec!["?"; own.len()].join(",");
+    let own: Vec<&[u8]> = own.iter().map(|i| i.0.as_slice()).collect();
     let rows: Vec<QueuedFrame> = {
         let mut q = tx
-            .prepare("SELECT d.conversation,v.peer,d.msg_id,min(d.wire) FROM push_delivery d JOIN conversation v ON v.id=d.conversation WHERE d.kind IN (1,2) GROUP BY d.conversation,d.msg_id ORDER BY d.conversation,d.msg_id")
+            .prepare(&format!("SELECT d.conversation,v.peer,d.msg_id,min(d.wire) FROM push_delivery d JOIN conversation v ON v.id=d.conversation WHERE d.kind IN (1,2) AND d.recipient_install NOT IN ({mine}) GROUP BY d.conversation,d.msg_id ORDER BY d.conversation,d.msg_id"))
             .map_err(sql)?;
-        q.query_map([], |r| {
+        q.query_map(rusqlite::params_from_iter(&own), |r| {
             Ok((bytes(r, 0)?, bytes(r, 1)?, bytes(r, 2)?, r.get(3)?))
         })
         .map_err(sql)?
         .collect::<Result<_, _>>()
         .map_err(sql)?
     };
-    tx.execute("UPDATE push_delivery SET handed_off=1 WHERE kind IN (1,2) AND handed_off=0", [])
-        .map_err(sql)?;
+    tx.execute(
+        &format!("UPDATE push_delivery SET handed_off=1 WHERE kind IN (1,2) AND handed_off=0 AND recipient_install NOT IN ({mine})"),
+        rusqlite::params_from_iter(&own),
+    )
+    .map_err(sql)?;
     finish(tx, fault)?;
     // The row holds the complete kind 17 `App` frame; the mailbox gets its ciphertext.
     Ok(rows
@@ -1539,6 +1545,55 @@ mod tests {
             .unwrap()
             .map(Result::unwrap)
             .collect()
+    }
+
+    /// Post-final review m6: a frame left queued for my other device alone is not handed to a
+    /// mailbox, which delivers to the peer account only (it was handed over again at every
+    /// background, for up to 7 days). A frame also queued for a peer device goes once, and only
+    /// the peer's row is marked.
+    #[test]
+    fn hand_off_takes_only_frames_queued_for_the_peer() {
+        use super::super::mls_store::NO_FAULT;
+        let (mut c, conv, id, peer, [_, mine]) = queued_for_both();
+        let wire = |conversation| {
+            MlsFrame::App {
+                conversation,
+                ciphertext: vec![7; 8],
+            }
+            .encode()
+            .to_vec()
+        };
+        c.execute("UPDATE push_delivery SET wire=?1,handed_off=0", params![wire(conv)])
+            .unwrap();
+        // Another conversation (one per peer), whose frame waits for my device alone.
+        let (mine_only, other) = (ConversationId([5; 32]), MessageId([6; 16]));
+        c.execute(
+            "INSERT INTO conversation VALUES(?1,?2,0,zeroblob(32),0,0)",
+            params![mine_only.0.as_slice(), [8u8; 32].as_slice()],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO push_delivery VALUES(?1,?2,2,?3,?4,0,0,0)",
+            params![
+                mine_only.0.as_slice(),
+                mine.0.as_slice(),
+                other.0.as_slice(),
+                wire(mine_only)
+            ],
+        )
+        .unwrap();
+
+        let handed = hand_off(&mut c, &[mine], NO_FAULT).unwrap();
+        let handed: Vec<_> = handed.iter().map(|e| (e.conversation, e.peer, e.msg_id)).collect();
+        assert_eq!(handed, [(conv, peer, id)]);
+        let marked: Vec<([u8; 32], bool)> = c
+            .prepare("SELECT recipient_install,handed_off FROM push_delivery ORDER BY conversation,recipient_install")
+            .unwrap()
+            .query_map([], |r| Ok((bytes::<32>(r, 0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(marked, [([2; 32], true), (mine.0, false), (mine.0, false)]);
     }
 
     /// The mailbox delivered the frame to the peer account: its rows go, mine stays.
