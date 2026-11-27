@@ -39,6 +39,9 @@ pub struct Limits {
     /// the same size. Over it: 429 before the body is read.
     pub recv_per_minute: u32,
     pub recv_burst: u32,
+    /// `DELETE` requests per client. Over it: 429 before the body is read.
+    pub delete_per_minute: u32,
+    pub delete_burst: u32,
     /// The database file's used bytes. A `SEND` that would pass it is `limited`.
     pub max_bytes: u64,
     /// From the request head being read to the response. Over it: 408.
@@ -57,6 +60,8 @@ impl Default for Limits {
             send_burst: 20,
             recv_per_minute: 120,
             recv_burst: 120,
+            delete_per_minute: 10,
+            delete_burst: 10,
             max_bytes: DEFAULT_MAX_BYTES,
             request_timeout: Duration::from_secs(10),
         }
@@ -68,6 +73,7 @@ pub(crate) struct Limiter {
     sends: Mutex<Buckets<QueueId>>,
     recvs: Mutex<Buckets<IpAddr>>,
     acks: Mutex<Buckets<IpAddr>>,
+    deletes: Mutex<Buckets<IpAddr>>,
 }
 
 impl Limiter {
@@ -80,6 +86,7 @@ impl Limiter {
             sends: Mutex::new(Buckets::new(limits.send_per_minute, limits.send_burst)),
             recvs: Mutex::new(Buckets::new(limits.recv_per_minute, limits.recv_burst)),
             acks: Mutex::new(Buckets::new(limits.recv_per_minute, limits.recv_burst)),
+            deletes: Mutex::new(Buckets::new(limits.delete_per_minute, limits.delete_burst)),
         }
     }
 
@@ -97,6 +104,10 @@ impl Limiter {
 
     pub(crate) fn allow_ack(&self, ip: IpAddr, now_ms: u64) -> bool {
         take(&self.acks, client_key(ip), now_ms)
+    }
+
+    pub(crate) fn allow_delete(&self, ip: IpAddr, now_ms: u64) -> bool {
+        take(&self.deletes, client_key(ip), now_ms)
     }
 }
 

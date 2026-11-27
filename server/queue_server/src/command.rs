@@ -234,6 +234,10 @@ impl Command for Delete {
     const NAME: CommandName = CommandName::Delete;
     type Item = DeleteItem;
 
+    fn admit(limiter: &Limiter, client: IpAddr, now: u64) -> bool {
+        limiter.allow_delete(client, now)
+    }
+
     fn decode(item: DeleteItem, now: u64) -> Option<Self> {
         Some(Delete {
             head: Head::decode(&item.queue_id, item.ts, &item.sig, now)?,

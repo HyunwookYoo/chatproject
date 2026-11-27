@@ -939,6 +939,55 @@ async fn recv_rate_limit_per_client() {
     assert_eq!(status, StatusCode::OK);
 }
 
+/// Final review I1: anyone can hold a queue id by creating a queue, so `DELETE` gets a
+/// per-client request bucket taken before the body is read, as `RECV` and `ACK` have. Past its
+/// burst a client's batches of forged signatures get 429 and cost the store worker no verify;
+/// another client is served, and the queue is still there.
+#[tokio::test]
+async fn delete_rate_limit_per_client() {
+    let s = start(Limits::default());
+    let q = Q::new(1);
+    s.create(&q).await;
+    let a = Some("203.0.113.5");
+    let forged = |s: &Server| {
+        let mut item = q.delete(s.now());
+        item.sig = q.sig(&q.sender, &Signed::Delete, s.now());
+        serde_json::to_vec(&QueueRequest {
+            items: vec![item; MAX_ITEMS],
+        })
+        .unwrap()
+    };
+    for _ in 0..10 {
+        let (status, body) = s.call_from(a, "/q/delete", forged(&s)).await;
+        assert_eq!(status, StatusCode::OK);
+        let resp: QueueResponse = serde_json::from_slice(&body).unwrap();
+        assert!(resp.results.iter().all(|r| *r == ItemResult::Bad));
+    }
+    let (status, _) = s.call_from(a, "/q/delete", forged(&s)).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    let (status, _) = s.call_from(a, "/q/delete", b"not json".to_vec()).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+
+    // The other commands and other clients keep their own buckets; 10 a minute refills one
+    // per 6 s.
+    assert_eq!(
+        one(s
+            .post_from(a, CommandName::Send, vec![q.send(b"still here", s.now())])
+            .await),
+        ItemResult::Ok
+    );
+    assert_eq!(
+        one(s
+            .post_from(Some("203.0.113.6"), CommandName::Delete, vec![q.delete(s.now())])
+            .await),
+        ItemResult::Ok
+    );
+    assert_eq!(s.rows("queue"), 0);
+    s.set_now(T0 + 6_000);
+    let (status, _) = s.call_from(a, "/q/delete", forged(&s)).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
 #[tokio::test]
 async fn recv_answer_fits_max_body_and_the_rest_is_limited() {
     let s = start(unlimited_sends());
