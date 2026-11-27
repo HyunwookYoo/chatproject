@@ -244,6 +244,44 @@ async fn group_made_after_configure_gets_its_queue_at_once() {
     }
 }
 
+/// E2E m8 (run 45998761905): B1 makes the group and its queue, and its `QueueRef` reaches A1
+/// before the `Welcome` does (a slow phone). A1 has no group to open it with yet and says so;
+/// B1 sends it again once A1 has joined instead of dropping it, so A1 keeps B1's queue.
+#[tokio::test]
+async fn queue_ref_ahead_of_the_welcome_is_sent_again() {
+    let (ra, rb) = (week_record(A, &[A1]), week_record(B, &[B1]));
+    let net = backend(&[(A, ra.clone()), (B, rb.clone())]);
+    let _server = queue_server(&net);
+    let a1 = device(A, A1, &ra, &net).await;
+    let b1 = device(B, B1, &rb, &net).await;
+    configure(&a1, QUEUE_URL);
+    configure(&b1, QUEUE_URL);
+    link(&a1, &b1).await;
+    befriend(&a1, &b1).await;
+    befriend(&b1, &a1).await;
+    a1.account.connect_account(b1.peer).await.unwrap();
+    let conv = conversation(&b1, &a1).await;
+    conversation(&a1, &b1).await;
+    quiet(&[&a1, &b1]).await;
+
+    // B1's `Welcome` waits; its queue is made and its `QueueRef` tried at A1 meanwhile.
+    b1.account.mls_test_hold_delivery(true).await.unwrap();
+    ensure(&b1, a1.peer).await;
+    settle!(
+        [&a1, &b1],
+        active(&b1).await.first().is_some_and(|q| q.server_confirmed)
+    );
+    quiet(&[&a1, &b1]).await;
+    assert_eq!(state(&a1, conv).await.group_epoch, None);
+
+    b1.account.mls_test_hold_delivery(false).await.unwrap();
+    settle!(
+        [&a1, &b1],
+        peer_queue(&a1, conv, &b1).await.flatten().is_some()
+            && queue_ref_deliveries_to(&b1, &a1).await == 0
+    );
+}
+
 /// The job converges: run again (the mode set again, and after a restart) it adds no queue,
 /// no `CREATE` or `DELETE` and no frame.
 #[tokio::test]
