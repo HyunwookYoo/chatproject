@@ -135,25 +135,23 @@ impl Command for Send {
         if !ctx.limiter.allow_send(&self.head.id, ctx.now) {
             return Ok(ItemResult::Limited);
         }
-        // One client cannot hold the whole cap: its bytes come from one bucket for all its
-        // queues, whether this ct is new to the queue or renews one it holds.
-        if !ctx
-            .limiter
-            .allow_send_bytes(ctx.client, self.ct.len(), ctx.now)
-        {
-            return Ok(ItemResult::Limited);
-        }
         if !self
             .head
             .signed_by(&keys.sender_pub, &Signed::Send { ct: &self.ct })
         {
             return Ok(ItemResult::Bad);
         }
+        // One client cannot hold the whole cap: the bytes the store keeps, new or renewed,
+        // come from one bucket for all its queues. What it does not keep costs nothing.
+        let budget = || {
+            ctx.limiter
+                .allow_send_bytes(ctx.client, self.ct.len(), ctx.now)
+        };
         Ok(
-            match tx.send(&self.head.id, &self.ct, ctx.now, ctx.max_bytes)? {
+            match tx.send(&self.head.id, &self.ct, ctx.now, ctx.max_bytes, budget)? {
                 Sent::Ok => ItemResult::Ok,
                 Sent::Full => ItemResult::Full,
-                Sent::OverCap => ItemResult::Limited,
+                Sent::OverCap | Sent::OverBudget => ItemResult::Limited,
             },
         )
     }

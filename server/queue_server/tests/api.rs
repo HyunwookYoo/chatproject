@@ -1038,6 +1038,90 @@ async fn send_bytes_per_client() {
     );
 }
 
+/// `count` distinct 64 KiB ciphertexts, numbered from `from`.
+fn big_cts(from: u32, count: u32) -> Vec<Vec<u8>> {
+    (from..from + count)
+        .map(|n| {
+            let mut ct = vec![0x6b; MAX_CT];
+            ct[..4].copy_from_slice(&n.to_be_bytes());
+            ct
+        })
+        .collect()
+}
+
+/// Post-final review I2: the byte budget pays for bytes the server keeps. A client whose
+/// outbox retries texts into a full queue (each answered `full`, nothing stored) still has its
+/// budget for its other queues.
+#[tokio::test]
+async fn retries_into_a_full_queue_do_not_spend_the_byte_budget() {
+    let s = start(unlimited_sends());
+    let (full, other) = (Q::new(1), Q::new(2));
+    let now = s.now();
+    s.post(
+        CommandName::Create,
+        vec![full.create(now), other.create(now)],
+    )
+    .await;
+    let a = Some("203.0.113.5");
+    let fill: Vec<SendItem> = (0..MAX_UNACKED as u32)
+        .map(|i| full.send(&i.to_be_bytes(), now))
+        .collect();
+    for chunk in fill.chunks(MAX_ITEMS) {
+        let results = s.post_from(a, CommandName::Send, chunk.to_vec()).await;
+        assert!(results.iter().all(|r| *r == ItemResult::Ok));
+    }
+    // 600 × 64 KiB is past the 32 MiB burst, had the full answers paid for it.
+    for chunk in big_cts(0, 600).chunks(8) {
+        let items = chunk.iter().map(|ct| full.send(ct, now)).collect();
+        let results = s.post_from(a, CommandName::Send, items).await;
+        assert!(
+            results.iter().all(|r| *r == ItemResult::Full),
+            "{results:?}"
+        );
+    }
+    let ct = &big_cts(1_000, 1)[0];
+    assert_eq!(
+        one(s
+            .post_from(a, CommandName::Send, vec![other.send(ct, now)])
+            .await),
+        ItemResult::Ok
+    );
+}
+
+/// The same for an entry acked within the last 20 minutes: a repeat is `ok` and stores
+/// nothing, so it costs nothing.
+#[tokio::test]
+async fn repeats_of_an_acked_entry_do_not_spend_the_byte_budget() {
+    let s = start(unlimited_sends());
+    let (q, other) = (Q::new(1), Q::new(2));
+    let now = s.now();
+    s.post(CommandName::Create, vec![q.create(now), other.create(now)])
+        .await;
+    let a = Some("203.0.113.5");
+    let ct = &big_cts(0, 1)[0];
+    let send = |q: &Q, ct: &[u8]| q.send(ct, now);
+    assert_eq!(
+        one(s.post_from(a, CommandName::Send, vec![send(&q, ct)]).await),
+        ItemResult::Ok
+    );
+    let seq = s.entries(&q, 0).await[0].seq;
+    assert_eq!(s.ack(&q, seq).await, ItemResult::Ok);
+    for _ in 0..75 {
+        let results = s
+            .post_from(a, CommandName::Send, vec![send(&q, ct); 8])
+            .await;
+        assert!(results.iter().all(|r| *r == ItemResult::Ok), "{results:?}");
+    }
+    assert_eq!(s.rows("entry"), 0);
+    let fresh = &big_cts(1, 1)[0];
+    assert_eq!(
+        one(s
+            .post_from(a, CommandName::Send, vec![send(&other, fresh)])
+            .await),
+        ItemResult::Ok
+    );
+}
+
 #[tokio::test]
 async fn recv_answer_fits_max_body_and_the_rest_is_limited() {
     let s = start(unlimited_sends());

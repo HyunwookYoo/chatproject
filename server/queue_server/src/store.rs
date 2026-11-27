@@ -53,6 +53,7 @@ const NEXT_SEQ: &str = "UPDATE queue SET last_used_ms = max(?2, last_used_ms + 1
 /// it in again because its own copy of the hold ran out.
 const RENEW_ENTRY: &str =
     "UPDATE entry SET received_ms = max(received_ms, ?3) WHERE queue_id = ?1 AND ct_hash = ?2";
+const HAS_ENTRY: &str = "SELECT 1 FROM entry WHERE queue_id = ?1 AND ct_hash = ?2";
 const HAS_ACKED: &str =
     "SELECT 1 FROM acked WHERE queue_id = ?1 AND ct_hash = ?2 AND drop_at_ms > ?3";
 const COUNT_ENTRIES: &str = "SELECT count(*) FROM entry WHERE queue_id = ?1";
@@ -236,6 +237,8 @@ pub(crate) enum Sent {
     Full,
     /// The file is at its size cap.
     OverCap,
+    /// The bytes it would keep are over the sender's budget.
+    OverBudget,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
@@ -315,42 +318,57 @@ impl Tx<'_> {
     /// only rises: `max(now, last_used_ms + 1)`, kept as the new
     /// `last_used_ms`. Since `last_used_ms` never falls, a drained queue or a
     /// clock stepping back still gives a seq above every one handed out.
+    /// `budget` is asked only when bytes are kept (a new entry, or a held one renewed), so a
+    /// `full` queue, a recently acked `ct` or the cap costs it nothing.
     pub(crate) fn send(
         &self,
         id: &QueueId,
         ct: &[u8],
         now: u64,
         max_bytes: u64,
+        budget: impl FnOnce() -> bool,
     ) -> rusqlite::Result<Sent> {
         let hash: [u8; 32] = Sha256::digest(ct).into();
-        let stored = self
-            .0
-            .prepare_cached(RENEW_ENTRY)?
-            .execute(params![id, hash, int(now)])?
-            > 0;
         let acked = self
             .0
             .prepare_cached(HAS_ACKED)?
             .exists(params![id, hash, int(now)])?;
-        if stored || acked {
+        if acked {
             self.touch(id, now)?;
             return Ok(Sent::Ok);
         }
-        let count: i64 = self
+        let held = self
             .0
-            .prepare_cached(COUNT_ENTRIES)?
-            .query_row([id], |r| r.get(0))?;
-        if uint(count) >= MAX_UNACKED as u64 {
-            self.touch(id, now)?;
-            return Ok(Sent::Full);
+            .prepare_cached(HAS_ENTRY)?
+            .exists(params![id, hash])?;
+        if !held {
+            let count: i64 = self
+                .0
+                .prepare_cached(COUNT_ENTRIES)?
+                .query_row([id], |r| r.get(0))?;
+            if uint(count) >= MAX_UNACKED as u64 {
+                self.touch(id, now)?;
+                return Ok(Sent::Full);
+            }
+            let used: i64 = self
+                .0
+                .prepare_cached(USED_BYTES)?
+                .query_row([], |r| r.get(0))?;
+            if uint(used).saturating_add(ct.len() as u64) > max_bytes {
+                self.touch(id, now)?;
+                return Ok(Sent::OverCap);
+            }
         }
-        let used: i64 = self
-            .0
-            .prepare_cached(USED_BYTES)?
-            .query_row([], |r| r.get(0))?;
-        if uint(used).saturating_add(ct.len() as u64) > max_bytes {
+        if !budget() {
             self.touch(id, now)?;
-            return Ok(Sent::OverCap);
+            return Ok(Sent::OverBudget);
+        }
+        if held {
+            self.0
+                .prepare_cached(RENEW_ENTRY)?
+                .execute(params![id, hash, int(now)])?;
+            self.touch(id, now)?;
+            return Ok(Sent::Ok);
         }
         let seq: i64 = self
             .0

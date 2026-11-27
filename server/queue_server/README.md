@@ -183,8 +183,12 @@ range or a bad signature is `bad`; the other items still run.
   32 MiB, per client over all its queues (spec 9.4: one client cannot fill the
   2 GiB cap). `RECV` and `ACK` 120 requests a minute per client, each; `DELETE`
   10 a minute, burst 10. Buckets are in memory and start full after a restart.
-  A `CREATE` or `SEND` item takes its tokens before its signature is checked,
-  so a badly signed item spends them and one over the limit costs no verify.
+  A `CREATE` item and a `SEND` item's per-queue token are taken before the
+  signature is checked, so a badly signed item spends them and one over the
+  limit costs no verify. The `SEND` bytes are taken only for a well-signed item
+  the server keeps (a new entry, or a held one renewed): an item answered
+  `full`, one acked in the last 20 minutes or one over the size cap costs no
+  bytes.
 - At most 128 open connections; one more is closed at once. That bounds the
   server's memory to about 221 MiB of held 1 MiB uploads.
 - Every hour (and at start): entries older than 24 hours, acked hashes past
