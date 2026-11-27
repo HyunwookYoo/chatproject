@@ -152,7 +152,16 @@ chmod 0644 "$new"
 cat > "$new" <<EOF
 $DOMAIN {
 	handle /q/* {
-		reverse_proxy 127.0.0.1:8788
+		# 1 MiB is a full legal request (queue_wire::MAX_BODY), with room to spare: a smaller
+		# bound would refuse a full SEND with 413.
+		request_body {
+			max_size 1152KiB
+		}
+		# The whole body is read here before the queue server is asked, so a slow upload holds
+		# a Caddy connection, not one of the server's 128.
+		reverse_proxy 127.0.0.1:8788 {
+			request_buffers 1152KiB
+		}
 	}
 	handle {
 		reverse_proxy 127.0.0.1:8787
@@ -164,8 +173,20 @@ if ! caddy validate --config "$new" --adapter caddyfile; then
   echo "new Caddyfile invalid: /etc/caddy/Caddyfile and the running Caddy are unchanged"
   exit 1
 fi
+old=$(mktemp /etc/caddy/Caddyfile.old.XXXXXX)
+if [ -f /etc/caddy/Caddyfile ]; then cp -p /etc/caddy/Caddyfile "$old"; else rm -f "$old"; fi
 mv "$new" /etc/caddy/Caddyfile
-systemctl reload-or-restart caddy
+if ! systemctl reload-or-restart caddy; then
+  if [ -f "$old" ]; then
+    mv "$old" /etc/caddy/Caddyfile
+    systemctl reload-or-restart caddy || true
+    echo "Caddy did not take the new Caddyfile: the old one is back (journalctl -u caddy)"
+  else
+    echo "Caddy did not start with the new Caddyfile (journalctl -u caddy)"
+  fi
+  exit 1
+fi
+rm -f "$old"
 
 echo "== check: each service active for 5 s"
 down=""

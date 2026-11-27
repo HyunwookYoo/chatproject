@@ -119,7 +119,16 @@ The push proxy's site, with `/q/*` routed here. `/etc/caddy/Caddyfile`, with
 ```caddy
 push.example.com {
 	handle /q/* {
-		reverse_proxy 127.0.0.1:8788
+		# 1 MiB is a full legal request (queue_wire::MAX_BODY), with room to spare: a smaller
+		# bound would refuse a full SEND with 413.
+		request_body {
+			max_size 1152KiB
+		}
+		# The whole body is read here before the queue server is asked, so a slow upload holds
+		# a Caddy connection, not one of the server's 128.
+		reverse_proxy 127.0.0.1:8788 {
+			request_buffers 1152KiB
+		}
 	}
 	handle {
 		reverse_proxy 127.0.0.1:8787
@@ -128,7 +137,11 @@ push.example.com {
 ```
 
 The paths keep their `/q/` prefix (`handle`, not `handle_path`): the server
-routes `/q/create` and the rest as they are. Caddy replaces any client-sent
+routes `/q/create` and the rest as they are. The body bound is at least
+`MAX_BODY` (1 MiB; write `MiB`, not `MB`): the core takes any 4xx but 408 and
+429 as a site with no queue server and quiets its queue jobs for an hour.
+`request_buffers` makes Caddy read the whole body before it connects to the
+server, so slow uploads cannot hold the server's 128 connections. Caddy replaces any client-sent
 `X-Forwarded-For` with the peer address it saw, which is what
 `QUEUE_TRUST_PROXY=1` relies on; keep `QUEUE_LISTEN` on `127.0.0.1` so nothing
 reaches the server around Caddy. Leave Caddy's access log off: it would record
@@ -148,7 +161,7 @@ that address, over `https://`; debug builds also take `--queue-url <url>`.
 | Command | Signed by | Results |
 |---|---|---|
 | `CREATE` | recipient | `ok` (new, or the same keys again), `exists` (other keys), `limited` |
-| `SEND` | sender | `ok` (stored, or already stored or acked in the last 20 minutes), `gone`, `full` (256 unacked), `limited` (rate or size cap) |
+| `SEND` | sender | `ok` (stored, or already stored or acked in the last 20 minutes), `gone`, `full` (256 unacked), `limited` (rate, client bytes or size cap) |
 | `RECV` | recipient | `entries` after `since_seq`, `gone`, `limited` (this answer is full: ask again) |
 | `ACK` | recipient | `ok`, `gone` |
 | `DELETE` | recipient | `ok` (also when the queue is already gone) |
@@ -161,15 +174,17 @@ range or a bad signature is `bad`; the other items still run.
 - A `RECV` answer is at most `MAX_BODY` (1 MiB). A queue that got entries may
   have more; one that got `limited` got none this time.
 - Request errors: 400 (not JSON, over 100 items), 413 (body over 1 MiB), 429
-  (`RECV`/`ACK` rate), 408 (request over 10 s), 500 (store failure).
+  (`RECV`/`ACK`/`DELETE` rate), 408 (request over 10 s), 500 (store failure).
 
 ## Limits and expiry
 
 - `CREATE` 500 an hour, burst 200, per client (an IPv4 address or an IPv6 /64).
-  `SEND` 60 a minute, burst 20, per queue. `RECV` and `ACK` 120 requests a
-  minute per client, each. Buckets are in memory and start full after a restart.
-  A `CREATE` or `SEND` item takes its token before its signature is checked,
-  so a badly signed item spends a token and one over the limit costs no verify.
+  `SEND` 60 a minute, burst 20, per queue, and 4 MiB of `ct` an hour, burst
+  32 MiB, per client over all its queues (spec 9.4: one client cannot fill the
+  2 GiB cap). `RECV` and `ACK` 120 requests a minute per client, each; `DELETE`
+  10 a minute, burst 10. Buckets are in memory and start full after a restart.
+  A `CREATE` or `SEND` item takes its tokens before its signature is checked,
+  so a badly signed item spends them and one over the limit costs no verify.
 - At most 128 open connections; one more is closed at once. That bounds the
   server's memory to about 221 MiB of held 1 MiB uploads.
 - Every hour (and at start): entries older than 24 hours, acked hashes past
