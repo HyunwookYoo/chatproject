@@ -62,7 +62,13 @@ fn ready_with(f: &Fixture, id: chat_core::account::InstallationId) -> bool {
 
 /// Items of the conversation that alerted (`new_messages > 0`).
 fn alerts(f: &Fixture, conv: ConversationId) -> Vec<NotifyItem> {
+    alerts_after(f, conv, 0)
+}
+
+/// `alerts` among `f`'s notify events after the first `before`.
+fn alerts_after(f: &Fixture, conv: ConversationId, before: usize) -> Vec<NotifyItem> {
     notify_events(f)
+        .split_off(before)
         .into_iter()
         .filter(|i| i.conversation == conv && i.new_messages > 0)
         .collect()
@@ -167,21 +173,21 @@ async fn offline_texts_arrive_once_in_order_after_start() {
     let before = notify_events(&a1).len();
 
     online(&a1).await;
+    // The alert comes at the end of the fetch run, after its `ACK` was answered.
     settle!(
         [&a1],
-        texts_from(&a1, conv, b_peer).await.len() == 2 && held(&server, &queue).await == 0
+        texts_from(&a1, conv, b_peer).await.len() == 2
+            && held(&server, &queue).await == 0
+            && alerts_after(&a1, conv, before).len() == 1
     );
+    quiet(&[&a1]).await;
     let keys: Vec<MessageKey> = texts_from(&a1, conv, b_peer)
         .await
         .into_iter()
         .map(|m| m.key)
         .collect();
     assert_eq!(keys, [k1, k2]);
-    let alerted: Vec<NotifyItem> = notify_events(&a1)
-        .split_off(before)
-        .into_iter()
-        .filter(|i| i.conversation == conv && i.new_messages > 0)
-        .collect();
+    let alerted = alerts_after(&a1, conv, before);
     assert_eq!(alerted.len(), 1);
     assert_eq!(alerted[0].new_messages, 2);
     assert_eq!(server.sent(&a1, CommandName::Ack).len(), 1);
@@ -527,13 +533,16 @@ async fn pages_past_one_answer_and_limited_queue_asked_first() {
     else {
         panic!("{:?}", asked[1].got);
     };
-    let old_now = tables(&a1)
-        .await
-        .own
-        .into_iter()
-        .find(|q| q.queue_id == old.queue_id)
-        .unwrap();
-    assert_eq!(Some(&old_now.last_seq), last.last());
+    // `last_seq` moves once the client hears the `ACK` answer, after the server took it.
+    within!(10, {
+        let old_now = tables(&a1)
+            .await
+            .own
+            .into_iter()
+            .find(|q| q.queue_id == old.queue_id)
+            .unwrap();
+        Some(&old_now.last_seq) == last.last()
+    });
 }
 
 /// The server lost a queue (`gone`): A1 makes a fresh one (a new id, never the old one again)
@@ -616,10 +625,14 @@ async fn epoch_change_then_texts_arrive_from_the_queue() {
     let before = notify_events(&a1).len();
 
     online(&a1).await;
+    // The alert comes at the end of the fetch run, after its `ACK` was answered.
     settle!(
         [&a1],
-        texts_from(&a1, conv, b_peer).await.len() == 2 && held(&server, &queue).await == 0
+        texts_from(&a1, conv, b_peer).await.len() == 2
+            && held(&server, &queue).await == 0
+            && alerts_after(&a1, conv, before).len() == 1
     );
+    quiet(&[&a1]).await;
     assert_eq!(state(&a1, conv).await.group_epoch, Some(epoch));
     let keys: Vec<MessageKey> = texts_from(&a1, conv, b_peer)
         .await
@@ -627,11 +640,7 @@ async fn epoch_change_then_texts_arrive_from_the_queue() {
         .map(|m| m.key)
         .collect();
     assert_eq!(keys, [k1, k2]);
-    let alerted: Vec<NotifyItem> = notify_events(&a1)
-        .split_off(before)
-        .into_iter()
-        .filter(|i| i.conversation == conv && i.new_messages > 0)
-        .collect();
+    let alerted = alerts_after(&a1, conv, before);
     assert_eq!(alerted.len(), 1);
     assert_eq!(alerted[0].new_messages, 2);
 }
