@@ -215,6 +215,35 @@ async fn rotation_keeps_using_queue_until_the_new_one_is_taken() {
     assert!(!a1.account.queue_state().await.unwrap().using_queue);
 }
 
+/// E2E m8 (run 45843490338): the address comes before the conversation has a group, as the
+/// app and `chat_node --queue-url` set it at start, so the job already ran with nothing to do.
+/// The group made (B1 creates it, A1 joins by Welcome), each device makes its queue for it
+/// then, not at the hourly check.
+#[tokio::test]
+async fn group_made_after_configure_gets_its_queue_at_once() {
+    let (ra, rb) = (week_record(A, &[A1]), week_record(B, &[B1]));
+    let net = backend(&[(A, ra.clone()), (B, rb.clone())]);
+    let server = queue_server(&net);
+    let a1 = device(A, A1, &ra, &net).await;
+    let b1 = device(B, B1, &rb, &net).await;
+    configure(&a1, QUEUE_URL);
+    configure(&b1, QUEUE_URL);
+    link(&a1, &b1).await;
+    befriend(&a1, &b1).await;
+    befriend(&b1, &a1).await;
+    a1.account.connect_account(b1.peer).await.unwrap();
+    let conv = conversation(&b1, &a1).await;
+    conversation(&a1, &b1).await;
+    quiet(&[&a1, &b1]).await;
+    assert!(server.queues().is_empty());
+
+    ensure(&b1, a1.peer).await;
+    settle!([&a1, &b1], announced_by(&a1).await && announced_by(&b1).await);
+    for f in [&a1, &b1] {
+        assert_eq!(active(f).await[0].conversation, conv);
+    }
+}
+
 /// The job converges: run again (the mode set again, and after a restart) it adds no queue,
 /// no `CREATE` or `DELETE` and no frame.
 #[tokio::test]
