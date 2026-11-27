@@ -171,6 +171,16 @@ impl FakeQueueServer {
             .collect()
     }
 
+    /// Every byte of the server's database files as they are on disk now, its write-ahead log
+    /// included: what anyone who reads the server's disk sees.
+    fn disk(&self) -> Vec<u8> {
+        let mut bytes = std::fs::read(&self.db).unwrap();
+        if let Ok(wal) = std::fs::read(self.db.with_extension("db-wal")) {
+            bytes.extend(wal);
+        }
+        bytes
+    }
+
     /// The server's own sweep at `now_ms`: what has been held longer than `ENTRY_TTL_MS` goes.
     async fn sweep(&self, now_ms: u64) {
         queue_server::sweep(&self.store, now_ms).await.unwrap();
@@ -560,14 +570,14 @@ async fn announced_with(
 }
 
 /// The queue entry of `wire`, a frame exactly as `from` writes it to a device it reaches
-/// directly, naming `from` as its sender: what Task 10 puts in a queue.
-async fn entry_of(from: &Fixture, wire: Vec<u8>) -> Vec<u8> {
+/// directly, naming `from` as its sender and sealed for `queue`: what `from` puts in it.
+async fn entry_of(from: &Fixture, wire: Vec<u8>, queue: &QueueOwnRow) -> Vec<u8> {
     QueueEntry {
         sender_peer: from.peer,
         sender_install: installation(from).await,
         frame: wire,
     }
-    .encode()
+    .seal(&queue.sender_secret)
 }
 
 /// The frame `from`'s attempts write for its text `key` (its outbox wire), sealed now if no
@@ -585,20 +595,21 @@ async fn sealed_wire(from: &Fixture, key: MessageKey) -> Vec<u8> {
     outbox(from, key).await.wire
 }
 
-/// The queue entry of `from`'s text `key`.
-async fn text_entry(from: &Fixture, key: MessageKey) -> Vec<u8> {
+/// The queue entry of `from`'s text `key`, for `queue`.
+async fn text_entry(from: &Fixture, key: MessageKey, queue: &QueueOwnRow) -> Vec<u8> {
     let wire = sealed_wire(from, key).await;
-    entry_of(from, wire).await
+    entry_of(from, wire, queue).await
 }
 
 /// The queue entry of the Commit (`kind` 1) or Welcome (2) `from` has queued for `to` at
-/// `epoch`: the frame its delivery writes.
+/// `epoch`, for `to`'s `queue`: the frame its delivery writes.
 async fn delivery_entry(
     from: &Fixture,
     conv: ConversationId,
     to: &Fixture,
     kind: u8,
     epoch: u64,
+    queue: &QueueOwnRow,
 ) -> Vec<u8> {
     let wire = from
         .account
@@ -607,5 +618,5 @@ async fn delivery_entry(
         .await
         .unwrap()
         .expect("a queued delivery");
-    entry_of(from, wire).await
+    entry_of(from, wire, queue).await
 }

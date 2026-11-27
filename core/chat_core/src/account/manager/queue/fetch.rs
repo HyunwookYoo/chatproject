@@ -9,8 +9,9 @@
 //!   first); queues the last answer had no room for (`limited`) come first. The run keeps the
 //!   server it began with, so its `ACK`s go where its `RECV`s went.
 //! * An entry is a frame as its sender writes it to a device directly, with that sender named
-//!   (`queue::QueueEntry`), and is taken as that frame is taken directly or from an own
-//!   device's log: an application message opened (from the peer account or another device of
+//!   (`queue::QueueEntry`), sealed with the queue's sender key (one that does not open with it
+//!   never will, and is taken as nothing), and is taken as that frame is taken directly or from
+//!   an own device's log: an application message opened (from the peer account or another device of
 //!   mine), a `Commit` or `Welcome` applied (`Via::Queue`), one transaction each, `processed_ct`
 //!   dropping what came another way. At most `PAGE_MAX_ENTRIES` are taken a turn; the rest at
 //!   the next polls, with nothing downloaded again.
@@ -183,12 +184,16 @@ fn ack_item(queue: &Fetchable, upto_seq: u64, ts: u64) -> AckItem {
     }
 }
 
-/// The kind 17 frame a queue entry holds (`QueueEntry`: the frame as its sender writes it to a
-/// device directly), and the device it names as its sender, if the frame is one of the queue's
-/// `conversation`. Anything else is no frame for it.
-fn entry_frame(entry: &Entry, conversation: ConversationId) -> Option<(Origin, MlsFrame)> {
+/// What a queue entry holds, if it was sealed for the queue whose sender key is `sender_secret`.
+fn open_entry(entry: &Entry, sender_secret: &[u8; 32]) -> Option<QueueEntry> {
     let bytes = queue_wire::decode_ct(&entry.ct).ok()?;
-    let held = QueueEntry::decode(&bytes).ok()?;
+    QueueEntry::open(&bytes, sender_secret).ok()
+}
+
+/// The kind 17 frame an opened entry holds (the frame as its sender writes it to a device
+/// directly), and the device it names as its sender, if the frame is one of the queue's
+/// `conversation`. Anything else is no frame for it.
+fn entry_frame(held: QueueEntry, conversation: ConversationId) -> Option<(Origin, MlsFrame)> {
     let frame = MlsFrame::decode(&auth::payload(&held.frame, 17).ok()?).ok()?;
     let id = match &frame {
         MlsFrame::App { conversation, .. }
@@ -449,11 +454,11 @@ impl Manager {
             else {
                 break;
             };
-            let Some(conversation) = run
+            let Some((conversation, sender_secret)) = run
                 .queues
                 .iter()
                 .find(|q| q.id == id)
-                .map(|q| q.conversation)
+                .map(|q| (q.conversation, q.sender_secret.clone()))
             else {
                 continue;
             };
@@ -464,7 +469,9 @@ impl Manager {
                 continue;
             }
             taken += 1;
-            let took = self.queue_entry(conversation, &entry, request).await;
+            let took = self
+                .queue_entry(conversation, &sender_secret, &entry, request)
+                .await;
             let Some(run) = self.messages.queue.fetch.run.as_mut() else {
                 return;
             };
@@ -524,10 +531,17 @@ impl Manager {
     async fn queue_entry(
         &mut self,
         conversation: ConversationId,
+        sender_secret: &[u8; 32],
         entry: &Entry,
         request: Request,
     ) -> Took {
-        let Some((from, frame)) = entry_frame(entry, conversation) else {
+        // Not sealed for this queue: it never opens, so it holds nothing up.
+        let Some(held) = open_entry(entry, sender_secret) else {
+            #[cfg(all(feature = "test-hooks", debug_assertions))]
+            self.shared.queue.unopened();
+            return Took::Taken;
+        };
+        let Some((from, frame)) = entry_frame(held, conversation) else {
             return Took::Taken;
         };
         let Ok(local) = self.local() else {
@@ -719,8 +733,8 @@ mod tests {
         let queue = Fetchable {
             id: [4; 32],
             conversation: conv(1),
-            peer: PeerId([2; 32]),
             recipient_secret: Zeroizing::new([5; 32]),
+            sender_secret: Zeroizing::new([2; 32]),
             last_seq: 77,
         };
         let sig = |s: &str| -> [u8; 64] {
@@ -750,22 +764,23 @@ mod tests {
     }
 
     /// An entry holds a kind 17 frame of the queue's conversation, as its sender writes it to a
-    /// device, and the sender it names; anything else is no frame.
+    /// device, and the sender it names, sealed with the queue's sender key; anything else is no
+    /// frame.
     #[test]
-    fn an_entry_holds_a_frame_of_its_conversation_or_nothing() {
+    fn an_entry_holds_a_sealed_frame_of_its_conversation_or_nothing() {
+        const SECRET: [u8; 32] = [6; 32];
         let entry = |body: &[u8]| Entry {
             seq: 1,
             ct: b64(body),
             ts: T,
         };
-        let held = |frame: &MlsFrame| {
-            QueueEntry {
-                sender_peer: PeerId([7; 32]),
-                sender_install: InstallationId([8; 32]),
-                frame: frame.encode().to_vec(),
-            }
-            .encode()
+        let held = |frame: Vec<u8>| QueueEntry {
+            sender_peer: PeerId([7; 32]),
+            sender_install: InstallationId([8; 32]),
+            frame,
         };
+        let frame_of =
+            |sealed: &[u8]| entry_frame(open_entry(&entry(sealed), &SECRET).unwrap(), conv(1));
         let app = |conversation| MlsFrame::App {
             conversation,
             ciphertext: vec![9; 40],
@@ -776,27 +791,26 @@ mod tests {
             commit: vec![5; 40],
         };
         for frame in [app(conv(1)), commit] {
-            let (from, got) = entry_frame(&entry(&held(&frame)), conv(1)).unwrap();
+            let (from, got) = frame_of(&held(frame.encode().to_vec()).seal(&SECRET)).unwrap();
             assert!(got == frame);
             assert_eq!((from.peer, from.installation), (PeerId([7; 32]), InstallationId([8; 32])));
         }
-        // Another conversation's, no conversation, the bare inner body, no frame at all.
-        assert!(entry_frame(&entry(&held(&app(conv(2)))), conv(1)).is_none());
-        assert!(entry_frame(&entry(&held(&MlsFrame::KeyPackageRequest)), conv(1)).is_none());
-        let inner = QueueEntry {
-            sender_peer: PeerId([7; 32]),
-            sender_install: InstallationId([8; 32]),
-            frame: app(conv(1)).inner().to_vec(),
-        };
-        assert!(entry_frame(&entry(&inner.encode()), conv(1)).is_none());
-        assert!(entry_frame(&entry(&app(conv(1)).encode()), conv(1)).is_none());
-        assert!(entry_frame(&entry(b"not a frame"), conv(1)).is_none());
+        // Another conversation's, no conversation, the bare inner body: opened, no frame.
+        assert!(frame_of(&held(app(conv(2)).encode().to_vec()).seal(&SECRET)).is_none());
+        let request = held(MlsFrame::KeyPackageRequest.encode().to_vec());
+        assert!(frame_of(&request.seal(&SECRET)).is_none());
+        assert!(frame_of(&held(app(conv(1)).inner().to_vec()).seal(&SECRET)).is_none());
+        // Sealed for another queue, not sealed, not base64: never opens.
+        let other = held(app(conv(1)).encode().to_vec()).seal(&[7; 32]);
+        assert!(open_entry(&entry(&other), &SECRET).is_none());
+        assert!(open_entry(&entry(&app(conv(1)).encode()), &SECRET).is_none());
+        assert!(open_entry(&entry(b"not a frame"), &SECRET).is_none());
         let bad = Entry {
             seq: 1,
             ct: "*".into(),
             ts: T,
         };
-        assert!(entry_frame(&bad, conv(1)).is_none());
+        assert!(open_entry(&bad, &SECRET).is_none());
     }
 
     /// What an `ACK` may cover: every entry up to it taken, none held.

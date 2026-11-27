@@ -56,12 +56,12 @@ fn alerts(f: &Fixture, conv: ConversationId) -> Vec<NotifyItem> {
         .collect()
 }
 
-/// The entries `queue` holds, decoded.
-fn entries_in(server: &FakeQueueServer, queue: QueueId) -> Vec<QueueEntry> {
+/// The entries `queue` holds, opened with its sender key.
+fn entries_in(server: &FakeQueueServer, queue: &QueueOwnRow) -> Vec<QueueEntry> {
     server
-        .stored(queue)
+        .stored(queue.queue_id)
         .iter()
-        .map(|ct| QueueEntry::decode(ct).unwrap())
+        .map(|ct| QueueEntry::open(ct, &queue.sender_secret).unwrap())
         .collect()
 }
 
@@ -142,7 +142,7 @@ async fn unreached_device_with_queue_gets_one_send() {
     let sends = server.sends(&b1);
     assert_eq!(sends.len(), 1);
     assert_eq!(sends[0].queues, [queue.queue_id]);
-    let entries = entries_in(&server, queue.queue_id);
+    let entries = entries_in(&server, &queue);
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].frame, outbox(&b1, key).await.wire);
     assert_eq!(entries[0].sender_peer, b1.peer);
@@ -155,6 +155,31 @@ async fn unreached_device_with_queue_gets_one_send() {
     online(&a1).await;
     settle!([&a1], message(&a1, key).await.is_some());
     assert_eq!(texts_from(&a1, conv, b_peer).await.len(), 1);
+}
+
+/// Spec 2 failure condition 1 (final review C1): the server's disk holds no account id, device
+/// id or conversation id of either side once a text and the routing frames are in a queue.
+#[tokio::test]
+async fn server_disk_holds_no_account_device_or_conversation_id() {
+    let (a1, b1, _net, conv, server) = announced().await;
+    let queue = active(&a1).await.remove(0);
+    off(&a1, &[&b1]).await;
+    send(&b1, &a1, 1, "into the queue").await;
+    settle!([&b1], server.held(queue.queue_id) == 1);
+
+    let disk = server.disk();
+    let named = |id: &[u8; 32]| disk.windows(32).any(|w| w == id);
+    for (what, id) in [
+        ("A account", a1.peer.0),
+        ("B account", b1.peer.0),
+        ("A1 device", installation(&a1).await.0),
+        ("B1 device", installation(&b1).await.0),
+        ("conversation", conv.0),
+    ] {
+        assert!(!named(&id), "the server's disk holds the {what} id");
+    }
+    // What it holds opens with the queue's sender key, which every member has.
+    assert_eq!(entries_in(&server, &queue)[0].sender_peer, b1.peer);
 }
 
 /// Plan Task 10 performance: one text, two devices off: one `SEND` request carrying both.
@@ -246,7 +271,7 @@ async fn expired_queue_copy_is_sent_again_and_stored_once() {
     settle!([&b1], server.sends(&b1).len() == 2);
     quiet(&[&b1]).await;
     assert_eq!(server.sends(&b1).len(), 2);
-    let entries = entries_in(&server, queue.queue_id);
+    let entries = entries_in(&server, &queue);
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].frame, outbox(&b1, key).await.wire);
 
@@ -348,7 +373,7 @@ async fn full_queue_falls_back_to_outbox_retry() {
     quiet(&[&b1]).await;
     assert_eq!(server.sends(&b1).len(), sends);
     assert_eq!(
-        entries_in(&server, queue.queue_id)[0].frame,
+        entries_in(&server, &queue)[0].frame,
         outbox(&b1, key).await.wire
     );
 }
@@ -435,7 +460,7 @@ async fn handed_off_entry_is_queued_by_mailbox() {
     assert_eq!(a1.account.mailbox_background().await.unwrap(), 1);
     settle!([&a1, &a2], server.held(queue.queue_id) == 1);
     let _a1 = stop(a1);
-    let entries = entries_in(&server, queue.queue_id);
+    let entries = entries_in(&server, &queue);
     assert_eq!(entries[0].sender_install, key.installation);
     assert!(server.sends(&a2).len() == 1);
 
@@ -558,13 +583,13 @@ async fn commit_goes_into_the_queue_ahead_of_the_text() {
     let queue = active(&a1).await.remove(0);
     off(&a1, &[&b1]).await;
     let epoch = adds_b2(&b1, &a1, conv).await;
-    let commit = delivery_entry(&b1, conv, &a1, 1, epoch).await;
+    let commit = delivery_entry(&b1, conv, &a1, 1, epoch, &queue).await;
     let key = send(&b1, &a1, 1, "after the Commit").await.key;
     settle!([&b1], server.held(queue.queue_id) == 2);
     let stored = server.stored(queue.queue_id);
     assert_eq!(stored[0], commit);
     assert_eq!(
-        QueueEntry::decode(&stored[1]).unwrap().frame,
+        QueueEntry::open(&stored[1], &queue.sender_secret).unwrap().frame,
         outbox(&b1, key).await.wire
     );
     assert_eq!(server.sends(&b1).len(), 1);
@@ -617,7 +642,7 @@ async fn commit_with_no_text_after_it_goes_into_the_queue() {
     let queue = active(&a1).await.remove(0);
     off(&a1, &[&b1]).await;
     let epoch = adds_b2(&b1, &a1, conv).await;
-    let commit = delivery_entry(&b1, conv, &a1, 1, epoch).await;
+    let commit = delivery_entry(&b1, conv, &a1, 1, epoch, &queue).await;
     // The standing pass's period.
     b1.clock.advance_monotonic_ms(300_000);
     settle!([&b1], server.held(queue.queue_id) == 1);
@@ -639,7 +664,7 @@ async fn receipt_goes_into_the_senders_queue() {
     let (a1, b1, _net, conv, server) = announced().await;
     let (qa, qb) = (
         active(&a1).await.remove(0).queue_id,
-        active(&b1).await.remove(0).queue_id,
+        active(&b1).await.remove(0),
     );
     off(&a1, &[&b1]).await;
     let key = send(&b1, &a1, 1, "read me").await.key;
@@ -649,22 +674,22 @@ async fn receipt_goes_into_the_senders_queue() {
     online(&a1).await;
     settle!(
         [&a1],
-        message(&a1, key).await.is_some() && server.held(qb) == 1
+        message(&a1, key).await.is_some() && server.held(qb.queue_id) == 1
     );
     a1.account
         .messages()
         .mark_read(conv, vec![key])
         .await
         .unwrap();
-    settle!([&a1], server.held(qb) == 2);
+    settle!([&a1], server.held(qb.queue_id) == 2);
     let a1_id = installation(&a1).await;
-    assert!(entries_in(&server, qb).iter().all(|e| e.sender_install == a1_id));
+    assert!(entries_in(&server, &qb).iter().all(|e| e.sender_install == a1_id));
     off(&a1, &[]).await;
 
     online(&b1).await;
     settle!(
         [&b1],
-        delivery(&b1, key).await == DeliveryState::Read && server.held(qb) == 0
+        delivery(&b1, key).await == DeliveryState::Read && server.held(qb.queue_id) == 0
     );
 }
 
@@ -710,21 +735,21 @@ async fn own_device_off_gets_my_text_from_its_queue() {
         [&a1, &a2, &b1],
         peer_queue(&a2, conv, &a1).await.flatten().is_some()
     );
-    let q1 = active(&a1).await.remove(0).queue_id;
+    let q1 = active(&a1).await.remove(0);
     off(&a1, &[&a2, &b1]).await;
     let key = send(&a2, &b1, 1, "from my other device").await.key;
     settle!(
         [&a2, &b1],
-        delivery(&a2, key).await == DeliveryState::Delivered && server.held(q1) == 1
+        delivery(&a2, key).await == DeliveryState::Delivered && server.held(q1.queue_id) == 1
     );
-    assert_eq!(entries_in(&server, q1)[0].sender_install, key.installation);
+    assert_eq!(entries_in(&server, &q1)[0].sender_install, key.installation);
     let _a2 = stop(a2);
     let _b1 = stop(b1);
 
     online(&a1).await;
     settle!(
         [&a1],
-        message(&a1, key).await.is_some() && server.held(q1) == 0
+        message(&a1, key).await.is_some() && server.held(q1.queue_id) == 0
     );
 }
 
@@ -762,7 +787,7 @@ async fn origin_and_mailbox_put_one_entry() {
     quiet(&[&a1, &a2]).await;
     assert_eq!(server.held(queue.queue_id), 1);
     assert_eq!(
-        entries_in(&server, queue.queue_id)[0].sender_install,
+        entries_in(&server, &queue)[0].sender_install,
         key.installation
     );
 }
@@ -850,7 +875,7 @@ async fn queue_taken_text_is_delivered_without_meeting_and_not_put_again() {
     let (a1, b1, _net, conv, server) = announced().await;
     let (qa, qb) = (
         active(&a1).await.remove(0).queue_id,
-        active(&b1).await.remove(0).queue_id,
+        active(&b1).await.remove(0),
     );
     off(&a1, &[&b1]).await;
     let key = send(&b1, &a1, 1, "taken from the queue").await.key;
@@ -860,15 +885,15 @@ async fn queue_taken_text_is_delivered_without_meeting_and_not_put_again() {
     online(&a1).await;
     settle!(
         [&a1],
-        message(&a1, key).await.is_some() && server.held(qb) == 1
+        message(&a1, key).await.is_some() && server.held(qb.queue_id) == 1
     );
-    assert_eq!(entries_in(&server, qb)[0].sender_install, installation(&a1).await);
+    assert_eq!(entries_in(&server, &qb)[0].sender_install, installation(&a1).await);
     off(&a1, &[]).await;
 
     online(&b1).await;
     settle!(
         [&b1],
-        delivery(&b1, key).await == DeliveryState::Delivered && server.held(qb) == 0
+        delivery(&b1, key).await == DeliveryState::Delivered && server.held(qb.queue_id) == 0
     );
     assert_eq!(texts_from(&a1, conv, b1.peer).await.len(), 1);
     let sends = server.sends(&b1).len();

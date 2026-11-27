@@ -69,7 +69,8 @@ pub(super) struct Shared {
 
 /// Since this core started (e2e m8): `CREATE` items the server took, `SEND` requests that
 /// came back for a text's or receipt's attempt and for the standing pass, entries the fetches
-/// took and `ACK` items the server took. Counts only.
+/// took, `ACK` items the server took, and entries that did not open with their queue's sender
+/// key. Counts only.
 #[cfg(all(feature = "test-hooks", debug_assertions))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct QueueCounts {
@@ -78,6 +79,7 @@ pub struct QueueCounts {
     pub sends_standing: u64,
     pub fetched: u64,
     pub acked: u64,
+    pub unopened: u64,
 }
 
 impl Shared {
@@ -108,6 +110,10 @@ impl Shared {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(entries);
+    }
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    fn unopened(&self) {
+        self.counts.lock().unwrap_or_else(|e| e.into_inner()).unopened += 1;
     }
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     fn count(&self, event: &QueueEvent) {

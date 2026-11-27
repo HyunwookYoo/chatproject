@@ -120,7 +120,7 @@ async fn queued_text(
     n: u8,
 ) -> MessageKey {
     let key = send(from, to, n, &format!("queued {n}")).await.key;
-    let entry = text_entry(from, key).await;
+    let entry = text_entry(from, key, queue).await;
     settle!([from], server.stored(queue.queue_id).contains(&entry));
     key
 }
@@ -135,7 +135,7 @@ async fn put_text(
     n: u8,
 ) -> MessageKey {
     let key = send(from, to, n, &format!("queued {n}")).await.key;
-    put(server, queue, &text_entry(from, key).await).await;
+    put(server, queue, &text_entry(from, key, queue).await).await;
     key
 }
 
@@ -300,7 +300,7 @@ async fn mailbox_sync_and_queue_same_ciphertext_store_once() {
     // B1 puts it into the queue of A1, which that attempt did not reach.
     b1.account.message_test_hold_scheduler(true).await.unwrap();
     let key = send(&b1, &a1, 1, "both ways").await.key;
-    let entry = text_entry(&b1, key).await;
+    let entry = text_entry(&b1, key, &queue).await;
     b1.account.message_test_hold_scheduler(false).await.unwrap();
     settle!(
         [&a2, &b1],
@@ -346,7 +346,7 @@ async fn push_wake_fetches_queue_too() {
     // No attempt, so no `SEND`: the entry comes only when the test puts it.
     b1.account.message_test_hold_scheduler(true).await.unwrap();
     let key = send(&b1, &a1, 1, "woken").await.key;
-    let frame = text_entry(&b1, key).await;
+    let frame = text_entry(&b1, key, &queue).await;
     let _b1 = stop(b1);
     // Back on: the fetch of the network start finds nothing yet.
     let before = server.fetches(&a1).len();
@@ -370,6 +370,36 @@ async fn push_wake_fetches_queue_too() {
     assert_eq!(a1.account.push_test_fetches().last(), Some(&(true, true)));
 }
 
+/// Final review C1: an entry that does not open with the queue's sender key (sealed for another
+/// queue, or not sealed) never will. It is acknowledged with the rest and counted, and the
+/// entry after it is taken.
+#[tokio::test]
+async fn entry_that_does_not_open_is_acknowledged_and_counted() {
+    let (a1, b1, _net, _conv, server) = announced().await;
+    let queue = active(&a1).await.remove(0);
+    off(&a1, &[&b1]).await;
+    b1.account.message_test_hold_scheduler(true).await.unwrap();
+    let foreign = send(&b1, &a1, 1, "sealed for another queue").await.key;
+    let key = send(&b1, &a1, 2, "sealed for this one").await.key;
+    let other = QueueOwnRow {
+        sender_secret: [0x5a; 32],
+        ..queue.clone()
+    };
+    put(&server, &queue, &text_entry(&b1, foreign, &other).await).await;
+    put(&server, &queue, b"not sealed").await;
+    put(&server, &queue, &text_entry(&b1, key, &queue).await).await;
+    let _b1 = stop(b1);
+    let before = a1.account.queue_test_counts().unopened;
+
+    online(&a1).await;
+    settle!(
+        [&a1],
+        message(&a1, key).await.is_some() && held(&server, &queue).await == 0
+    );
+    assert!(message(&a1, foreign).await.is_none());
+    assert_eq!(a1.account.queue_test_counts().unopened - before, 2);
+}
+
 /// Spec 11 (roadmap M7): after FCM dropped pushes (`onDeletedMessages`) the full sync fetches
 /// the queue too, with no clock moving.
 #[tokio::test]
@@ -379,7 +409,7 @@ async fn on_deleted_messages_fetches_queue() {
     off(&a1, &[&b1]).await;
     b1.account.message_test_hold_scheduler(true).await.unwrap();
     let key = send(&b1, &a1, 1, "dropped push").await.key;
-    let frame = text_entry(&b1, key).await;
+    let frame = text_entry(&b1, key, &queue).await;
     let _b1 = stop(b1);
     let before = server.fetches(&a1).len();
     online(&a1).await;
@@ -618,7 +648,7 @@ async fn epoch_change_then_texts_arrive_from_the_queue() {
     // B1's attempts put the Commit A1 lacks ahead of each text.
     let k1 = queued_text(&b1, &a1, &server, &queue, 1).await;
     let k2 = queued_text(&b1, &a1, &server, &queue, 2).await;
-    let commit = delivery_entry(&b1, conv, &a1, 1, epoch).await;
+    let commit = delivery_entry(&b1, conv, &a1, 1, epoch, &queue).await;
     assert_eq!(server.stored(queue.queue_id)[0], commit);
     let b_peer = b1.peer;
     let _b1 = stop(b1);
@@ -655,7 +685,7 @@ async fn text_ahead_of_its_commit_is_held_until_the_commit_comes() {
     let queue = active(&a1).await.remove(0);
     off(&a1, &[&b1]).await;
     let epoch = adds_b2(&b1, &a1, conv).await;
-    let commit = delivery_entry(&b1, conv, &a1, 1, epoch).await;
+    let commit = delivery_entry(&b1, conv, &a1, 1, epoch, &queue).await;
     // B1's own `SEND` puts the Commit ahead of the text: held here to test the wrong order.
     b1.account.message_test_hold_scheduler(true).await.unwrap();
     let key = put_text(&b1, &a1, &server, &queue, 1).await;
@@ -708,7 +738,7 @@ async fn welcome_from_the_queue_joins_the_group() {
     });
     let epoch = epoch.unwrap();
     assert_eq!(state(&a1, conv).await.group_epoch, None);
-    put(&server, &queue, &delivery_entry(&b1, conv, &a1, 2, epoch).await).await;
+    put(&server, &queue, &delivery_entry(&b1, conv, &a1, 2, epoch, &queue).await).await;
 
     a1.account.push_messages_deleted().await.unwrap();
     within!(20, agreed(&a1, &b1, conv).await);
@@ -741,7 +771,7 @@ async fn own_device_text_from_the_queue_is_stored() {
     );
     // The very bytes A2 wrote to B1.
     assert!(frames(&a2).await.contains(&wire));
-    put(&server, &queue, &entry_of(&a2, wire).await).await;
+    put(&server, &queue, &entry_of(&a2, wire, &queue).await).await;
     let _a2 = stop(a2);
     let _b1 = stop(b1);
 
@@ -763,7 +793,10 @@ async fn entry_that_fails_to_store_is_not_acknowledged() {
     b1.account.message_test_hold_scheduler(true).await.unwrap();
     let k1 = send(&b1, &a1, 1, "first").await.key;
     let k2 = send(&b1, &a1, 2, "second").await.key;
-    let (e1, e2) = (text_entry(&b1, k1).await, text_entry(&b1, k2).await);
+    let (e1, e2) = (
+        text_entry(&b1, k1, &queue).await,
+        text_entry(&b1, k2, &queue).await,
+    );
     let _b1 = stop(b1);
     let before = server.fetches(&a1).len();
     online(&a1).await;

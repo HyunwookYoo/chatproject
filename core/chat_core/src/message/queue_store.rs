@@ -121,9 +121,9 @@ pub(crate) struct NewQueue {
 pub(crate) struct Fetchable {
     pub id: QueueId,
     pub conversation: ConversationId,
-    /// The conversation's peer account: what its entries are opened as coming from.
-    pub peer: PeerId,
     pub recipient_secret: Zeroizing<[u8; 32]>,
+    /// What its entries are sealed with (`QueueEntry`).
+    pub sender_secret: Zeroizing<[u8; 32]>,
     pub last_seq: u64,
 }
 
@@ -734,16 +734,16 @@ fn mode(c: &Connection) -> R<QueueMode> {
     }
 }
 
-/// Every queue a fetch asks, with its conversation's peer, in one query.
+/// Every queue a fetch asks, of a conversation this device has, in one query.
 fn fetchable(c: &Connection) -> R<Vec<Fetchable>> {
-    c.prepare("SELECT q.queue_id,q.conversation,v.peer,q.recipient_secret,q.last_seq FROM queue_own q JOIN conversation v ON v.id=q.conversation WHERE q.state=1 OR q.server_confirmed=1 ORDER BY q.conversation,q.created_at_ms")
+    c.prepare("SELECT q.queue_id,q.conversation,q.recipient_secret,q.sender_secret,q.last_seq FROM queue_own q JOIN conversation v ON v.id=q.conversation WHERE q.state=1 OR q.server_confirmed=1 ORDER BY q.conversation,q.created_at_ms")
         .map_err(sql)?
         .query_map([], |r| {
             Ok(Fetchable {
                 id: bytes(r, 0)?,
                 conversation: ConversationId(bytes(r, 1)?),
-                peer: PeerId(bytes(r, 2)?),
-                recipient_secret: Zeroizing::new(bytes(r, 3)?),
+                recipient_secret: Zeroizing::new(bytes(r, 2)?),
+                sender_secret: Zeroizing::new(bytes(r, 3)?),
                 last_seq: uint(r, 4)?,
             })
         })

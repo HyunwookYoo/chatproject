@@ -4,7 +4,8 @@
 //!   direct send reaches it: texts, receipts, `Commit`s, `Welcome`s, `PushHandle`s and
 //!   `QueueRef`s, each the frame the direct send keeps (`queue_store`), as an entry naming the
 //!   device that sealed it (`QueueEntry`: this device, or a handed-off text's origin, so the
-//!   origin's copy and its mailbox's are the same entry and the server keeps one). A device
+//!   origin's copy and its mailbox's are the same entry and the server keeps one), sealed with
+//!   that queue's sender key so the server sees neither. A device
 //!   with a live queue on this device's server (`queue_peer`) gets them, a peer's device or
 //!   another of mine (spec 7.1: my other devices send in the conversation too).
 //! * Two triggers, one path (`queue_send`):
@@ -97,7 +98,7 @@ fn send_items(
                     sender_install: sealer,
                     frame,
                 };
-                (hash, entry.encode())
+                (hash, entry.seal(&target.sender_secret))
             })
             .collect();
         let size: usize = cts
@@ -358,7 +359,7 @@ mod tests {
     }
 
     #[test]
-    fn send_items_keep_each_devices_frames_in_order_signed_by_its_queue() {
+    fn send_items_keep_each_devices_frames_in_order_signed_and_sealed_by_its_queue() {
         let me = PeerId([9; 32]);
         let mut sealed_elsewhere = target(1, vec![b"commit".to_vec()]);
         sealed_elsewhere
@@ -383,7 +384,9 @@ mod tests {
                     &signing_bytes(&Signed::Send { ct: &ct }, &q.queue_id, T),
                     &sig
                 ));
-                let entry = QueueEntry::decode(&ct).unwrap();
+                // `target(n)`'s sender key is its queue id, [n; 32].
+                let entry = QueueEntry::open(&ct, &q.queue_id).unwrap();
+                assert!(QueueEntry::open(&ct, &[0; 32]).is_err());
                 assert_eq!(entry.sender_peer, me);
                 (entry.sender_install, entry.frame)
             })
