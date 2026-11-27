@@ -143,10 +143,10 @@ pub(crate) enum QueueDbOp {
     /// fetched and peers still put into it until the new `QueueRef` reaches them.
     Using,
     /// The local half of a reconcile: `retire` goes `Retiring` (its withdrawal sealed for each
-    /// current device of the peer when `true`), then `new` rows are written, and `forget` rows
-    /// are dropped without a request. `devices`: each peer account's
-    /// current devices; `wall` the time frames and states are stamped at, `now` the scheduler
-    /// time their deliveries are due at.
+    /// current device of the peer and my other ones when `true`), then `new` rows are written,
+    /// and `forget` rows are dropped without a request. `devices`: each peer account's current
+    /// devices and my other current ones; `wall` the time frames and states are stamped at,
+    /// `now` the scheduler time their deliveries are due at.
     Apply {
         retire: Vec<(QueueId, bool)>,
         new: Vec<NewQueue>,
@@ -813,18 +813,20 @@ fn floor(tx: &Transaction<'_>, conversation: ConversationId) -> R<u64> {
     Ok(created.max(retired))
 }
 
-/// Seals this device's `QueueRef` frames for the conversations' peers.
+/// Seals this device's `QueueRef` frames for the conversations' other members.
 struct Sealer<'a> {
     routing: Routing<'a>,
-    /// Each peer account's current devices.
+    /// Each peer account's current devices, and my other current ones.
     devices: &'a [(PeerId, Vec<InstallationId>)],
 }
 
 impl Sealer<'_> {
     /// Seals `queue` (`None`: a withdrawal) sent at `sent_at_ms` in the conversation's group and
-    /// queues it for each current device of the peer (a newer frame replaces what is still
-    /// queued); my other devices take it from the device log. False when it cannot be sealed
-    /// now: no group, no known device of the peer, or a group that cannot seal.
+    /// queues it for each current device of the peer and each other current device of mine (a
+    /// newer frame replaces what is still queued): my devices send in the conversation too
+    /// (spec 7.1), and a copy in the device log alone is lost to one that reads it before it
+    /// has joined. False when it cannot be sealed now: no group, no known device of the peer,
+    /// or a group that cannot seal.
     fn queue_ref(
         &self,
         tx: &Transaction<'_>,
@@ -840,12 +842,14 @@ impl Sealer<'_> {
             )
             .optional()
             .map_err(sql)?;
-        let Some(recipients) = peer.and_then(|peer| recipients(self.devices, peer)) else {
+        let Some(theirs) = peer.and_then(|peer| recipients(self.devices, peer)) else {
             return Ok(false);
         };
+        let mine = recipients(self.devices, self.routing.identity.peer.0).unwrap_or_default();
+        let all: Vec<InstallationId> = theirs.iter().chain(mine).copied().collect();
         let message = queue_ref_message(self.routing.identity.installation, sent_at_ms, queue);
         self.routing
-            .seal(tx, conversation, &message, FrameKind::QueueRef, recipients)
+            .seal(tx, conversation, &message, FrameKind::QueueRef, &all)
     }
 }
 

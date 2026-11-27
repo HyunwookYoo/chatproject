@@ -1948,7 +1948,11 @@ impl Manager {
 
     /// The account to dial `recipient` under: this one if its record lists the device (none if
     /// this account revoked it), else the conversation's `peer` if its record lists it.
-    fn recipient_account(&self, peer: PeerId, recipient: InstallationId) -> Option<PeerId> {
+    pub(super) fn recipient_account(
+        &self,
+        peer: PeerId,
+        recipient: InstallationId,
+    ) -> Option<PeerId> {
         let local = self.local().ok()?;
         let lists = |record: &crate::account::publication::SignedRecord| {
             record

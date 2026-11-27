@@ -13,7 +13,7 @@
 //!   most `MAX_ITEMS` items a request) run in a spawned task, nothing waits on them in a
 //!   transaction or an actor turn, and their answers are stored the same way, one transaction
 //!   confirming each created queue and sealing its `QueueRef`. The frames ride `push_delivery`
-//!   (kind 2), sent by the push handles' delivery loop.
+//!   (kind 2) to the peer's devices and my other ones, sent by the push handles' delivery loop.
 //! * It runs when what it reads changes: the queue address, the verdict, the mode, a device
 //!   list, a conversation that got its group (created or joined); when a timer is due
 //!   (rotation, deletion); hourly; and after a failed request, with the M4 back-off (1 s
@@ -187,15 +187,23 @@ impl Manager {
         self.messages.queue.check.ok(now, CHECK_MS);
     }
 
-    /// Each peer account's current devices, for the frames sealed for them.
+    /// Each peer account's current devices and my other current ones, for the frames sealed
+    /// for them.
     fn queue_devices(&self) -> Vec<(PeerId, Vec<InstallationId>)> {
         let Ok(local) = self.local() else {
             return Vec::new();
         };
+        let (own, me) = (local.keys.peer_id(), local.device.installation_id());
+        let mine = self
+            .current_installations(own)
+            .into_iter()
+            .filter(|i| *i != me)
+            .collect();
         local
             .remote
             .iter()
             .map(|r| (r.peer, self.current_installations(r.peer)))
+            .chain([(own, mine)])
             .collect()
     }
 

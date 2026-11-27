@@ -476,7 +476,14 @@ impl Messages {
     }
     /// Applies a note as if it was pulled from another own device's log; rows it changed.
     pub async fn mailbox_apply_note(&self, entry: LogEntry, now: u64) -> Result<u64, CoreError> {
-        match self.mailbox(MailboxDbOp::ApplyNote { entry, now }).await? {
+        match self
+            .mailbox(MailboxDbOp::ApplyNote {
+                entry,
+                own: Vec::new(),
+                now,
+            })
+            .await?
+        {
             MailboxDbReply::Count(n) => Ok(n),
             _ => unreachable!(),
         }

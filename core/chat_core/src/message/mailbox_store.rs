@@ -235,8 +235,13 @@ pub(crate) enum MailboxDbOp {
     },
     /// Drops what every cursor passed and what is older than the retention (now).
     Prune(u64),
-    /// A note pulled from another own device's log, applied (and logged here) at `now`.
-    ApplyNote { entry: LogEntry, now: u64 },
+    /// A note pulled from another own device's log, applied (and logged here) at `now`. `own`:
+    /// this account's current devices, whose queued `QueueRef` frames a peer's delivery leaves.
+    ApplyNote {
+        entry: LogEntry,
+        own: Vec<InstallationId>,
+        now: u64,
+    },
     /// The plaintext record of entry `seq` of this device's log, for another own device that
     /// could not open it (spec 6.3; the caller checked the device): only an App Text entry
     /// whose message is still here has one.
@@ -511,9 +516,9 @@ pub(super) fn mailbox_op(
             finish(tx, fault)?;
             MailboxDbReply::Count(pruned)
         }
-        MailboxDbOp::ApplyNote { entry, now } => {
+        MailboxDbOp::ApplyNote { entry, own, now } => {
             let tx = c.transaction().map_err(sql)?;
-            let changed = apply_note(&tx, identity, &entry, now)?;
+            let changed = apply_note(&tx, identity, &entry, &own, now)?;
             finish(tx, fault)?;
             MailboxDbReply::Count(changed)
         }
@@ -1107,7 +1112,7 @@ fn handoff_result(
             };
             // This device's copy of the message is delivered too (that also drops the row);
             // the note is logged even if the copy already was, for the origin.
-            let changed = apply_note(tx, identity, &entry, wall)?;
+            let changed = apply_note(tx, identity, &entry, &[], wall)?;
             note(body)?;
             Ok(changed)
         }
@@ -1277,7 +1282,13 @@ fn serve_page(
 /// kept in `mailbox_status_ahead` (kind 4) so a handoff of it that comes later is refused
 /// (Ruling 27); it is not logged again. `HandoffStop` is the origin's alone to act on (the account actor does,
 /// Ruling 1): nothing here. Returns the rows changed (messages, or the withdrawn ciphertext).
-fn apply_note(tx: &Transaction, identity: Identity, entry: &LogEntry, now: u64) -> R<u64> {
+fn apply_note(
+    tx: &Transaction,
+    identity: Identity,
+    entry: &LogEntry,
+    own: &[InstallationId],
+    now: u64,
+) -> R<u64> {
     // Only this account's own sent messages have a delivery or a withdrawal to learn.
     if entry.sender_peer != identity.peer {
         return Ok(0);
@@ -1301,9 +1312,9 @@ fn apply_note(tx: &Transaction, identity: Identity, entry: &LogEntry, now: u64) 
         _ => return Ok(0),
     };
     drop_handoff(tx, entry.sender_install, entry.conversation, msg_id)?;
-    // This device's `PushHandle` frame (M7), handed over and delivered: no longer queued.
+    // This device's routing frame, handed over and delivered: no longer queued for the peer.
     if entry.sender_install == identity.installation {
-        super::push_store::drop_delivered(tx, entry.conversation, msg_id)?;
+        super::push_store::drop_delivered(tx, entry.conversation, msg_id, own)?;
     }
     let key = params![
         entry.conversation.0.as_slice(),

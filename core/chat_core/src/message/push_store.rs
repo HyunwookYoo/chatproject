@@ -1048,10 +1048,12 @@ fn prune(
                 .map_err(sql)?
         };
         for (conversation, installation, peer) in rows {
-            let gone = peers
-                .iter()
-                .find(|(p, _)| p.0 == peer)
-                .is_some_and(|(_, current)| !current.iter().any(|i| i.0 == installation));
+            // A `QueueRef` is queued for my other devices too.
+            let gone = !own.iter().any(|o| o.0 == installation)
+                && peers
+                    .iter()
+                    .find(|(p, _)| p.0 == peer)
+                    .is_some_and(|(_, current)| !current.iter().any(|i| i.0 == installation));
             if gone {
                 dropped += tx
                     .execute(
@@ -1092,18 +1094,31 @@ pub(super) fn store_own_handle(
 
 /// A mailbox delivered this device's `PushHandle` or `QueueRef` frame `msg_id` (its `Delivered`
 /// note, M6 spec 7): the peer account has it, so it is no longer queued for any of its devices.
-/// The note names no kind; a msg_id names one, since the two kinds derive theirs under
-/// different domains (`payload::routing_message`).
+/// What is queued for `own` (this account's devices; a `QueueRef`'s) stays. The note names no
+/// kind; a msg_id names one, since the two kinds derive theirs under different domains
+/// (`payload::routing_message`).
 pub(super) fn drop_delivered(
     tx: &Transaction<'_>,
     conversation: ConversationId,
     msg_id: MessageId,
+    own: &[InstallationId],
 ) -> R<()> {
-    tx.execute(
-        "DELETE FROM push_delivery WHERE conversation=?1 AND kind IN (1,2) AND msg_id=?2",
-        params![conversation.0.as_slice(), msg_id.0.as_slice()],
-    )
-    .map_err(sql)?;
+    let recipients: Vec<[u8; 32]> = tx
+        .prepare("SELECT recipient_install FROM push_delivery WHERE conversation=?1 AND kind IN (1,2) AND msg_id=?2")
+        .map_err(sql)?
+        .query_map(params![conversation.0.as_slice(), msg_id.0.as_slice()], |r| {
+            bytes::<32>(r, 0)
+        })
+        .map_err(sql)?
+        .collect::<Result<_, _>>()
+        .map_err(sql)?;
+    for recipient in recipients.iter().filter(|r| !own.iter().any(|o| o.0 == **r)) {
+        tx.execute(
+            "DELETE FROM push_delivery WHERE conversation=?1 AND recipient_install=?2 AND kind IN (1,2) AND msg_id=?3",
+            params![conversation.0.as_slice(), recipient.as_slice(), msg_id.0.as_slice()],
+        )
+        .map_err(sql)?;
+    }
     Ok(())
 }
 
@@ -1456,5 +1471,59 @@ mod tests {
             1
         );
         assert!(rows(&c).is_empty());
+    }
+
+    /// A `QueueRef` queued for a peer's device and for my other device, under one conversation
+    /// whose peer account lists only its own device.
+    fn queued_for_both() -> (Connection, ConversationId, MessageId, PeerId, [InstallationId; 2]) {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(include_str!("../storage/schema.sql"))
+            .unwrap();
+        let (conv, peer, id) = (ConversationId([1; 32]), PeerId([9; 32]), MessageId([4; 16]));
+        let (theirs, mine) = (InstallationId([2; 32]), InstallationId([3; 32]));
+        c.execute(
+            "INSERT INTO conversation VALUES(?1,?2,0,zeroblob(32),0,0)",
+            params![conv.0.as_slice(), peer.0.as_slice()],
+        )
+        .unwrap();
+        for to in [theirs, mine] {
+            c.execute(
+                "INSERT INTO push_delivery VALUES(?1,?2,2,?3,x'01',0,0,1)",
+                params![conv.0.as_slice(), to.0.as_slice(), id.0.as_slice()],
+            )
+            .unwrap();
+        }
+        (c, conv, id, peer, [theirs, mine])
+    }
+
+    fn recipients_left(c: &Connection) -> Vec<[u8; 32]> {
+        c.prepare("SELECT recipient_install FROM push_delivery ORDER BY recipient_install")
+            .unwrap()
+            .query_map([], |r| bytes::<32>(r, 0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    /// The mailbox delivered the frame to the peer account: its rows go, mine stays.
+    #[test]
+    fn mailbox_delivery_to_the_peer_keeps_my_devices_row() {
+        let (mut c, conv, id, _, [_, mine]) = queued_for_both();
+        let tx = c.transaction().unwrap();
+        drop_delivered(&tx, conv, id, &[mine]).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(recipients_left(&c), [mine.0]);
+    }
+
+    /// A device list change keeps what is queued for my other current device although the
+    /// peer's record does not list it, and drops it once it is not current either.
+    #[test]
+    fn prune_keeps_my_current_devices_rows() {
+        use super::super::mls_store::NO_FAULT;
+        let (mut c, _, _, peer, [theirs, mine]) = queued_for_both();
+        prune(&mut c, &[mine], &[(peer, vec![theirs])], NO_FAULT).unwrap();
+        assert_eq!(recipients_left(&c), [theirs.0, mine.0]);
+        prune(&mut c, &[], &[(peer, vec![theirs])], NO_FAULT).unwrap();
+        assert_eq!(recipients_left(&c), [theirs.0]);
     }
 }

@@ -2083,6 +2083,7 @@ impl Manager {
                 };
                 let op = MailboxDbOp::ApplyNote {
                     entry,
+                    own: self.current_installations(self.local()?.keys.peer_id()),
                     now: self.services.clock.wall_ms(),
                 };
                 return match self.mailbox_db(op, request).await {

@@ -1199,17 +1199,11 @@ impl Manager {
         Ok(())
     }
 
-    /// Sends due frames over ready sessions with other accounts' devices (one per recipient of
-    /// a conversation at a time), and dials one recipient without a session per check.
+    /// Sends due frames over ready sessions (one per recipient of a conversation at a time):
+    /// the peer's devices and my other ones (a `QueueRef`), as Commits and Welcomes go. Dials
+    /// one recipient without a session per check.
     async fn push_deliver(&mut self, now: u64, request: Request) {
-        let Ok(own) = self.local().map(|local| local.keys.peer_id()) else {
-            return;
-        };
-        let sessions: Vec<Session> = self
-            .mls_sessions()
-            .into_iter()
-            .filter(|s| s.grant.peer != own)
-            .collect();
+        let sessions: Vec<Session> = self.mls_sessions();
         let ids: Vec<InstallationId> = sessions.iter().map(|s| s.grant.installation).collect();
         let push = &mut self.messages.push;
         if push.sessions != ids {
@@ -1263,8 +1257,11 @@ impl Manager {
             {
                 continue;
             }
+            let Some(account) = self.recipient_account(peer, recipient) else {
+                continue;
+            };
             self.messages.push.dials.insert(recipient, now);
-            if self.start_dial(peer, recipient, request) {
+            if self.start_dial(account, recipient, request) {
                 return;
             }
         }
