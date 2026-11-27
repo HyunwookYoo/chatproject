@@ -321,9 +321,15 @@ struct Peer {
     info: PeerInfo,
     target: EndpointAddr,
     session: Option<Session>,
+    /// The other session of a duplicate pair: never written, still read until the peer has
+    /// switched too ([`RETIRED_GRACE`]), so a text it wrote there before it did arrives.
+    retired: Option<Session>,
     pending: Option<Pending>,
     disconnected_before: Option<u64>,
 }
+/// How long a retired session is still read. The peer settles the same duplicate pair the
+/// same way once its side of the newer session is ready.
+const RETIRED_GRACE: Duration = Duration::from_secs(5);
 struct Manager {
     account_input: Option<mpsc::Sender<crate::account::connection::Input>>,
     pair_input: Option<mpsc::Sender<crate::account::pair::session::Input>>,
@@ -614,6 +620,7 @@ impl Manager {
                             },
                             target: id.into(),
                             session: None,
+                            retired: None,
                             pending: None,
                             disconnected_before: None,
                         },
@@ -634,7 +641,7 @@ impl Manager {
                             let _ = reply.send(Err(err(ErrorCode::PeerNotConnected)));
                         }
                     }
-                    if let Some(session) = peer.session.take() {
+                    for session in [peer.session.take(), peer.retired.take()].into_iter().flatten() {
                         session.close();
                     }
                     peer.info.phase = PeerPhase::Disconnected;
@@ -797,6 +804,7 @@ impl Manager {
                 target: target.clone(),
                 disconnected_before,
                 session: None,
+                retired: None,
                 pending: Some(Pending {
                     tag: tag.clone(),
                     cancel: cancel.clone(),
@@ -1104,7 +1112,7 @@ impl Manager {
                 }
                 self.ready(tag, outgoing, started, result);
             }
-            Note::Text { tag, text } if self.current(&tag) => {
+            Note::Text { tag, text } if self.current(&tag) || self.retired(&tag) => {
                 self.bus.publish(CoreEvent::ProbeTextReceived {
                     peer_id: tag.peer_id,
                     text,
@@ -1166,6 +1174,12 @@ impl Manager {
             .and_then(|p| p.session.as_ref())
             .is_some_and(|s| tag.is_current(&s.tag))
     }
+    fn retired(&self, tag: &SessionTag) -> bool {
+        self.peers
+            .get(&tag.peer_id)
+            .and_then(|p| p.retired.as_ref())
+            .is_some_and(|s| tag.is_current(&s.tag))
+    }
     fn ready(
         &mut self,
         tag: SessionTag,
@@ -1217,7 +1231,17 @@ impl Manager {
         let preferred_outgoing = self.key.public() < prepared.connection.remote_id();
         if let Some(existing) = self.peers.get(&id).and_then(|p| p.session.as_ref()) {
             if existing.outgoing == preferred_outgoing || outgoing != preferred_outgoing {
-                prepared.connection.close(0u32.into(), b"duplicate session");
+                let tag = self.tag(id.clone());
+                let session = session::spawn_session(
+                    &mut self.tasks,
+                    prepared,
+                    tag,
+                    outgoing,
+                    started,
+                    &self.cancel,
+                    &self.notes,
+                );
+                self.retire(&id, session);
                 if let Some(sender) = pending.and_then(|p| p.reply) {
                     let _ = sender.send(Ok(NetworkReply::Peer(self.peers[&id].info.clone())));
                 }
@@ -1261,12 +1285,11 @@ impl Manager {
             },
             target,
             session: None,
+            retired: None,
             pending: None,
             disconnected_before: None,
         });
-        if let Some(old) = peer.session.take() {
-            old.close();
-        }
+        let old = peer.session.take();
         peer.info.phase = PeerPhase::Connected;
         peer.info.path = PeerPath::Unknown;
         peer.info.connect_ms =
@@ -1282,10 +1305,26 @@ impl Manager {
             &self.notes,
         ));
         let info = peer.info.clone();
+        if let Some(old) = old {
+            self.retire(&id, old);
+        }
         self.publish(Some(&id));
         if let Some(sender) = pending.and_then(|p| p.reply) {
             let _ = sender.send(Ok(NetworkReply::Peer(info)));
         }
+    }
+    /// Keeps `session`, the loser of a duplicate pair, readable for [`RETIRED_GRACE`], then
+    /// closes it.
+    fn retire(&mut self, id: &str, session: Session) {
+        let (cancel, connection) = (session.cancel.clone(), session.connection.clone());
+        if let Some(older) = self.peers.get_mut(id).unwrap().retired.replace(session) {
+            older.close();
+        }
+        self.tasks.spawn(async move {
+            tokio::select! { biased; _ = cancel.cancelled() => {}, _ = tokio::time::sleep(RETIRED_GRACE) => {} }
+            cancel.cancel();
+            connection.close(0u32.into(), b"duplicate session");
+        });
     }
     async fn stop(&mut self) {
         self.finish_activation(Err(err(ErrorCode::Busy)));
@@ -1298,7 +1337,7 @@ impl Manager {
                     let _ = reply.send(Err(err(ErrorCode::NetworkNotStarted)));
                 }
             }
-            if let Some(session) = peer.session.take() {
+            for session in [peer.session.take(), peer.retired.take()].into_iter().flatten() {
                 session.close();
             }
             peer.info.phase = PeerPhase::Disconnected;
@@ -1603,6 +1642,7 @@ mod tests {
             },
             target: id.into(),
             session: None,
+            retired: None,
             pending: None,
             disconnected_before: None,
         }
@@ -1830,12 +1870,18 @@ mod tests {
                 observed: Instant::now(),
             })
             .await;
+        assert!(rx.try_recv().is_err());
+        // The replaced session is retired: a text the peer wrote there before it switched too
+        // still arrives, and changes nothing else.
         manager
             .note(Note::Text {
                 tag: old,
-                text: "obsolete".into(),
+                text: "before the switch".into(),
             })
             .await;
+        assert!(
+            matches!(rx.try_recv().unwrap(), CoreEvent::ProbeTextReceived { text, .. } if text == "before the switch")
+        );
         assert!(manager.current(&current));
         assert_eq!(manager.peers[&id].info.phase, PeerPhase::Connected);
         assert_eq!(manager.peers[&id].info.path, PeerPath::Direct);
@@ -1878,6 +1924,7 @@ mod tests {
                     },
                     target: id.into(),
                     session: None,
+                    retired: None,
                     pending: None,
                     disconnected_before: None,
                 },
@@ -2085,6 +2132,7 @@ mod tests {
                 target: id.into(),
                 disconnected_before: None,
                 session: None,
+                retired: None,
                 pending: Some(Pending {
                     tag: tag.clone(),
                     cancel: CancellationToken::new(),
