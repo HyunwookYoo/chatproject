@@ -1085,6 +1085,33 @@
       "e3",
       "e4plus",
       "unknown"
+    ],
+    "m8_refs_holder": [
+      "phone",
+      "other",
+      "node"
+    ],
+    "m8_refs_of": [
+      "phone",
+      "other",
+      "node"
+    ],
+    "m8_refs_live": [
+      "l0",
+      "l1plus",
+      "unknown"
+    ],
+    "m8_refs_pending": [
+      "p0",
+      "p1",
+      "p2plus",
+      "unknown"
+    ],
+    "m8_refs_pending_back": [
+      "p0",
+      "p1",
+      "p2plus",
+      "unknown"
     ]
   },
   "wait_kinds": [

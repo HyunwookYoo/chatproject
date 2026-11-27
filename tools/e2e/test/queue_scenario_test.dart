@@ -236,6 +236,41 @@ void main() {
       await fixture.close();
     }
   });
+  // Run 45998761905: the phone never kept B1's `QueueRef` and nothing was left
+  // to send; the facts said neither which pair nor which side.
+  test('a QueueRef never kept notes the pair and both sides', () async {
+    final fixture = QueueFixture()..fault = 'ref_dropped';
+    await fixture.start();
+    failureFacts.clear();
+    try {
+      await expectLater(
+        run(fixture, timeout: const Duration(seconds: 1)),
+        throwsA(
+          isA<ScenarioDeadline>().having(
+            (e) => e.message,
+            'text',
+            'Queue scenario deadline: queue_refs',
+          ),
+        ),
+      );
+      expect(failureFacts, {
+        'm8_network_phone': 'Online',
+        'm8_network_other': 'Online',
+        'm8_network_node': 'Online',
+        'm8_server_queues': 'q3plus',
+        'm8_server_entries': 'e0',
+        'm8_refs_holder': 'phone',
+        'm8_refs_of': 'node',
+        'm8_refs_live': 'l0',
+        'm8_refs_pending': 'p0',
+        'm8_refs_pending_back': 'p0',
+      });
+      expect(safeFacts(failureFacts, loadSafeFacts()), failureFacts);
+    } finally {
+      failureFacts.clear();
+      await fixture.close();
+    }
+  });
   for (final (fault, code) in [
     ('delivered_early', 'Queue scenario: sent_not_delivered'),
     ('duplicate', 'Queue scenario: phone_once'),
@@ -480,7 +515,13 @@ class QueueFixture {
           'own_active': name == 'phone' && judged ? 0 : 1,
           'own_retiring': name == 'phone' && judged ? 1 : 0,
           'peer_dead': 0,
-          'peer_live': withdrawn ? 0 : 1,
+          'peer_live':
+              withdrawn ||
+                  fault == 'ref_dropped' &&
+                      name == 'phone' &&
+                      jsonEncode(args['peer']) == jsonEncode(install('node'))
+              ? 0
+              : 1,
           'peer_withdrawn': withdrawn ? 1 : 0,
           'refs_pending': 0,
           'sends_message': name == 'node' ? sends : 0,

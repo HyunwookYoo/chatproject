@@ -423,7 +423,9 @@ class SummaryTests(unittest.TestCase):
                 'android_crash': False, 'last_view': None, 'participant': 'node',
                 'rpc_op': 'queue_local_test_counts',
                 'facts': {'m8_network_phone': 'Stopped', 'm8_server_queues': 'q3plus',
-                          'm8_server_entries': 'e2'},
+                          'm8_server_entries': 'e2', 'm8_refs_holder': 'phone',
+                          'm8_refs_of': 'node', 'm8_refs_live': 'l0',
+                          'm8_refs_pending': 'p0', 'm8_refs_pending_back': 'p1'},
                 'android': None, 'waits': [{'name': 'queue_local_test_counts', 'ms': 40}],
                 'transport': None, 'push': None}
         queue = {'server_queues': 3, 'server_entries': 4, 'sends_message': 2,

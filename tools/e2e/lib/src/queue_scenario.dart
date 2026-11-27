@@ -430,14 +430,32 @@ Future<void> runQueueScenario(
   // Every device keeps each other's `QueueRef` and has none left to deliver: one still on
   // its way to a device that goes off in step 2 would go into its queue beside the texts.
   final ids = {a1: a1Id, a2: a2Id, b1: b1Id};
+  final sides = {a1: 'phone', a2: 'other', b1: 'node'};
   for (final p in [a1, a2, b1]) {
     for (final other in [a1, a2, b1]) {
       if (other == p) continue;
-      await until(
-        () => counts(p, ids[other]),
-        (v) => v['peer_live'] == 1 && v['refs_pending'] == 0,
-        'queue_refs',
-      );
+      Map<String, Object?>? last;
+      try {
+        await until(
+          () async => last = await counts(p, ids[other]),
+          (v) => v['peer_live'] == 1 && v['refs_pending'] == 0,
+          'queue_refs',
+        );
+      } on ScenarioDeadline {
+        // Which device lacks whose `QueueRef`, and each side's frames still on their way to
+        // the other: none back means the frame was dropped, not still tried.
+        Object? back;
+        try {
+          back = (await counts(other, ids[p]))['refs_pending'];
+        } catch (_) {}
+        failureFacts
+          ..['m8_refs_holder'] = sides[p]!
+          ..['m8_refs_of'] = sides[other]!
+          ..['m8_refs_live'] = factBucket(last?['peer_live'], 'l', 1)
+          ..['m8_refs_pending'] = factBucket(last?['refs_pending'], 'p', 2)
+          ..['m8_refs_pending_back'] = factBucket(back, 'p', 2);
+        rethrow;
+      }
     }
   }
   final made = await until(held, (c) => c.queues == 3, 'server_queues');
