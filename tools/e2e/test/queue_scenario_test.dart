@@ -271,6 +271,33 @@ void main() {
       await fixture.close();
     }
   });
+  // A local three-node run: B1 still had A2's `Welcome` to send (answered
+  // `Busy`, in its back-off) when A2 went off, so A2's queue held it beside
+  // the two texts ([3,2,0]) and server_held never matched.
+  test('a Welcome still on its way holds step 2 back', () async {
+    final fixture = QueueFixture()..fault = 'welcome_left';
+    await fixture.start();
+    failureFacts.clear();
+    try {
+      await expectLater(
+        run(fixture, timeout: const Duration(seconds: 1)),
+        throwsA(
+          isA<ScenarioDeadline>()
+              .having(
+                (e) => e.message,
+                'text',
+                'Queue scenario deadline: group_deliveries',
+              )
+              .having((e) => e.participant, 'participant', 'node'),
+        ),
+      );
+      expect(fixture.actions, isEmpty);
+      expect(safeFacts(failureFacts, loadSafeFacts()), failureFacts);
+    } finally {
+      failureFacts.clear();
+      await fixture.close();
+    }
+  });
   for (final (fault, code) in [
     ('delivered_early', 'Queue scenario: sent_not_delivered'),
     ('duplicate', 'Queue scenario: phone_once'),
@@ -495,6 +522,17 @@ class QueueFixture {
         return text;
       case 'message_local_load_messages':
         return {'revision': 1, 'items': texts[name], 'next': null};
+      case 'message_local_test_group_facts':
+        return {
+          'group': true,
+          'epoch': 1,
+          'members': 3,
+          'processed_mls': 4,
+          'deliveries': fault == 'welcome_left' && name == 'node' ? 1 : 0,
+          'holds': 0,
+          'rejoins': 0,
+          'attempted': 0,
+        };
       case 'queue_local_state':
         final has = judged;
         return {

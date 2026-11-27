@@ -152,6 +152,7 @@
     "Push scenario: wake_title",
     "Queue scenario deadline: created",
     "Queue scenario deadline: first_text",
+    "Queue scenario deadline: group_deliveries",
     "Queue scenario deadline: initial_account",
     "Queue scenario deadline: isolated",
     "Queue scenario deadline: new_device",

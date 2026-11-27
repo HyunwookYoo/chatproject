@@ -81,7 +81,8 @@ final queueStats = QueueStats();
 /// B = [B1 a node]; none is a mailbox, so each device makes a queue at the
 /// local queue server ([server] reads its file).
 ///
-/// 1. A1 and A2 judge "no mailbox" and make queues; B1 keeps both `QueueRef`s.
+/// 1. A1 and A2 judge "no mailbox" and make queues; B1 keeps both `QueueRef`s,
+///    and no device has a frame left to deliver.
 /// 2. A1 and A2 are taken off line (`Stopped`); B1's two texts go into their
 ///    queues: two entries in each. B1 shows them not delivered.
 /// 3. B1 is taken off line too, so the queue is the only way to A1. A1 back on
@@ -457,6 +458,20 @@ Future<void> runQueueScenario(
         rethrow;
       }
     }
+  }
+  // Nor a `Commit` or `Welcome` of the group: a `Welcome` answered `Busy` waits out its
+  // back-off, and one still on its way to A1 or A2 would go into its queue the same way.
+  for (final p in [a1, a2, b1]) {
+    await until(
+      () async => object(
+        await call(p, 'message_local_test_group_facts', {
+          'conversation': conversation,
+          'key': null,
+        }),
+      ),
+      (v) => v['deliveries'] == 0,
+      'group_deliveries',
+    );
   }
   final made = await until(held, (c) => c.queues == 3, 'server_queues');
   evidence?.call('queues', {'server': made.toJson()});
