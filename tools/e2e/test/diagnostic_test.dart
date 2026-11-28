@@ -205,6 +205,27 @@ void main() {
     failureFacts.clear();
   });
 
+  test('an m8 deadline notes the same facts under its own prefix', () async {
+    failureFacts.clear();
+    await noteGroup(
+      'other',
+      () async => {'group': false, 'welcomes': 0},
+      scenario: 'm8',
+    );
+    await noteOwnSync(
+      'other',
+      () async => {'own_sessions': 0, 'pull_failure': 'request'},
+      scenario: 'm8',
+    );
+    expect(failureFacts['m8_group_other'], 'none');
+    expect(failureFacts['m8_welcomes_other'], 'w0');
+    expect(failureFacts['m8_own_sessions_other'], 's0');
+    expect(failureFacts['m8_pull_failure_other'], 'request');
+    expect(failureFacts.keys.where((k) => k.startsWith('m6_')), isEmpty);
+    expect(safeFacts(failureFacts, loadSafeFacts()), failureFacts);
+    failureFacts.clear();
+  });
+
   test('an m6 deadline notes each A side own-device sync as buckets', () async {
     failureFacts.clear();
     await noteOwnSync(

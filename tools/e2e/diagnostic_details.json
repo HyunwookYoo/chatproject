@@ -1128,6 +1128,267 @@
       "p1",
       "p2plus",
       "unknown"
+    ],
+    "m8_group_phone": [
+      "none",
+      "m0",
+      "m1",
+      "m2",
+      "m3",
+      "m4plus",
+      "unknown"
+    ],
+    "m8_epoch_phone": [
+      "none",
+      "e0",
+      "e1",
+      "e2",
+      "e3plus",
+      "unknown"
+    ],
+    "m8_received_phone": [
+      "p0",
+      "p1",
+      "p2",
+      "p3plus",
+      "unknown"
+    ],
+    "m8_deliveries_phone": [
+      "d0",
+      "d1",
+      "d2plus",
+      "unknown"
+    ],
+    "m8_welcomes_phone": [
+      "w0",
+      "w1plus",
+      "unknown"
+    ],
+    "m8_holds_phone": [
+      "h0",
+      "h1plus",
+      "unknown"
+    ],
+    "m8_attempted_phone": [
+      "r0",
+      "r1",
+      "r2",
+      "r3plus",
+      "unknown"
+    ],
+    "m8_group_other": [
+      "none",
+      "m0",
+      "m1",
+      "m2",
+      "m3",
+      "m4plus",
+      "unknown"
+    ],
+    "m8_epoch_other": [
+      "none",
+      "e0",
+      "e1",
+      "e2",
+      "e3plus",
+      "unknown"
+    ],
+    "m8_received_other": [
+      "p0",
+      "p1",
+      "p2",
+      "p3plus",
+      "unknown"
+    ],
+    "m8_deliveries_other": [
+      "d0",
+      "d1",
+      "d2plus",
+      "unknown"
+    ],
+    "m8_welcomes_other": [
+      "w0",
+      "w1plus",
+      "unknown"
+    ],
+    "m8_holds_other": [
+      "h0",
+      "h1plus",
+      "unknown"
+    ],
+    "m8_attempted_other": [
+      "r0",
+      "r1",
+      "r2",
+      "r3plus",
+      "unknown"
+    ],
+    "m8_group_node": [
+      "none",
+      "m0",
+      "m1",
+      "m2",
+      "m3",
+      "m4plus",
+      "unknown"
+    ],
+    "m8_epoch_node": [
+      "none",
+      "e0",
+      "e1",
+      "e2",
+      "e3plus",
+      "unknown"
+    ],
+    "m8_received_node": [
+      "p0",
+      "p1",
+      "p2",
+      "p3plus",
+      "unknown"
+    ],
+    "m8_deliveries_node": [
+      "d0",
+      "d1",
+      "d2plus",
+      "unknown"
+    ],
+    "m8_welcomes_node": [
+      "w0",
+      "w1plus",
+      "unknown"
+    ],
+    "m8_holds_node": [
+      "h0",
+      "h1plus",
+      "unknown"
+    ],
+    "m8_attempted_node": [
+      "r0",
+      "r1",
+      "r2",
+      "r3plus",
+      "unknown"
+    ],
+    "m8_own_sessions_phone": [
+      "s0",
+      "s1plus",
+      "unknown"
+    ],
+    "m8_pulls_phone": [
+      "p0",
+      "p1",
+      "p2plus",
+      "unknown"
+    ],
+    "m8_pulls_done_phone": [
+      "d0",
+      "d1",
+      "d2plus",
+      "unknown"
+    ],
+    "m8_pulls_failed_phone": [
+      "pf0",
+      "pf1",
+      "pf2plus",
+      "unknown"
+    ],
+    "m8_pulls_stopped_phone": [
+      "ps0",
+      "ps1plus",
+      "unknown"
+    ],
+    "m8_pull_failure_phone": [
+      "none",
+      "busy",
+      "request",
+      "entries",
+      "storage",
+      "session_gone",
+      "plain",
+      "unknown"
+    ],
+    "m8_own_closes_phone": [
+      "c0",
+      "c1",
+      "c2plus",
+      "unknown"
+    ],
+    "m8_own_close_phone": [
+      "none",
+      "open",
+      "local",
+      "timeout",
+      "reset",
+      "peer_simultaneous_dial",
+      "peer_new_proof",
+      "peer_restricted",
+      "peer_auth_failed",
+      "peer_record_changed",
+      "peer_stopped",
+      "peer_other",
+      "other",
+      "unknown"
+    ],
+    "m8_own_sessions_other": [
+      "s0",
+      "s1plus",
+      "unknown"
+    ],
+    "m8_pulls_other": [
+      "p0",
+      "p1",
+      "p2plus",
+      "unknown"
+    ],
+    "m8_pulls_done_other": [
+      "d0",
+      "d1",
+      "d2plus",
+      "unknown"
+    ],
+    "m8_pulls_failed_other": [
+      "pf0",
+      "pf1",
+      "pf2plus",
+      "unknown"
+    ],
+    "m8_pulls_stopped_other": [
+      "ps0",
+      "ps1plus",
+      "unknown"
+    ],
+    "m8_pull_failure_other": [
+      "none",
+      "busy",
+      "request",
+      "entries",
+      "storage",
+      "session_gone",
+      "plain",
+      "unknown"
+    ],
+    "m8_own_closes_other": [
+      "c0",
+      "c1",
+      "c2plus",
+      "unknown"
+    ],
+    "m8_own_close_other": [
+      "none",
+      "open",
+      "local",
+      "timeout",
+      "reset",
+      "peer_simultaneous_dial",
+      "peer_new_proof",
+      "peer_restricted",
+      "peer_auth_failed",
+      "peer_record_changed",
+      "peer_stopped",
+      "peer_other",
+      "other",
+      "unknown"
     ]
   },
   "wait_kinds": [

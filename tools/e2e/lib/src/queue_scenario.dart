@@ -406,17 +406,49 @@ Future<void> runQueueScenario(
     require(same(own, conversation), 'one_conversation');
   }
   // The first text makes the group with both of A's devices.
-  await call(b1, 'message_local_send_text', {
-    'peer': aPeer,
-    'id': id(0),
-    'body': 'm8 setup text',
-  });
-  for (final p in [a1, a2]) {
-    await until(
-      () => messages(p, conversation),
-      (items) => idsFrom(items, bPeer).length == 1,
-      'first_text',
-    );
+  final setupKey = object(
+    await call(b1, 'message_local_send_text', {
+      'peer': aPeer,
+      'id': id(0),
+      'body': 'm8 setup text',
+    }),
+  )['key'];
+  try {
+    for (final p in [a1, a2]) {
+      await until(
+        () => messages(p, conversation),
+        (items) => idsFrom(items, bPeer).length == 1,
+        'first_text',
+      );
+    }
+  } on ScenarioDeadline {
+    // A device without the text: whether it has the group (or a Welcome is still queued
+    // for it), and whether its own devices could hand the text over (as m6 notes).
+    for (final (side, p) in [('phone', a1), ('other', a2), ('node', b1)]) {
+      await noteGroup(
+        side,
+        () => p.call(
+          'message_local_test_group_facts',
+          {'conversation': conversation, 'key': p == b1 ? setupKey : null},
+          timeout: const Duration(seconds: 5),
+          failOnTimeout: false,
+        ),
+        scenario: 'm8',
+      );
+    }
+    for (final (side, p) in [('phone', a1), ('other', a2)]) {
+      await noteOwnSync(
+        side,
+        () => p.call(
+          'push_local_test_counts',
+          const {},
+          timeout: const Duration(seconds: 5),
+          failOnTimeout: false,
+        ),
+        scenario: 'm8',
+      );
+    }
+    rethrow;
   }
 
   // 1. No mailbox: each device makes a queue; B1 keeps A1's and A2's `QueueRef`s.

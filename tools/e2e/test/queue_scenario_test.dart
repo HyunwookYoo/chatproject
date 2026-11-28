@@ -271,6 +271,42 @@ void main() {
       await fixture.close();
     }
   });
+  // Run 46099431991: the other device never showed the setup text, and the
+  // facts said nothing about its group or its own-device sessions.
+  test('a first text that never arrives notes groups and own sync', () async {
+    final fixture = QueueFixture()..fault = 'first_text_lost';
+    await fixture.start();
+    failureFacts.clear();
+    try {
+      await expectLater(
+        run(fixture, timeout: const Duration(seconds: 1)),
+        throwsA(
+          isA<ScenarioDeadline>()
+              .having(
+                (e) => e.message,
+                'text',
+                'Queue scenario deadline: first_text',
+              )
+              .having((e) => e.participant, 'participant', 'other'),
+        ),
+      );
+      for (final side in ['phone', 'other', 'node']) {
+        expect(failureFacts['m8_group_$side'], 'm3');
+        expect(failureFacts['m8_epoch_$side'], 'e1');
+        expect(failureFacts['m8_welcomes_$side'], 'w0');
+      }
+      for (final side in ['phone', 'other']) {
+        expect(failureFacts['m8_own_sessions_$side'], 's0');
+        expect(failureFacts['m8_pull_failure_$side'], 'request');
+        expect(failureFacts['m8_own_close_$side'], 'timeout');
+      }
+      expect(failureFacts.containsKey('m8_own_sessions_node'), isFalse);
+      expect(safeFacts(failureFacts, loadSafeFacts()), failureFacts);
+    } finally {
+      failureFacts.clear();
+      await fixture.close();
+    }
+  });
   // A local three-node run: B1 still had A2's `Welcome` to send (answered
   // `Busy`, in its back-off) when A2 went off, so A2's queue held it beside
   // the two texts ([3,2,0]) and server_held never matched.
@@ -512,6 +548,7 @@ class QueueFixture {
         };
         texts['node']!.add(text);
         for (final to in ['phone', 'other']) {
+          if (fault == 'first_text_lost' && to == 'other') continue;
           if (online[to]!) {
             receive(to, Map.of(text));
           } else if (fault != 'not_held') {
@@ -529,9 +566,22 @@ class QueueFixture {
           'members': 3,
           'processed_mls': 4,
           'deliveries': fault == 'welcome_left' && name == 'node' ? 1 : 0,
+          'welcomes': fault == 'welcome_left' && name == 'node' ? 1 : 0,
           'holds': 0,
           'rejoins': 0,
           'attempted': 0,
+        };
+      case 'push_local_test_counts':
+        // `first_text_lost`: the phone and the other device have no session.
+        return {
+          'own_sessions': 0,
+          'pulls': 1,
+          'pulls_done': 0,
+          'pulls_failed': 1,
+          'pulls_stopped': 0,
+          'pull_failure': 'request',
+          'own_closes': 1,
+          'own_close': 'timeout',
         };
       case 'queue_local_state':
         final has = judged;
