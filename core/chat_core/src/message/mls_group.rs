@@ -1550,7 +1550,8 @@ fn join_request(
 ) -> R<Committed> {
     let asker = key_package_installation(key_package)?;
     // Its Welcome is queued here already: another Commit would only replace that leaf again
-    // and move the group past what was sealed for it meanwhile.
+    // and move the group past what was sealed for it meanwhile. The asker is reachable now, so
+    // the Welcome goes now instead of after the back-off of its failed attempts.
     let queued: Option<u64> = c
         .query_row(
             "SELECT epoch FROM mls_delivery WHERE conversation=?1 AND recipient_install=?2 AND kind=?3 ORDER BY epoch DESC LIMIT 1",
@@ -1560,6 +1561,11 @@ fn join_request(
         .optional()
         .map_err(sql)?;
     if let Some(epoch) = queued {
+        c.execute(
+            "UPDATE mls_delivery SET next_retry_at_ms=min(next_retry_at_ms,?4) WHERE conversation=?1 AND recipient_install=?2 AND kind=?3",
+            params![conversation.0.as_slice(), asker.0.as_slice(), DELIVER_WELCOME, integer(arrival.now)?],
+        )
+        .map_err(sql)?;
         return Ok(Committed::Done { epoch });
     }
     let committed = own_commit(
