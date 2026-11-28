@@ -603,10 +603,12 @@ async fn a1_adds_a2(a1: &Fixture, a2: &Fixture, b1: &Fixture, conv: Conversation
 }
 
 /// e2e m6 (run 46037571545): B1 made the group with A1 alone, A1 added A2, and A1 went off
-/// before A2's Welcome left it. A2 has a session with B1 only. Returns A2, B1, the network and
-/// the conversation.
-async fn welcome_stuck_on_a_gone_a1() -> (Fixture, Fixture, Arc<Backend>, ConversationId) {
-    let (a1, a2, b1, net, conv) = three_with(&[B1], false).await;
+/// before A2's Welcome left it. A2 has a session with B1 only. B's record lists `b_devices`.
+/// Returns A2, B1, the network and the conversation.
+async fn welcome_stuck_on_a_gone_a1(
+    b_devices: &[u8],
+) -> (Fixture, Fixture, Arc<Backend>, ConversationId) {
+    let (a1, a2, b1, net, conv) = three_with(b_devices, false).await;
     a1_adds_a2(&a1, &a2, &b1, conv).await;
     let ia1 = installation(&a1).await;
     drop(a1);
@@ -619,7 +621,7 @@ async fn welcome_stuck_on_a_gone_a1() -> (Fixture, Fixture, Arc<Backend>, Conver
 /// for, instead of waiting for A1.
 #[tokio::test]
 async fn a_member_whose_welcome_is_stuck_on_an_off_device_gets_the_text() {
-    let (a2, b1, _net, _) = welcome_stuck_on_a_gone_a1().await;
+    let (a2, b1, _net, _) = welcome_stuck_on_a_gone_a1(&[B1]).await;
     let sent = send(&b1, &a2, 1, "to the device added last").await;
     settle!(
         [&a2, &b1],
@@ -634,7 +636,7 @@ async fn a_member_whose_welcome_is_stuck_on_an_off_device_gets_the_text() {
 /// group once one is.
 #[tokio::test]
 async fn an_ask_started_by_a_received_text_never_creates_a_group() {
-    let (a2, b1, _net, conv) = welcome_stuck_on_a_gone_a1().await;
+    let (a2, b1, _net, conv) = welcome_stuck_on_a_gone_a1(&[B1]).await;
     let (group, ib1) = (state(&b1, conv).await.group_id, installation(&b1).await);
     a2.account.mls_test_drop_queries(true).await.unwrap();
     let sent = send(&b1, &a2, 1, "to a device whose queries are lost").await;
@@ -651,6 +653,40 @@ async fn an_ask_started_by_a_received_text_never_creates_a_group() {
     );
     assert_eq!(state(&a2, conv).await.group_id, group);
     assert_eq!(state(&b1, conv).await.group_id, group);
+}
+
+/// The m6 state, and B1's own Commit (adding B2, which never comes online) stays
+/// unacknowledged, so B1 answers every JoinRequest Busy, as it does for a device it no longer
+/// lists. A2, asking because of a text it cannot open, waits longer after each refusal instead
+/// of asking every 2 s.
+#[tokio::test]
+async fn a_refused_ask_started_by_a_received_text_backs_off() {
+    let (a2, b1, _net, conv) = welcome_stuck_on_a_gone_a1(&[B1, B2]).await;
+    b1.account
+        .storage_test_fixture()
+        .messages()
+        .await
+        .unwrap()
+        .mls_commit(
+            conv,
+            a2.peer,
+            vec![mls_detached_key_package(b1.peer, [B2; 32])],
+            vec![],
+            NOW * 1000,
+        )
+        .await
+        .unwrap()
+        .expect("an own Commit");
+    assert_eq!(state(&b1, conv).await.own_commit_unacked, Some(true));
+    let ib1 = installation(&b1).await;
+    send(&b1, &a2, 1, "to a device B1 keeps refusing").await;
+    settle!([&a2, &b1], sent_to(&a2, ib1, "join_request").await >= 1);
+    let first = sent_to(&a2, ib1, "join_request").await;
+    idle(&[&a2, &b1], 60).await;
+    let asked = sent_to(&a2, ib1, "join_request").await - first;
+    assert!((2..=6).contains(&asked), "A2 asked {asked} times in 60 s");
+    assert_eq!(state(&a2, conv).await.group_id, None);
+    assert_eq!(state(&b1, conv).await.own_commit_unacked, Some(true));
 }
 
 /// A1 holds A2's Welcome, backed off 5 min by failed attempts (the most it waits). A2 asks A1
