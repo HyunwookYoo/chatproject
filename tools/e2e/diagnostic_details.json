@@ -632,6 +632,11 @@
       "d2plus",
       "unknown"
     ],
+    "m6_welcomes_phone": [
+      "w0",
+      "w1plus",
+      "unknown"
+    ],
     "m6_holds_phone": [
       "h0",
       "h1plus",
@@ -674,6 +679,11 @@
       "d2plus",
       "unknown"
     ],
+    "m6_welcomes_mailbox": [
+      "w0",
+      "w1plus",
+      "unknown"
+    ],
     "m6_holds_mailbox": [
       "h0",
       "h1plus",
@@ -714,6 +724,11 @@
       "d0",
       "d1",
       "d2plus",
+      "unknown"
+    ],
+    "m6_welcomes_node": [
+      "w0",
+      "w1plus",
       "unknown"
     ],
     "m6_holds_node": [

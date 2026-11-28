@@ -193,7 +193,8 @@ String _named(Object? value, Set<String> names) =>
 /// Notes one m6 side's MLS group for the conversation as buckets
 /// (`message_local_test_group_facts`): `m6_group_<side>` (members or `none`),
 /// `m6_epoch_<side>`, `m6_received_<side>` (MLS ciphertexts processed),
-/// `m6_deliveries_<side>` (queued Commits/Welcomes), `m6_holds_<side>` and
+/// `m6_deliveries_<side>` (queued Commits/Welcomes), `m6_welcomes_<side>` (of
+/// them Welcomes: a member left without its group), `m6_holds_<side>` and
 /// `m6_attempted_<side>` (receivers the sent text was tried to). `unknown`
 /// when it could not be read.
 Future<void> noteGroup(String side, Future<Object?> Function() facts) async {
@@ -215,6 +216,7 @@ Future<void> noteGroup(String side, Future<Object?> Function() facts) async {
       : _bucket(map['epoch'], 'e', 3);
   failureFacts['m6_received_$side'] = _bucket(map['processed_mls'], 'p', 3);
   failureFacts['m6_deliveries_$side'] = _bucket(map['deliveries'], 'd', 2);
+  failureFacts['m6_welcomes_$side'] = _bucket(map['welcomes'], 'w', 1);
   failureFacts['m6_holds_$side'] = _bucket(map['holds'], 'h', 1);
   failureFacts['m6_attempted_$side'] = _bucket(map['attempted'], 'r', 3);
 }

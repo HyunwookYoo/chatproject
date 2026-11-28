@@ -246,7 +246,8 @@ mod commands {
         assert_eq!(
             facts["value"],
             json!({"group": false, "epoch": null, "members": 0, "processed_mls": 0,
-                   "deliveries": 0, "holds": 0, "rejoins": null, "attempted": 0}),
+                   "deliveries": 0, "welcomes": 0, "holds": 0, "rejoins": null,
+                   "attempted": 0}),
             "{facts}"
         );
         assert_eq!(
