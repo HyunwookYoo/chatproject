@@ -35,10 +35,48 @@ struct Backend {
     lookup_starts: Mutex<Vec<PeerId>>,
     /// The push proxy every core started on this backend reaches (M7 `push_network.rs`).
     push: Mutex<Option<Arc<dyn chat_core::push::PushProxy>>>,
+    /// The queue server every core started on this backend reaches, as the core with this
+    /// clock sees it (M8 `queue_network.rs`).
+    queue: Mutex<Option<QueueAt>>,
 }
-/// The services of a core on `backend`: its records, `clock`, and the backend's push proxy.
+type QueueAt = Arc<dyn Fn(&Arc<FakeClock>) -> Arc<dyn chat_core::queue::QueueServer> + Send + Sync>;
+/// The services of a core on `backend`: its records, `clock`, and the backend's push proxy and
+/// queue server.
 fn services(backend: Arc<Backend>, clock: Arc<FakeClock>) -> AccountServices {
-    AccountServices::new(backend.clone(), clock).with_push_proxy(Arc::new(BackendPush(backend)))
+    AccountServices::new(backend.clone(), clock.clone())
+        .with_push_proxy(Arc::new(BackendPush(backend.clone())))
+        .with_queue_server(Arc::new(BackendQueue(backend, clock)))
+}
+/// Forwards each queue request to the server the backend holds at that time (none:
+/// unreachable). A core sends none before `queue_configure` gives it an address.
+struct BackendQueue(Arc<Backend>, Arc<FakeClock>);
+impl BackendQueue {
+    fn at(&self) -> Option<Arc<dyn chat_core::queue::QueueServer>> {
+        let at = self.0.queue.lock().unwrap().clone()?;
+        Some(at(&self.1))
+    }
+}
+fn unreachable_queue() -> chat_core::queue::QueueFuture {
+    Box::pin(async { Err(chat_core::queue::QueueError::Network) })
+}
+impl chat_core::queue::QueueServer for BackendQueue {
+    fn create(&self, items: Vec<chat_core::queue::CreateItem>) -> chat_core::queue::QueueFuture {
+        self.at()
+            .map_or_else(unreachable_queue, |s| s.create(items))
+    }
+    fn send(&self, items: Vec<chat_core::queue::SendItem>) -> chat_core::queue::QueueFuture {
+        self.at().map_or_else(unreachable_queue, |s| s.send(items))
+    }
+    fn recv(&self, items: Vec<chat_core::queue::RecvItem>) -> chat_core::queue::QueueFuture {
+        self.at().map_or_else(unreachable_queue, |s| s.recv(items))
+    }
+    fn ack(&self, items: Vec<chat_core::queue::AckItem>) -> chat_core::queue::QueueFuture {
+        self.at().map_or_else(unreachable_queue, |s| s.ack(items))
+    }
+    fn delete(&self, items: Vec<chat_core::queue::DeleteItem>) -> chat_core::queue::QueueFuture {
+        self.at()
+            .map_or_else(unreachable_queue, |s| s.delete(items))
+    }
 }
 /// Forwards each push request to the proxy the backend holds at that time (none: unreachable).
 /// A core sends none before `push_configure` gives it a proxy address.

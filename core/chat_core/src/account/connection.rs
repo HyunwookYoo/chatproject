@@ -167,6 +167,8 @@ pub(crate) enum Input {
     Mailbox(super::manager::mailbox::MailboxEvent),
     /// A push proxy reply, or how a sent `PushHandle` frame ended (M7).
     Push(super::manager::push::PushEvent),
+    /// A queue server reply (M8).
+    Queue(super::manager::queue::QueueEvent),
     Incoming(Connection),
     Control {
         connection: Connection,

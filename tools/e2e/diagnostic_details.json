@@ -150,6 +150,44 @@
     "Push scenario: pair_sas",
     "Push scenario: phone_once",
     "Push scenario: wake_title",
+    "Queue scenario deadline: created",
+    "Queue scenario deadline: first_text",
+    "Queue scenario deadline: group_deliveries",
+    "Queue scenario deadline: initial_account",
+    "Queue scenario deadline: isolated",
+    "Queue scenario deadline: new_device",
+    "Queue scenario deadline: other_received",
+    "Queue scenario deadline: pair_awaiting_approval",
+    "Queue scenario deadline: pair_code",
+    "Queue scenario deadline: pair_joined",
+    "Queue scenario deadline: pair_listed",
+    "Queue scenario deadline: phone_acked",
+    "Queue scenario deadline: phone_has_mailbox",
+    "Queue scenario deadline: phone_queue_empty",
+    "Queue scenario deadline: phone_received",
+    "Queue scenario deadline: phone_retiring",
+    "Queue scenario deadline: queue_refs",
+    "Queue scenario deadline: sender_delivered",
+    "Queue scenario deadline: sender_withdrawn",
+    "Queue scenario deadline: server_held",
+    "Queue scenario deadline: server_queues",
+    "Queue scenario deadline: stopped_node",
+    "Queue scenario deadline: stopped_other",
+    "Queue scenario deadline: stopped_phone",
+    "Queue scenario deadline: ticket",
+    "Queue scenario deadline: using_queue",
+    "Queue scenario: distinct_accounts",
+    "Queue scenario: no_mailbox",
+    "Queue scenario: one_conversation",
+    "Queue scenario: one_notification",
+    "Queue scenario: other_once",
+    "Queue scenario: pair_flow",
+    "Queue scenario: pair_same_account",
+    "Queue scenario: pair_sas",
+    "Queue scenario: phone_no_duplicate",
+    "Queue scenario: phone_once",
+    "Queue scenario: retiring_kept",
+    "Queue scenario: sent_not_delivered",
     "RPC failed: AccountExists",
     "RPC failed: AccountRestricted",
     "RPC failed: AlreadyStartedDifferentConfig",
@@ -594,6 +632,11 @@
       "d2plus",
       "unknown"
     ],
+    "m6_welcomes_phone": [
+      "w0",
+      "w1plus",
+      "unknown"
+    ],
     "m6_holds_phone": [
       "h0",
       "h1plus",
@@ -636,6 +679,11 @@
       "d2plus",
       "unknown"
     ],
+    "m6_welcomes_mailbox": [
+      "w0",
+      "w1plus",
+      "unknown"
+    ],
     "m6_holds_mailbox": [
       "h0",
       "h1plus",
@@ -676,6 +724,11 @@
       "d0",
       "d1",
       "d2plus",
+      "unknown"
+    ],
+    "m6_welcomes_node": [
+      "w0",
+      "w1plus",
       "unknown"
     ],
     "m6_holds_node": [
@@ -1012,6 +1065,330 @@
     ],
     "logcat_lost": [
       "lost"
+    ],
+    "m8_network_phone": [
+      "Stopped",
+      "Starting",
+      "Online",
+      "Failed",
+      "unknown"
+    ],
+    "m8_network_other": [
+      "Stopped",
+      "Starting",
+      "Online",
+      "Failed",
+      "unknown"
+    ],
+    "m8_network_node": [
+      "Stopped",
+      "Starting",
+      "Online",
+      "Failed",
+      "unknown"
+    ],
+    "m8_server_queues": [
+      "q0",
+      "q1",
+      "q2",
+      "q3plus",
+      "unknown"
+    ],
+    "m8_server_entries": [
+      "e0",
+      "e1",
+      "e2",
+      "e3",
+      "e4plus",
+      "unknown"
+    ],
+    "m8_refs_holder": [
+      "phone",
+      "other",
+      "node"
+    ],
+    "m8_refs_of": [
+      "phone",
+      "other",
+      "node"
+    ],
+    "m8_refs_live": [
+      "l0",
+      "l1plus",
+      "unknown"
+    ],
+    "m8_refs_pending": [
+      "p0",
+      "p1",
+      "p2plus",
+      "unknown"
+    ],
+    "m8_refs_pending_back": [
+      "p0",
+      "p1",
+      "p2plus",
+      "unknown"
+    ],
+    "m8_group_phone": [
+      "none",
+      "m0",
+      "m1",
+      "m2",
+      "m3",
+      "m4plus",
+      "unknown"
+    ],
+    "m8_epoch_phone": [
+      "none",
+      "e0",
+      "e1",
+      "e2",
+      "e3plus",
+      "unknown"
+    ],
+    "m8_received_phone": [
+      "p0",
+      "p1",
+      "p2",
+      "p3plus",
+      "unknown"
+    ],
+    "m8_deliveries_phone": [
+      "d0",
+      "d1",
+      "d2plus",
+      "unknown"
+    ],
+    "m8_welcomes_phone": [
+      "w0",
+      "w1plus",
+      "unknown"
+    ],
+    "m8_holds_phone": [
+      "h0",
+      "h1plus",
+      "unknown"
+    ],
+    "m8_attempted_phone": [
+      "r0",
+      "r1",
+      "r2",
+      "r3plus",
+      "unknown"
+    ],
+    "m8_group_other": [
+      "none",
+      "m0",
+      "m1",
+      "m2",
+      "m3",
+      "m4plus",
+      "unknown"
+    ],
+    "m8_epoch_other": [
+      "none",
+      "e0",
+      "e1",
+      "e2",
+      "e3plus",
+      "unknown"
+    ],
+    "m8_received_other": [
+      "p0",
+      "p1",
+      "p2",
+      "p3plus",
+      "unknown"
+    ],
+    "m8_deliveries_other": [
+      "d0",
+      "d1",
+      "d2plus",
+      "unknown"
+    ],
+    "m8_welcomes_other": [
+      "w0",
+      "w1plus",
+      "unknown"
+    ],
+    "m8_holds_other": [
+      "h0",
+      "h1plus",
+      "unknown"
+    ],
+    "m8_attempted_other": [
+      "r0",
+      "r1",
+      "r2",
+      "r3plus",
+      "unknown"
+    ],
+    "m8_group_node": [
+      "none",
+      "m0",
+      "m1",
+      "m2",
+      "m3",
+      "m4plus",
+      "unknown"
+    ],
+    "m8_epoch_node": [
+      "none",
+      "e0",
+      "e1",
+      "e2",
+      "e3plus",
+      "unknown"
+    ],
+    "m8_received_node": [
+      "p0",
+      "p1",
+      "p2",
+      "p3plus",
+      "unknown"
+    ],
+    "m8_deliveries_node": [
+      "d0",
+      "d1",
+      "d2plus",
+      "unknown"
+    ],
+    "m8_welcomes_node": [
+      "w0",
+      "w1plus",
+      "unknown"
+    ],
+    "m8_holds_node": [
+      "h0",
+      "h1plus",
+      "unknown"
+    ],
+    "m8_attempted_node": [
+      "r0",
+      "r1",
+      "r2",
+      "r3plus",
+      "unknown"
+    ],
+    "m8_own_sessions_phone": [
+      "s0",
+      "s1plus",
+      "unknown"
+    ],
+    "m8_pulls_phone": [
+      "p0",
+      "p1",
+      "p2plus",
+      "unknown"
+    ],
+    "m8_pulls_done_phone": [
+      "d0",
+      "d1",
+      "d2plus",
+      "unknown"
+    ],
+    "m8_pulls_failed_phone": [
+      "pf0",
+      "pf1",
+      "pf2plus",
+      "unknown"
+    ],
+    "m8_pulls_stopped_phone": [
+      "ps0",
+      "ps1plus",
+      "unknown"
+    ],
+    "m8_pull_failure_phone": [
+      "none",
+      "busy",
+      "request",
+      "entries",
+      "storage",
+      "session_gone",
+      "plain",
+      "unknown"
+    ],
+    "m8_own_closes_phone": [
+      "c0",
+      "c1",
+      "c2plus",
+      "unknown"
+    ],
+    "m8_own_close_phone": [
+      "none",
+      "open",
+      "local",
+      "timeout",
+      "reset",
+      "peer_simultaneous_dial",
+      "peer_new_proof",
+      "peer_restricted",
+      "peer_auth_failed",
+      "peer_record_changed",
+      "peer_stopped",
+      "peer_other",
+      "other",
+      "unknown"
+    ],
+    "m8_own_sessions_other": [
+      "s0",
+      "s1plus",
+      "unknown"
+    ],
+    "m8_pulls_other": [
+      "p0",
+      "p1",
+      "p2plus",
+      "unknown"
+    ],
+    "m8_pulls_done_other": [
+      "d0",
+      "d1",
+      "d2plus",
+      "unknown"
+    ],
+    "m8_pulls_failed_other": [
+      "pf0",
+      "pf1",
+      "pf2plus",
+      "unknown"
+    ],
+    "m8_pulls_stopped_other": [
+      "ps0",
+      "ps1plus",
+      "unknown"
+    ],
+    "m8_pull_failure_other": [
+      "none",
+      "busy",
+      "request",
+      "entries",
+      "storage",
+      "session_gone",
+      "plain",
+      "unknown"
+    ],
+    "m8_own_closes_other": [
+      "c0",
+      "c1",
+      "c2plus",
+      "unknown"
+    ],
+    "m8_own_close_other": [
+      "none",
+      "open",
+      "local",
+      "timeout",
+      "reset",
+      "peer_simultaneous_dial",
+      "peer_new_proof",
+      "peer_restricted",
+      "peer_auth_failed",
+      "peer_record_changed",
+      "peer_stopped",
+      "peer_other",
+      "other",
+      "unknown"
     ]
   },
   "wait_kinds": [

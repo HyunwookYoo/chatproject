@@ -127,7 +127,8 @@ impl From<chat_core::CoreEvent> for ChatEvent {
             chat_core::CoreEvent::ConnectionState(s) => Self::ConnectionState {
                 direct_peers: s.direct_peers,
                 mailbox_ok: s.mailbox_ok,
-                queue_ok: s.queue_ok,
+                using_queue: s.using_queue,
+                has_mailbox: s.has_mailbox,
             },
             chat_core::CoreEvent::Error { code, detail } => Self::Error { code: code.into(), detail },
             chat_core::CoreEvent::NetworkChanged(info) => Self::NetworkChanged { info: info.into() },
@@ -392,11 +393,22 @@ mod tests {
         let event = chat_core::CoreEvent::ConnectionState(chat_core::ConnectionSnapshot {
             direct_peers: 2,
             mailbox_ok: true,
-            queue_ok: Some(false),
+            using_queue: true,
+            has_mailbox: false,
         });
         assert_eq!(
             ChatEvent::from(event),
-            ChatEvent::ConnectionState { direct_peers: 2, mailbox_ok: true, queue_ok: Some(false) }
+            ChatEvent::ConnectionState { direct_peers: 2, mailbox_ok: true, using_queue: true, has_mailbox: false }
+        );
+        let event = chat_core::CoreEvent::ConnectionState(chat_core::ConnectionSnapshot {
+            direct_peers: 0,
+            mailbox_ok: false,
+            using_queue: false,
+            has_mailbox: true,
+        });
+        assert_eq!(
+            ChatEvent::from(event),
+            ChatEvent::ConnectionState { direct_peers: 0, mailbox_ok: false, using_queue: false, has_mailbox: true }
         );
     }
 
@@ -533,6 +545,24 @@ mod tests {
                 }),
                 MailboxStateView { enabled, first_link_shown, uptime_7d_permille }
             );
+        }
+    }
+
+    #[test]
+    fn queue_state_keeps_every_field_and_mode_both_ways() {
+        use crate::api::queue::{QueueMode, QueueStateView, Verdict};
+        use chat_core::account::{QueueMode as M, Verdict as V};
+        let installation = chat_core::account::InstallationId([7; 32]);
+        for (core, ffi) in [(M::Auto, QueueMode::Auto), (M::Always, QueueMode::Always), (M::Never, QueueMode::Never)] {
+            assert_eq!(M::from(ffi), core);
+            for (verdict, shown) in [(V::HasMailbox { installation }, Verdict::HasMailbox), (V::NoMailbox, Verdict::NoMailbox)] {
+                for (using_queue, uptime_7d_permille) in [(true, 960), (false, 0)] {
+                    assert_eq!(
+                        QueueStateView::from(chat_core::account::QueueStateView { mode: core, verdict, using_queue, uptime_7d_permille }),
+                        QueueStateView { mode: ffi, verdict: shown, using_queue, uptime_7d_permille }
+                    );
+                }
+            }
         }
     }
 
@@ -704,5 +734,36 @@ mod message_event_tests {
 impl From<chat_core::account::MailboxStateView> for crate::api::mailbox::MailboxStateView {
     fn from(v: chat_core::account::MailboxStateView) -> Self {
         Self { enabled: v.enabled, first_link_shown: v.first_link_shown, uptime_7d_permille: v.uptime_7d_permille }
+    }
+}
+
+impl From<chat_core::account::QueueStateView> for crate::api::queue::QueueStateView {
+    fn from(v: chat_core::account::QueueStateView) -> Self {
+        use crate::api::queue::{QueueMode, Verdict};
+        use chat_core::account::{QueueMode as M, Verdict as V};
+        Self {
+            mode: match v.mode {
+                M::Auto => QueueMode::Auto,
+                M::Always => QueueMode::Always,
+                M::Never => QueueMode::Never,
+            },
+            verdict: match v.verdict {
+                V::HasMailbox { .. } => Verdict::HasMailbox,
+                V::NoMailbox => Verdict::NoMailbox,
+            },
+            using_queue: v.using_queue,
+            uptime_7d_permille: v.uptime_7d_permille,
+        }
+    }
+}
+
+impl From<crate::api::queue::QueueMode> for chat_core::account::QueueMode {
+    fn from(mode: crate::api::queue::QueueMode) -> Self {
+        use crate::api::queue::QueueMode;
+        match mode {
+            QueueMode::Auto => Self::Auto,
+            QueueMode::Always => Self::Always,
+            QueueMode::Never => Self::Never,
+        }
     }
 }

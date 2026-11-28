@@ -539,7 +539,8 @@ void main() {
         'kind': 'connection_state',
         'direct_peers': 1,
         'mailbox_ok': false,
-        'queue_ok': null,
+        'using_queue': true,
+        'has_mailbox': true,
       },
       {'kind': 'error', 'code': 'TransportFailed', 'detail': 'fixture failure'},
       {
@@ -562,6 +563,36 @@ void main() {
         'event': events[i],
       });
       expect(await participant.expectEvent((_) => true), events[i]);
+    }
+  });
+
+  test('connection_state keeps the queue words in diagnostics (M8)', () async {
+    final logs = await Directory.systemTemp.createTemp('m8-connection-');
+    final logged = await Controller.start(port: 0, logDir: logs);
+    final peer = await MockParticipant.connect(logged);
+    try {
+      await peer.next();
+      final participant = await logged.waitParticipant('node');
+      peer.send({
+        'type': 'event',
+        'seq': 1,
+        'instance': 'one',
+        'event': {
+          'kind': 'connection_state',
+          'direct_peers': 1,
+          'mailbox_ok': true,
+          'using_queue': true,
+          'has_mailbox': true,
+        },
+      });
+      await participant.expectEvent((e) => e['kind'] == 'connection_state');
+      await logged.close();
+      final retained = await File('${logs.path}/wire.jsonl').readAsString();
+      expect(retained, contains(r'\"using_queue\":true,\"has_mailbox\":true'));
+    } finally {
+      await peer.close();
+      await logged.close();
+      await logs.delete(recursive: true);
     }
   });
 

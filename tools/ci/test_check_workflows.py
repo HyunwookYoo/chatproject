@@ -14,7 +14,8 @@ def testflight(**overrides):
     doc = {
         "on": {"workflow_dispatch": None, "push": {"tags": ["testflight-*"]}},
         "permissions": {"contents": "read"},
-        "env": {"RUST_TOOLCHAIN": "1.92.0", "CARGOKIT_TOOLCHAIN": "1.92.0"},
+        "env": {"RUST_TOOLCHAIN": "1.92.0", "CARGOKIT_TOOLCHAIN": "1.92.0",
+                "CHATPROJECT_QUEUE_URL": "https://queue.example"},
         "jobs": {"testflight": {
             "environment": "testflight",
             "steps": [
@@ -540,6 +541,43 @@ class PushE2eEnvironmentTest(unittest.TestCase):
         self.assertTrue(any("upload-artifact" in p for p in check(ORDINARY, doc)))
         doc["jobs"]["android-fcm"]["environment"] = {"name": "push-e2e"}
         self.assertTrue(any("upload-artifact" in p for p in check(ORDINARY, doc)))
+
+
+class ReleaseQueueUrlTest(unittest.TestCase):
+    """Rule (d): a workflow that builds an app for users sets CHATPROJECT_QUEUE_URL (an https:// address) in its env."""
+
+    def apk(self, environment="android-apk", **env):
+        return {
+            "on": {"workflow_dispatch": None},
+            "permissions": {"contents": "read"},
+            "env": env,
+            "jobs": {"apk": {"environment": environment, "steps": []}},
+        }
+
+    def test_release_workflows_with_the_address_pass(self):
+        self.assertEqual(check(pathlib.Path("android-apk.yml"), self.apk(CHATPROJECT_QUEUE_URL="https://q.example")), [])
+        self.assertEqual(check(CheckTest.path, testflight()), [])
+
+    def test_a_missing_or_plain_http_address_is_rejected(self):
+        for env in ({}, {"CHATPROJECT_QUEUE_URL": ""}, {"CHATPROJECT_QUEUE_URL": "http://q.example"}):
+            with self.subTest(env=env):
+                problems = check(pathlib.Path("android-apk.yml"), self.apk(**env))
+                self.assertTrue(any("CHATPROJECT_QUEUE_URL" in p for p in problems), problems)
+                doc = testflight()
+                doc["env"] = {"RUST_TOOLCHAIN": "1.92.0", "CARGOKIT_TOOLCHAIN": "1.92.0", **env}
+                problems = check(CheckTest.path, doc)
+                self.assertTrue(any("CHATPROJECT_QUEUE_URL" in p for p in problems), problems)
+
+    def test_the_rule_follows_the_file_or_the_environment(self):
+        for path, environment in ((pathlib.Path("android-apk.yaml"), None), (ORDINARY, "android-apk"),
+                                  (ORDINARY, {"name": "TestFlight"})):
+            with self.subTest(path=path.name, environment=environment):
+                problems = check(path, self.apk(environment))
+                self.assertTrue(any("CHATPROJECT_QUEUE_URL" in p for p in problems), problems)
+
+    def test_other_workflows_need_no_address(self):
+        self.assertEqual(check(ORDINARY, self.apk("release")), [])
+        self.assertEqual(check(pathlib.Path("ci.yml"), ci()), [])
 
 
 if __name__ == "__main__":

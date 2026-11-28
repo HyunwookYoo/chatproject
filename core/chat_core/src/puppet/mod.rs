@@ -2,6 +2,7 @@ mod account;
 mod mailbox;
 mod message;
 mod push;
+mod queue;
 pub(crate) mod records;
 pub mod protocol;
 
@@ -237,6 +238,9 @@ async fn run(
                             } else if op.starts_with("push_local_") {
                                 let handle = account.lock().expect("account slot lock poisoned").handle.clone();
                                 pending.push(Box::pin(async move { (id, protocol::Outcome::account(push::execute(handle, &op, args).await)) }));
+                            } else if op.starts_with("queue_local_") {
+                                let handle = account.lock().expect("account slot lock poisoned").handle.clone();
+                                pending.push(Box::pin(async move { (id, protocol::Outcome::account(queue::execute(handle, &op, args).await)) }));
                             } else if op.starts_with("account_local_") {
                                 let handle = account.lock().expect("account slot lock poisoned").handle.clone();
                                 let network = network.clone();

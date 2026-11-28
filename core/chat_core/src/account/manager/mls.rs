@@ -26,7 +26,7 @@ use crate::account::{
     connection::{Input, Session},
 };
 use crate::message::mls_group::{
-    Committed, Delivery, DueDelivery, GroupOp, GroupReply, Outcome, OwnWelcome,
+    Committed, DELIVER_WELCOME, Delivery, DueDelivery, GroupOp, GroupReply, Outcome, OwnWelcome,
 };
 use crate::message::store::{MessageDbOp, MessageDbReply, OpenFrom, conversation_id};
 use crate::message::types::{BlockReason, ConversationId, MessageKey};
@@ -299,6 +299,10 @@ pub(super) enum Via {
     /// A push (M7 spec 5.3): no device carried it, nobody waits for an answer, and nothing is
     /// sent to the sender (it learns of the delivery from its next direct attempt).
     Push,
+    /// An entry of one of this device's server queues (M8 spec 6.4), from the device it names
+    /// (`queue::QueueEntry`, a hint the frame's own checks bind): nobody waits for an answer,
+    /// and a text it stores is notified when the fetch ends (`manager/queue/fetch.rs`).
+    Queue,
 }
 
 /// What opening one received application ciphertext did.
@@ -788,15 +792,42 @@ impl Manager {
         request: Request,
     ) -> Result<(), CoreError> {
         for (delivery, outcome) in deliveries {
-            let now = self.schedule_now();
-            let op = GroupOp::Delivered {
-                recipient: delivery.recipient,
-                kind: delivery.kind,
-                epoch: delivery.epoch,
+            self.delivery_done(
+                delivery.conversation,
+                delivery.recipient,
+                delivery.kind,
+                delivery.epoch,
                 outcome,
-                now,
-            };
-            self.group_db(delivery.conversation, op, request).await?;
+                request,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Records how a queued Commit or Welcome ended. An acknowledged `Welcome` means the
+    /// recipient has the group now: the routing frames it could not open before go at once.
+    async fn delivery_done(
+        &mut self,
+        conversation: ConversationId,
+        recipient: InstallationId,
+        kind: u8,
+        epoch: u64,
+        outcome: Delivery,
+        request: Request,
+    ) -> Result<(), CoreError> {
+        let joined = kind == DELIVER_WELCOME && matches!(outcome, Delivery::Acked);
+        let now = self.schedule_now();
+        let op = GroupOp::Delivered {
+            recipient,
+            kind,
+            epoch,
+            outcome,
+            now,
+        };
+        self.group_db(conversation, op, request).await?;
+        if joined {
+            self.push_joined(conversation, recipient, request).await?;
         }
         Ok(())
     }
@@ -1344,6 +1375,8 @@ impl Manager {
         mls.wanted.remove(&conversation);
         mls.rejoins.remove(&conversation);
         mls.sync.insert(conversation, (peer, 0));
+        // A conversation with a group gets its queue at the next poll (spec 6.3).
+        self.queue_changed();
         // Rows that backed off while waiting for the group become due at this time.
         let now = self.schedule_now();
         let _ = self
@@ -1942,7 +1975,11 @@ impl Manager {
 
     /// The account to dial `recipient` under: this one if its record lists the device (none if
     /// this account revoked it), else the conversation's `peer` if its record lists it.
-    fn recipient_account(&self, peer: PeerId, recipient: InstallationId) -> Option<PeerId> {
+    pub(super) fn recipient_account(
+        &self,
+        peer: PeerId,
+        recipient: InstallationId,
+    ) -> Option<PeerId> {
         let local = self.local().ok()?;
         let lists = |record: &crate::account::publication::SignedRecord| {
             record
@@ -2218,15 +2255,8 @@ impl Manager {
                 epoch,
             } => {
                 let outcome = delivery_outcome(&result);
-                let now = self.schedule_now();
-                let op = GroupOp::Delivered {
-                    recipient,
-                    kind,
-                    epoch,
-                    outcome,
-                    now,
-                };
-                self.group_db(conversation, op, request).await.map(|_| ())
+                self.delivery_done(conversation, recipient, kind, epoch, outcome, request)
+                    .await
             }
             Task::Lookup { .. } | Task::Dial => Ok(()),
         }
@@ -2423,10 +2453,11 @@ impl Manager {
                     });
                 };
                 let ct_hash = sha256(&commit);
-                // Ruling 25: a logged Commit that cannot be vetted because the peer's record is
-                // not here is held and the record looked up (as for a missing device), so the
-                // log behind it goes on.
-                let logged = matches!(via, Via::Mailbox { .. }).then(|| commit.clone());
+                // Ruling 25: a logged (or queued) Commit that cannot be vetted because the
+                // peer's record is not here is held and the record looked up (as for a missing
+                // device), so the log or queue behind it goes on.
+                let logged =
+                    matches!(via, Via::Mailbox { .. } | Via::Queue).then(|| commit.clone());
                 let op = GroupOp::ApplyCommit {
                     peer,
                     sender_peer: sender,
@@ -2676,7 +2707,7 @@ impl Manager {
     }
 
     /// `receive_app` of a ciphertext from `sender`'s account carried by its device `carrier`, or
-    /// by no device (`None`: a push, `Via::Push`); tells which text it carried too.
+    /// by no device (`None`: a push or a queue entry); tells which text it carried too.
     pub(super) async fn open_received(
         &mut self,
         sender: PeerId,
@@ -2700,10 +2731,14 @@ impl Manager {
             peer: sender,
             transport: carrier,
             allowed: self.current_installations(sender),
+            // A queue entry is marked under this device, for the notification at the fetch's end.
             pull: match via {
                 Via::Mailbox { holder, .. } => Some(*holder),
+                Via::Queue => Some(self.local()?.device.installation_id()),
                 Via::Direct(_) | Via::Push => None,
             },
+            queue_url: self.queue_url(),
+            delivered_receipt: matches!(via, Via::Queue),
         };
         let op = MessageDbOp::OpenApp(
             open,
@@ -2748,7 +2783,7 @@ impl Manager {
             // message opened in), so it is not taken from the ciphertext but goes to the
             // plaintext hand-over (spec 6.3), not skipped.
             Ok(MessageDbReply::NotCurrent) => match via {
-                Via::Direct(_) | Via::Push => Ok(answer(None)),
+                Via::Direct(_) | Via::Push | Via::Queue => Ok(answer(None)),
                 Via::Mailbox { .. } => Ok(answer(Some(MlsReply::DecryptFailed {
                     class: CLASS_OTHER,
                     epoch: 0,
@@ -2759,10 +2794,12 @@ impl Manager {
                     self.move_epoch(conversation, peer, epoch, request).await?,
                 ))),
                 // No sender waits to seal it again in a new epoch: it is not opened here.
-                Via::Mailbox { .. } | Via::Push => Ok(answer(Some(MlsReply::DecryptFailed {
-                    class: CLASS_OUT_OF_ORDER,
-                    epoch,
-                }))),
+                Via::Mailbox { .. } | Via::Push | Via::Queue => {
+                    Ok(answer(Some(MlsReply::DecryptFailed {
+                        class: CLASS_OUT_OF_ORDER,
+                        epoch,
+                    })))
+                }
             },
             Ok(_) => Err(unavailable(ErrorCode::InvalidMessage)),
             // The MLS sender is not the authenticated device, or the message conflicts.

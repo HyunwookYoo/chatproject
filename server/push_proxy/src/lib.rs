@@ -11,7 +11,6 @@ mod harness;
 mod jwt;
 mod limit;
 mod log;
-mod serve;
 mod upstream;
 
 pub use apns::{APNS_PRODUCTION, APNS_SANDBOX, ApnsUpstream};
@@ -23,7 +22,6 @@ pub use harness::HarnessUpstream;
 pub use limit::Limits;
 pub use log::{LogSink, stderr_sink};
 pub use reqwest::Url;
-pub use serve::serve;
 pub use upstream::{
     Clock, Delivery, DeliveryKind, FakeUpstream, SenderError, Upstream, UpstreamResult,
 };

@@ -132,12 +132,19 @@ pub(super) async fn execute_test(
                 Some(key) => fixture.message_facts(key).await?.attempted_receivers.len(),
                 None => 0,
             };
+            let welcomes = state
+                .deliveries
+                .iter()
+                .filter(|(_, kind, _)| *kind == crate::message::mls_group::DELIVER_WELCOME)
+                .count();
             Ok(json!({
                 "group": state.group_epoch.is_some(),
                 "epoch": state.group_epoch,
                 "members": state.members.len(),
                 "processed_mls": state.processed_mls,
                 "deliveries": state.deliveries.len(),
+                // Of them Welcomes: a member that has no group until one arrives.
+                "welcomes": welcomes,
                 "holds": state.holds,
                 "rejoins": state.rejoin_count,
                 "attempted": attempted,

@@ -116,13 +116,41 @@ pub enum MailboxFrame {
     PlainReq { seq: u64 },
     /// One to `PAGE_MAX_ENTRIES` entries.
     Handoff { entries: Vec<HandoffEntry> },
-    /// Whether the sender is a mailbox, and its own-device push handle (M7 spec 5.2; `None`: it
-    /// has none). Sent as `[1, 4, mailbox, handle or null]`; an M6 device's `[1, 4, mailbox]`
-    /// decodes with no handle.
+    /// Whether the sender is a mailbox, its own-device push handle (M7 spec 5.2; `None`: it has
+    /// none), and whether it is a qualified mailbox (M8 spec 5.2). Sent as `[1, 4, mailbox,
+    /// handle or null, true]` when qualified and as M7's `[1, 4, mailbox, handle or null]`
+    /// otherwise; an M6 device's `[1, 4, mailbox]` decodes with no handle, and it, the M7 form
+    /// and `[.., false]` as not qualified.
     Announce {
         mailbox: bool,
         handle: Option<Vec<u8>>,
+        qualified: bool,
     },
+}
+
+/// Fields of the `Announce` this version sends when qualified, and the most it reads.
+const ANNOUNCE_FIELDS: u64 = 5;
+
+/// The first `fields` fields of an `Announce` (3 to `ANNOUNCE_FIELDS`, the forms M6, M7 and M8
+/// send).
+fn announce_inner(
+    fields: u64,
+    mailbox: bool,
+    handle: Option<&[u8]>,
+    qualified: bool,
+) -> Zeroizing<Vec<u8>> {
+    let mut e = start(fields, OP_ANNOUNCE);
+    e.bool(mailbox).unwrap();
+    if fields >= 4 {
+        match handle {
+            Some(handle) => e.bytes(handle).unwrap(),
+            None => e.null().unwrap(),
+        };
+    }
+    if fields >= 5 {
+        e.bool(qualified).unwrap();
+    }
+    finish(e)
 }
 
 /// The answer to a [`MailboxFrame`].
@@ -391,13 +419,18 @@ impl MailboxFrame {
                         .unwrap();
                 }
             }
-            Self::Announce { mailbox, handle } => {
-                e = start(4, OP_ANNOUNCE);
-                e.bool(*mailbox).unwrap();
-                match handle {
-                    Some(handle) => e.bytes(handle).unwrap(),
-                    None => e.null().unwrap(),
-                };
+            Self::Announce {
+                mailbox,
+                handle,
+                qualified,
+            } => {
+                // Four fields while not qualified: what M7 reads (it refuses five).
+                return announce_inner(
+                    if *qualified { ANNOUNCE_FIELDS } else { 4 },
+                    *mailbox,
+                    handle.as_deref(),
+                    *qualified,
+                );
             }
         }
         finish(e)
@@ -407,10 +440,16 @@ impl MailboxFrame {
         Zeroizing::new(crate::account::auth::envelope(super::KIND, &self.inner()))
     }
     pub fn decode(inner: &[u8]) -> R<Self> {
+        Self::decode_as(inner, ANNOUNCE_FIELDS)
+    }
+    /// `decode` as a device whose longest `Announce` has `announce_fields` fields: 4 for M7,
+    /// which refuses the five-field form (M8 spec 5.2).
+    fn decode_as(inner: &[u8], announce_fields: u64) -> R<Self> {
         let (mut d, fields, op) = open(inner)?;
-        // An M6 `Announce` has no handle field (plan 2, kind 18 `Announce`).
-        let m6_announce = op == OP_ANNOUNCE && fields == 3;
-        if fields != 3 && !(op == OP_ANNOUNCE && fields == 4) {
+        // An M6 `Announce` has no handle field (plan 2, kind 18 `Announce`), an M7 one no
+        // `qualified`.
+        let announce = op == OP_ANNOUNCE && (3..=announce_fields).contains(&fields);
+        if fields != 3 && !announce {
             return Err(invalid());
         }
         let frame = match op {
@@ -442,7 +481,7 @@ impl MailboxFrame {
             }
             OP_ANNOUNCE => {
                 let mailbox = d.bool().map_err(|_| invalid())?;
-                let handle = if m6_announce {
+                let handle = if fields < 4 {
                     None
                 } else if d.datatype().map_err(|_| invalid())? == minicbor::data::Type::Null {
                     d.null().map_err(|_| invalid())?;
@@ -450,16 +489,21 @@ impl MailboxFrame {
                 } else {
                     Some(blob(&mut d, MAX_HANDLE)?)
                 };
-                Self::Announce { mailbox, handle }
+                let qualified = fields >= 5 && d.bool().map_err(|_| invalid())?;
+                Self::Announce {
+                    mailbox,
+                    handle,
+                    qualified,
+                }
             }
             _ => return Err(invalid()),
         };
         let canonical = match &frame {
-            Self::Announce { mailbox, .. } if m6_announce => {
-                let mut e = start(3, OP_ANNOUNCE);
-                e.bool(*mailbox).unwrap();
-                *finish(e) == *inner
-            }
+            Self::Announce {
+                mailbox,
+                handle,
+                qualified,
+            } => *announce_inner(fields, *mailbox, handle.as_deref(), *qualified) == *inner,
             _ => *frame.inner() == *inner,
         };
         if d.position() != inner.len() || !canonical {
@@ -673,6 +717,119 @@ mod tests {
             assert!(inner.len() <= MAX_INNER);
             assert!(MailboxFrame::decode(&inner).unwrap() == frame);
         }
+    }
+
+    /// The longest `Announce` an M7 decoder reads.
+    const M7_ANNOUNCE_FIELDS: u64 = 4;
+
+    fn announce(mailbox: bool, handle: Option<&[u8]>, qualified: bool) -> MailboxFrame {
+        MailboxFrame::Announce {
+            mailbox,
+            handle: handle.map(<[u8]>::to_vec),
+            qualified,
+        }
+    }
+
+    #[test]
+    fn announce_decodes_3_4_5_fields() {
+        let decoded = |inner: &[u8]| MailboxFrame::decode(inner).unwrap();
+        // M6 `[1, 4, mailbox]` and M7 `[1, 4, mailbox, handle or null]`: never qualified.
+        assert!(decoded(&[0x83, 0x01, 0x04, 0xf5]) == announce(true, None, false));
+        assert!(decoded(&[0x84, 0x01, 0x04, 0xf4, 0xf6]) == announce(false, None, false));
+        assert!(
+            decoded(&[0x84, 0x01, 0x04, 0xf5, 0x42, 7, 7]) == announce(true, Some(&[7, 7]), false)
+        );
+        // M8 `[1, 4, mailbox, handle or null, qualified]`.
+        assert!(decoded(&[0x85, 0x01, 0x04, 0xf5, 0xf6, 0xf5]) == announce(true, None, true));
+        assert!(
+            decoded(&[0x85, 0x01, 0x04, 0xf5, 0x42, 7, 7, 0xf4])
+                == announce(true, Some(&[7, 7]), false)
+        );
+        for bad in [
+            // Six fields, a qualified that is null or a number, a handle too long, too few.
+            &[0x86, 0x01, 0x04, 0xf5, 0xf6, 0xf5, 0xf5][..],
+            &[0x85, 0x01, 0x04, 0xf5, 0xf6, 0xf6][..],
+            &[0x85, 0x01, 0x04, 0xf5, 0xf6, 0x01][..],
+            &[0x85, 0x01, 0x04, 0xf5, 0xf5][..],
+            &[0x82, 0x01, 0x04][..],
+            // Five fields of another op.
+            &[0x85, 0x01, 0x00, 0x01, 0xf6, 0xf5][..],
+        ] {
+            let code = MailboxFrame::decode(bad).err().map(|e| e.code);
+            assert_eq!(code, Some(ErrorCode::InvalidMessage), "{bad:02x?}");
+        }
+        let mut long = vec![0x85, 0x01, 0x04, 0xf5, 0x59, 0x04, 0x01];
+        long.extend(std::iter::repeat_n(7, MAX_HANDLE + 1));
+        long.push(0xf5);
+        assert!(MailboxFrame::decode(&long).is_err());
+    }
+
+    #[test]
+    fn announce_5_qualified_round_trip() {
+        let longest = vec![9; MAX_HANDLE];
+        for mailbox in [false, true] {
+            for qualified in [false, true] {
+                for handle in [None, Some(&longest[..])] {
+                    let frame = announce(mailbox, handle, qualified);
+                    let inner = frame.inner();
+                    if qualified {
+                        assert_eq!(inner[..3], [0x85, 0x01, 0x04]);
+                        assert_eq!(inner[inner.len() - 1], 0xf5);
+                    } else {
+                        assert_eq!(inner[..3], [0x84, 0x01, 0x04]);
+                    }
+                    assert!(MailboxFrame::decode(&inner).unwrap() == frame);
+                }
+            }
+        }
+        assert_eq!(
+            *announce(true, None, true).inner(),
+            [0x85, 0x01, 0x04, 0xf5, 0xf6, 0xf5]
+        );
+        // What an M8 device that is not qualified never sends, it still reads.
+        let five = [0x85, 0x01, 0x04, 0xf4, 0x41, 0x07, 0xf4];
+        assert!(MailboxFrame::decode(&five).unwrap() == announce(false, Some(&[7]), false));
+    }
+
+    /// Controller decision on the Task 6 review: while not qualified, M8 sends the four-field
+    /// form M7 reads, so an M7 own device keeps the mailbox flag and the push handle; only a
+    /// qualified mailbox sends five fields, which M7 refuses (`Busy`).
+    #[test]
+    fn four_field_announce_while_not_qualified() {
+        let m7 = |inner: &[u8]| MailboxFrame::decode_as(inner, M7_ANNOUNCE_FIELDS);
+        for mailbox in [false, true] {
+            for handle in [None, Some(&[7u8; 40][..])] {
+                let frame = announce(mailbox, handle, false);
+                let inner = frame.inner();
+                assert_eq!(inner[0], 0x84, "four fields");
+                assert!(m7(&inner).unwrap() == frame, "M7 reads all of it");
+                let qualified = announce(mailbox, handle, true).inner();
+                assert_eq!(qualified[0], 0x85);
+                assert!(m7(&qualified).is_err());
+            }
+        }
+        assert_eq!(
+            *announce(true, Some(&[7]), false).inner(),
+            [0x84, 0x01, 0x04, 0xf5, 0x41, 0x07]
+        );
+    }
+
+    /// Spec 5.2's compatibility limit: an M7 device reads `Announce` of 3 or 4 fields only, so
+    /// it refuses the five-field form and answers `Busy` (the decode error arm of the kind 18
+    /// handler, account/manager/mailbox.rs). It never learns a mailbox's `qualified`.
+    #[test]
+    fn m7_decoder_shape_rejects_5_fields() {
+        let m7 = |inner: &[u8]| MailboxFrame::decode_as(inner, M7_ANNOUNCE_FIELDS);
+        let five = announce(true, Some(&[7]), true).inner();
+        assert_eq!(m7(&five).err().map(|e| e.code), Some(ErrorCode::InvalidMessage));
+        assert!(MailboxFrame::decode(&five).unwrap() == announce(true, Some(&[7]), true));
+        // Even unqualified: the shape alone is refused (M8 sends it only when qualified).
+        assert!(m7(&[0x85, 0x01, 0x04, 0xf4, 0xf6, 0xf4]).is_err());
+        // What M6 and M7 send it still reads.
+        assert!(m7(&[0x83, 0x01, 0x04, 0xf5]).unwrap() == announce(true, None, false));
+        assert!(
+            m7(&[0x84, 0x01, 0x04, 0xf5, 0x41, 0x07]).unwrap() == announce(true, Some(&[7]), false)
+        );
     }
 
     #[test]

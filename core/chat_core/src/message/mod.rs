@@ -4,6 +4,7 @@ pub(crate) mod mailbox_store;
 pub(crate) mod mls_group;
 pub(crate) mod mls_store;
 pub(crate) mod push_store;
+pub(crate) mod queue_store;
 pub(crate) mod store;
 pub(crate) mod types;
 pub(crate) mod wire;

@@ -16,6 +16,7 @@ import 'package:chat_e2e/src/owned_resources.dart';
 import 'package:chat_e2e/src/process_runner.dart';
 import 'package:chat_e2e/src/protocol.dart';
 import 'package:chat_e2e/src/push_scenario.dart';
+import 'package:chat_e2e/src/queue_scenario.dart';
 import 'package:chat_e2e/src/scenario.dart';
 import 'package:chat_e2e/src/transport_trace.dart';
 import 'package:path/path.dart' as p;
@@ -82,7 +83,7 @@ Future<void> main(List<String> arguments) async {
     ..addOption(
       'scenario',
       defaultsTo: 'm2',
-      allowed: ['m2', 'm3', 'm3-auth', 'm4', 'm6', 'm7', 'm7-fcm'],
+      allowed: ['m2', 'm3', 'm3-auth', 'm4', 'm6', 'm7', 'm7-fcm', 'm8'],
     )
     ..addOption('repo-root', mandatory: true);
   late ArgResults options;
@@ -94,8 +95,9 @@ Future<void> main(List<String> arguments) async {
         // M6 needs an Android phone: a Windows app or a second emulator is
         // its mailbox.
         (options['scenario'] == 'm6' && options['profile'] == 'windows') ||
-        // M7 drives one Android app and two nodes.
-        ((options['scenario'] as String).startsWith('m7') &&
+        // M7 and M8 drive one Android app and two nodes.
+        (((options['scenario'] as String).startsWith('m7') ||
+                options['scenario'] == 'm8') &&
             options['profile'] != 'android')) {
       throw const FormatException(
         'Profile requires a supported host and absolute repo root',
@@ -103,7 +105,7 @@ Future<void> main(List<String> arguments) async {
     }
   } on FormatException {
     stderr.writeln(
-      'Usage: dart run bin/run.dart --profile mixed|android|windows --scenario m2|m3|m3-auth|m4|m6|m7|m7-fcm --repo-root <absolute>',
+      'Usage: dart run bin/run.dart --profile mixed|android|windows --scenario m2|m3|m3-auth|m4|m6|m7|m7-fcm|m8 --repo-root <absolute>',
     );
     exitCode = 64;
     return;
@@ -117,6 +119,8 @@ Future<void> main(List<String> arguments) async {
   // broadcasts them to the app's debug receiver. m7-fcm: real FCM (nightly).
   final pushScenario = (options['scenario'] as String).startsWith('m7');
   final realFcm = options['scenario'] == 'm7-fcm';
+  // m8: a local queue server, reached by the app through `adb reverse`.
+  final queueScenario = options['scenario'] == 'm8';
   final accountScenario = options['scenario'] != 'm2';
   final scenarioName = options['scenario'] as String;
   final logs = await Directory(
@@ -157,7 +161,12 @@ Future<void> main(List<String> arguments) async {
     if (!File(p.join(root, 'Cargo.toml')).existsSync()) {
       throw StateError('Invalid repository root');
     }
-    for (final port in [3340, 47000, if (pushScenario) _pushPort]) {
+    for (final port in [
+      3340,
+      47000,
+      if (pushScenario) _pushPort,
+      if (queueScenario) _queuePort,
+    ]) {
       final socket = await ServerSocket.bind(
         InternetAddress.loopbackIPv4,
         port,
@@ -209,10 +218,29 @@ Future<void> main(List<String> arguments) async {
         timeout: const Duration(minutes: 20),
       );
     }
+    if (queueScenario) {
+      run.phase = _Phase.buildQueueServer;
+      await run.command(
+        'rustup',
+        [
+          'run',
+          '1.92.0',
+          'cargo',
+          'build',
+          '--locked',
+          '-p',
+          'queue_server',
+          '--features',
+          'harness-counts',
+        ],
+        cwd: root,
+        timeout: const Duration(minutes: 20),
+      );
+    }
     final flutter = Platform.isWindows ? 'flutter.bat' : 'flutter';
     final androidCount = profile == 'windows'
         ? 0
-        : profile == 'android' && !pushScenario
+        : profile == 'android' && !pushScenario && !queueScenario
         ? 2
         : 1;
     final windowsCount = profile == 'android'
@@ -270,6 +298,11 @@ Future<void> main(List<String> arguments) async {
       upstream = realFcm ? null : await FakeUpstreamReceiver.start();
       if (upstream != null) run.owned.add('fake upstream', upstream.close);
       await _startPushProxy(run, root, logs, upstream);
+    }
+    String? queueDb;
+    if (queueScenario) {
+      run.phase = _Phase.queueServerReady;
+      queueDb = await _startQueueServer(run, root, logs);
     }
     run.phase = _Phase.controllerStart;
     controller = await Controller.start(
@@ -393,7 +426,12 @@ Future<void> main(List<String> arguments) async {
       for (var i = 0; i < specs.length; i++) {
         final spec = specs[i];
         run.phase = _Phase.adbReverse;
-        for (final port in [3340, 47000, if (pushScenario) _pushPort]) {
+        for (final port in [
+          3340,
+          47000,
+          if (pushScenario) _pushPort,
+          if (queueScenario) _queuePort,
+        ]) {
           await run.reverse(sdk, spec, port);
         }
         final name = 'android-${i + 1}';
@@ -534,6 +572,7 @@ Future<void> main(List<String> arguments) async {
                 '/data/user/0/$package/files/e2e/${p.basename(logs.parent.path)}/$name/store-$store',
               ],
               if (pushScenario) ...['--es', 'chat_push_url', _pushUrl],
+              if (queueScenario) ...['--es', 'chat_queue_url', _queueUrl],
             ], requireSuccess: false);
             await _captureAndroidLaunch(
               launched,
@@ -765,7 +804,7 @@ Future<void> main(List<String> arguments) async {
       }
     }
     final nodeProcesses = <String, OwnedProcess>{};
-    // `node`, or m7's second node `mailbox` (A's other device).
+    // `node`, or m7's and m8's second node `mailbox` (A's other device).
     Future<Participant> launchNode([
       Participant? old,
       String nodeName = 'node',
@@ -783,7 +822,8 @@ Future<void> main(List<String> arguments) async {
         nodeName,
         '--data-dir',
         p.join(logs.path, nodeName),
-        if (mailboxScenario || pushScenario) '--account',
+        if (mailboxScenario || pushScenario || queueScenario) '--account',
+        if (queueScenario) ...['--queue-url', _queueUrl],
       ], logDir: logs);
       Participant? next;
       run.phase = _Phase.nodeParticipant;
@@ -795,16 +835,32 @@ Future<void> main(List<String> arguments) async {
       return next!;
     }
 
-    if (!accountScenario || mailboxScenario || pushScenario) {
+    if (!accountScenario || mailboxScenario || pushScenario || queueScenario) {
       participants.add(await launchNode());
     }
-    if (pushScenario) participants.add(await launchNode(null, 'mailbox'));
+    if (pushScenario || queueScenario) {
+      participants.add(await launchNode(null, 'mailbox'));
+    }
     run.phase = _Phase.scenario;
     Participant named(String name) =>
         participants.singleWhere((participant) => participant.name == name);
     await run.wait(
       _traceOnFailure(
-        pushScenario
+        queueScenario
+            ? runQueueScenario(
+                control,
+                [named('android-1'), named('mailbox'), named('node')],
+                server: () => _queueCounts(run, root, queueDb!),
+                evidence: (stage, data) =>
+                    File(
+                      p.join(logs.path, 'queue-public-evidence.jsonl'),
+                    ).writeAsStringSync(
+                      '${jsonEncode({'stage': stage, ...data})}\n',
+                      mode: FileMode.append,
+                      flush: true,
+                    ),
+              )
+            : pushScenario
             ? runPushScenario(
                 control,
                 [named('android-1'), named('mailbox'), named('node')],
@@ -911,7 +967,9 @@ Future<void> main(List<String> arguments) async {
             run.transport ??= await collectTransport(control.participants),
       ),
       timeout: Duration(
-        minutes: pushScenario
+        minutes: queueScenario
+            ? 20
+            : pushScenario
             ? 12
             : accountScenario
             ? 8
@@ -975,7 +1033,9 @@ Future<void> main(List<String> arguments) async {
     if (userInterrupted && code == 0) code = 130;
     if (code == 0) {
       stdout.writeln(
-        pushScenario
+        queueScenario
+            ? '$profile M8 PASS: phone and its other device off line, texts held in their queues, phone got them once with one alert, a qualified mailbox retired its queue.'
+            : pushScenario
             ? realFcm
                   ? '$profile M7 FCM PASS: a real FCM push into a killed app showed the alias and the text.'
                   : '$profile M7 PASS: cold cipher push showed alias and text, read push cleared it, wake push fetched the large text.'
@@ -1028,6 +1088,7 @@ Future<void> main(List<String> arguments) async {
             'waits': run.waits(),
             'transport': run.transport,
             'push': pushStats.toSafeJson(),
+            'queue': queueStats.toSafeJson(),
           }),
           flush: true,
         );
@@ -1104,6 +1165,8 @@ enum _Phase {
   nodeParticipant('node_participant'),
   buildPushProxy('build_push_proxy'),
   pushProxyReady('push_proxy_ready'),
+  buildQueueServer('build_queue_server'),
+  queueServerReady('queue_server_ready'),
   scenario('scenario'),
   cleanup('cleanup'),
   complete('complete');
@@ -1641,7 +1704,9 @@ class _Managed implements OwnedProcess {
 }
 
 /// A fixed scenario op name (tools/ci/write_e2e_summary.py `RPC_OP`).
-final _rpcOp = RegExp(r'^(?:account|message|mailbox|push)_local_[a-z_]{1,48}$');
+final _rpcOp = RegExp(
+  r'^(?:account|message|mailbox|push|queue)_local_[a-z_]{1,48}$',
+);
 
 /// The host's 1-minute load average times 100 (Linux), or null.
 int? _hostLoad() {
@@ -1698,6 +1763,55 @@ Future<void> _captureAndroidLaunch(
   if ((launch.stdout as String).contains('Activity not started')) {
     throw StateError('Android launch did not start the activity');
   }
+}
+
+/// The local queue server (m8): loopback only, reached by the app through
+/// `adb reverse`, by the nodes directly (`--queue-url`).
+const _queuePort = 8788;
+const _queueUrl = 'http://127.0.0.1:$_queuePort';
+
+String _queueServer(String root) => p.join(
+  root,
+  'target',
+  'debug',
+  Platform.isWindows ? 'queue_server.exe' : 'queue_server',
+);
+
+/// Starts `queue_server` (`harness-counts` build) on a fresh file in the run's
+/// logs; returns the file's path.
+Future<String> _startQueueServer(_Run run, String root, Directory logs) async {
+  final dir = await Directory(p.join(logs.path, 'queue')).create();
+  final db = p.join(dir.path, 'queue.db');
+  await run.start(
+    _queueServer(root),
+    const [],
+    logDir: logs,
+    environment: {'QUEUE_LISTEN': '127.0.0.1:$_queuePort', 'QUEUE_DB': db},
+  );
+  await run.until(() async {
+    try {
+      final socket = await Socket.connect(
+        InternetAddress.loopbackIPv4,
+        _queuePort,
+        timeout: const Duration(seconds: 1),
+      );
+      socket.destroy();
+      return true;
+    } on SocketException {
+      return false;
+    }
+  }, const Duration(seconds: 15));
+  return db;
+}
+
+/// The queue server's counts, read from its file beside it (values only).
+Future<QueueServerCounts> _queueCounts(_Run run, String root, String db) async {
+  final result = await run.command(
+    _queueServer(root),
+    ['--harness-counts'],
+    environment: {'QUEUE_DB': db},
+  );
+  return QueueServerCounts.parse(result.stdout as String);
 }
 
 /// The local push proxy (m7): loopback only, reached by the app through

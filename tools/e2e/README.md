@@ -64,6 +64,12 @@ notification`. `--scenario m7-fcm` sends through real FCM instead: it needs
 `E2E_FCM_SERVICE_ACCOUNT_FILE`, an app built with `google-services.json`, and a
 Google Play image (`E2E_AVD_PROFILE=local`); the `android-fcm` job runs it.
 
+`--profile android --scenario m8` (M8 queue) uses the same emulator and two
+nodes. It builds `queue_server` with the debug-only `harness-counts` feature,
+runs it on 127.0.0.1:8788 with a fresh file under the run's logs (reversed to
+the emulator, `--queue-url` for the nodes), and reads how many entries each
+queue holds with `queue_server --harness-counts` (counts only).
+
 Ports 3340/47000 must be free. Existing AVDs and reverse mappings are preserved;
 an already running target test AVD fails before install/launch. Only emulators
 newly launched by this run receive the test APK. Handled Ctrl+C, stage failure,

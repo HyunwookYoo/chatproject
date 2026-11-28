@@ -172,7 +172,22 @@ def check(path, doc):
     for job_id, job in jobs.items():
         if environment(job) == "push-e2e":
             problems += check_push_e2e(name, job_id, job)
+    if path.stem.lower() in RELEASE or any(environment(job) in RELEASE for job in jobs.values()):
+        problems += check_release(name, doc)
     return problems
+
+
+# The workflows that build an app for users, by file stem and by the Environment of their job.
+RELEASE = {"android-apk", "testflight"}
+
+
+def check_release(name, doc):
+    """Rule (d): the build takes its queue server address from CHATPROJECT_QUEUE_URL (option_env! in
+    core/chat_core/src/queue/mod.rs). Without it every device of that build has the queue off."""
+    url = (doc.get("env") or {}).get("CHATPROJECT_QUEUE_URL")
+    if isinstance(url, str) and url.startswith("https://"):
+        return []
+    return [f"{name}: a release workflow must set CHATPROJECT_QUEUE_URL to an https:// address in its env"]
 
 
 # Each phase: (test class, methods that must pass, the one method that must be skipped or None).

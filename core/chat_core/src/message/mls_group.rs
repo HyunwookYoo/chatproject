@@ -1750,7 +1750,7 @@ fn group_members(c: &Connection, conversation: ConversationId) -> R<Vec<Installa
 }
 
 /// At most this many queued deliveries go ahead of one application message.
-const PENDING_LIMIT: i64 = 8;
+pub(super) const PENDING_LIMIT: i64 = 8;
 
 fn pending_deliveries(
     c: &Connection,

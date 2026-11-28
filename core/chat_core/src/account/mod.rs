@@ -33,8 +33,9 @@ mod manager;
 pub use creation::RecoveryDisplay;
 pub use manager::{
     AccountHandle, AccountPhase, AccountView, CandidateInfo, GroupState, MailboxStateView,
-    PublishIntent,
+    PublishIntent, QueueStateView,
 };
+pub use crate::mailbox::verdict::{QueueMode, Verdict};
 
 mod invite;
 mod contacts;

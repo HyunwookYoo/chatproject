@@ -39,30 +39,35 @@ impl HttpPushProxy {
         }
         let handle = root.join("handle").map_err(|_| invalid())?;
         let push = root.join("push").map_err(|_| invalid())?;
-        let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .map_err(|_| CoreError::new(ErrorCode::NotAvailable, "push_tls"))?
-        .with_root_certificates(rustls::RootCertStore {
-            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-        })
-        .with_no_client_auth();
-        tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-        let client = reqwest::Client::builder()
-            .tls_backend_preconfigured(tls)
-            .https_only(release)
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(REQUEST_TIMEOUT)
-            .connect_timeout(CONNECT_TIMEOUT)
-            .build()
-            .map_err(|_| CoreError::new(ErrorCode::NotAvailable, "push_client"))?;
         Ok(Self {
             handle,
             push,
-            client,
+            client: https_client(release)?,
         })
     }
+}
+
+/// The pooled client of both servers (push proxy, queue server): TLS on `ring` with the
+/// bundled web roots, no redirects, `REQUEST_TIMEOUT` per request; `https://` only in release.
+pub(crate) fn https_client(release: bool) -> Result<reqwest::Client, CoreError> {
+    let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|_| CoreError::new(ErrorCode::NotAvailable, "push_tls"))?
+    .with_root_certificates(rustls::RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    })
+    .with_no_client_auth();
+    tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    reqwest::Client::builder()
+        .tls_backend_preconfigured(tls)
+        .https_only(release)
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(REQUEST_TIMEOUT)
+        .connect_timeout(CONNECT_TIMEOUT)
+        .build()
+        .map_err(|_| CoreError::new(ErrorCode::NotAvailable, "push_client"))
 }
 
 impl PushProxy for HttpPushProxy {

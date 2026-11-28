@@ -19,9 +19,10 @@ use std::{fs, path::Path};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 type R<T> = Result<T, CoreError>;
-/// Current SQL schema. v1 (M4), v2 (M5) and v3 (M6) are upgraded in place by `upgrade_v1_to_v2`,
-/// `upgrade_v2_to_v3` and `upgrade_v3_to_v4`; nothing else is accepted.
-const SCHEMA_VERSION: i64 = 4;
+/// Current SQL schema. v1 (M4), v2 (M5), v3 (M6) and v4 (M7) are upgraded in place by
+/// `upgrade_v1_to_v2`, `upgrade_v2_to_v3`, `upgrade_v3_to_v4` and `upgrade_v4_to_v5`; nothing else
+/// is accepted.
+const SCHEMA_VERSION: i64 = 5;
 const DB: &str = "db.sqlite3";
 const PREP: &str = "migration.prep";
 pub(crate) struct OpenedStore {
@@ -521,9 +522,12 @@ fn upgrade_if_old(conn: &mut Connection) -> R<()> {
     if (1..=3).contains(&version) {
         upgrade_v3_to_v4(conn)?;
     }
+    if (1..=4).contains(&version) {
+        upgrade_v4_to_v5(conn)?;
+    }
     Ok(())
 }
-/// The one `push_local` row every v4 database starts with (fresh or upgraded): push on, no
+/// The one `push_local` row every v4 and later database starts with (fresh or upgraded): push on, no
 /// platform, token or handle yet, and this database's own random 16-byte tag. Seeded here and
 /// not in SQL so the tag comes from the OS CSPRNG rather than SQLite's `randomblob`.
 fn seed_push_local(c: &Connection) -> R<()> {
@@ -641,6 +645,41 @@ pub(crate) fn upgrade_v3_to_v4(c: &mut Connection) -> R<()> {
     })
 }
 
+/// One transaction: the queue tables and the `queue_local` row, `mailbox_device.qualified` and
+/// `last_seen_ms`, `push_delivery` rebuilt with `kind` in its key (every row kind 1),
+/// `storage_meta` rebuilt as v5, `user_version = 5`. Any failure rolls back to an intact v4
+/// database. A v4 app opening the result rejects it as corrupt (version != 4).
+pub(crate) fn upgrade_v4_to_v5(c: &mut Connection) -> R<()> {
+    let tx = c.transaction().map_err(upgrade_failed)?;
+    let version: i64 = tx
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .map_err(|_| corrupt())?;
+    let schema: i64 = tx
+        .query_row(
+            "SELECT schema_version FROM storage_meta WHERE singleton=1",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|_| corrupt())?;
+    if version != 4 || schema != 4 {
+        return Err(corrupt());
+    }
+    tx.execute_batch(include_str!("upgrade_v4_to_v5.sql"))
+        .map_err(upgrade_failed)?;
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    if take_upgrade_fault(&tx) {
+        return Err(CoreError::new(
+            ErrorCode::StorageCorrupt,
+            "schema_upgrade_fixture_fault",
+        ));
+    }
+    tx.pragma_update(None, "user_version", 5)
+        .map_err(upgrade_failed)?;
+    tx.commit().map_err(|_| {
+        CoreError::new(ErrorCode::StorageUncertain, "schema_upgrade_commit_uncertain")
+    })
+}
+
 // ---- debug fixtures: raw access that deliberately bypasses the upgrade -------------------
 
 #[cfg(all(feature = "test-hooks", debug_assertions))]
@@ -728,6 +767,25 @@ pub(crate) fn ready_v3(conn: &Connection) -> R<()> {
         )
         .map_err(|_| corrupt())?;
     if version != 3 || schema != 3 {
+        return Err(corrupt());
+    }
+    Ok(())
+}
+
+/// Test-only copy of the M7 (v4) reader's version check, to prove v4 rejects a v5 database.
+#[cfg(all(feature = "test-hooks", debug_assertions))]
+pub(crate) fn ready_v4(conn: &Connection) -> R<()> {
+    let version: i64 = conn
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .map_err(|_| corrupt())?;
+    let schema: i64 = conn
+        .query_row(
+            "SELECT schema_version FROM storage_meta WHERE singleton=1",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|_| corrupt())?;
+    if version != 4 || schema != 4 {
         return Err(corrupt());
     }
     Ok(())
@@ -852,4 +910,120 @@ pub(crate) fn load_validated(
         return Err(corrupt());
     }
     Ok(state.zip(decoded))
+}
+
+#[cfg(test)]
+mod tests {
+    use rusqlite::Connection;
+
+    fn fresh() -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(include_str!("schema.sql")).unwrap();
+        c
+    }
+    fn ok(c: &Connection, sql: &str) -> bool {
+        c.execute_batch(sql).is_ok()
+    }
+    /// A 32-byte blob literal of byte `n`.
+    fn blob(n: u8) -> String {
+        format!("x'{}'", format!("{n:02x}").repeat(32))
+    }
+    fn plan(c: &Connection, sql: &str) -> String {
+        let mut q = c.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let unbound = vec![rusqlite::types::Value::Null; q.parameter_count()];
+        q.query_map(rusqlite::params_from_iter(unbound), |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join("; ")
+    }
+
+    #[test]
+    fn push_delivery_holds_one_frame_per_kind() {
+        let c = fresh();
+        let row = |kind: &str| {
+            format!("INSERT INTO push_delivery VALUES(zeroblob(32),zeroblob(32),{kind},zeroblob(16),x'01',0,0,0)")
+        };
+        assert!(ok(&c, &row("1")));
+        assert!(ok(&c, &row("2")));
+        assert!(!ok(&c, &row("1")));
+        assert!(!ok(&c, &row("3")));
+        assert!(ok(&c, &format!("INSERT INTO push_delivery(conversation,recipient_install,msg_id,wire,attempts,next_retry_at_ms,handed_off) VALUES(zeroblob(32),{},zeroblob(16),x'01',0,0,0)", blob(1))));
+        let kind: i64 = c
+            .query_row(&format!("SELECT kind FROM push_delivery WHERE recipient_install={}", blob(1)), [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kind, 1);
+    }
+
+    #[test]
+    fn queue_own_has_at_most_one_active_queue_per_conversation() {
+        let c = fresh();
+        let queue = |id: u8, state: u8, delete_at: &str| {
+            format!("INSERT INTO queue_own VALUES({},zeroblob(32),zeroblob(32),zeroblob(32),0,{state},{delete_at},0,0)", blob(id))
+        };
+        assert!(ok(&c, &queue(1, 0, "NULL")));
+        assert!(!ok(&c, &queue(2, 0, "NULL")));
+        assert!(ok(&c, &queue(2, 1, "5")));
+        assert!(ok(&c, &queue(3, 1, "6")));
+        // Active has no delete time, Retiring always has one.
+        assert!(!ok(&c, &queue(4, 1, "NULL")));
+        assert!(!ok(&c, "UPDATE queue_own SET delete_at_ms=1 WHERE state=0"));
+        assert!(ok(&c, "UPDATE queue_own SET state=1,delete_at_ms=7 WHERE state=0"));
+        assert!(ok(&c, &queue(4, 0, "NULL")));
+        assert!(!ok(&c, &queue(5, 2, "NULL")));
+    }
+
+    #[test]
+    fn queue_peer_is_a_queue_or_a_tombstone() {
+        let c = fresh();
+        let peer = |n: u8, url: &str, id: &str, secret: &str| {
+            format!("INSERT INTO queue_peer VALUES(zeroblob(32),{},{url},{id},{secret},1,2,0)", blob(n))
+        };
+        assert!(ok(&c, &peer(1, "'https://q.example'", "zeroblob(32)", "zeroblob(32)")));
+        assert!(ok(&c, &peer(2, "NULL", "NULL", "NULL")));
+        assert!(!ok(&c, &peer(3, "NULL", "zeroblob(32)", "zeroblob(32)")));
+        assert!(!ok(&c, &peer(4, "'https://q.example'", "NULL", "zeroblob(32)")));
+        assert!(!ok(&c, &peer(5, "'https://q.example'", "zeroblob(32)", "NULL")));
+        assert!(!ok(&c, &peer(6, "''", "zeroblob(32)", "zeroblob(32)")));
+        assert!(!ok(&c, &peer(7, "'https://q.example'", "zeroblob(31)", "zeroblob(32)")));
+    }
+
+    #[test]
+    fn queue_local_starts_auto_and_mailbox_device_unqualified() {
+        let c = fresh();
+        let local: (i64, i64, i64, Option<i64>, Option<i64>) = c
+            .query_row("SELECT * FROM queue_local", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+            .unwrap();
+        assert_eq!(local, (1, 0, 0, None, None));
+        assert!(!ok(&c, "UPDATE queue_local SET mode=3"));
+        assert!(!ok(&c, "INSERT INTO queue_local VALUES(2,0,0,NULL,NULL)"));
+        c.execute_batch("INSERT INTO mailbox_device(installation,mailbox,announced_at_ms) VALUES(zeroblob(32),1,0)")
+            .unwrap();
+        let device: (i64, Option<i64>) = c
+            .query_row("SELECT qualified,last_seen_ms FROM mailbox_device", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!(device, (0, None));
+        assert!(!ok(&c, "UPDATE mailbox_device SET qualified=2"));
+        assert!(!ok(&c, "UPDATE mailbox_device SET last_seen_ms=-1"));
+    }
+
+    /// The lookups Tasks 8-10 make, and the existing kind 1 `push_delivery` key lookups, use an
+    /// index rather than a scan.
+    #[test]
+    fn queue_lookups_use_indexes() {
+        let c = fresh();
+        for (sql, index) in [
+            ("SELECT queue_id FROM queue_own WHERE conversation=?1 AND state=0", "queue_own_"),
+            ("SELECT queue_id FROM queue_own WHERE conversation=?1 AND state=1", "queue_own_conversation"),
+            ("SELECT queue_id FROM queue_peer WHERE conversation=?1 AND installation=?2", "sqlite_autoindex_queue_peer_1"),
+            ("SELECT frame_hash FROM queue_delivery WHERE expires_at_ms<=?1", "queue_delivery_due"),
+            (
+                "SELECT attempts FROM push_delivery WHERE conversation=?1 AND recipient_install=?2 AND kind=1 AND msg_id=?3",
+                "sqlite_autoindex_push_delivery_1",
+            ),
+        ] {
+            let plan = plan(&c, sql);
+            assert!(plan.contains(index) && !plan.starts_with("SCAN"), "{sql}: {plan}");
+        }
+    }
 }

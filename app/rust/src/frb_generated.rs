@@ -37,7 +37,7 @@ flutter_rust_bridge::frb_generated_boilerplate!(
     default_rust_auto_opaque = RustAutoOpaqueMoi,
 );
 pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_VERSION: &str = "2.11.1";
-pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = 1260103182;
+pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = -1506957663;
 
 // Section: executor
 
@@ -1633,6 +1633,110 @@ fn wire__crate__api__push__push_status_impl(
         },
     )
 }
+fn wire__crate__api__queue__queue_configure_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "queue_configure",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_server_url = <Option<String>>::sse_decode(&mut deserializer);
+            deserializer.end();
+            move |context| {
+                transform_result_sse::<_, crate::api::chat::CoreError>((move || {
+                    let output_ok = crate::api::queue::queue_configure(api_server_url)?;
+                    Ok(output_ok)
+                })())
+            }
+        },
+    )
+}
+fn wire__crate__api__queue__queue_set_mode_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_async::<flutter_rust_bridge::for_generated::SseCodec, _, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "queue_set_mode",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_mode = <crate::api::queue::QueueMode>::sse_decode(&mut deserializer);
+            deserializer.end();
+            move |context| async move {
+                transform_result_sse::<_, crate::api::chat::CoreError>(
+                    (move || async move {
+                        let output_ok = crate::api::queue::queue_set_mode(api_mode).await?;
+                        Ok(output_ok)
+                    })()
+                    .await,
+                )
+            }
+        },
+    )
+}
+fn wire__crate__api__queue__queue_state_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_async::<flutter_rust_bridge::for_generated::SseCodec, _, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "queue_state",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            deserializer.end();
+            move |context| async move {
+                transform_result_sse::<_, crate::api::chat::CoreError>(
+                    (move || async move {
+                        let output_ok = crate::api::queue::queue_state().await?;
+                        Ok(output_ok)
+                    })()
+                    .await,
+                )
+            }
+        },
+    )
+}
 fn wire__crate__api__account__recover_impl(
     port_: flutter_rust_bridge::for_generated::MessagePort,
     ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
@@ -2292,11 +2396,13 @@ impl SseDecode for crate::api::chat::ChatEvent {
             5 => {
                 let mut var_directPeers = <u32>::sse_decode(deserializer);
                 let mut var_mailboxOk = <bool>::sse_decode(deserializer);
-                let mut var_queueOk = <Option<bool>>::sse_decode(deserializer);
+                let mut var_usingQueue = <bool>::sse_decode(deserializer);
+                let mut var_hasMailbox = <bool>::sse_decode(deserializer);
                 return crate::api::chat::ChatEvent::ConnectionState {
                     direct_peers: var_directPeers,
                     mailbox_ok: var_mailboxOk,
-                    queue_ok: var_queueOk,
+                    using_queue: var_usingQueue,
+                    has_mailbox: var_hasMailbox,
                 };
             }
             6 => {
@@ -2874,17 +2980,6 @@ impl SseDecode for Option<crate::api::message::BlockReason> {
     }
 }
 
-impl SseDecode for Option<bool> {
-    // Codec=Sse (Serialization based), see doc to use other codecs
-    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
-        if (<bool>::sse_decode(deserializer)) {
-            return Some(<bool>::sse_decode(deserializer));
-        } else {
-            return None;
-        }
-    }
-}
-
 impl SseDecode for Option<crate::api::message::ConversationCursor> {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
@@ -3231,6 +3326,35 @@ impl SseDecode for crate::api::push::PushStatusView {
     }
 }
 
+impl SseDecode for crate::api::queue::QueueMode {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut inner = <i32>::sse_decode(deserializer);
+        return match inner {
+            0 => crate::api::queue::QueueMode::Auto,
+            1 => crate::api::queue::QueueMode::Always,
+            2 => crate::api::queue::QueueMode::Never,
+            _ => unreachable!("Invalid variant for QueueMode: {}", inner),
+        };
+    }
+}
+
+impl SseDecode for crate::api::queue::QueueStateView {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut var_mode = <crate::api::queue::QueueMode>::sse_decode(deserializer);
+        let mut var_verdict = <crate::api::queue::Verdict>::sse_decode(deserializer);
+        let mut var_usingQueue = <bool>::sse_decode(deserializer);
+        let mut var_uptime7DPermille = <u32>::sse_decode(deserializer);
+        return crate::api::queue::QueueStateView {
+            mode: var_mode,
+            verdict: var_verdict,
+            using_queue: var_usingQueue,
+            uptime_7d_permille: var_uptime7DPermille,
+        };
+    }
+}
+
 impl SseDecode for crate::api::account::RecordView {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
@@ -3341,6 +3465,18 @@ impl SseDecode for () {
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {}
 }
 
+impl SseDecode for crate::api::queue::Verdict {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut inner = <i32>::sse_decode(deserializer);
+        return match inner {
+            0 => crate::api::queue::Verdict::HasMailbox,
+            1 => crate::api::queue::Verdict::NoMailbox,
+            _ => unreachable!("Invalid variant for Verdict: {}", inner),
+        };
+    }
+}
+
 fn pde_ffi_dispatcher_primary_impl(
     func_id: i32,
     port: flutter_rust_bridge::for_generated::MessagePort,
@@ -3407,24 +3543,27 @@ fn pde_ffi_dispatcher_primary_impl(
         42 => wire__crate__api__push__push_set_enabled_impl(port, ptr, rust_vec_len, data_len),
         43 => wire__crate__api__push__push_set_token_impl(port, ptr, rust_vec_len, data_len),
         44 => wire__crate__api__push__push_status_impl(port, ptr, rust_vec_len, data_len),
-        45 => wire__crate__api__account__recover_impl(port, ptr, rust_vec_len, data_len),
-        46 => wire__crate__api__account__refresh_record_impl(port, ptr, rust_vec_len, data_len),
-        47 => wire__crate__api__account__republish_accepted_record_impl(
+        45 => wire__crate__api__queue__queue_configure_impl(port, ptr, rust_vec_len, data_len),
+        46 => wire__crate__api__queue__queue_set_mode_impl(port, ptr, rust_vec_len, data_len),
+        47 => wire__crate__api__queue__queue_state_impl(port, ptr, rust_vec_len, data_len),
+        48 => wire__crate__api__account__recover_impl(port, ptr, rust_vec_len, data_len),
+        49 => wire__crate__api__account__refresh_record_impl(port, ptr, rust_vec_len, data_len),
+        50 => wire__crate__api__account__republish_accepted_record_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        48 => wire__crate__api__account__retry_open_impl(port, ptr, rust_vec_len, data_len),
-        49 => wire__crate__api__message__retry_send_impl(port, ptr, rust_vec_len, data_len),
-        50 => wire__crate__api__account__revoke_device_impl(port, ptr, rust_vec_len, data_len),
-        51 => wire__crate__api__account__safety_display_impl(port, ptr, rust_vec_len, data_len),
-        52 => wire__crate__api__chat__send_probe_text_impl(port, ptr, rust_vec_len, data_len),
-        53 => wire__crate__api__message__send_text_impl(port, ptr, rust_vec_len, data_len),
-        54 => wire__crate__api__mailbox__set_mailbox_impl(port, ptr, rust_vec_len, data_len),
-        55 => wire__crate__api__account__snapshot_impl(port, ptr, rust_vec_len, data_len),
-        56 => wire__crate__api__chat__test_hooks_start_impl(port, ptr, rust_vec_len, data_len),
-        57 => wire__crate__api__account__test_storage_start_impl(port, ptr, rust_vec_len, data_len),
+        51 => wire__crate__api__account__retry_open_impl(port, ptr, rust_vec_len, data_len),
+        52 => wire__crate__api__message__retry_send_impl(port, ptr, rust_vec_len, data_len),
+        53 => wire__crate__api__account__revoke_device_impl(port, ptr, rust_vec_len, data_len),
+        54 => wire__crate__api__account__safety_display_impl(port, ptr, rust_vec_len, data_len),
+        55 => wire__crate__api__chat__send_probe_text_impl(port, ptr, rust_vec_len, data_len),
+        56 => wire__crate__api__message__send_text_impl(port, ptr, rust_vec_len, data_len),
+        57 => wire__crate__api__mailbox__set_mailbox_impl(port, ptr, rust_vec_len, data_len),
+        58 => wire__crate__api__account__snapshot_impl(port, ptr, rust_vec_len, data_len),
+        59 => wire__crate__api__chat__test_hooks_start_impl(port, ptr, rust_vec_len, data_len),
+        60 => wire__crate__api__account__test_storage_start_impl(port, ptr, rust_vec_len, data_len),
         _ => unreachable!(),
     }
 }
@@ -3599,12 +3738,14 @@ impl flutter_rust_bridge::IntoDart for crate::api::chat::ChatEvent {
             crate::api::chat::ChatEvent::ConnectionState {
                 direct_peers,
                 mailbox_ok,
-                queue_ok,
+                using_queue,
+                has_mailbox,
             } => [
                 5.into_dart(),
                 direct_peers.into_into_dart().into_dart(),
                 mailbox_ok.into_into_dart().into_dart(),
-                queue_ok.into_into_dart().into_dart(),
+                using_queue.into_into_dart().into_dart(),
+                has_mailbox.into_into_dart().into_dart(),
             ]
             .into_dart(),
             crate::api::chat::ChatEvent::Error { code, detail } => [
@@ -4407,6 +4548,48 @@ impl flutter_rust_bridge::IntoIntoDart<crate::api::push::PushStatusView>
     }
 }
 // Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::api::queue::QueueMode {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        match self {
+            Self::Auto => 0.into_dart(),
+            Self::Always => 1.into_dart(),
+            Self::Never => 2.into_dart(),
+            _ => unreachable!(),
+        }
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive for crate::api::queue::QueueMode {}
+impl flutter_rust_bridge::IntoIntoDart<crate::api::queue::QueueMode>
+    for crate::api::queue::QueueMode
+{
+    fn into_into_dart(self) -> crate::api::queue::QueueMode {
+        self
+    }
+}
+// Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::api::queue::QueueStateView {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        [
+            self.mode.into_into_dart().into_dart(),
+            self.verdict.into_into_dart().into_dart(),
+            self.using_queue.into_into_dart().into_dart(),
+            self.uptime_7d_permille.into_into_dart().into_dart(),
+        ]
+        .into_dart()
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive
+    for crate::api::queue::QueueStateView
+{
+}
+impl flutter_rust_bridge::IntoIntoDart<crate::api::queue::QueueStateView>
+    for crate::api::queue::QueueStateView
+{
+    fn into_into_dart(self) -> crate::api::queue::QueueStateView {
+        self
+    }
+}
+// Codec=Dco (DartCObject based), see doc to use other codecs
 impl flutter_rust_bridge::IntoDart for crate::api::account::RecordView {
     fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
         [
@@ -4520,6 +4703,22 @@ impl flutter_rust_bridge::IntoIntoDart<crate::api::account::SafetyDisplay>
     for crate::api::account::SafetyDisplay
 {
     fn into_into_dart(self) -> crate::api::account::SafetyDisplay {
+        self
+    }
+}
+// Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::api::queue::Verdict {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        match self {
+            Self::HasMailbox => 0.into_dart(),
+            Self::NoMailbox => 1.into_dart(),
+            _ => unreachable!(),
+        }
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive for crate::api::queue::Verdict {}
+impl flutter_rust_bridge::IntoIntoDart<crate::api::queue::Verdict> for crate::api::queue::Verdict {
+    fn into_into_dart(self) -> crate::api::queue::Verdict {
         self
     }
 }
@@ -4675,12 +4874,14 @@ impl SseEncode for crate::api::chat::ChatEvent {
             crate::api::chat::ChatEvent::ConnectionState {
                 direct_peers,
                 mailbox_ok,
-                queue_ok,
+                using_queue,
+                has_mailbox,
             } => {
                 <i32>::sse_encode(5, serializer);
                 <u32>::sse_encode(direct_peers, serializer);
                 <bool>::sse_encode(mailbox_ok, serializer);
-                <Option<bool>>::sse_encode(queue_ok, serializer);
+                <bool>::sse_encode(using_queue, serializer);
+                <bool>::sse_encode(has_mailbox, serializer);
             }
             crate::api::chat::ChatEvent::Error { code, detail } => {
                 <i32>::sse_encode(6, serializer);
@@ -5133,16 +5334,6 @@ impl SseEncode for Option<crate::api::message::BlockReason> {
     }
 }
 
-impl SseEncode for Option<bool> {
-    // Codec=Sse (Serialization based), see doc to use other codecs
-    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
-        <bool>::sse_encode(self.is_some(), serializer);
-        if let Some(value) = self {
-            <bool>::sse_encode(value, serializer);
-        }
-    }
-}
-
 impl SseEncode for Option<crate::api::message::ConversationCursor> {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
@@ -5459,6 +5650,33 @@ impl SseEncode for crate::api::push::PushStatusView {
     }
 }
 
+impl SseEncode for crate::api::queue::QueueMode {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <i32>::sse_encode(
+            match self {
+                crate::api::queue::QueueMode::Auto => 0,
+                crate::api::queue::QueueMode::Always => 1,
+                crate::api::queue::QueueMode::Never => 2,
+                _ => {
+                    unimplemented!("");
+                }
+            },
+            serializer,
+        );
+    }
+}
+
+impl SseEncode for crate::api::queue::QueueStateView {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <crate::api::queue::QueueMode>::sse_encode(self.mode, serializer);
+        <crate::api::queue::Verdict>::sse_encode(self.verdict, serializer);
+        <bool>::sse_encode(self.using_queue, serializer);
+        <u32>::sse_encode(self.uptime_7d_permille, serializer);
+    }
+}
+
 impl SseEncode for crate::api::account::RecordView {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
@@ -5535,6 +5753,22 @@ impl SseEncode for u8 {
 impl SseEncode for () {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {}
+}
+
+impl SseEncode for crate::api::queue::Verdict {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <i32>::sse_encode(
+            match self {
+                crate::api::queue::Verdict::HasMailbox => 0,
+                crate::api::queue::Verdict::NoMailbox => 1,
+                _ => {
+                    unimplemented!("");
+                }
+            },
+            serializer,
+        );
+    }
 }
 
 #[cfg(not(target_family = "wasm"))]

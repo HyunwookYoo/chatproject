@@ -37,6 +37,8 @@ pub struct CoreSlot {
     /// Lifecycle requests of the scene (`account_suspend` / `account_resume`) so far, no-ops
     /// included. A native task's own requests (`account_lifecycle_since`) do not count.
     scene_requests: Mutex<u64>,
+    /// The queue server address given (`queue_configure`); `None`: this build's.
+    queue_given: Mutex<Option<String>>,
 }
 
 struct RunningCore {
@@ -148,9 +150,30 @@ impl CoreSlot {
             Some(url) => crate::puppet::records::services(url.clone(), account.controlled_clock.clone().map(|clock| clock as Arc<dyn crate::account::clock::Clock>))?,
             None => services,
         };
-        let handle = AccountHandle::open(core.runtime.as_ref().unwrap().handle(), &core.info.data_dir, protector, core.network.clone(), services, core.bus.clone())?;
+        let queue = crate::queue::open_url(self.queue_given().as_deref());
+        let handle = AccountHandle::open(core.runtime.as_ref().unwrap().handle(), &core.info.data_dir, protector, core.network.clone(), services, core.bus.clone(), queue)?;
         account.handle = Some(handle.clone());
         Ok(handle)
+    }
+    /// The queue server address (M8 spec 7.2). The account opens with this build's
+    /// (`CHATPROJECT_QUEUE_URL`) unless one is given here: the debug `--queue-url`, which the
+    /// open account takes at once and every later open takes too. `None` goes back to this
+    /// build's. Release builds take only this build's address (`InvalidConfig`, nothing changes).
+    pub fn queue_configure(&self, given: Option<String>) -> Result<(), CoreError> {
+        crate::queue::queue_url(given.as_deref())?;
+        *self.queue_given.lock().unwrap_or_else(|e| e.into_inner()) = given;
+        let core = self.running.lock().expect("core slot lock poisoned").clone();
+        let Some(core) = core else { return Ok(()); };
+        // Read again under the account lock, as an open reads it: an open either read this
+        // address or made the handle it goes to here.
+        let account = core.account.lock().expect("account slot lock poisoned");
+        match &account.handle {
+            Some(handle) => handle.queue_configure(self.queue_given()),
+            None => Ok(()),
+        }
+    }
+    fn queue_given(&self) -> Option<String> {
+        self.queue_given.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
     pub fn account(&self) -> Result<AccountHandle, CoreError> {
         let core = self.running.lock().expect("core slot lock poisoned").clone()

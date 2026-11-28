@@ -16,7 +16,6 @@ import '../theme/tokens.dart';
 String connectionLabel(ChatEvent_ConnectionState state) {
   if (state.directPeers > 0) return '직접 연결 ${state.directPeers}';
   if (state.mailboxOk) return '메일박스 연결됨';
-  if (state.queueOk ?? false) return '서버 큐 사용 중';
   return '연결 없음';
 }
 
@@ -149,6 +148,23 @@ class _HomeScreenState extends State<HomeScreen> {
                 ),
                 child: Text(_status, style: const TextStyle(fontSize: 14, color: AppColors.textSecondary)),
               ),
+              // Spec 4: with a mailbox there is no card, though this device may use a
+              // queue ("항상 서버 사용").
+              if (_connection case ChatEvent_ConnectionState(usingQueue: true, hasMailbox: false)) ...[
+                const SizedBox(height: 8),
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+                  decoration: const BoxDecoration(
+                    color: AppColors.surface,
+                    borderRadius: BorderRadius.all(Radius.circular(16)),
+                  ),
+                  child: const Text(
+                    '메일박스 없음 · 서버가 대신 받아 둬요',
+                    style: TextStyle(fontSize: 14, color: AppColors.textSecondary),
+                  ),
+                ),
+              ],
               Expanded(
                 child: _messages != null && widget.onOpenConversation != null
                     ? ConversationListScreen(

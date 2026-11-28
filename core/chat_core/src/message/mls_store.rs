@@ -560,39 +560,88 @@ pub(super) fn prepare_receipt(
         return Err(invalid());
     }
     schedule_retry(&tx, key, true, now)?;
-    let cache = params![
-        key.conversation.0.as_slice(),
-        key.sender.0.as_slice(),
-        key.installation.0.as_slice(),
-        key.id.0.as_slice(),
-        kind as i64
-    ];
-    // Sealed by an earlier attempt: the same ciphertext goes out again (spec 5.3).
-    let sealed: Option<Vec<u8>> = tx
-        .query_row(
-            "SELECT wire FROM mls_receipt WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4 AND kind=?5",
-            cache,
-            |r| r.get(0),
-        )
-        .optional()
-        .map_err(sql)?;
-    let frame = match sealed {
-        Some(frame) => frame,
-        None => seal_receipt(
-            &tx,
-            identity,
-            local,
-            key,
-            &group.group_id,
-            receipt.kind,
-            wall,
-        )?,
-    };
+    let frame = sealed_receipt(&tx, identity, local, key, &group.group_id, receipt.kind, wall)?;
     finish(tx, fault)?;
     Ok(MessageDbReply::Prepared(
         zeroize::Zeroizing::new(frame),
         Some(receipt),
     ))
+}
+
+/// The receipt this device owes for received message `key` (its job's highest kind), sealed now
+/// if no attempt sealed it yet, so a queue can carry it while no device of the message's sender
+/// is reached (M8 spec 8.1); its attempts then send this same frame. Nothing for a message that
+/// did not come over MLS or has no open job; `NeedGroup` without a group, as `prepare_receipt`.
+pub(super) fn seal_owed_receipt(
+    c: &mut Connection,
+    identity: Identity,
+    local: &LocalAccount,
+    key: MessageKey,
+    wall: u64,
+    fault: Fault,
+) -> R<MessageDbReply> {
+    target(c, identity, key, true)?;
+    let tx = c.transaction().map_err(sql)?;
+    if !received_over_mls(&tx, key)? {
+        return Ok(MessageDbReply::Done);
+    }
+    let kind: Option<u64> = tx
+        .query_row(
+            "SELECT kind FROM receipt_job WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4 AND recipient_install=?5 ORDER BY kind DESC LIMIT 1",
+            params![key.conversation.0.as_slice(), key.sender.0.as_slice(), key.installation.0.as_slice(), key.id.0.as_slice(), identity.installation.0.as_slice()],
+            |r| uint(r, 0),
+        )
+        .optional()
+        .map_err(sql)?;
+    let Some(kind) = kind else {
+        return Ok(MessageDbReply::Done);
+    };
+    let Some(group) = group_row(&tx, key.conversation)? else {
+        return Ok(MessageDbReply::NeedGroup(key.conversation));
+    };
+    let kind = if kind == 2 {
+        ReceiptKind::Read
+    } else {
+        ReceiptKind::Delivered
+    };
+    sealed_receipt(&tx, identity, local, key, &group.group_id, kind, wall)?;
+    finish(tx, fault)?;
+    Ok(MessageDbReply::Done)
+}
+
+/// Receipt `kind` for received message `key` as its attempts send it: sealed by an earlier
+/// attempt (the same ciphertext goes out again, spec 5.3), or sealed now.
+fn sealed_receipt(
+    tx: &Transaction<'_>,
+    identity: Identity,
+    local: &LocalAccount,
+    key: MessageKey,
+    group_id: &[u8],
+    kind: ReceiptKind,
+    wall: u64,
+) -> R<Vec<u8>> {
+    let number: i64 = match kind {
+        ReceiptKind::Delivered => 1,
+        ReceiptKind::Read => 2,
+    };
+    let sealed: Option<Vec<u8>> = tx
+        .query_row(
+            "SELECT wire FROM mls_receipt WHERE conversation=?1 AND sender_peer=?2 AND sender_install=?3 AND msg_id=?4 AND kind=?5",
+            params![
+                key.conversation.0.as_slice(),
+                key.sender.0.as_slice(),
+                key.installation.0.as_slice(),
+                key.id.0.as_slice(),
+                number
+            ],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sql)?;
+    match sealed {
+        Some(frame) => Ok(frame),
+        None => seal_receipt(tx, identity, local, key, group_id, kind, wall),
+    }
 }
 
 /// Final review I2: the `Read` receipt for received message `key` that `mark_read` just made
@@ -838,6 +887,8 @@ fn decrypt_failed(class: u8, epoch: u64) -> MessageDbReply {
 /// * an undecodable plaintext or unknown content still advances the ratchet and is
 ///   acknowledged, so its sender stops retrying;
 /// * a `Receipt` is applied to this device's sent messages and acknowledged;
+/// * a new text from the other account that a queue entry brought (`delivered_receipt`) gets
+///   a `Delivered` receipt job: no `Ack` tells its sender (M8 spec 3);
 /// * a text M4 would refuse advances the ratchet but stores nothing and is `Rejected` (the
 ///   sender gives the message up, as for an M4 `Reject`);
 /// * the same message id again (a re-encrypted resend) stores nothing new;
@@ -1004,6 +1055,20 @@ pub(super) fn open_app(
                 }
                 Stored::Yes
             }
+            // M8 spec 7.2: the sender's queue (or its withdrawal), from either account, since
+            // my other devices send in this conversation too.
+            Content::QueueRef(queue) => {
+                super::queue_store::store_peer_ref(
+                    &tx,
+                    conversation,
+                    sender_install,
+                    queue.as_ref(),
+                    message.sent_at_ms,
+                    now,
+                    from.queue_url.as_deref(),
+                )?;
+                Stored::Yes
+            }
             // Content this version does not know is dropped (spec 5.1 `Custom` fallback).
             Content::Custom { .. } => Stored::Yes,
         };
@@ -1035,6 +1100,22 @@ pub(super) fn open_app(
     // pull's end; marked here so that a device dying first still notifies it.
     if let (Stored::New, Some(key), false, Some(holder)) = (&stored, text, own, from.pull) {
         super::mailbox_store::mark_notify(&tx, key, holder)?;
+    }
+    // M8 spec 3: a text from the other account taken from a queue is `Delivered` once its
+    // sender hears so from this device: a receipt job, due now. Taken again (any path), it is
+    // no longer new, so it never gets a second one.
+    if let (Stored::New, Some(key), false, true) = (&stored, text, own, from.delivered_receipt) {
+        tx.execute(
+            "INSERT OR IGNORE INTO receipt_job VALUES(?1,?2,?3,?4,?5,1,0,0)",
+            params![
+                key.conversation.0.as_slice(),
+                key.sender.0.as_slice(),
+                key.installation.0.as_slice(),
+                key.id.0.as_slice(),
+                identity.installation.0.as_slice()
+            ],
+        )
+        .map_err(sql)?;
     }
     if !own {
         tx.execute(
@@ -1692,23 +1773,29 @@ pub(super) fn fixture_state(c: &Connection, conversation: ConversationId) -> R<M
     })
 }
 
-/// Test-only: seals a `PushHandle` of this device in the conversation's group and returns the
-/// MLS ciphertext. Only the ratchet changes (no frame is queued or logged).
+/// Test-only: seals a `PushHandle` or `QueueRef` of this device in the conversation's group and
+/// returns the MLS ciphertext. Only the ratchet changes (no frame is queued or logged).
 #[cfg(all(feature = "test-hooks", debug_assertions))]
-pub(super) fn fixture_seal_push_handle(
+pub(super) fn fixture_seal_routing(
     c: &mut Connection,
     identity: Identity,
     local: &LocalAccount,
     conversation: ConversationId,
-    handle: Vec<u8>,
+    content: Content,
     issued_at_ms: u64,
 ) -> R<MessageDbReply> {
+    use crate::mls::payload::{push_handle_message, queue_ref_message};
+    let message = match content {
+        Content::PushHandle { handle } => {
+            push_handle_message(identity.installation, issued_at_ms, handle)
+        }
+        Content::QueueRef(queue) => queue_ref_message(identity.installation, issued_at_ms, queue),
+        _ => return Err(invalid()),
+    };
     let tx = c.transaction().map_err(sql)?;
     let group = group_row(&tx, conversation)?.ok_or_else(missing)?;
     let provider = MlsProvider::new(KvStore::load_scope(&tx, conversation.0)?);
     let (signer, _) = signer_of(local);
-    let message =
-        crate::mls::payload::push_handle_message(identity.installation, issued_at_ms, handle);
     let ciphertext = group::seal(&provider, &signer, &group.group_id, &message)?;
     provider.storage().flush(&tx, conversation.0)?;
     finish(tx, NO_FAULT)?;
@@ -1823,6 +1910,8 @@ mod tests {
             transport: Some(b2.installation_id()),
             allowed: vec![b1.installation_id(), b2.installation_id()],
             pull: None,
+            queue_url: None,
+            delivered_receipt: false,
         };
         let reply = open(&mut b1_connection, own, ciphertext);
         assert!(matches!(
@@ -1853,6 +1942,8 @@ mod tests {
             transport: Some(a1.installation_id()),
             allowed: vec![a1.installation_id()],
             pull: None,
+            queue_url: None,
+            delivered_receipt: false,
         };
         let reply = open(&mut b1_connection, peer, ciphertext);
         assert!(matches!(
@@ -1970,6 +2061,8 @@ mod tests {
                     transport: Some(a_device.installation_id()),
                     allowed: vec![a_device.installation_id()],
                     pull: None,
+                    queue_url: None,
+                    delivered_receipt: false,
                 },
                 conversation,
                 ciphertext.clone(),

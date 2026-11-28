@@ -41,7 +41,15 @@ async fn accounts(
     seeds: &[u8],
     b_devices: &[u8],
 ) -> (Vec<Fixture>, Fixture, Arc<Backend>, ConversationId) {
-    let (ra, rb) = (record(A, seeds, 0), record(B, b_devices, 0));
+    accounts_with(seeds, record(A, seeds, 0), record(B, b_devices, 0)).await
+}
+
+/// `accounts` with A's record `ra` and B's record `rb`.
+async fn accounts_with(
+    seeds: &[u8],
+    ra: SignedPacket,
+    rb: SignedPacket,
+) -> (Vec<Fixture>, Fixture, Arc<Backend>, ConversationId) {
     let net = backend(&[(A, ra.clone()), (B, rb.clone())]);
     let mut a = Vec::new();
     for seed in seeds {

@@ -95,7 +95,7 @@ Dart 패키지 하나다. M1a에서는 기기 관리 명령만 만들고(`bin/de
 {"type":"cmd","id":7,"op":"send_text","args":{"conversation_id":"c1","body":"안녕"}}
 {"type":"result","id":7,"ok":true,"value":{"message_id":"m9"}}
 {"type":"result","id":8,"ok":false,"error":{"code":"AlreadyStartedDifferentConfig","detail":"core already runs with /data/user/0/dev.chatproject.chat_app/files/core"}}
-{"type":"event","seq":42,"event":{"kind":"connection_state","direct_peers":1,"mailbox_ok":false,"queue_ok":null}}
+{"type":"event","seq":42,"event":{"kind":"connection_state","direct_peers":1,"mailbox_ok":false,"using_queue":false,"has_mailbox":false}}
 ```
 
 - `kind`: `android` | `windows` | `ios` | `headless`.

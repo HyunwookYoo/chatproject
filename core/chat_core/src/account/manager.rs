@@ -9,6 +9,7 @@ use super::{
     random_secret, recovery,
     storage::{KeyProtector, schema::AccountState},
 };
+use crate::mailbox::verdict::{QueueMode, Verdict};
 use crate::{CoreError, ErrorCode, NetworkHandle, storage::worker::StorageHandle};
 use std::{
     path::Path,
@@ -65,6 +66,22 @@ pub struct MailboxStateView {
     /// Time up as a mailbox within the last 7 days, per mille of them.
     pub uptime_7d_permille: u32,
 }
+
+/// This device's server queue (M8 spec 5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueueStateView {
+    pub mode: QueueMode,
+    /// Whether the account has a qualified mailbox, as last worked out (hourly, and when what
+    /// it is made of changes).
+    pub verdict: Verdict,
+    /// Whether this device uses a server queue: it has an `Active` queue the server took, or
+    /// one it still fetches while the server has yet to take its replacement (the table of
+    /// spec 5.3 says what is wanted; `manager/queue/` makes it so). Also published as
+    /// `ConnectionSnapshot::using_queue`.
+    pub using_queue: bool,
+    /// Time up as a mailbox within the last 7 days, per mille of them.
+    pub uptime_7d_permille: u32,
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CandidateInfo {
     pub installation_id: InstallationId,
@@ -93,6 +110,8 @@ enum Command {
     MailboxState(oneshot::Sender<Result<MailboxStateView,CoreError>>),
     SetMailbox(bool,oneshot::Sender<Result<(),CoreError>>),
     MailboxFirstLinkShown(oneshot::Sender<Result<(),CoreError>>),
+    QueueState(oneshot::Sender<Result<QueueStateView,CoreError>>),
+    SetQueueMode(QueueMode,oneshot::Sender<Result<(),CoreError>>),
     PushSetToken(crate::push::Platform,String,oneshot::Sender<Result<(),CoreError>>),
     PushSetEnabled(bool,oneshot::Sender<Result<(),CoreError>>),
     PushStatus(oneshot::Sender<Result<crate::push::PushStatus,CoreError>>),
@@ -175,6 +194,8 @@ impl Command {
             Self::MailboxState(reply)=>{let _=reply.send(Err(error));}
             Self::SetMailbox(_,reply)=>{let _=reply.send(Err(error));}
             Self::MailboxFirstLinkShown(reply)=>{let _=reply.send(Err(error));}
+            Self::QueueState(reply)=>{let _=reply.send(Err(error));}
+            Self::SetQueueMode(_,reply)=>{let _=reply.send(Err(error));}
             Self::PushSetToken(_,_,reply)|Self::PushSetEnabled(_,reply)=>{let _=reply.send(Err(error));}
             Self::PushStatus(reply)=>{let _=reply.send(Err(error));}
             Self::PushRenewDue(_,reply)=>{let _=reply.send(Err(error));}
@@ -243,6 +264,9 @@ struct Shared {
     /// The latest `push_configure`, taken by the actor at its next poll, and the network a
     /// received push started (M7).
     push: push::Shared,
+    /// The queue server address the account opened with, or the latest `queue_configure`,
+    /// taken by the actor at its next poll (M8).
+    queue: queue::Shared,
 }
 #[derive(Clone)]
 pub struct AccountHandle {
@@ -280,6 +304,7 @@ impl AccountHandle {
         network: NetworkHandle,
         mut services: AccountServices,
         bus: crate::EventBus,
+        queue_url: Option<String>,
     ) -> Result<Self, CoreError> {
         network.begin_account();
         let ticket = network.block();
@@ -306,6 +331,7 @@ impl AccountHandle {
             requests,
             status: AtomicU64::new(ticket << 2),
             push: Default::default(),
+            queue: queue::Shared::new(queue_url),
         });
         let (commands, input) = mpsc::channel(32);
         let auth = super::connection::Runtime::default();
@@ -443,7 +469,7 @@ impl AccountHandle {
         self.send(Command::MailboxBackground).await
     }
     /// This device's mailbox setting, whether the first-link screen was shown, and its uptime
-    /// over the last 7 days (spec 8.4: recorded only, nothing is judged from it in M6).
+    /// over the last 7 days (spec 8.4; M8 judges its qualification from it, `queue_state`).
     pub async fn mailbox_state(&self) -> Result<MailboxStateView, CoreError> {
         self.send(Command::MailboxState).await
     }
@@ -456,6 +482,15 @@ impl AccountHandle {
     /// The first-link screen (spec 8.1) was shown; it is not shown again.
     pub async fn mark_first_link_shown(&self) -> Result<(), CoreError> {
         self.send(Command::MailboxFirstLinkShown).await
+    }
+    /// The server queue setting, whether the account has a qualified mailbox, whether this
+    /// device uses a queue, and its uptime (M8 spec 5).
+    pub async fn queue_state(&self) -> Result<QueueStateView, CoreError> {
+        self.send(Command::QueueState).await
+    }
+    /// Sets the server queue setting (M8 spec 5.3).
+    pub async fn set_queue_mode(&self, mode: QueueMode) -> Result<(), CoreError> {
+        self.send(|reply| Command::SetQueueMode(mode, reply)).await
     }
     pub async fn refresh_record(&self, peer: PeerId) -> Result<(), CoreError> {
         self.send(|reply| Command::Refresh(peer, reply)).await
@@ -1278,6 +1313,8 @@ impl Manager {
                         Command::MailboxState(reply)=>{let result=self.mailbox_state().await;let _=reply.send(result);}
                         Command::SetMailbox(enabled,reply)=>{let result=self.set_mailbox(enabled).await;let _=reply.send(result);}
                         Command::MailboxFirstLinkShown(reply)=>{let result=self.mark_first_link_shown().await;let _=reply.send(result);}
+                        Command::QueueState(reply)=>{let result=self.queue_state().await;let _=reply.send(result);}
+                        Command::SetQueueMode(mode,reply)=>{let result=self.set_queue_mode(mode).await;let _=reply.send(result);}
                         Command::PushSetToken(platform,token,reply)=>{let result=self.push_set_token(platform,token).await;let _=reply.send(result);}
                         Command::PushSetEnabled(enabled,reply)=>{let result=self.push_set_enabled(enabled).await;let _=reply.send(result);}
                         Command::PushStatus(reply)=>{let result=self.push_status().await;let _=reply.send(result);}
@@ -1976,7 +2013,7 @@ mod tests {
         )
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn explicit_retry_reloads_failed_foreground_without_overriding_suspend() {
         use std::sync::atomic::AtomicU8;
         struct Flaky(AtomicU8);
@@ -1991,11 +2028,14 @@ mod tests {
             }
             fn delete(&self, _: StoreId) -> Result<(), CoreError> { Ok(()) }
         }
-        let dir = tempfile::tempdir().unwrap(); let slot = CoreSlot::new();
-        slot.start(CoreConfig { data_dir: dir.path().into() }, &EventBus::new()).unwrap();
+        let dir = tempfile::tempdir().unwrap(); let slot = CoreSlot::new(); let bus = EventBus::new();
+        slot.start(CoreConfig { data_dir: dir.path().into() }, &bus).unwrap();
         slot.network().unwrap().configure_local(None).await.unwrap();
         let protector = Arc::new(Flaky(AtomicU8::new(0)));
-        let account = slot.open_account_with_services(protector.clone(), offline_services()).unwrap();
+        // The actor runs on this test's single thread, so it answers Retry only once the test
+        // yields: the first poll below is pending however a loaded runner schedules threads.
+        let runtime = tokio::runtime::Handle::current();
+        let account = AccountHandle::open(&runtime, dir.path(), protector.clone(), slot.network().unwrap(), offline_services(), bus, None).unwrap();
         account.prepare_candidate().await.unwrap();
         account.request_suspend(); account.snapshot().await.unwrap();
         protector.0.store(1, Ordering::SeqCst);
@@ -2076,6 +2116,7 @@ mod tests {
             requests,
             status: AtomicU64::new((ticket << 2) | 1),
             push: Default::default(),
+            queue: Default::default(),
         });
         let sink = Arc::new(BoundarySink {
             network,
@@ -2114,6 +2155,27 @@ mod tests {
                 assert_eq!(&snapshot, published, "one revision must identify exactly one public projection");
             }
         }
+    }
+
+    /// M8: the account opens with the queue address given before it opened (the debug
+    /// `--queue-url`), with no call after the open; one given later reaches the open account; a
+    /// refused one changes nothing; `None` goes back to this build's.
+    #[tokio::test]
+    async fn the_account_opens_with_the_given_queue_url_and_takes_a_later_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let slot = CoreSlot::new();
+        slot.queue_configure(Some("http://127.0.0.1:8788".into())).unwrap();
+        slot.start(CoreConfig { data_dir: dir.path().into() }, &EventBus::new()).unwrap();
+        slot.network().unwrap().configure_local(None).await.unwrap();
+        let account = slot.open_account_with_services(Arc::new(Protector), offline_services()).unwrap();
+        let url = || account.shared.queue.url().map(|url| url.to_string());
+        assert_eq!(url().as_deref(), Some("http://127.0.0.1:8788"));
+        slot.queue_configure(Some("http://127.0.0.1:9".into())).unwrap();
+        assert_eq!(url().as_deref(), Some("http://127.0.0.1:9"));
+        assert_eq!(slot.queue_configure(Some("ftp://queue.example".into())).unwrap_err().code, ErrorCode::InvalidConfig);
+        assert_eq!(url().as_deref(), Some("http://127.0.0.1:9"));
+        slot.queue_configure(None).unwrap();
+        assert_eq!(url(), crate::queue::queue_url(None).unwrap());
     }
 
     #[tokio::test]
@@ -2209,6 +2271,7 @@ mod tests {
             requests,
             status: AtomicU64::new(ticket << 2),
             push: Default::default(),
+            queue: Default::default(),
         });
         let backend = Arc::new(Backend {
             absent: AtomicBool::new(false),
@@ -2321,6 +2384,7 @@ mod tests {
                     requests,
                     status: AtomicU64::new(ticket << 2),
                     push: Default::default(),
+                    queue: Default::default(),
                 }),
                 services: offline_services(),
             };
@@ -2453,6 +2517,7 @@ mod tests {
             requests,
             status: AtomicU64::new(ticket << 2),
             push: Default::default(),
+            queue: Default::default(),
         });
         let mut manager = Manager {
             messages: Default::default(),
@@ -2552,6 +2617,7 @@ mod tests {
             requests,
             status: AtomicU64::new(ticket << 2),
             push: Default::default(),
+            queue: Default::default(),
         });
         let mut manager = Manager {
             messages: Default::default(),
@@ -3182,6 +3248,7 @@ impl Manager {
             Input::Mls(event)=>self.mls_event(event).await,
             Input::Mailbox(event)=>self.mailbox_event(event).await,
             Input::Push(event)=>self.push_event(event).await,
+            Input::Queue(event)=>self.queue_event(event).await,
             Input::Incoming(conn) => {
                 // My device that showed an older record of the accepted shape (Ruling R30), dialed
                 // back if its authentication still fails (Ruling R31).
@@ -4008,5 +4075,6 @@ pub(super) mod mls;
 pub use mls::GroupState;
 pub(super) mod mailbox;
 pub(super) mod push;
+pub(super) mod queue;
 #[cfg(all(feature="test-hooks",debug_assertions))]
 pub use mailbox::MailboxCounters;

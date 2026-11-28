@@ -23,6 +23,9 @@ env:
   RUST_TOOLCHAIN: 1.92.0
   # cargokit (app/rust_builder) builds with this toolchain. Must equal RUST_TOOLCHAIN.
   CARGOKIT_TOOLCHAIN: 1.92.0
+  # Not a secret. The push proxy's site: Caddy routes /q/* to the queue server (option_env! in
+  # core/chat_core/src/queue/mod.rs); server/queue_server/README.md.
+  CHATPROJECT_QUEUE_URL: https://chatproject-push.duckdns.org
   XCODE: /Applications/Xcode_26.6.app
   APP_ID: dev.chatproject.chatapp
   NSE_ID: dev.chatproject.chatapp.NotificationService

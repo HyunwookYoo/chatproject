@@ -7,8 +7,9 @@ import '../src/rust/api/chat.dart' as rust;
 import 'mailbox_client.dart';
 import 'mailbox_platform.dart';
 
-/// This device's mailbox setting (M6 spec 4, 8) and the app's foreground and
-/// background hooks into the core.
+/// This device's mailbox setting (M6 spec 4, 8), its "오프라인 메시지" server
+/// queue setting (M8 spec 4), and the app's foreground and background hooks
+/// into the core.
 class MailboxModel extends ChangeNotifier {
   MailboxModel(
     this.client,
@@ -25,6 +26,9 @@ class MailboxModel extends ChangeNotifier {
   /// Windows: starts in the tray at login.
   bool autostart = false;
   bool firstLinkShown = true;
+
+  /// The "오프라인 메시지" setting and the verdict, as last read.
+  QueueStateView? queue;
   bool busy = false;
   String? error;
 
@@ -73,6 +77,7 @@ class MailboxModel extends ChangeNotifier {
     enabled = state.enabled;
     firstLinkShown = state.firstLinkShown;
     if (windows) autostart = await platform.autostart();
+    await _readQueue();
     loaded = true;
     _changed();
     if (!supported) return;
@@ -118,6 +123,40 @@ class MailboxModel extends ChangeNotifier {
     }
     await platform.quit();
   }
+
+  /// The settings screen opened: the verdict may have changed (hourly).
+  Future<void> refreshQueue() async {
+    if (!loaded || busy) return;
+    await _readQueue();
+    _changed();
+  }
+
+  Future<void> _readQueue() async {
+    try {
+      queue = await client.queueState();
+    } catch (failure) {
+      _log(failure);
+    }
+  }
+
+  Future<void> setQueueMode(QueueMode mode) => _busy(() async {
+    try {
+      await client.queueSetMode(mode);
+    } catch (failure) {
+      _failed(failure, _queueError);
+      return;
+    }
+    // The core took it: shown even if the read after it fails.
+    if (queue case final old?) {
+      queue = QueueStateView(
+        mode: mode,
+        verdict: old.verdict,
+        usingQueue: old.usingQueue,
+        uptime7DPermille: old.uptime7DPermille,
+      );
+    }
+    await _readQueue();
+  });
 
   Future<void> setEnabled(bool on) => _busy(() => _setEnabled(on));
   Future<void> setAutostart(bool on) => _busy(() => _setAutostart(on));
@@ -191,9 +230,12 @@ class MailboxModel extends ChangeNotifier {
     }
   }
 
-  void _failed(Object failure) {
+  static const _mailboxError = '메일박스 설정을 바꾸지 못했어요. 잠시 뒤 다시 시도해 주세요.';
+  static const _queueError = '오프라인 메시지 설정을 바꾸지 못했어요. 잠시 뒤 다시 시도해 주세요.';
+
+  void _failed(Object failure, [String message = _mailboxError]) {
     _log(failure);
-    error = '메일박스 설정을 바꾸지 못했어요. 잠시 뒤 다시 시도해 주세요.';
+    error = message;
     _changed();
   }
 

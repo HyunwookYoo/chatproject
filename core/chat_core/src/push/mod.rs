@@ -12,7 +12,7 @@ pub use push_wire::{
 use crate::{CoreError, ErrorCode};
 
 #[cfg(feature = "push-http")]
-mod client;
+pub(crate) mod client;
 pub mod ios_state;
 #[cfg(feature = "push-http")]
 pub use client::{HttpPushProxy, Url};
@@ -119,7 +119,9 @@ pub fn check_proxy_url(url: &str) -> Result<(), CoreError> {
     check_scheme(url, cfg!(debug_assertions))
 }
 
-fn check_scheme(url: &str, allow_http: bool) -> Result<(), CoreError> {
+/// `https://`, or also `http://` when `allow_http` (debug builds); shared with the queue server
+/// address (`queue::queue_url`).
+pub(crate) fn check_scheme(url: &str, allow_http: bool) -> Result<(), CoreError> {
     let lower = url.get(..8).map(str::to_ascii_lowercase).unwrap_or_default();
     let http = url.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("http://"));
     if lower == "https://" || (allow_http && http) {

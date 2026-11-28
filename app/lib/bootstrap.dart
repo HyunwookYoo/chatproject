@@ -14,6 +14,7 @@ import 'main.dart';
 import 'network/network_client.dart';
 import 'push/push_client.dart';
 import 'src/rust/api/chat.dart' as rust;
+import 'src/rust/api/queue.dart' as queue;
 import 'startup_error_app.dart';
 
 Future<Widget> bootstrap(
@@ -22,11 +23,13 @@ Future<Widget> bootstrap(
   required CoreClient Function(String?) createClient,
   Future<void> Function(String, String)? startTestHooks,
   AccountClient? Function(CoreClient)? createAccountClient,
+  Future<void> Function(String)? configureQueue,
 }) async {
   var startingHooks = false;
   try {
     final dataDir = startupDataDir(arguments, releaseMode: kReleaseMode);
     final pushUrl = startupPushUrl(arguments);
+    final queueUrl = startupQueueUrl(arguments);
     await initializeRust();
     final core = createClient(dataDir);
     await core.start();
@@ -44,6 +47,10 @@ Future<Widget> bootstrap(
     final accountModel = accountClient == null
         ? null
         : AccountModel(accountClient);
+    // Before the account opens: every open configures the queue with it.
+    if (queueUrl != null) {
+      await (configureQueue ?? _configureQueue)(queueUrl);
+    }
     await accountModel?.open();
     final app = ChatApp(
       core: core,
@@ -80,6 +87,7 @@ String? startupDataDir(List<String> arguments, {required bool releaseMode}) {
           '--control-url',
           '--name',
           '--push-url',
+          '--queue-url',
         ].any((flag) => argument == flag || argument.startsWith('$flag='))) {
       throw const FormatException(
         'Debug control arguments are unavailable in Release',
@@ -105,21 +113,32 @@ String? startupDataDir(List<String> arguments, {required bool releaseMode}) {
 
 /// Debug `--push-url <url>`: the push proxy instead of the build's
 /// `CHATPROJECT_PUSH_URL` (Release refuses it in [startupDataDir]).
-String? startupPushUrl(List<String> arguments) {
+String? startupPushUrl(List<String> arguments) =>
+    _urlArgument(arguments, '--push-url');
+
+/// Debug `--queue-url <url>`: the queue server instead of the build's
+/// `CHATPROJECT_QUEUE_URL` (Release refuses it in [startupDataDir]).
+String? startupQueueUrl(List<String> arguments) =>
+    _urlArgument(arguments, '--queue-url');
+
+String? _urlArgument(List<String> arguments, String flag) {
   String? url;
   for (var i = 0; i < arguments.length; i++) {
     final argument = arguments[i];
-    if (argument == '--push-url') {
+    if (argument == flag) {
       if (++i >= arguments.length) {
-        throw const FormatException('--push-url requires a URL');
+        throw FormatException('$flag requires a URL');
       }
       url = arguments[i];
-    } else if (argument.startsWith('--push-url=')) {
-      url = argument.substring('--push-url='.length);
+    } else if (argument.startsWith('$flag=')) {
+      url = argument.substring(flag.length + 1);
     }
   }
   return url;
 }
+
+Future<void> _configureQueue(String url) =>
+    queue.queueConfigure(serverUrl: url);
 
 Future<void> _startTestHooks(String url, String name) =>
     rust.testHooksStart(controlUrl: url, name: name);

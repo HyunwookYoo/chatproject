@@ -2,8 +2,10 @@ import 'dart:async';
 
 import 'package:chat_app/account/account_model.dart';
 import 'package:chat_app/account/account_routes.dart';
+import 'package:chat_app/mailbox/mailbox_client.dart';
 import 'package:chat_app/mailbox/mailbox_model.dart';
 import 'package:chat_app/mailbox/mailbox_settings_screen.dart';
+import 'package:chat_app/src/rust/api/chat.dart' show ErrorCode;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -238,13 +240,15 @@ void main() {
     variant: TargetPlatformVariant.only(TargetPlatform.windows),
   );
 
-  for (final (platform, shown) in [
-    (TargetPlatform.windows, true),
-    (TargetPlatform.android, true),
-    (TargetPlatform.iOS, false),
+  // M8 spec 4: iOS cannot be a mailbox but uses a queue, so the screen opens
+  // there too, with the "오프라인 메시지" choice only.
+  for (final platform in [
+    TargetPlatform.windows,
+    TargetPlatform.android,
+    TargetPlatform.iOS,
   ]) {
-    testWidgets('the account home ${shown ? 'opens' : 'hides'} the mailbox '
-        'settings on ${platform.name}', (tester) async {
+    testWidgets('the account home opens the mailbox settings on '
+        '${platform.name}', (tester) async {
       final account = AccountModel(ActiveAccountClient());
       final client = FakeMailboxClient()..firstLinkShown = true;
       final channel = FakeMailboxPlatform();
@@ -266,11 +270,143 @@ void main() {
         mailbox.dispose();
       });
       expect(client.states, 1, reason: 'loaded once the account is Active');
-      expect(find.text('메일박스'), shown ? findsOneWidget : findsNothing);
-      if (!shown) return;
+      expect(find.text('메일박스'), findsOneWidget);
       await tester.tap(find.text('메일박스'));
       await tester.pumpAndSettle();
       expect(find.byType(MailboxSettingsScreen), findsOneWidget);
+      expect(find.text(_offline), findsOneWidget);
     }, variant: TargetPlatformVariant.only(platform));
   }
+
+  group('오프라인 메시지 (M8 spec 4)', () {
+    testWidgets('iOS shows the choice and no mailbox switch', (tester) async {
+      await _settings(tester, FakeMailboxClient(), FakeMailboxPlatform());
+      expect(find.text(_offline), findsOneWidget);
+      for (final label in _choices.values) {
+        expect(find.text(label), findsOneWidget);
+      }
+      expect(find.byType(SwitchListTile), findsNothing);
+      expect(_chosen(tester), QueueMode.auto);
+    }, variant: TargetPlatformVariant.only(TargetPlatform.iOS));
+
+    testWidgets('each choice sets the mode in the core', (tester) async {
+      final client = FakeMailboxClient()..firstLinkShown = true;
+      await _settings(tester, client, FakeMailboxPlatform());
+      for (final mode in [QueueMode.always, QueueMode.never, QueueMode.auto]) {
+        await tester.ensureVisible(find.text(_choices[mode]!));
+        await tester.tap(find.text(_choices[mode]!));
+        await tester.pumpAndSettle();
+        expect(_chosen(tester), mode);
+      }
+      expect(client.modes, [QueueMode.always, QueueMode.never, QueueMode.auto]);
+    }, variant: TargetPlatformVariant.only(TargetPlatform.windows));
+
+    testWidgets('a failed choice keeps the mode and says so', (tester) async {
+      final client = FakeMailboxClient()..firstLinkShown = true;
+      await _settings(tester, client, FakeMailboxPlatform());
+      client.failure = ErrorCode.busy;
+      await tester.ensureVisible(find.text(_choices[QueueMode.never]!));
+      await tester.tap(find.text(_choices[QueueMode.never]!));
+      await tester.pumpAndSettle();
+      expect(_chosen(tester), QueueMode.auto);
+      expect(find.textContaining('오프라인 메시지 설정을 바꾸지 못했어요'), findsOneWidget);
+    }, variant: TargetPlatformVariant.only(TargetPlatform.android));
+
+    testWidgets('a failed read shows the choice without a value', (
+      tester,
+    ) async {
+      final client = FakeMailboxClient()
+        ..firstLinkShown = true
+        ..queueStateFailure = ErrorCode.busy;
+      await _settings(tester, client, FakeMailboxPlatform());
+      for (final label in _choices.values) {
+        expect(find.text(label), findsOneWidget);
+      }
+      expect(_chosen(tester), isNull);
+      expect(find.textContaining('메일박스 있음'), findsNothing);
+      expect(find.textContaining('메일박스 없음'), findsNothing);
+      // Once a read works, the screen has its value.
+      client.queueStateFailure = null;
+      await tester.ensureVisible(find.text(_choices[QueueMode.always]!));
+      await tester.tap(find.text(_choices[QueueMode.always]!));
+      await tester.pumpAndSettle();
+      expect(_chosen(tester), QueueMode.always);
+      expect(find.text('메일박스 없음'), findsOneWidget);
+    }, variant: TargetPlatformVariant.only(TargetPlatform.iOS));
+
+    testWidgets('a choice the core took shows though the read after it fails', (
+      tester,
+    ) async {
+      final client = FakeMailboxClient()..firstLinkShown = true;
+      await _settings(tester, client, FakeMailboxPlatform());
+      client.queueStateFailure = ErrorCode.busy;
+      await tester.ensureVisible(find.text(_choices[QueueMode.never]!));
+      await tester.tap(find.text(_choices[QueueMode.never]!));
+      await tester.pumpAndSettle();
+      expect(client.modes, [QueueMode.never]);
+      expect(_chosen(tester), QueueMode.never);
+      expect(find.textContaining('오프라인 메시지 설정을 바꾸지 못했어요'), findsNothing);
+    }, variant: TargetPlatformVariant.only(TargetPlatform.android));
+
+    for (final (verdict, enabled, platform, text) in [
+      (
+        Verdict.hasMailbox,
+        true,
+        TargetPlatform.windows,
+        '메일박스 있음 · 이 PC 7일 가동률 96%',
+      ),
+      (Verdict.hasMailbox, false, TargetPlatform.android, '메일박스 있음'),
+      (Verdict.noMailbox, false, TargetPlatform.iOS, '메일박스 없음'),
+      (
+        Verdict.noMailbox,
+        true,
+        TargetPlatform.android,
+        '메일박스 없음 · 이 기기 7일 가동률 96%',
+      ),
+    ]) {
+      testWidgets('the verdict reads "$text"', (tester) async {
+        final client = FakeMailboxClient()
+          ..firstLinkShown = true
+          ..enabled = enabled
+          ..queue = QueueStateView(
+            mode: QueueMode.auto,
+            verdict: verdict,
+            usingQueue: false,
+            uptime7DPermille: 964,
+          );
+        await _settings(tester, client, FakeMailboxPlatform());
+        expect(find.text(text), findsOneWidget);
+      }, variant: TargetPlatformVariant.only(platform));
+    }
+
+    testWidgets('the verdict is read again when the screen opens', (
+      tester,
+    ) async {
+      final client = FakeMailboxClient()..firstLinkShown = true;
+      final model = MailboxModel(client, FakeMailboxPlatform());
+      addTearDown(model.dispose);
+      await model.accountActive();
+      client.queue = const QueueStateView(
+        mode: QueueMode.auto,
+        verdict: Verdict.hasMailbox,
+        usingQueue: false,
+        uptime7DPermille: 0,
+      );
+      await tester.pumpWidget(
+        MaterialApp(home: MailboxSettingsScreen(model: model)),
+      );
+      await tester.pumpAndSettle();
+      expect(find.text('메일박스 있음'), findsOneWidget);
+    }, variant: TargetPlatformVariant.only(TargetPlatform.iOS));
+  });
 }
+
+const _offline = '오프라인 메시지';
+const _choices = {
+  QueueMode.auto: '자동',
+  QueueMode.always: '항상 서버 사용',
+  QueueMode.never: '서버 사용 안 함',
+};
+
+QueueMode? _chosen(WidgetTester tester) =>
+    tester.widget<RadioGroup<QueueMode>>(find.byType(RadioGroup<QueueMode>)).groupValue;

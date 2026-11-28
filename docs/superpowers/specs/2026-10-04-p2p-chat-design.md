@@ -647,7 +647,7 @@ enum ChatEvent {
     MessageStateChanged { message_id, state: MessageState },
     ConversationUpdated { conversation_id },
     PeerPresence        { peer_id, online: bool, path: Direct | Mailbox | Queue },
-    ConnectionState     { direct_peers: u32, mailbox_ok: bool, queue_ok: Option<bool> },
+    ConnectionState     { direct_peers: u32, mailbox_ok: bool, using_queue: bool, has_mailbox: bool },
     GroupEvent          { conversation_id, event: SystemEvent },
     Error               { code: ErrorCode, detail: String },
 }

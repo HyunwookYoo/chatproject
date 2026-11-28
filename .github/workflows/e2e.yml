@@ -158,11 +158,12 @@ jobs:
           set +e
           code=0
           failed=
-          # M6 (phone, mailbox, node) and M7 (app, two nodes, local push proxy)
-          # need an Android phone: android job only. Each scenario boots its own
+          # M6 (phone, mailbox, node), M7 (app, two nodes, local push proxy) and
+          # M8 (app, two nodes, local queue server) need an Android phone:
+          # android job only. Each scenario boots its own
           # emulators, so every one runs even after a failure; the step fails
           # with the first failure's code.
-          for scenario in m3 m3-auth m4 m6 m7; do
+          for scenario in m3 m3-auth m4 m6 m7 m8; do
             E2E_DIAGNOSTIC_FILE="$RUNNER_TEMP/$scenario-diagnostic.json" dart run bin/run.dart --profile android --scenario "$scenario" --repo-root "$GITHUB_WORKSPACE" > "$RUNNER_TEMP/$scenario-private.log" 2>&1
             result=$?
             echo "$result" > "$RUNNER_TEMP/$scenario-code.txt"
@@ -180,12 +181,12 @@ jobs:
         run: |
           code="${ACCOUNT_CODE:-1}"
           outcome=failure; if [ "$code" = 0 ]; then outcome=success; fi
-          case "$ACCOUNT_SCENARIO" in m3|m3-auth|m4|m6|m7) ;; *) ACCOUNT_SCENARIO=m3 ;; esac
+          case "$ACCOUNT_SCENARIO" in m3|m3-auth|m4|m6|m7|m8) ;; *) ACCOUNT_SCENARIO=m3 ;; esac
           mkdir -p "$RUNNER_TEMP/account-summaries"
           python3 tools/ci/write_e2e_summary.py --profile android --stage scenario --outcome "$outcome" --exit-code "$code" --diagnostic-file "$RUNNER_TEMP/$ACCOUNT_SCENARIO-diagnostic.json" --output "$RUNNER_TEMP/account-summaries/m3-summary.json"
           cat "$RUNNER_TEMP/account-summaries/m3-summary.json" >> "$GITHUB_STEP_SUMMARY"
           # One summary per scenario that ran, with its own exit code.
-          for scenario in m3 m3-auth m4 m6 m7; do
+          for scenario in m3 m3-auth m4 m6 m7 m8; do
             [ -f "$RUNNER_TEMP/$scenario-code.txt" ] || continue
             each="$(cat "$RUNNER_TEMP/$scenario-code.txt")"
             case "$each" in ''|*[!0-9]*) each=1 ;; esac

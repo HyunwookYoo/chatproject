@@ -133,12 +133,17 @@ String _bucket(Object? value, String prefix, int top) => value is! int
     ? '$prefix${top}plus'
     : '$prefix$value';
 
-/// Notes one m6 A side's own-device sync as buckets (`push_local_test_counts`):
+/// Notes one A side's own-device sync as buckets (`push_local_test_counts`)
+/// under the [scenario]'s prefix (`m6` or `m8`):
 /// `m6_own_sessions_<side>` (ready sessions with my other devices now),
 /// `m6_pulls_<side>` (pulls started since the core started) and how they
 /// ended (`_done`, `_failed`, `_stopped`: a `Refused` or out-of-order page ends
 /// syncing over that session). `unknown` when it could not be read.
-Future<void> noteOwnSync(String side, Future<Object?> Function() facts) async {
+Future<void> noteOwnSync(
+  String side,
+  Future<Object?> Function() facts, {
+  String scenario = 'm6',
+}) async {
   Object? value;
   try {
     value = await facts();
@@ -146,21 +151,40 @@ Future<void> noteOwnSync(String side, Future<Object?> Function() facts) async {
     value = null;
   }
   final map = value is Map ? value : const {};
-  failureFacts['m6_own_sessions_$side'] = _bucket(map['own_sessions'], 's', 1);
-  failureFacts['m6_pulls_$side'] = _bucket(map['pulls'], 'p', 2);
-  failureFacts['m6_pulls_done_$side'] = _bucket(map['pulls_done'], 'd', 2);
-  failureFacts['m6_pulls_failed_$side'] = _bucket(map['pulls_failed'], 'pf', 2);
-  failureFacts['m6_pulls_stopped_$side'] = _bucket(
+  failureFacts['${scenario}_own_sessions_$side'] = _bucket(
+    map['own_sessions'],
+    's',
+    1,
+  );
+  failureFacts['${scenario}_pulls_$side'] = _bucket(map['pulls'], 'p', 2);
+  failureFacts['${scenario}_pulls_done_$side'] = _bucket(
+    map['pulls_done'],
+    'd',
+    2,
+  );
+  failureFacts['${scenario}_pulls_failed_$side'] = _bucket(
+    map['pulls_failed'],
+    'pf',
+    2,
+  );
+  failureFacts['${scenario}_pulls_stopped_$side'] = _bucket(
     map['pulls_stopped'],
     'ps',
     1,
   );
-  failureFacts['m6_pull_failure_$side'] = _named(
+  failureFacts['${scenario}_pull_failure_$side'] = _named(
     map['pull_failure'],
     _pullFailures,
   );
-  failureFacts['m6_own_closes_$side'] = _bucket(map['own_closes'], 'c', 2);
-  failureFacts['m6_own_close_$side'] = _named(map['own_close'], _closes);
+  failureFacts['${scenario}_own_closes_$side'] = _bucket(
+    map['own_closes'],
+    'c',
+    2,
+  );
+  failureFacts['${scenario}_own_close_$side'] = _named(
+    map['own_close'],
+    _closes,
+  );
 }
 
 const _pullFailures = {
@@ -190,13 +214,19 @@ const _closes = {
 String _named(Object? value, Set<String> names) =>
     names.contains(value) ? value as String : 'unknown';
 
-/// Notes one m6 side's MLS group for the conversation as buckets
-/// (`message_local_test_group_facts`): `m6_group_<side>` (members or `none`),
+/// Notes one side's MLS group for the conversation as buckets
+/// (`message_local_test_group_facts`) under the [scenario]'s prefix (`m6` or
+/// `m8`): `m6_group_<side>` (members or `none`),
 /// `m6_epoch_<side>`, `m6_received_<side>` (MLS ciphertexts processed),
-/// `m6_deliveries_<side>` (queued Commits/Welcomes), `m6_holds_<side>` and
+/// `m6_deliveries_<side>` (queued Commits/Welcomes), `m6_welcomes_<side>` (of
+/// them Welcomes: a member left without its group), `m6_holds_<side>` and
 /// `m6_attempted_<side>` (receivers the sent text was tried to). `unknown`
 /// when it could not be read.
-Future<void> noteGroup(String side, Future<Object?> Function() facts) async {
+Future<void> noteGroup(
+  String side,
+  Future<Object?> Function() facts, {
+  String scenario = 'm6',
+}) async {
   Object? value;
   try {
     value = await facts();
@@ -205,18 +235,31 @@ Future<void> noteGroup(String side, Future<Object?> Function() facts) async {
   }
   final map = value is Map ? value : const {};
   final group = map['group'];
-  failureFacts['m6_group_$side'] = group == false
+  failureFacts['${scenario}_group_$side'] = group == false
       ? 'none'
       : group == true
       ? _bucket(map['members'], 'm', 4)
       : 'unknown';
-  failureFacts['m6_epoch_$side'] = group == false
+  failureFacts['${scenario}_epoch_$side'] = group == false
       ? 'none'
       : _bucket(map['epoch'], 'e', 3);
-  failureFacts['m6_received_$side'] = _bucket(map['processed_mls'], 'p', 3);
-  failureFacts['m6_deliveries_$side'] = _bucket(map['deliveries'], 'd', 2);
-  failureFacts['m6_holds_$side'] = _bucket(map['holds'], 'h', 1);
-  failureFacts['m6_attempted_$side'] = _bucket(map['attempted'], 'r', 3);
+  failureFacts['${scenario}_received_$side'] = _bucket(
+    map['processed_mls'],
+    'p',
+    3,
+  );
+  failureFacts['${scenario}_deliveries_$side'] = _bucket(
+    map['deliveries'],
+    'd',
+    2,
+  );
+  failureFacts['${scenario}_welcomes_$side'] = _bucket(map['welcomes'], 'w', 1);
+  failureFacts['${scenario}_holds_$side'] = _bucket(map['holds'], 'h', 1);
+  failureFacts['${scenario}_attempted_$side'] = _bucket(
+    map['attempted'],
+    'r',
+    3,
+  );
 }
 
 /// The slowest time in ms of each named wait, pass or fail: a scenario
@@ -232,7 +275,7 @@ void noteWait(String name, int ms) {
 }
 
 final _scenarioOp = RegExp(
-  r'^(?:account|message|mailbox|push)_local_[a-z_]{1,48}$',
+  r'^(?:account|message|mailbox|push|queue)_local_[a-z_]{1,48}$',
 );
 
 /// The [waitsLimit] slowest waits whose name is a listed failure text, a listed

@@ -230,7 +230,12 @@ extension ChatEventPatterns on ChatEvent {
     TResult Function(String peerId, String installationId, bool ready)?
     accountAuthChanged,
     TResult Function(String peerId)? accountCacheUsed,
-    TResult Function(int directPeers, bool mailboxOk, bool? queueOk)?
+    TResult Function(
+      int directPeers,
+      bool mailboxOk,
+      bool usingQueue,
+      bool hasMailbox,
+    )?
     connectionState,
     TResult Function(ErrorCode code, String detail)? error,
     TResult Function(NetworkInfo info)? networkChanged,
@@ -264,7 +269,8 @@ extension ChatEventPatterns on ChatEvent {
         return connectionState(
           _that.directPeers,
           _that.mailboxOk,
-          _that.queueOk,
+          _that.usingQueue,
+          _that.hasMailbox,
         );
       case ChatEvent_Error() when error != null:
         return error(_that.code, _that.detail);
@@ -309,7 +315,12 @@ extension ChatEventPatterns on ChatEvent {
     required TResult Function(String peerId, String installationId, bool ready)
     accountAuthChanged,
     required TResult Function(String peerId) accountCacheUsed,
-    required TResult Function(int directPeers, bool mailboxOk, bool? queueOk)
+    required TResult Function(
+      int directPeers,
+      bool mailboxOk,
+      bool usingQueue,
+      bool hasMailbox,
+    )
     connectionState,
     required TResult Function(ErrorCode code, String detail) error,
     required TResult Function(NetworkInfo info) networkChanged,
@@ -342,7 +353,8 @@ extension ChatEventPatterns on ChatEvent {
         return connectionState(
           _that.directPeers,
           _that.mailboxOk,
-          _that.queueOk,
+          _that.usingQueue,
+          _that.hasMailbox,
         );
       case ChatEvent_Error():
         return error(_that.code, _that.detail);
@@ -383,7 +395,12 @@ extension ChatEventPatterns on ChatEvent {
     TResult? Function(String peerId, String installationId, bool ready)?
     accountAuthChanged,
     TResult? Function(String peerId)? accountCacheUsed,
-    TResult? Function(int directPeers, bool mailboxOk, bool? queueOk)?
+    TResult? Function(
+      int directPeers,
+      bool mailboxOk,
+      bool usingQueue,
+      bool hasMailbox,
+    )?
     connectionState,
     TResult? Function(ErrorCode code, String detail)? error,
     TResult? Function(NetworkInfo info)? networkChanged,
@@ -416,7 +433,8 @@ extension ChatEventPatterns on ChatEvent {
         return connectionState(
           _that.directPeers,
           _that.mailboxOk,
-          _that.queueOk,
+          _that.usingQueue,
+          _that.hasMailbox,
         );
       case ChatEvent_Error() when error != null:
         return error(_that.code, _that.detail);
@@ -864,12 +882,19 @@ class ChatEvent_ConnectionState extends ChatEvent {
   const ChatEvent_ConnectionState({
     required this.directPeers,
     required this.mailboxOk,
-    this.queueOk,
+    required this.usingQueue,
+    required this.hasMailbox,
   }) : super._();
 
   final int directPeers;
   final bool mailboxOk;
-  final bool? queueOk;
+
+  /// This device uses a server queue (M8 spec 4).
+  final bool usingQueue;
+
+  /// The account has a qualified mailbox (M8 spec 5.1). The home card shows while
+  /// `using_queue` and not `has_mailbox` (spec 4).
+  final bool hasMailbox;
 
   /// Create a copy of ChatEvent
   /// with the given fields replaced by the non-null parameter values.
@@ -890,15 +915,19 @@ class ChatEvent_ConnectionState extends ChatEvent {
                 other.directPeers == directPeers) &&
             (identical(other.mailboxOk, mailboxOk) ||
                 other.mailboxOk == mailboxOk) &&
-            (identical(other.queueOk, queueOk) || other.queueOk == queueOk));
+            (identical(other.usingQueue, usingQueue) ||
+                other.usingQueue == usingQueue) &&
+            (identical(other.hasMailbox, hasMailbox) ||
+                other.hasMailbox == hasMailbox));
   }
 
   @override
-  int get hashCode => Object.hash(runtimeType, directPeers, mailboxOk, queueOk);
+  int get hashCode =>
+      Object.hash(runtimeType, directPeers, mailboxOk, usingQueue, hasMailbox);
 
   @override
   String toString() {
-    return 'ChatEvent.connectionState(directPeers: $directPeers, mailboxOk: $mailboxOk, queueOk: $queueOk)';
+    return 'ChatEvent.connectionState(directPeers: $directPeers, mailboxOk: $mailboxOk, usingQueue: $usingQueue, hasMailbox: $hasMailbox)';
   }
 }
 
@@ -910,7 +939,12 @@ abstract mixin class $ChatEvent_ConnectionStateCopyWith<$Res>
     $Res Function(ChatEvent_ConnectionState) _then,
   ) = _$ChatEvent_ConnectionStateCopyWithImpl;
   @useResult
-  $Res call({int directPeers, bool mailboxOk, bool? queueOk});
+  $Res call({
+    int directPeers,
+    bool mailboxOk,
+    bool usingQueue,
+    bool hasMailbox,
+  });
 }
 
 /// @nodoc
@@ -927,7 +961,8 @@ class _$ChatEvent_ConnectionStateCopyWithImpl<$Res>
   $Res call({
     Object? directPeers = null,
     Object? mailboxOk = null,
-    Object? queueOk = freezed,
+    Object? usingQueue = null,
+    Object? hasMailbox = null,
   }) {
     return _then(
       ChatEvent_ConnectionState(
@@ -939,10 +974,14 @@ class _$ChatEvent_ConnectionStateCopyWithImpl<$Res>
             ? _self.mailboxOk
             : mailboxOk // ignore: cast_nullable_to_non_nullable
                   as bool,
-        queueOk: freezed == queueOk
-            ? _self.queueOk
-            : queueOk // ignore: cast_nullable_to_non_nullable
-                  as bool?,
+        usingQueue: null == usingQueue
+            ? _self.usingQueue
+            : usingQueue // ignore: cast_nullable_to_non_nullable
+                  as bool,
+        hasMailbox: null == hasMailbox
+            ? _self.hasMailbox
+            : hasMailbox // ignore: cast_nullable_to_non_nullable
+                  as bool,
       ),
     );
   }

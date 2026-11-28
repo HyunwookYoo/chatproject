@@ -18,7 +18,9 @@
 //!   replaces what is still queued. The queue is sent like `mls_delivery`: over a ready
 //!   session, one frame per recipient at a time, a recipient without one dialed at most every
 //!   `DIAL_RETRY_MS`, back-off 1 s doubling to 5 min. A mailbox handoff (M6 spec 7) carries the
-//!   queue too; its `Delivered` note empties the rows of that frame.
+//!   queue too; its `Delivered` note empties the rows of that frame. The `QueueRef` frames of
+//!   this device's server queues (M8, `manager/queue/`) are rows of their own kind in the same
+//!   table, sent, acknowledged and handed off the same way.
 //! * Push off: every conversation that had a handle gets a withdrawal (an empty handle), the
 //!   token and handles are dropped, and no proxy request is made until push is on again.
 //! * What revoked or unlisted devices announced, and what is queued for them, goes when the
@@ -52,13 +54,14 @@ use crate::account::connection::{Input, Session};
 use crate::message::{
     mls_group::Delivery,
     push_store::{
-        FirstAttempt, Issued, PushBatch, PushDbOp, PushDbReply, PushDue, RenewPlan, Tagged,
+        FirstAttempt, FrameKind, Issued, PushBatch, PushDbOp, PushDbReply, PushDue, RenewPlan,
+        Tagged,
     },
     store::{MessageDbOp, MessageDbReply},
     types::{ConversationId, MessageId, MessageKey},
 };
 use crate::mls::{
-    group::MAX_MLS_MESSAGE_BYTES,
+    group::{CLASS_NO_GROUP, MAX_MLS_MESSAGE_BYTES},
     push_ct::{PushCtError, restore_group_id},
     wire::MlsReply,
 };
@@ -210,6 +213,7 @@ pub(crate) enum PushEvent {
         ticket: u64,
         conversation: ConversationId,
         recipient: InstallationId,
+        kind: FrameKind,
         msg_id: MessageId,
         outcome: Delivery,
     },
@@ -511,6 +515,38 @@ impl Manager {
         self.messages.push.loaded
     }
 
+    /// The hash of the device lists this poll pruned against (`None` before the first).
+    pub(super) fn push_devices(&self) -> Option<[u8; 32]> {
+        self.messages.push.fingerprint
+    }
+
+    /// New frames were queued in `push_delivery` (the queues' `QueueRef`s): read at the next
+    /// poll.
+    /// `recipient` joined the conversation's group: its routing frames there go now, not after
+    /// the back-off its "no group" answers grew (`routing_outcome`).
+    pub(super) async fn push_joined(
+        &mut self,
+        conversation: ConversationId,
+        recipient: InstallationId,
+        request: Request,
+    ) -> Result<(), CoreError> {
+        let op = PushDbOp::Joined {
+            conversation,
+            recipient,
+            now: self.schedule_now(),
+        };
+        if let PushDbReply::Count(1..) = self.push_db(op, request).await? {
+            self.push_deliver_soon();
+        }
+        Ok(())
+    }
+
+    pub(super) fn push_deliver_soon(&mut self) {
+        self.messages.push.delivery_at = None;
+        // Devices no session reaches get them in their queues (M8 spec 8).
+        self.queue_standing_soon();
+    }
+
     /// Reads `push_local` again. A changed own-device handle reaches my other devices with the
     /// next poll's `Announce` (own-device sync tells each one until it took what holds now).
     async fn push_reload(&mut self, request: Request) -> Result<(), CoreError> {
@@ -573,20 +609,9 @@ impl Manager {
         }))
     }
 
-    /// `push_first` for a text no device was reached for, sealed first: the push carries its
-    /// ciphertext. `None` while it cannot be sealed (no group yet); a later attempt decides.
-    pub(super) async fn push_first_unreached(
-        &mut self,
-        key: MessageKey,
-        peer: PeerId,
-        request: Request,
-    ) -> Option<Box<FirstAttempt>> {
-        let first = self.push_first(peer, Vec::new())?;
-        let seal = MessageDbOp::Seal(key, self.services.clock.wall_ms());
-        match self.message_db(seal, request).await {
-            Ok(MessageDbReply::Sealed { .. }) => Some(first),
-            _ => None,
-        }
+    /// Whether a push proxy is configured: texts no device was reached for are pushed.
+    pub(super) fn push_on(&self) -> bool {
+        self.messages.push.proxy.is_some()
     }
 
     /// Records a text attempt's outcome `op`, with its push decision in the same transaction
@@ -1022,6 +1047,7 @@ impl Manager {
                 ticket,
                 conversation,
                 recipient,
+                kind,
                 msg_id,
                 outcome,
             } => {
@@ -1034,6 +1060,7 @@ impl Manager {
                 let op = PushDbOp::Delivered {
                     conversation,
                     recipient,
+                    kind,
                     msg_id,
                     outcome,
                     now: self.schedule_now(),
@@ -1191,17 +1218,11 @@ impl Manager {
         Ok(())
     }
 
-    /// Sends due frames over ready sessions with other accounts' devices (one per recipient of
-    /// a conversation at a time), and dials one recipient without a session per check.
+    /// Sends due frames over ready sessions (one per recipient of a conversation at a time):
+    /// the peer's devices and my other ones (a `QueueRef`), as Commits and Welcomes go. Dials
+    /// one recipient without a session per check.
     async fn push_deliver(&mut self, now: u64, request: Request) {
-        let Ok(own) = self.local().map(|local| local.keys.peer_id()) else {
-            return;
-        };
-        let sessions: Vec<Session> = self
-            .mls_sessions()
-            .into_iter()
-            .filter(|s| s.grant.peer != own)
-            .collect();
+        let sessions: Vec<Session> = self.mls_sessions();
         let ids: Vec<InstallationId> = sessions.iter().map(|s| s.grant.installation).collect();
         let push = &mut self.messages.push;
         if push.sessions != ids {
@@ -1255,8 +1276,11 @@ impl Manager {
             {
                 continue;
             }
+            let Some(account) = self.recipient_account(peer, recipient) else {
+                continue;
+            };
             self.messages.push.dials.insert(recipient, now);
-            if self.start_dial(peer, recipient, request) {
+            if self.start_dial(account, recipient, request) {
                 return;
             }
         }
@@ -1516,13 +1540,14 @@ impl Manager {
         Ok(Some((peer, told)))
     }
 
-    /// Dials `peer`'s devices without a session and syncs with my devices; the dials run in
-    /// spawned tasks.
+    /// Dials `peer`'s devices without a session, fetches this device's server queues (M8 spec
+    /// 6.4) and syncs with my devices; the dials and the fetch run in spawned tasks.
     async fn push_fetch_now(&mut self, peer: Option<PeerId>) -> Result<(), CoreError> {
         let request = self.ready()?;
         if let Some(peer) = peer {
             self.push_dial_devices(peer, request);
         }
+        self.queue_fetch_soon();
         self.mailbox_sync_now().await
     }
 
@@ -1534,8 +1559,9 @@ impl Manager {
         }
     }
 
-    /// The network is up after `push_messages_deleted`: syncs with my devices and dials every
-    /// contact's devices (spec 5.4, design 8.3).
+    /// The network is up after `push_messages_deleted`: syncs with my devices, dials every
+    /// contact's devices (spec 5.4, design 8.3) and fetches this device's server queues (M8
+    /// spec 11).
     async fn push_full_sync(&mut self, request: Request) {
         let Ok(local) = self.local() else {
             return;
@@ -1544,6 +1570,7 @@ impl Manager {
         for peer in peers {
             self.push_dial_devices(peer, request);
         }
+        self.queue_fetch_soon();
         let _ = self.mailbox_sync_now().await;
     }
 
@@ -1724,6 +1751,21 @@ async fn end_network_use(shared: &super::Shared) {
     }
 }
 
+/// What a routing frame's (`PushHandle`, `QueueRef`) delivery attempt's answer means for its
+/// queued row: a Commit's (`delivery_outcome`), except that a recipient without the group yet is
+/// tried again. Unlike a text, the frame goes with no `Welcome` ahead of it, and the group's own
+/// delivery may not have brought one yet (E2E m8: a slow phone); dropped, it would be lost until
+/// the next frame, a queue's 7 days on.
+fn routing_outcome(result: &Result<MlsReply, ErrorCode>) -> Delivery {
+    match result {
+        Ok(MlsReply::DecryptFailed {
+            class: CLASS_NO_GROUP,
+            ..
+        }) => Delivery::Retry,
+        result => super::mls::delivery_outcome(result),
+    }
+}
+
 /// Sends one queued frame (a kind 17 `App`) and reports how it ended.
 fn push_launch(
     session: Session,
@@ -1732,12 +1774,13 @@ fn push_launch(
     ticket: u64,
 ) {
     tokio::spawn(async move {
-        let outcome = super::mls::delivery_outcome(&super::mls::exchange(&session, &row.wire).await);
+        let outcome = routing_outcome(&super::mls::exchange(&session, &row.wire).await);
         let _ = mailbox
             .send(Input::Push(PushEvent::Delivered {
                 ticket,
                 conversation: row.conversation,
                 recipient: row.recipient,
+                kind: row.kind,
                 msg_id: row.msg_id,
                 outcome,
             }))

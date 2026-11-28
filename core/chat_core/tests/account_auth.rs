@@ -1436,6 +1436,16 @@ async fn different_accounts_exchange_expired_public_records_durably_before_fresh
             .filter(|e| matches!(e, CoreEvent::AccountAuthChanged { ready: true, .. }))
             .count()
     };
+    // The renewals below travel over this session. A's connect returns once A installed it;
+    // B installs its side in its own actor turn, which on a loaded runner can come after the
+    // clocks move, and then B rightly refuses the expired proof and closes the session.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while ready(&b) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("B never installed its side of the session");
     let before = (ready(&a), ready(&b));
     a.clock.set_unix_seconds(NOW + 600);
     b.clock.set_unix_seconds(NOW + 600);
@@ -1446,8 +1456,6 @@ async fn different_accounts_exchange_expired_public_records_durably_before_fresh
     a.account.refresh_record(a.peer).await.unwrap();
     a.account.refresh_record(a.peer).await.unwrap();
     let renewed_a = backend.packets.lock().unwrap()[&a.peer].clone();
-    // Polled every 20 ms within 10 s: a busy loop over durable snapshots can starve the
-    // actors on a loaded CI runner (CI run 43724728893 timed out at 3 s).
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if durable_remote(&b, a.peer).await
@@ -1463,8 +1471,6 @@ async fn different_accounts_exchange_expired_public_records_durably_before_fresh
     b.account.refresh_record(b.peer).await.unwrap();
     b.account.refresh_record(b.peer).await.unwrap();
     let renewed_b = backend.packets.lock().unwrap()[&b.peer].clone();
-    // Polled every 20 ms within 10 s: a busy loop over durable snapshots can starve the
-    // actors on a loaded CI runner (CI run 43724728893 timed out at 3 s).
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if durable_remote(&a, b.peer).await

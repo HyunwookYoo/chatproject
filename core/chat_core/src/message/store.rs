@@ -31,6 +31,13 @@ pub(crate) struct OpenFrom {
     /// The own device whose log it came from (a pull), if it did: a text from the other account
     /// stored just now is marked for that pull's notification (Ruling 35).
     pub pull: Option<InstallationId>,
+    /// The queue server this device uses (`None`: none): a received `QueueRef` is taken only
+    /// on it (M8 spec 7.2).
+    pub queue_url: Option<std::sync::Arc<str>>,
+    /// A queue entry (M8 spec 3): no `Ack` tells its sender, so a text from the other account
+    /// stored just now gets a `Delivered` receipt job, sent like a `Read` receipt (directly, or
+    /// into the sender's queue).
+    pub delivered_receipt: bool,
 }
 pub(crate) enum MessageDbOp {
     Observed(Box<MessageDbOp>),
@@ -57,6 +64,9 @@ pub(crate) enum MessageDbOp {
     Enqueue(PeerId, MessageId, String, u64),
     /// Codec 3 row -> MLS ciphertext (codec 2), `processed_ct` for the own ciphertext.
     Seal(MessageKey, u64),
+    /// Seals the receipt this device owes for a received MLS message, if no attempt did yet
+    /// (now): its sender's queue can then carry it (M8 spec 8.1).
+    SealReceipt(MessageKey, u64),
     /// Seals every codec 3 row of the conversation, in lamport order.
     SealPending(ConversationId, u64),
     /// Holds every own text of the conversation that waits for a group (codec 3): `Blocked`
@@ -76,15 +86,18 @@ pub(crate) enum MessageDbOp {
     /// Test-hook builds: the M4-peer fixture's plaintext frame for a row awaiting encryption.
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     M4Encode(MessageKey),
-    /// Test-hook builds: seals a `PushHandle` (handle, issued at) in the conversation's group
-    /// as this device and returns the MLS ciphertext; only the ratchet changes.
+    /// Test-hook builds: seals a `PushHandle` or `QueueRef` (content, issued at) in the
+    /// conversation's group as this device and returns the MLS ciphertext; only the ratchet
+    /// changes.
     #[cfg(all(feature = "test-hooks", debug_assertions))]
-    SealPushHandle(ConversationId, Vec<u8>, u64),
+    SealRouting(ConversationId, crate::mls::payload::Content, u64),
     MlsGroupOp(ConversationId, super::mls_group::GroupOp),
     /// The device log: pages, cursors, retention (M6).
     Mailbox(super::mailbox_store::MailboxDbOp),
     /// This device's push handles and their delivery (M7).
     Push(super::push_store::PushDbOp),
+    /// This device's queues and the ones other devices announced (M8).
+    Queue(super::queue_store::QueueDbOp),
     /// The outcome of a text's first attempt (`MlsAcked`, `AttemptOutcome`, or `Defer` of a
     /// text no device was reached for) with its push decision in the same transaction (M7 spec
     /// 6.1). Replies `Push(Batch)`.
@@ -592,6 +605,7 @@ pub(crate) fn execute(
             Ok(MessageDbReply::Message(view))
         }
         MessageDbOp::Seal(key, now) => super::mls_store::seal(c, identity, local, key, now, mls_fault!(fault)),
+        MessageDbOp::SealReceipt(key, now) => super::mls_store::seal_owed_receipt(c, identity, local, key, now, mls_fault!(fault)),
         MessageDbOp::SealPending(id, now) => super::mls_store::seal_pending(c, identity, local, id, now, mls_fault!(fault)),
         MessageDbOp::BlockPending(id, reason) => super::mls_store::block_pending(c, identity, id, reason, mls_fault!(fault)),
         MessageDbOp::Reencrypt(key, now, counted) => super::mls_store::reencrypt(c, identity, local, key, now, counted, mls_fault!(fault)),
@@ -612,10 +626,11 @@ pub(crate) fn execute(
         #[cfg(all(feature = "test-hooks", debug_assertions))]
         MessageDbOp::M4Encode(key) => super::mls_store::m4_encode(c, identity, key),
         #[cfg(all(feature = "test-hooks", debug_assertions))]
-        MessageDbOp::SealPushHandle(id, handle, issued_at_ms) => super::mls_store::fixture_seal_push_handle(c, identity, local, id, handle, issued_at_ms),
+        MessageDbOp::SealRouting(id, content, issued_at_ms) => super::mls_store::fixture_seal_routing(c, identity, local, id, content, issued_at_ms),
         MessageDbOp::MlsGroupOp(id, op) => super::mls_group::group_op(c, identity, local, id, op, mls_fault!(fault)),
         MessageDbOp::Mailbox(op) => super::mailbox_store::mailbox_op(c, identity, op, mls_fault!(fault)),
         MessageDbOp::Push(op) => super::push_store::push_op(c, identity, local, op, mls_fault!(fault)),
+        MessageDbOp::Queue(op) => super::queue_store::queue_op(c, identity, local, op, mls_fault!(fault)),
         MessageDbOp::NotifyItems(keys, read) => {
             let tx = c.transaction().map_err(sql_error)?;
             let items = notify_items(&tx, &keys, &read)?;
@@ -872,6 +887,8 @@ pub(crate) enum FixtureOp {
     PushPeerState(tokio::sync::oneshot::Sender<R<super::push_store::PushPeerState>>),
     /// This device's push rows (`push_local`, `push_tag`, `push_own`, `push_delivery`).
     PushState(tokio::sync::oneshot::Sender<R<super::push_store::PushState>>),
+    /// The `queue_own` and `queue_peer` rows.
+    QueueTables(tokio::sync::oneshot::Sender<R<super::queue_store::QueueTables>>),
 }
 #[cfg(all(feature = "test-hooks", debug_assertions))]
 pub(crate) fn fixture(c: &mut Connection, op: FixtureOp) {
@@ -1027,6 +1044,9 @@ pub(crate) fn fixture(c: &mut Connection, op: FixtureOp) {
         }
         FixtureOp::PushState(reply) => {
             let _ = reply.send(super::push_store::fixture_state(c));
+        }
+        FixtureOp::QueueTables(reply) => {
+            let _ = reply.send(super::queue_store::fixture_state(c));
         }
         FixtureOp::DropMessage(k, reply) => {
             let result = ["receipt_job", "mls_receipt", "outbox", "message"].iter().try_for_each(|table| {
@@ -1184,6 +1204,7 @@ pub(crate) enum MessageDbReply {
     Group(super::mls_group::GroupReply),
     Mailbox(super::mailbox_store::MailboxDbReply),
     Push(super::push_store::PushDbReply),
+    Queue(super::queue_store::QueueDbReply),
     Notify(Vec<crate::event::NotifyItem>),
     /// `MarkRead`: how many messages were read just now, and the conversation's notification
     /// item when the read changed what it shows (none otherwise; Ruling R21).
@@ -1290,10 +1311,11 @@ impl MessageDbOp {
             // The M4-peer fixture's frame is what its enqueue would have stored: not a step
             // of the attempt that fault tests interrupt.
             #[cfg(all(feature = "test-hooks", debug_assertions))]
-            Self::M4Encode(_) | Self::SealPushHandle(..) => false,
+            Self::M4Encode(_) | Self::SealRouting(..) => false,
             Self::MlsGroupOp(_, op) => op.writes(),
             Self::Mailbox(op) => op.writes(),
             Self::Push(op) => op.writes(),
+            Self::Queue(op) => op.writes(),
             Self::FirstAttempt(op, _) => return op.faultable(identity),
             _ => self.key(identity)?.is_some(),
         })
@@ -1318,7 +1340,7 @@ impl MessageDbOp {
                 id: *id,
             }),
             Self::Receive(t, _, _, _) => Some(t.key),
-            Self::Seal(k, _) | Self::Reencrypt(k, _, _) | Self::MarkWaitingPeerUpdate(k, _) => Some(*k),
+            Self::Seal(k, _) | Self::SealReceipt(k, _) | Self::Reencrypt(k, _, _) | Self::MarkWaitingPeerUpdate(k, _) => Some(*k),
             Self::MlsAcked(k, _, _) | Self::ResealReceipt(k) => Some(*k),
             #[cfg(all(feature="test-hooks",debug_assertions))]
             Self::RejectedPrepare(k,_,_,_) => Some(*k),

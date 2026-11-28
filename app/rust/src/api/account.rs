@@ -191,7 +191,7 @@ pub async fn open_account() -> Result<(), CoreError> {
         if storage_fixture::enabled() {
             return storage_fixture::open(protector);
         }
-        crate::global::CORE.open_account(protector).map(|_| ()).map_err(Into::into)
+        crate::global::CORE.open_account(protector).map(drop).map_err(CoreError::from)
     }).await.map_err(|_| CoreError {
         code: super::chat::ErrorCode::NotAvailable,
         detail: "Account open unavailable".into(),

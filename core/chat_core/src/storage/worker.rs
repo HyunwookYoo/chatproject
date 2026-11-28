@@ -65,7 +65,12 @@ struct Worker {
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     hook: Option<(usize, CommitAction)>,
     #[cfg(all(feature = "test-hooks", debug_assertions))]
-    message_fault: Option<CommitFault>,
+    /// The next faultable message operation's fault; with a key, only an operation on that
+    /// message takes it.
+    message_fault: Option<(CommitFault, Option<crate::message::types::MessageKey>)>,
+    /// A fault for the received ciphertext opened after this many others.
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    open_fault: Option<(usize, CommitFault)>,
     #[cfg(all(feature="test-hooks",debug_assertions))]
     message_reply_pause: Option<(oneshot::Sender<()>,std::sync::mpsc::Receiver<()>)>,
     #[cfg(all(feature="test-hooks",debug_assertions))]
@@ -97,11 +102,23 @@ impl Worker {
         let pending = self.pending_message.clone();
         let mut reconciled = false;
         #[cfg(all(feature = "test-hooks", debug_assertions))]
-        let fault = if op.faultable(identity)? {
-            self.message_fault.take()
-        } else {
-            None
+        let fault = match self.message_fault {
+            Some((_, only))
+                if op.faultable(identity)? && (only.is_none() || op.key(identity)? == only) =>
+            {
+                self.message_fault.take().map(|(fault, _)| fault)
+            }
+            _ => None,
         };
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
+        let fault = fault.or_else(|| match self.open_fault.as_mut() {
+            Some((0, _)) if op.opens_app() => self.open_fault.take().map(|(_, f)| f),
+            Some((skip, _)) if op.opens_app() => {
+                *skip -= 1;
+                None
+            }
+            _ => None,
+        });
         // A received MLS ciphertext learns its message only once opened; it moves the clock too.
         #[cfg(all(feature="test-hooks",debug_assertions))]
         let clock=if key.is_some() || op.opens_app() {self.message_clock.take()} else {None};
@@ -443,6 +460,8 @@ impl StorageHandle {
             hook: None,
             #[cfg(all(feature = "test-hooks", debug_assertions))]
             message_fault: None,
+            #[cfg(all(feature = "test-hooks", debug_assertions))]
+            open_fault: None,
             #[cfg(all(feature="test-hooks",debug_assertions))]
             message_clock: None,
             #[cfg(all(feature="test-hooks",debug_assertions))]
@@ -662,8 +681,12 @@ fn run(mut w: Worker, mut rx: mpsc::Receiver<Request>, fence: Arc<Mutex<Fence>>)
                 }
                 TestOp::MessageReplyPause(entered,release,reply)=>{w.message_reply_pause=Some((entered,release));let _=reply.send(());}
                 TestOp::MessageClock(clock,seconds,reply)=>{w.message_clock=Some((clock,seconds));let _=reply.send(());}
-                TestOp::MessageFault(fault, reply) => {
-                    w.message_fault = Some(fault);
+                TestOp::MessageFault(fault, only, reply) => {
+                    w.message_fault = Some((fault, only));
+                    let _ = reply.send(());
+                }
+                TestOp::MessageOpenFault(skip, fault, reply) => {
+                    w.open_fault = Some((skip, fault));
                     let _ = reply.send(());
                 }
                 TestOp::Pause(entered, release) => {
@@ -716,7 +739,8 @@ pub(crate) enum TestOp {
     #[cfg(test)]
     MessageCounts(oneshot::Sender<R<(i64, i64, i64, i64)>>),
     Message(messages::FixtureOp),
-    MessageFault(CommitFault, oneshot::Sender<()>),
+    MessageFault(CommitFault, Option<crate::message::types::MessageKey>, oneshot::Sender<()>),
+    MessageOpenFault(usize, CommitFault, oneshot::Sender<()>),
     MessageReplyPause(oneshot::Sender<()>,std::sync::mpsc::Receiver<()>,oneshot::Sender<()>),
     MessageClock(Arc<crate::account::clock::FakeClock>,u64,oneshot::Sender<()>),
     Pause(oneshot::Sender<()>, std::sync::mpsc::Receiver<()>),
@@ -1036,7 +1060,7 @@ mod tests {
             let (tx, rx) = oneshot::channel();
             store
                 .handle
-                .test(TestOp::MessageFault(CommitFault::BeforeCommit, tx))
+                .test(TestOp::MessageFault(CommitFault::BeforeCommit, None, tx))
                 .await;
             rx.await.unwrap();
             assert_eq!(
@@ -1082,6 +1106,46 @@ mod tests {
                 .unwrap();
             assert!(!store.handle.due_hint(0).await.unwrap());
             assert_eq!(store.counts().await, (0, 0, 0, 0));
+        })
+        .await
+        .unwrap();
+    }
+    /// A fault armed for one message is left by upkeep writes and other messages' operations
+    /// that come first (message_auth: a push prune after a device list changed).
+    #[tokio::test]
+    async fn keyed_fault_is_taken_only_by_its_message() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let store = OwnedStore::open().await;
+            let stored = crate::account::storage::migration_fixtures::migration_states()
+                .pop()
+                .unwrap()
+                .unwrap();
+            let AccountState::Active(local) = AccountState::decode(&stored).unwrap() else {
+                unreachable!()
+            };
+            let identity = Identity {
+                peer: local.keys.peer_id(),
+                installation: local.device.installation_id(),
+            };
+            store.handle.commit_account(stored).await.unwrap();
+            let enqueue = |id: u8| {
+                MessageDbOp::Enqueue(PeerId([2; 32]), MessageId([id; 16]), "fixture".into(), 0)
+            };
+            let key = enqueue(2).key(identity).unwrap();
+            let (tx, rx) = oneshot::channel();
+            store
+                .handle
+                .test(TestOp::MessageFault(CommitFault::BeforeCommit, key, tx))
+                .await;
+            rx.await.unwrap();
+            let prune = MessageDbOp::Mailbox(crate::message::mailbox_store::MailboxDbOp::Prune(0));
+            assert!(prune.faultable(identity).unwrap());
+            store.handle.message(identity, prune).await.unwrap();
+            store.handle.message(identity, enqueue(1)).await.unwrap();
+            assert_eq!(
+                store.handle.message(identity, enqueue(2)).await.err().unwrap().code,
+                ErrorCode::StorageUncertain
+            );
         })
         .await
         .unwrap();

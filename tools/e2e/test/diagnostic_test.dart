@@ -156,6 +156,7 @@ void main() {
         'members': 3,
         'processed_mls': 0,
         'deliveries': 1,
+        'welcomes': 1,
         'holds': 0,
         'rejoins': 0,
         'attempted': 2,
@@ -170,6 +171,7 @@ void main() {
         'members': 0,
         'processed_mls': 7,
         'deliveries': 0,
+        'welcomes': 0,
         'holds': 4,
         'rejoins': null,
         'attempted': 0,
@@ -181,21 +183,45 @@ void main() {
       'm6_epoch_node': 'e1',
       'm6_received_node': 'p0',
       'm6_deliveries_node': 'd1',
+      'm6_welcomes_node': 'w1plus',
       'm6_holds_node': 'h0',
       'm6_attempted_node': 'r2',
       'm6_group_mailbox': 'none',
       'm6_epoch_mailbox': 'none',
       'm6_received_mailbox': 'p3plus',
       'm6_deliveries_mailbox': 'd0',
+      'm6_welcomes_mailbox': 'w0',
       'm6_holds_mailbox': 'h1plus',
       'm6_attempted_mailbox': 'r0',
       'm6_group_phone': 'unknown',
       'm6_epoch_phone': 'unknown',
       'm6_received_phone': 'unknown',
       'm6_deliveries_phone': 'unknown',
+      'm6_welcomes_phone': 'unknown',
       'm6_holds_phone': 'unknown',
       'm6_attempted_phone': 'unknown',
     });
+    expect(safeFacts(failureFacts, loadSafeFacts()), failureFacts);
+    failureFacts.clear();
+  });
+
+  test('an m8 deadline notes the same facts under its own prefix', () async {
+    failureFacts.clear();
+    await noteGroup(
+      'other',
+      () async => {'group': false, 'welcomes': 0},
+      scenario: 'm8',
+    );
+    await noteOwnSync(
+      'other',
+      () async => {'own_sessions': 0, 'pull_failure': 'request'},
+      scenario: 'm8',
+    );
+    expect(failureFacts['m8_group_other'], 'none');
+    expect(failureFacts['m8_welcomes_other'], 'w0');
+    expect(failureFacts['m8_own_sessions_other'], 's0');
+    expect(failureFacts['m8_pull_failure_other'], 'request');
+    expect(failureFacts.keys.where((k) => k.startsWith('m6_')), isEmpty);
     expect(safeFacts(failureFacts, loadSafeFacts()), failureFacts);
     failureFacts.clear();
   });
@@ -289,6 +315,7 @@ void main() {
       'message_scenario': ('Message scenario: ', 'Message scenario deadline: '),
       'mailbox_scenario': ('Mailbox scenario: ', 'Mailbox scenario deadline: '),
       'push_scenario': ('Push scenario: ', 'Push scenario deadline: '),
+      'queue_scenario': ('Queue scenario: ', 'Queue scenario deadline: '),
     };
     for (final MapEntry(key: file, value: (code, deadline))
         in prefixes.entries) {

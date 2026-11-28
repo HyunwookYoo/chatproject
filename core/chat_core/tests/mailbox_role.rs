@@ -39,9 +39,12 @@ async fn announced(f: &Fixture, of: &Fixture) -> Option<bool> {
         .map(|(_, mailbox)| mailbox)
 }
 
-/// Every `Announce` `f` sent: to which installation, and what it said.
+/// Every `Announce` `f` sent: to which installation, and whether it said mailbox (never
+/// qualified here: no device runs a week).
 async fn announces(f: &Fixture) -> Vec<(InstallationId, bool)> {
-    f.account.mailbox_test_announces().await.unwrap()
+    let all = f.account.mailbox_test_announces().await.unwrap();
+    assert!(all.iter().all(|(_, _, qualified)| !qualified));
+    all.into_iter().map(|(to, mailbox, _)| (to, mailbox)).collect()
 }
 
 /// `mailbox_ok` of the latest connection state `f` published.
@@ -127,6 +130,7 @@ async fn announce_reaches_own_devices_only() {
             MailboxFrame::Announce {
                 mailbox: true,
                 handle: None,
+                qualified: false,
             },
         )
         .await

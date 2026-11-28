@@ -11,7 +11,17 @@ import 'package:chat_app/src/rust/api/chat.dart' as r;
 class FakeMailboxClient implements MailboxClient {
   bool enabled = false;
   bool firstLinkShown = false;
+  QueueStateView queue = const QueueStateView(
+    mode: QueueMode.auto,
+    verdict: Verdict.noMailbox,
+    usingQueue: false,
+    uptime7DPermille: 0,
+  );
+  final modes = <QueueMode>[];
   r.ErrorCode? failure;
+
+  /// Fails `queueState` only.
+  r.ErrorCode? queueStateFailure;
   Completer<void>? backgroundWait;
   final sets = <bool>[];
   int states = 0, marks = 0, foregrounds = 0, backgrounds = 0, starts = 0;
@@ -65,6 +75,27 @@ class FakeMailboxClient implements MailboxClient {
     await backgroundWait?.future;
     _check();
     return 0;
+  }
+
+  @override
+  Future<QueueStateView> queueState() async {
+    _check();
+    if (queueStateFailure case final code?) {
+      throw r.CoreError(code: code, detail: 'fixture failure');
+    }
+    return queue;
+  }
+
+  @override
+  Future<void> queueSetMode(QueueMode mode) async {
+    modes.add(mode);
+    _check();
+    queue = QueueStateView(
+      mode: mode,
+      verdict: queue.verdict,
+      usingQueue: queue.usingQueue,
+      uptime7DPermille: queue.uptime7DPermille,
+    );
   }
 }
 

@@ -8,7 +8,8 @@ use chat_core::{
     account::{InstallationId, PeerId},
     storage_fixture::{
         ConversationId, Fixture, MessageId, MessageKey, Messages, MlsReply, PushCtError,
-        PushPeerRow, mls_account, mls_app_from_wire, restore_group_id, strip_group_id,
+        PushPeerRow, QueueRefBody, mls_account, mls_app_from_wire, restore_group_id,
+        strip_group_id,
     },
 };
 use sha2::{Digest, Sha256};
@@ -253,6 +254,59 @@ async fn push_handle_opens_into_push_peer_not_messages() {
         unread(b.m.list_conversations(None, 50).await.unwrap()),
         unread_before
     );
+}
+
+/// M8 spec 7.1: a `QueueRef`, like a `PushHandle`, is no text. Brought by a pull it is taken
+/// (processed_ct), logged and acknowledged, with no message row, nothing unread and no
+/// notification mark; a withdrawal likewise.
+#[tokio::test]
+async fn queue_ref_is_not_a_text() {
+    let (a, b, conversation, _) = linked().await;
+    let counts = b.f().message_counts().await.unwrap();
+    let log = b.f().mailbox_state().await.unwrap().entries.len();
+    let unread = |listed: chat_core::ConversationPage| listed.items[0].unread;
+    let unread_before = unread(b.m.list_conversations(None, 50).await.unwrap());
+    let holder = InstallationId([9; 32]);
+    let open = |ct: Vec<u8>| {
+        b.m.mls_open_app_via(
+            a.peer,
+            a.install,
+            vec![a.install],
+            Some(holder),
+            conversation,
+            ct,
+            NOW,
+        )
+    };
+    let queue = QueueRefBody {
+        server_url: "https://queue.example".into(),
+        queue_id: [0x31; 32],
+        sender_secret: [0x32; 32].into(),
+    };
+    let sealed = [
+        a.m.mls_seal_queue_ref(conversation, Some(queue), 1_000)
+            .await
+            .unwrap(),
+        a.m.mls_seal_queue_ref(conversation, None, 2_000)
+            .await
+            .unwrap(),
+    ];
+    for (n, ct) in sealed.into_iter().enumerate() {
+        assert_eq!(ack(&open(ct.clone()).await.unwrap()), hash(&ct));
+        let after = b.f().message_counts().await.unwrap();
+        assert_eq!((after.0, after.2), (counts.0, counts.2));
+        assert_eq!(after.1, counts.1 + 1 + n as u64);
+        assert_eq!(
+            unread(b.m.list_conversations(None, 50).await.unwrap()),
+            unread_before
+        );
+        assert_eq!(
+            b.f().mailbox_state().await.unwrap().entries.len(),
+            log + 1 + n
+        );
+        // Not a push handle either.
+        assert!(peers(&b).await.is_empty());
+    }
 }
 
 /// `to` opens `from`'s ciphertext (acknowledged) and returns its `push_peer` rows.

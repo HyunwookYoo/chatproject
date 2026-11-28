@@ -264,7 +264,7 @@ void main() {
         ),
       );
       client.controller.add(
-        const rust.ChatEvent.connectionState(directPeers: 0, mailboxOk: false),
+        const rust.ChatEvent.connectionState(directPeers: 0, mailboxOk: false, usingQueue: false, hasMailbox: false),
       );
       await tester.pumpAndSettle();
       expect(find.text('대화'), findsOneWidget);

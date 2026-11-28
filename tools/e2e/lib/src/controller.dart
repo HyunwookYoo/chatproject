@@ -243,7 +243,8 @@ class Controller {
               op.startsWith('account_local_') ||
               op.startsWith('message_local_') ||
               op.startsWith('mailbox_local_') ||
-              op.startsWith('push_local_')) {
+              op.startsWith('push_local_') ||
+              op.startsWith('queue_local_')) {
             return jsonEncode({
               'type': 'result',
               'id': safe['id'],
@@ -363,14 +364,16 @@ class Controller {
             'kind': 'connection_state',
             'direct_peers': final int peers,
             'mailbox_ok': final bool mailbox,
-            'queue_ok': final bool? queue,
+            'using_queue': final bool queue,
+            'has_mailbox': final bool hasMailbox,
           }
           when peers >= 0:
         return {
           'kind': 'connection_state',
           'direct_peers': peers,
           'mailbox_ok': mailbox,
-          'queue_ok': queue,
+          'using_queue': queue,
+          'has_mailbox': hasMailbox,
         };
       default:
         return null;
@@ -453,6 +456,7 @@ class Controller {
                     'message_local_',
                     'mailbox_local_',
                     'push_local_',
+                    'queue_local_',
                   ].any(
                     (prefix) =>
                         participant._operations[record.id]?.startsWith(

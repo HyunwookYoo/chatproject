@@ -37,6 +37,7 @@ tokio-tungstenite = { version = "0.28", default-features = false, features = ["c
 serde_json = { version = "1", optional = true }
 
 push_wire = { path = "../push_wire" }
+queue_wire = { path = "../queue_wire" }
 # The push proxy client (`push-http`): TLS on `ring` with the bundled web roots, no aws-lc.
 reqwest = { version = "=0.13.5", default-features = false, features = ["rustls-no-provider", "http2"], optional = true }
 rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std", "tls12"], optional = true }
@@ -49,14 +50,16 @@ tempfile = "3"
 tokio = { version = "1", features = ["test-util"] }
 # Tests only: `FakePushProxy` runs the real proxy router in memory (Ruling R2).
 push_proxy = { path = "../../server/push_proxy" }
+# Tests only: `FakeQueueServer` runs the real queue server router on a temp file (M8).
+queue_server = { path = "../../server/queue_server" }
 axum = { version = "=0.8.9", default-features = false }
 tower = { version = "=0.5.3", features = ["util"] }
 http-body-util = "=0.1.5"
 [features]
 default = ["push-http"]
 test-hooks = ["dep:tokio-tungstenite", "dep:serde_json", "iroh/metrics"]
-# The HTTP client for the push proxy (`push::HttpPushProxy`). Off for the iOS notification
-# extension, which never talks to the proxy.
+# The HTTP clients for the push proxy (`push::HttpPushProxy`) and the queue server
+# (`queue::HttpQueueServer`). Off for the iOS notification extension, which talks to neither.
 push-http = ["dep:reqwest", "dep:rustls", "dep:webpki-roots", "dep:serde_json"]
 # Read-only MLS decrypt for the iOS notification extension (`mls::nse`). Nothing else of `mls` is public.
 nse = []

@@ -1,6 +1,7 @@
 //! Push rows of the message store (M7, schema v4): the handles this device has (`push_local`,
 //! `push_tag`), the ones others announced (`push_peer`, `push_own`) and the per-device delivery
-//! of sealed `PushHandle` frames (`push_delivery`, the `mls_delivery` way). The `pub(super)`
+//! of sealed `PushHandle` frames and (M8, kind 2) `QueueRef` frames (`push_delivery`, the
+//! `mls_delivery` way). Every statement on `push_delivery` names the kinds it means. The `pub(super)`
 //! helpers run inside the caller's transaction; each `PushDbOp` is its own transaction (one per
 //! conversation for `Seal`).
 use push_wire::{
@@ -16,7 +17,10 @@ use super::types::{ConversationId, MessageId, MessageKey};
 use crate::account::{InstallationId, PeerId, storage::schema::LocalAccount};
 use crate::mailbox::wire::HandoffEntry;
 use crate::mls::{
-    MlsProvider, kv::KvStore, payload::push_handle_message, push_ct::strip_group_id,
+    MlsProvider,
+    kv::KvStore,
+    payload::{ChatMessage, push_handle_message},
+    push_ct::strip_group_id,
     wire::MlsFrame,
 };
 use crate::push::{PushStatus, ios_state};
@@ -58,10 +62,37 @@ pub(crate) struct Issued {
     pub own: Option<(Tag, Vec<u8>)>,
 }
 
+/// What a `push_delivery` row carries: one frame of each kind per conversation and recipient.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FrameKind {
+    PushHandle = 1,
+    /// M8 spec 7: sealed by `queue_store`.
+    QueueRef = 2,
+}
+
+impl FrameKind {
+    pub(crate) fn value(self) -> i64 {
+        self as i64
+    }
+    fn from_value(value: i64) -> Option<Self> {
+        match value {
+            1 => Some(Self::PushHandle),
+            2 => Some(Self::QueueRef),
+            _ => None,
+        }
+    }
+}
+
+fn frame_kind(r: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<FrameKind> {
+    let value: i64 = r.get(index)?;
+    FrameKind::from_value(value).ok_or(rusqlite::Error::IntegralValueOutOfRange(index, value))
+}
+
 /// A due `push_delivery` row.
 pub(crate) struct PushDue {
     pub conversation: ConversationId,
     pub recipient: InstallationId,
+    pub kind: FrameKind,
     pub msg_id: MessageId,
     pub wire: Vec<u8>,
 }
@@ -219,13 +250,22 @@ pub(crate) enum PushDbOp {
     Delivered {
         conversation: ConversationId,
         recipient: InstallationId,
+        kind: FrameKind,
         msg_id: MessageId,
         outcome: Delivery,
         now: u64,
     },
-    /// The queued frames for a mailbox (M6 spec 7), one per conversation and frame; marked
-    /// handed off.
-    HandOff,
+    /// `recipient` has the conversation's group now (its `Welcome` was acknowledged): its frames
+    /// there are due at `now` (scheduler time), the back-off started over. Replies `Count`.
+    Joined {
+        conversation: ConversationId,
+        recipient: InstallationId,
+        now: u64,
+    },
+    /// The queued frames of both kinds for a mailbox (M6 spec 7), one per conversation and
+    /// frame; marked handed off. Only frames queued for a device of the peer account: a mailbox
+    /// delivers to that account alone, so a row of one of my devices (`own`) is no reason.
+    HandOff { own: Vec<InstallationId> },
     /// Drops what revoked or unlisted devices announced and what is queued for them: `own` are
     /// this account's other current devices, `peers` each known account's current ones.
     Prune {
@@ -401,7 +441,7 @@ pub(super) fn push_op(
         PushDbOp::DueDeliveries { now, recipients } => due(c, now, &recipients)?,
         PushDbOp::UnreachableDue { now } => {
             let mut q = c
-                .prepare("SELECT DISTINCT d.conversation,d.recipient_install,v.peer FROM push_delivery d JOIN conversation v ON v.id=d.conversation WHERE d.next_retry_at_ms<=?1 ORDER BY d.recipient_install,d.conversation LIMIT ?2")
+                .prepare("SELECT DISTINCT d.conversation,d.recipient_install,v.peer FROM push_delivery d JOIN conversation v ON v.id=d.conversation WHERE d.kind IN (1,2) AND d.next_retry_at_ms<=?1 ORDER BY d.recipient_install,d.conversation LIMIT ?2")
                 .map_err(sql)?;
             let rows = q
                 .query_map(params![integer(now)?, UNREACHABLE_MAX], |r| {
@@ -419,58 +459,23 @@ pub(super) fn push_op(
         PushDbOp::Delivered {
             conversation,
             recipient,
+            kind,
             msg_id,
             outcome,
             now,
-        } => {
-            let tx = c.transaction().map_err(sql)?;
-            let key = params![
-                conversation.0.as_slice(),
-                recipient.0.as_slice(),
-                msg_id.0.as_slice()
-            ];
-            // A frame replaced meanwhile (a newer handle) is another row: left as it is.
-            let changed = match outcome {
-                Delivery::Acked | Delivery::Settled => tx
-                    .execute(
-                        "DELETE FROM push_delivery WHERE conversation=?1 AND recipient_install=?2 AND msg_id=?3",
-                        key,
-                    )
-                    .map_err(sql)?,
-                Delivery::Retry => {
-                    let attempts: Option<u64> = tx
-                        .query_row(
-                            "SELECT attempts FROM push_delivery WHERE conversation=?1 AND recipient_install=?2 AND msg_id=?3",
-                            key,
-                            |r| uint(r, 0),
-                        )
-                        .optional()
-                        .map_err(sql)?;
-                    match attempts {
-                        Some(attempts) => {
-                            // The M4 receipt back-off: 1 s doubling to 5 min.
-                            let attempts = attempts.saturating_add(1).min(u64::from(u32::MAX));
-                            let next = now.saturating_add(super::scheduler::retry_delay(attempts));
-                            tx.execute(
-                                "UPDATE push_delivery SET attempts=?4,next_retry_at_ms=?5 WHERE conversation=?1 AND recipient_install=?2 AND msg_id=?3",
-                                params![
-                                    conversation.0.as_slice(),
-                                    recipient.0.as_slice(),
-                                    msg_id.0.as_slice(),
-                                    integer(attempts)?,
-                                    integer(next)?
-                                ],
-                            )
-                            .map_err(sql)?
-                        }
-                        None => 0,
-                    }
-                }
-            };
-            finish(tx, fault)?;
-            PushDbReply::Count(changed as u64)
-        }
-        PushDbOp::HandOff => PushDbReply::Handoff(hand_off(c, fault)?),
+        } => PushDbReply::Count(delivered(
+            c,
+            (conversation, recipient, kind, msg_id),
+            outcome,
+            now,
+            fault,
+        )?),
+        PushDbOp::Joined {
+            conversation,
+            recipient,
+            now,
+        } => PushDbReply::Count(joined(c, conversation, recipient, now, fault)?),
+        PushDbOp::HandOff { own } => PushDbReply::Handoff(hand_off(c, &own, fault)?),
         PushDbOp::Prune { own, peers } => {
             prune(c, &own, &peers, fault)?;
             // A state not sealed for want of a known device may be sealed now.
@@ -736,6 +741,86 @@ fn store_issued(c: &mut Connection, issued: &Issued, fault: Fault) -> R<u64> {
     Ok(stored as u64)
 }
 
+/// The current devices of account `peer` in `devices` (each peer account's), `None` when none
+/// is known yet: a frame for them is sealed once one is (the ratchet does not move).
+pub(super) fn recipients(
+    devices: &[(PeerId, Vec<InstallationId>)],
+    peer: [u8; 32],
+) -> Option<&[InstallationId]> {
+    devices
+        .iter()
+        .find(|(p, _)| p.0 == peer)
+        .map(|(_, r)| r.as_slice())
+        .filter(|r| !r.is_empty())
+}
+
+/// Seals this device's routing frames (`PushHandle`, `QueueRef`): `wall` is the time they are
+/// sealed at, `now` the scheduler time their deliveries are due at.
+pub(super) struct Routing<'a> {
+    pub identity: Identity,
+    pub local: &'a LocalAccount,
+    pub wall: u64,
+    pub now: u64,
+}
+
+impl Routing<'_> {
+    /// Seals `message` in the conversation's group, in `tx`, and queues its frame of `kind`
+    /// for each of `recipients`: a newer frame of a kind replaces what is still queued of it
+    /// (plan 2). False when it cannot be sealed now (no group, or a group that cannot seal):
+    /// tried again with a later pass.
+    pub(super) fn seal(
+        &self,
+        tx: &Transaction<'_>,
+        conversation: ConversationId,
+        message: &ChatMessage,
+        kind: FrameKind,
+        recipients: &[InstallationId],
+    ) -> R<bool> {
+        let Some(group) = group_row(tx, conversation)? else {
+            return Ok(false);
+        };
+        let provider = MlsProvider::new(KvStore::load_scope(tx, conversation.0)?);
+        let (signer, _) = signer_of(self.local);
+        let key = MessageKey {
+            conversation,
+            sender: self.identity.peer,
+            installation: self.identity.installation,
+            id: message.msg_id,
+        };
+        let sealed = seal_one(
+            tx,
+            &provider,
+            &signer,
+            self.identity,
+            key,
+            &group.group_id,
+            message,
+            self.wall,
+        );
+        let frame = match sealed {
+            Ok((_, frame)) => frame,
+            Err(error) if error.code == ErrorCode::InvalidMessage => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        for recipient in recipients {
+            tx.execute(
+                "INSERT OR REPLACE INTO push_delivery VALUES(?1,?2,?3,?4,?5,0,?6,0)",
+                params![
+                    conversation.0.as_slice(),
+                    recipient.0.as_slice(),
+                    kind.value(),
+                    message.msg_id.0.as_slice(),
+                    frame,
+                    integer(self.now)?
+                ],
+            )
+            .map_err(sql)?;
+        }
+        provider.storage().flush(tx, conversation.0)?;
+        Ok(true)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn seal(
     c: &mut Connection,
@@ -763,16 +848,16 @@ fn seal(
         .collect::<Result<_, _>>()
         .map_err(sql)?
     };
+    let routing = Routing {
+        identity,
+        local,
+        wall,
+        now,
+    };
     let (mut announced, mut withdrawn) = (0, 0);
     for (conversation, peer, handle, issued_at_ms) in pending {
         let conversation = ConversationId(conversation);
-        // No device of the peer known yet: sealed once one is (the ratchet does not move).
-        let Some(recipients) = devices
-            .iter()
-            .find(|(p, _)| p.0 == peer)
-            .map(|(_, r)| r)
-            .filter(|r| !r.is_empty())
-        else {
+        let Some(recipients) = recipients(devices, peer) else {
             continue;
         };
         let Some(issued_at_ms) = issued_at_ms else {
@@ -780,45 +865,16 @@ fn seal(
         };
         let handle_sent = handle.is_some();
         let tx = c.transaction().map_err(sql)?;
-        let Some(group) = group_row(&tx, conversation)? else {
-            continue;
-        };
-        let provider = MlsProvider::new(KvStore::load_scope(&tx, conversation.0)?);
-        let (signer, _) = signer_of(local);
         let message =
             push_handle_message(identity.installation, issued_at_ms, handle.unwrap_or_default());
-        let key = MessageKey {
-            conversation,
-            sender: identity.peer,
-            installation: identity.installation,
-            id: message.msg_id,
-        };
-        let frame = match seal_one(&tx, &provider, &signer, identity, key, &group.group_id, &message, wall) {
-            Ok((_, frame)) => frame,
-            // A group that cannot seal now: tried again with the next pass.
-            Err(error) if error.code == ErrorCode::InvalidMessage => continue,
-            Err(error) => return Err(error),
-        };
-        // One frame per recipient: a newer one replaces what is still queued (plan 2).
-        for recipient in recipients {
-            tx.execute(
-                "INSERT OR REPLACE INTO push_delivery VALUES(?1,?2,?3,?4,0,?5,0)",
-                params![
-                    conversation.0.as_slice(),
-                    recipient.0.as_slice(),
-                    message.msg_id.0.as_slice(),
-                    frame,
-                    integer(now)?
-                ],
-            )
-            .map_err(sql)?;
+        if !routing.seal(&tx, conversation, &message, FrameKind::PushHandle, recipients)? {
+            continue;
         }
         tx.execute(
             "UPDATE push_tag SET announced=1 WHERE conversation=?1",
             params![conversation.0.as_slice()],
         )
         .map_err(sql)?;
-        provider.storage().flush(&tx, conversation.0)?;
         finish(tx, fault)?;
         if handle_sent {
             announced += 1;
@@ -829,6 +885,90 @@ fn seal(
     Ok((announced, withdrawn))
 }
 
+/// How the frame `msg_id` of `kind` sent to `recipient` ended: taken (its row goes), or tried
+/// again later with the M4 back-off. A frame replaced meanwhile (a newer one of the same kind)
+/// is another row, left as it is; a row of the other kind is never touched. Returns the rows
+/// changed.
+fn delivered(
+    c: &mut Connection,
+    (conversation, recipient, kind, msg_id): (ConversationId, InstallationId, FrameKind, MessageId),
+    outcome: Delivery,
+    now: u64,
+    fault: Fault,
+) -> R<u64> {
+    let tx = c.transaction().map_err(sql)?;
+    let key = params![
+        conversation.0.as_slice(),
+        recipient.0.as_slice(),
+        msg_id.0.as_slice(),
+        kind.value()
+    ];
+    let changed = match outcome {
+        Delivery::Acked | Delivery::Settled => tx
+            .execute(
+                "DELETE FROM push_delivery WHERE conversation=?1 AND recipient_install=?2 AND kind=?4 AND msg_id=?3",
+                key,
+            )
+            .map_err(sql)?,
+        Delivery::Retry => {
+            let attempts: Option<u64> = tx
+                .query_row(
+                    "SELECT attempts FROM push_delivery WHERE conversation=?1 AND recipient_install=?2 AND kind=?4 AND msg_id=?3",
+                    key,
+                    |r| uint(r, 0),
+                )
+                .optional()
+                .map_err(sql)?;
+            match attempts {
+                Some(attempts) => {
+                    // The M4 receipt back-off: 1 s doubling to 5 min.
+                    let attempts = attempts.saturating_add(1).min(u64::from(u32::MAX));
+                    let next = now.saturating_add(super::scheduler::retry_delay(attempts));
+                    tx.execute(
+                        "UPDATE push_delivery SET attempts=?4,next_retry_at_ms=?5 WHERE conversation=?1 AND recipient_install=?2 AND kind=?6 AND msg_id=?3",
+                        params![
+                            conversation.0.as_slice(),
+                            recipient.0.as_slice(),
+                            msg_id.0.as_slice(),
+                            integer(attempts)?,
+                            integer(next)?,
+                            kind.value()
+                        ],
+                    )
+                    .map_err(sql)?
+                }
+                None => 0,
+            }
+        }
+    };
+    finish(tx, fault)?;
+    Ok(changed as u64)
+}
+
+/// A "no group" answer before the join grew the row's wait (`delivered`, up to 5 min); the
+/// recipient has the group now, so nothing is gained by waiting it out. Returns the rows changed.
+fn joined(
+    c: &mut Connection,
+    conversation: ConversationId,
+    recipient: InstallationId,
+    now: u64,
+    fault: Fault,
+) -> R<u64> {
+    let tx = c.transaction().map_err(sql)?;
+    let changed = tx
+        .execute(
+            "UPDATE push_delivery SET attempts=0,next_retry_at_ms=min(next_retry_at_ms,?3) WHERE conversation=?1 AND recipient_install=?2 AND kind IN (1,2)",
+            params![
+                conversation.0.as_slice(),
+                recipient.0.as_slice(),
+                integer(now)?
+            ],
+        )
+        .map_err(sql)?;
+    finish(tx, fault)?;
+    Ok(changed as u64)
+}
+
 fn due(c: &Connection, now: u64, recipients: &[InstallationId]) -> R<PushDbReply> {
     let now_value = integer(now)?;
     let rows = if recipients.is_empty() {
@@ -836,7 +976,7 @@ fn due(c: &Connection, now: u64, recipients: &[InstallationId]) -> R<PushDbReply
     } else {
         let reachable = vec!["?"; recipients.len()].join(",");
         let mut q = c
-            .prepare(&format!("SELECT conversation,recipient_install,msg_id,wire FROM push_delivery WHERE next_retry_at_ms<=? AND recipient_install IN ({reachable}) ORDER BY next_retry_at_ms,conversation,recipient_install LIMIT {DUE_MAX}"))
+            .prepare(&format!("SELECT conversation,recipient_install,kind,msg_id,wire FROM push_delivery WHERE kind IN (1,2) AND next_retry_at_ms<=? AND recipient_install IN ({reachable}) ORDER BY next_retry_at_ms,conversation,recipient_install,kind LIMIT {DUE_MAX}"))
             .map_err(sql)?;
         let mut values: Vec<rusqlite::types::Value> = vec![now_value.into()];
         values.extend(recipients.iter().map(|r| r.0.to_vec().into()));
@@ -844,8 +984,9 @@ fn due(c: &Connection, now: u64, recipients: &[InstallationId]) -> R<PushDbReply
             Ok(PushDue {
                 conversation: ConversationId(bytes(r, 0)?),
                 recipient: InstallationId(bytes(r, 1)?),
-                msg_id: MessageId(bytes(r, 2)?),
-                wire: r.get(3)?,
+                kind: frame_kind(r, 2)?,
+                msg_id: MessageId(bytes(r, 3)?),
+                wire: r.get(4)?,
             })
         })
         .map_err(sql)?
@@ -854,7 +995,7 @@ fn due(c: &Connection, now: u64, recipients: &[InstallationId]) -> R<PushDbReply
     };
     let (next, left) = c
         .query_row(
-            "SELECT (SELECT min(next_retry_at_ms) FROM push_delivery WHERE next_retry_at_ms>?1),EXISTS(SELECT 1 FROM push_delivery WHERE next_retry_at_ms<=?1)",
+            "SELECT (SELECT min(next_retry_at_ms) FROM push_delivery WHERE kind IN (1,2) AND next_retry_at_ms>?1),EXISTS(SELECT 1 FROM push_delivery WHERE kind IN (1,2) AND next_retry_at_ms<=?1)",
             params![now_value],
             |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, bool>(1)?)),
         )
@@ -869,21 +1010,26 @@ fn due(c: &Connection, now: u64, recipients: &[InstallationId]) -> R<PushDbReply
 /// A queued frame as `hand_off` reads it: conversation, peer account, msg_id, frame.
 type QueuedFrame = ([u8; 32], [u8; 32], [u8; 16], Vec<u8>);
 
-fn hand_off(c: &mut Connection, fault: Fault) -> R<Vec<HandoffEntry>> {
+fn hand_off(c: &mut Connection, own: &[InstallationId], fault: Fault) -> R<Vec<HandoffEntry>> {
     let tx = c.transaction().map_err(sql)?;
+    let mine = vec!["?"; own.len()].join(",");
+    let own: Vec<&[u8]> = own.iter().map(|i| i.0.as_slice()).collect();
     let rows: Vec<QueuedFrame> = {
         let mut q = tx
-            .prepare("SELECT d.conversation,v.peer,d.msg_id,min(d.wire) FROM push_delivery d JOIN conversation v ON v.id=d.conversation GROUP BY d.conversation,d.msg_id ORDER BY d.conversation,d.msg_id")
+            .prepare(&format!("SELECT d.conversation,v.peer,d.msg_id,min(d.wire) FROM push_delivery d JOIN conversation v ON v.id=d.conversation WHERE d.kind IN (1,2) AND d.recipient_install NOT IN ({mine}) GROUP BY d.conversation,d.msg_id ORDER BY d.conversation,d.msg_id"))
             .map_err(sql)?;
-        q.query_map([], |r| {
+        q.query_map(rusqlite::params_from_iter(&own), |r| {
             Ok((bytes(r, 0)?, bytes(r, 1)?, bytes(r, 2)?, r.get(3)?))
         })
         .map_err(sql)?
         .collect::<Result<_, _>>()
         .map_err(sql)?
     };
-    tx.execute("UPDATE push_delivery SET handed_off=1 WHERE handed_off=0", [])
-        .map_err(sql)?;
+    tx.execute(
+        &format!("UPDATE push_delivery SET handed_off=1 WHERE kind IN (1,2) AND handed_off=0 AND recipient_install NOT IN ({mine})"),
+        rusqlite::params_from_iter(&own),
+    )
+    .map_err(sql)?;
     finish(tx, fault)?;
     // The row holds the complete kind 17 `App` frame; the mailbox gets its ciphertext.
     Ok(rows
@@ -944,10 +1090,12 @@ fn prune(
                 .map_err(sql)?
         };
         for (conversation, installation, peer) in rows {
-            let gone = peers
-                .iter()
-                .find(|(p, _)| p.0 == peer)
-                .is_some_and(|(_, current)| !current.iter().any(|i| i.0 == installation));
+            // A `QueueRef` is queued for my other devices too.
+            let gone = !own.iter().any(|o| o.0 == installation)
+                && peers
+                    .iter()
+                    .find(|(p, _)| p.0 == peer)
+                    .is_some_and(|(_, current)| !current.iter().any(|i| i.0 == installation));
             if gone {
                 dropped += tx
                     .execute(
@@ -986,18 +1134,33 @@ pub(super) fn store_own_handle(
     Ok(())
 }
 
-/// A mailbox delivered this device's `PushHandle` frame `msg_id` (its `Delivered` note, M6 spec
-/// 7): the peer account has it, so it is no longer queued for any of its devices.
+/// A mailbox delivered this device's `PushHandle` or `QueueRef` frame `msg_id` (its `Delivered`
+/// note, M6 spec 7): the peer account has it, so it is no longer queued for any of its devices.
+/// What is queued for `own` (this account's devices; a `QueueRef`'s) stays. The note names no
+/// kind; a msg_id names one, since the two kinds derive theirs under different domains
+/// (`payload::routing_message`).
 pub(super) fn drop_delivered(
     tx: &Transaction<'_>,
     conversation: ConversationId,
     msg_id: MessageId,
+    own: &[InstallationId],
 ) -> R<()> {
-    tx.execute(
-        "DELETE FROM push_delivery WHERE conversation=?1 AND msg_id=?2",
-        params![conversation.0.as_slice(), msg_id.0.as_slice()],
-    )
-    .map_err(sql)?;
+    let recipients: Vec<[u8; 32]> = tx
+        .prepare("SELECT recipient_install FROM push_delivery WHERE conversation=?1 AND kind IN (1,2) AND msg_id=?2")
+        .map_err(sql)?
+        .query_map(params![conversation.0.as_slice(), msg_id.0.as_slice()], |r| {
+            bytes::<32>(r, 0)
+        })
+        .map_err(sql)?
+        .collect::<Result<_, _>>()
+        .map_err(sql)?;
+    for recipient in recipients.iter().filter(|r| !own.iter().any(|o| o.0 == **r)) {
+        tx.execute(
+            "DELETE FROM push_delivery WHERE conversation=?1 AND recipient_install=?2 AND kind IN (1,2) AND msg_id=?3",
+            params![conversation.0.as_slice(), recipient.as_slice(), msg_id.0.as_slice()],
+        )
+        .map_err(sql)?;
+    }
     Ok(())
 }
 
@@ -1203,6 +1366,8 @@ pub struct PushTagRow {
 pub struct PushDeliveryRow {
     pub conversation: ConversationId,
     pub recipient: InstallationId,
+    /// 1 `PushHandle`, 2 `QueueRef`.
+    pub kind: u8,
     pub msg_id: MessageId,
     pub attempts: u64,
     pub handed_off: bool,
@@ -1222,7 +1387,7 @@ pub struct PushState {
     pub tags: Vec<PushTagRow>,
     /// `push_own`, by installation.
     pub own: Vec<(InstallationId, Vec<u8>)>,
-    /// By conversation and recipient.
+    /// By conversation, recipient and kind.
     pub deliveries: Vec<PushDeliveryRow>,
 }
 
@@ -1259,15 +1424,16 @@ pub(super) fn fixture_state(c: &rusqlite::Connection) -> R<PushState> {
         .collect::<Result<_, _>>()
         .map_err(sql)?;
     let deliveries = c
-        .prepare("SELECT conversation,recipient_install,msg_id,attempts,handed_off FROM push_delivery ORDER BY conversation,recipient_install")
+        .prepare("SELECT conversation,recipient_install,kind,msg_id,attempts,handed_off FROM push_delivery WHERE kind IN (1,2) ORDER BY conversation,recipient_install,kind")
         .map_err(sql)?
         .query_map([], |r| {
             Ok(PushDeliveryRow {
                 conversation: ConversationId(bytes(r, 0)?),
                 recipient: InstallationId(bytes(r, 1)?),
-                msg_id: MessageId(bytes(r, 2)?),
-                attempts: uint(r, 3)?,
-                handed_off: r.get(4)?,
+                kind: frame_kind(r, 2)? as u8,
+                msg_id: MessageId(bytes(r, 3)?),
+                attempts: uint(r, 4)?,
+                handed_off: r.get(5)?,
             })
         })
         .map_err(sql)?
@@ -1284,4 +1450,171 @@ pub(super) fn fixture_state(c: &rusqlite::Connection) -> R<PushState> {
         own,
         deliveries,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One `PushHandle` and one `QueueRef` frame queued for the same device of a conversation:
+    /// its acknowledgement of the `QueueRef` takes that row only, and a retry backs off that
+    /// row only.
+    #[test]
+    fn ack_of_queue_ref_deletes_only_its_kind() {
+        let mut c = Connection::open_in_memory().unwrap();
+        c.execute_batch(include_str!("../storage/schema.sql"))
+            .unwrap();
+        let (conv, to) = (ConversationId([1; 32]), InstallationId([2; 32]));
+        let (handle_id, queue_id) = (MessageId([3; 16]), MessageId([4; 16]));
+        for (kind, id) in [
+            (FrameKind::PushHandle, handle_id),
+            (FrameKind::QueueRef, queue_id),
+        ] {
+            c.execute(
+                "INSERT INTO push_delivery VALUES(?1,?2,?3,?4,x'01',0,0,0)",
+                params![
+                    conv.0.as_slice(),
+                    to.0.as_slice(),
+                    kind.value(),
+                    id.0.as_slice()
+                ],
+            )
+            .unwrap();
+        }
+        let rows = |c: &Connection| -> Vec<(i64, i64)> {
+            c.prepare("SELECT kind,attempts FROM push_delivery ORDER BY kind")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        use super::super::mls_store::NO_FAULT;
+        // The handle's msg_id under the other kind names no row.
+        let wrong = (conv, to, FrameKind::QueueRef, handle_id);
+        assert_eq!(
+            delivered(&mut c, wrong, Delivery::Acked, 5, NO_FAULT).unwrap(),
+            0
+        );
+        let queue = (conv, to, FrameKind::QueueRef, queue_id);
+        assert_eq!(
+            delivered(&mut c, queue, Delivery::Retry, 5, NO_FAULT).unwrap(),
+            1
+        );
+        assert_eq!(rows(&c), [(1, 0), (2, 1)]);
+        assert_eq!(
+            delivered(&mut c, queue, Delivery::Acked, 5, NO_FAULT).unwrap(),
+            1
+        );
+        assert_eq!(rows(&c), [(1, 0)]);
+        let handle = (conv, to, FrameKind::PushHandle, handle_id);
+        assert_eq!(
+            delivered(&mut c, handle, Delivery::Acked, 5, NO_FAULT).unwrap(),
+            1
+        );
+        assert!(rows(&c).is_empty());
+    }
+
+    /// A `QueueRef` queued for a peer's device and for my other device, under one conversation
+    /// whose peer account lists only its own device.
+    fn queued_for_both() -> (Connection, ConversationId, MessageId, PeerId, [InstallationId; 2]) {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(include_str!("../storage/schema.sql"))
+            .unwrap();
+        let (conv, peer, id) = (ConversationId([1; 32]), PeerId([9; 32]), MessageId([4; 16]));
+        let (theirs, mine) = (InstallationId([2; 32]), InstallationId([3; 32]));
+        c.execute(
+            "INSERT INTO conversation VALUES(?1,?2,0,zeroblob(32),0,0)",
+            params![conv.0.as_slice(), peer.0.as_slice()],
+        )
+        .unwrap();
+        for to in [theirs, mine] {
+            c.execute(
+                "INSERT INTO push_delivery VALUES(?1,?2,2,?3,x'01',0,0,1)",
+                params![conv.0.as_slice(), to.0.as_slice(), id.0.as_slice()],
+            )
+            .unwrap();
+        }
+        (c, conv, id, peer, [theirs, mine])
+    }
+
+    fn recipients_left(c: &Connection) -> Vec<[u8; 32]> {
+        c.prepare("SELECT recipient_install FROM push_delivery ORDER BY recipient_install")
+            .unwrap()
+            .query_map([], |r| bytes::<32>(r, 0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    /// Post-final review m6: a frame left queued for my other device alone is not handed to a
+    /// mailbox, which delivers to the peer account only (it was handed over again at every
+    /// background, for up to 7 days). A frame also queued for a peer device goes once, and only
+    /// the peer's row is marked.
+    #[test]
+    fn hand_off_takes_only_frames_queued_for_the_peer() {
+        use super::super::mls_store::NO_FAULT;
+        let (mut c, conv, id, peer, [_, mine]) = queued_for_both();
+        let wire = |conversation| {
+            MlsFrame::App {
+                conversation,
+                ciphertext: vec![7; 8],
+            }
+            .encode()
+            .to_vec()
+        };
+        c.execute("UPDATE push_delivery SET wire=?1,handed_off=0", params![wire(conv)])
+            .unwrap();
+        // Another conversation (one per peer), whose frame waits for my device alone.
+        let (mine_only, other) = (ConversationId([5; 32]), MessageId([6; 16]));
+        c.execute(
+            "INSERT INTO conversation VALUES(?1,?2,0,zeroblob(32),0,0)",
+            params![mine_only.0.as_slice(), [8u8; 32].as_slice()],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO push_delivery VALUES(?1,?2,2,?3,?4,0,0,0)",
+            params![
+                mine_only.0.as_slice(),
+                mine.0.as_slice(),
+                other.0.as_slice(),
+                wire(mine_only)
+            ],
+        )
+        .unwrap();
+
+        let handed = hand_off(&mut c, &[mine], NO_FAULT).unwrap();
+        let handed: Vec<_> = handed.iter().map(|e| (e.conversation, e.peer, e.msg_id)).collect();
+        assert_eq!(handed, [(conv, peer, id)]);
+        let marked: Vec<([u8; 32], bool)> = c
+            .prepare("SELECT recipient_install,handed_off FROM push_delivery ORDER BY conversation,recipient_install")
+            .unwrap()
+            .query_map([], |r| Ok((bytes::<32>(r, 0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(marked, [([2; 32], true), (mine.0, false), (mine.0, false)]);
+    }
+
+    /// The mailbox delivered the frame to the peer account: its rows go, mine stays.
+    #[test]
+    fn mailbox_delivery_to_the_peer_keeps_my_devices_row() {
+        let (mut c, conv, id, _, [_, mine]) = queued_for_both();
+        let tx = c.transaction().unwrap();
+        drop_delivered(&tx, conv, id, &[mine]).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(recipients_left(&c), [mine.0]);
+    }
+
+    /// A device list change keeps what is queued for my other current device although the
+    /// peer's record does not list it, and drops it once it is not current either.
+    #[test]
+    fn prune_keeps_my_current_devices_rows() {
+        use super::super::mls_store::NO_FAULT;
+        let (mut c, _, _, peer, [theirs, mine]) = queued_for_both();
+        prune(&mut c, &[mine], &[(peer, vec![theirs])], NO_FAULT).unwrap();
+        assert_eq!(recipients_left(&c), [theirs.0, mine.0]);
+        prune(&mut c, &[], &[(peer, vec![theirs])], NO_FAULT).unwrap();
+        assert_eq!(recipients_left(&c), [theirs.0]);
+    }
 }
