@@ -653,6 +653,41 @@ async fn an_ask_started_by_a_received_text_never_creates_a_group() {
     assert_eq!(state(&b1, conv).await.group_id, group);
 }
 
+/// A1 holds A2's Welcome, backed off 5 min by failed attempts (the most it waits). A2 asks A1
+/// to join: A1 makes no new Commit, since the queued Welcome is the answer, and sends that
+/// Welcome now instead of after its back-off.
+#[tokio::test]
+async fn an_ask_sends_a_backed_off_welcome_now() {
+    use chat_core::account::clock::Clock as _;
+    let (a1, a2, b1, _net, conv) = three_with(&[B1], false).await;
+    let epoch = a1_adds_a2(&a1, &a2, &b1, conv).await;
+    let ia2 = installation(&a2).await;
+    let fixture = a1.account.storage_test_fixture();
+    let welcome = fixture
+        .mls_delivery_frame(conv, ia2, 2, epoch)
+        .await
+        .unwrap()
+        .expect("A2's Welcome");
+    let backed_off = NOW * 1000 + a1.clock.monotonic_ms() + 300_000;
+    fixture
+        .mls_set_delivery(conv, ia2, 2, epoch, Some((welcome, backed_off)))
+        .await
+        .unwrap();
+    link(&a1, &a2).await;
+    a2.account.connect_account(a2.peer).await.unwrap();
+    let asked = a2.clock.monotonic_ms();
+    ensure(&a2, b1.peer).await;
+    settle!(
+        [&a1, &a2, &b1],
+        state(&a2, conv).await.group_epoch == Some(epoch)
+    );
+    let waited = a2.clock.monotonic_ms() - asked;
+    assert!(sent_to(&a2, installation(&a1).await, "join_request").await >= 1);
+    assert!(waited <= 30_000, "the Welcome waited {waited} ms");
+    assert_eq!(state(&a1, conv).await.group_epoch, Some(epoch), "A1 committed again");
+    assert!(agreed(&a1, &a2, conv).await);
+}
+
 /// A1 revoked A2 and still has a delivery queued for it: A2 is never dialed. A delivery queued
 /// for B's device B2 (in B's record, never online) is, so the dialing itself runs.
 #[tokio::test]
