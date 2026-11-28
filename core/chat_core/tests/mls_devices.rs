@@ -569,13 +569,10 @@ async fn welcome_to_member_without_session_dials_it() {
     assert!(sent_to(&b1, ia2, "welcome").await >= 1);
 }
 
-/// e2e m6 (run 46037571545): B1 made the group with A1 alone, A1 added A2, and A1 went off
-/// before A2's Welcome left it (A1 cannot reach A2 here). B1's next text reaches A2 anyway:
-/// A2 asks B1 for the group it has no Welcome for, instead of waiting for A1.
-#[tokio::test]
-async fn a_member_whose_welcome_is_stuck_on_an_off_device_gets_the_text() {
-    let (a1, a2, b1, _net, conv) = three_with(&[B1], false).await;
-    let (ia1, ia2) = (installation(&a1).await, installation(&a2).await);
+/// A1 adds A2 to the group B1 made with A1 alone and keeps A2's Welcome queued (A1 cannot reach
+/// A2 here). Returns the epoch of the Welcome once B1 has the Commit.
+async fn a1_adds_a2(a1: &Fixture, a2: &Fixture, b1: &Fixture, conv: ConversationId) -> u64 {
+    let ia2 = installation(a2).await;
     let key_package = a2
         .account
         .storage_test_fixture()
@@ -596,21 +593,64 @@ async fn a_member_whose_welcome_is_stuck_on_an_off_device_gets_the_text() {
         .unwrap()
         .expect("an own Commit");
     settle!(
-        [&a1, &b1],
-        state(&b1, conv).await.group_epoch == Some(epoch)
+        [a1, b1],
+        state(b1, conv).await.group_epoch == Some(epoch)
     );
-    assert!(state(&b1, conv).await.members.contains(&ia2));
-    let welcome = |(to, kind, _): &(_, u8, u64)| *to == ia2 && *kind == 2;
-    assert!(state(&a1, conv).await.deliveries.iter().any(welcome));
+    assert!(state(b1, conv).await.members.contains(&ia2));
+    let welcome = |(to, kind, at): &(_, u8, u64)| *to == ia2 && *kind == 2 && *at == epoch;
+    assert!(state(a1, conv).await.deliveries.iter().any(welcome));
+    epoch
+}
+
+/// e2e m6 (run 46037571545): B1 made the group with A1 alone, A1 added A2, and A1 went off
+/// before A2's Welcome left it. A2 has a session with B1 only. Returns A2, B1, the network and
+/// the conversation.
+async fn welcome_stuck_on_a_gone_a1() -> (Fixture, Fixture, Arc<Backend>, ConversationId) {
+    let (a1, a2, b1, net, conv) = three_with(&[B1], false).await;
+    a1_adds_a2(&a1, &a2, &b1, conv).await;
+    let ia1 = installation(&a1).await;
     drop(a1);
     b1.account.mls_test_close_session(ia1).await.unwrap();
     a2.account.connect_account(b1.peer).await.unwrap();
+    (a2, b1, net, conv)
+}
+
+/// The m6 state: B1's next text reaches A2 anyway. A2 asks B1 for the group it has no Welcome
+/// for, instead of waiting for A1.
+#[tokio::test]
+async fn a_member_whose_welcome_is_stuck_on_an_off_device_gets_the_text() {
+    let (a2, b1, _net, _) = welcome_stuck_on_a_gone_a1().await;
     let sent = send(&b1, &a2, 1, "to the device added last").await;
     settle!(
         [&a2, &b1],
         message(&a2, sent.key).await.is_some()
             && delivery(&b1, sent.key).await == DeliveryState::Delivered
     );
+}
+
+/// The m6 state over a link that drops every GroupQuery of A2's, while B1 still answers
+/// KeyPackageRequests. A2 asks because of a text it cannot open, so it only joins: it makes no
+/// group of its own while no query is answered (B1 would have to switch to it), and joins B1's
+/// group once one is.
+#[tokio::test]
+async fn an_ask_started_by_a_received_text_never_creates_a_group() {
+    let (a2, b1, _net, conv) = welcome_stuck_on_a_gone_a1().await;
+    let (group, ib1) = (state(&b1, conv).await.group_id, installation(&b1).await);
+    a2.account.mls_test_drop_queries(true).await.unwrap();
+    let sent = send(&b1, &a2, 1, "to a device whose queries are lost").await;
+    settle!([&a2, &b1], sent_to(&a2, ib1, "group_query").await >= 1);
+    idle(&[&a2, &b1], 30).await;
+    assert_eq!(state(&a2, conv).await.group_id, None, "A2 made a group of its own");
+    assert_eq!(state(&b1, conv).await.group_id, group, "B1 switched groups");
+    assert!(sent_to(&a2, ib1, "group_query").await >= 3, "A2 stopped asking");
+    a2.account.mls_test_drop_queries(false).await.unwrap();
+    settle!(
+        [&a2, &b1],
+        message(&a2, sent.key).await.is_some()
+            && delivery(&b1, sent.key).await == DeliveryState::Delivered
+    );
+    assert_eq!(state(&a2, conv).await.group_id, group);
+    assert_eq!(state(&b1, conv).await.group_id, group);
 }
 
 /// A1 revoked A2 and still has a delivery queued for it: A2 is never dialed. A delivery queued

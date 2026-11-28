@@ -206,6 +206,9 @@ pub(crate) struct Runtime {
     /// spawned, and accepted ones.
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     pub(super) settled: u64,
+    /// While true, every `GroupQuery` this actor sends ends as if the link dropped it.
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    drop_queries: bool,
 }
 
 /// Back-off of an installation that refused kind 17.
@@ -429,6 +432,7 @@ pub(crate) enum MlsTest {
     HoldDials(bool),
     Dial(PeerId, InstallationId),
     Sessions,
+    DropQueries(bool),
 }
 #[cfg(all(feature = "test-hooks", debug_assertions))]
 pub(crate) enum MlsTestReply {
@@ -584,6 +588,10 @@ impl AccountHandle {
             _ => unreachable!(),
         }
     }
+    /// Makes every `GroupQuery` this core sends time out (a link that drops it), or not.
+    pub async fn mls_test_drop_queries(&self, drop: bool) -> Result<(), CoreError> {
+        self.mls_test(MlsTest::DropQueries(drop)).await.map(|_| ())
+    }
     /// How many connections this core finished with so far (results of the dials it spawned,
     /// and connections it accepted), and its live ready sessions: with which installation, and
     /// whether this device dialed it.
@@ -667,6 +675,10 @@ impl Manager {
             MlsTest::Recovered => MlsTestReply::Count(self.messages.mls.recovered),
             MlsTest::HoldDials(hold) => {
                 self.messages.mls.dial_hold.send_replace(hold);
+                MlsTestReply::Done
+            }
+            MlsTest::DropQueries(drop) => {
+                self.messages.mls.drop_queries = drop;
                 MlsTestReply::Done
             }
             MlsTest::Dial(peer, installation) => {
@@ -762,6 +774,10 @@ impl Manager {
 
     fn launch(&mut self, session: &Session, body: Vec<u8>, task: Task, request: Request) {
         #[cfg(all(feature = "test-hooks", debug_assertions))]
+        let dropped = self.messages.mls.drop_queries && matches!(task, Task::Query { .. });
+        #[cfg(not(all(feature = "test-hooks", debug_assertions)))]
+        let dropped = false;
+        #[cfg(all(feature = "test-hooks", debug_assertions))]
         {
             self.messages
                 .mls
@@ -773,7 +789,12 @@ impl Manager {
         let session = session.clone();
         let ticket = request.ticket;
         tokio::spawn(async move {
-            let answer = Answer::Reply(exchange(&session, &body).await);
+            let reply = if dropped {
+                Err(ErrorCode::NetworkTimeout)
+            } else {
+                exchange(&session, &body).await
+            };
+            let answer = Answer::Reply(reply);
             let _ = mailbox
                 .send(Input::Mls(MlsEvent {
                     ticket,
