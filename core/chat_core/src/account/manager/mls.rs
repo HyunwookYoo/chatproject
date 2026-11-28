@@ -32,7 +32,9 @@ use crate::message::store::{MessageDbOp, MessageDbReply, OpenFrom, conversation_
 use crate::message::types::{BlockReason, ConversationId, MessageKey};
 use crate::message::wire::{Frame, RejectReason};
 use crate::mls::{
-    group::{CLASS_FUTURE_EPOCH, CLASS_OTHER, CLASS_OUT_OF_ORDER, inspect_key_package},
+    group::{
+        CLASS_FUTURE_EPOCH, CLASS_NO_GROUP, CLASS_OTHER, CLASS_OUT_OF_ORDER, inspect_key_package,
+    },
     identity::MlsCredential,
     wire::{MlsFrame, MlsReply},
 };
@@ -2754,7 +2756,17 @@ impl Manager {
             self.speaks_mls(carrier);
         }
         match result {
-            Ok(MessageDbReply::Opened(reply)) => Ok(answer(Some(reply))),
+            Ok(MessageDbReply::Opened(reply)) => {
+                // A member of the sender's group without its Welcome: the device that added it
+                // may be gone, so it joins through the group the sender has (spec 4.4) instead
+                // of waiting for that Welcome.
+                if matches!(via, Via::Direct(_))
+                    && matches!(reply, MlsReply::DecryptFailed { class: CLASS_NO_GROUP, .. })
+                {
+                    self.messages.mls.wanted.entry(conversation).or_insert(peer);
+                }
+                Ok(answer(Some(reply)))
+            }
             Ok(MessageDbReply::OpenedText(reply, key, new)) => {
                 // The keyed response checkpoint of tests: the Ack that stores this text.
                 #[cfg(all(feature = "test-hooks", debug_assertions))]

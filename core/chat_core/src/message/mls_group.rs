@@ -1549,6 +1549,19 @@ fn join_request(
     fault: Fault,
 ) -> R<Committed> {
     let asker = key_package_installation(key_package)?;
+    // Its Welcome is queued here already: another Commit would only replace that leaf again
+    // and move the group past what was sealed for it meanwhile.
+    let queued: Option<u64> = c
+        .query_row(
+            "SELECT epoch FROM mls_delivery WHERE conversation=?1 AND recipient_install=?2 AND kind=?3 ORDER BY epoch DESC LIMIT 1",
+            params![conversation.0.as_slice(), asker.0.as_slice(), DELIVER_WELCOME],
+            |r| uint(r, 0),
+        )
+        .optional()
+        .map_err(sql)?;
+    if let Some(epoch) = queued {
+        return Ok(Committed::Done { epoch });
+    }
     let committed = own_commit(
         c,
         identity,
