@@ -333,8 +333,6 @@ async fn backoff_caps_without_exhaustion() {
     let (a, b, _net, conv) = manual().await;
     let m = send(&a, &b, 9, "never opened").await;
     // B lost its group: every attempt is refused (class 4) and backs off, nothing is spent.
-    // B asks to join again (`open_received`); A's Welcome for it is held, so B stays out.
-    a.account.mls_test_hold_delivery(true).await.unwrap();
     b.account
         .storage_test_fixture()
         .messages()

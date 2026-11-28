@@ -3,8 +3,7 @@
 //! * `ensure_group` first asks the connected devices of the peer and of this account whether
 //!   the conversation has a group. If one says yes this device sends it a `JoinRequest` with a
 //!   new KeyPackage and waits for the Welcome; otherwise it collects KeyPackages from those
-//!   devices and creates the group. A device that asks because an App it got cannot be opened
-//!   (`Want::Join`) only joins: it asks again until a device answers that it has the group.
+//!   devices and creates the group.
 //! * `sync_members` keeps the group in step with both accounts' device lists: one own Commit at
 //!   a time, queued in `mls_delivery` for every other member installation (and a Welcome for
 //!   every added one) until each of them acknowledges it.
@@ -33,9 +32,7 @@ use crate::message::store::{MessageDbOp, MessageDbReply, OpenFrom, conversation_
 use crate::message::types::{BlockReason, ConversationId, MessageKey};
 use crate::message::wire::{Frame, RejectReason};
 use crate::mls::{
-    group::{
-        CLASS_FUTURE_EPOCH, CLASS_NO_GROUP, CLASS_OTHER, CLASS_OUT_OF_ORDER, inspect_key_package,
-    },
+    group::{CLASS_FUTURE_EPOCH, CLASS_OTHER, CLASS_OUT_OF_ORDER, inspect_key_package},
     identity::MlsCredential,
     wire::{MlsFrame, MlsReply},
 };
@@ -46,9 +43,6 @@ use std::collections::{BTreeMap, BTreeSet};
 const JOIN_WAIT_MS: u64 = 10_000;
 /// Pause before asking again when no device could help.
 const RETRY_MS: u64 = 2_000;
-/// A `Want::Join` whose JoinRequests are refused in a row waits `RETRY_MS` doubled once per
-/// refusal, up to this long.
-const JOIN_REFUSED_MAX_MS: u64 = 30_000;
 /// Pause between two lookups of one account for the holds waiting on it.
 const LOOKUP_RETRY_MS: u64 = 30_000;
 /// Pause before planning again while the own Commit is unacknowledged.
@@ -118,20 +112,6 @@ enum Phase {
     },
 }
 
-/// Why a conversation is in `wanted`, which decides what happens when no asked device answers
-/// that it has a group.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Want {
-    /// Something waits to be sealed in the group: create it.
-    Seal,
-    /// An App that came directly opened with class 4 (no group here), so the sender has a group
-    /// this device is missing: ask again. A timed-out query is no answer, and a group made
-    /// here would be a second one that the sender's whole group has to settle. `refused`
-    /// counts the JoinRequests answered with anything but `Accepted` in a row (`Busy` for a
-    /// device the record no longer lists), each of which doubles the pause before the next.
-    Join { refused: u32 },
-}
-
 /// KeyPackages being collected for one `sync_members` Commit.
 struct Collect {
     peer: PeerId,
@@ -143,7 +123,7 @@ struct Collect {
 #[derive(Default)]
 pub(crate) struct Runtime {
     /// Conversations that need a group; every poll drives `ensure_group` until it is ready.
-    wanted: BTreeMap<ConversationId, (PeerId, Want)>,
+    wanted: BTreeMap<ConversationId, PeerId>,
     phases: BTreeMap<ConversationId, Phase>,
     /// First-Commit hashes from `GroupInfo` replies, by conversation and answering installation;
     /// each is used for one Welcome from that installation.
@@ -224,9 +204,6 @@ pub(crate) struct Runtime {
     /// spawned, and accepted ones.
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     pub(super) settled: u64,
-    /// While true, every `GroupQuery` this actor sends ends as if the link dropped it.
-    #[cfg(all(feature = "test-hooks", debug_assertions))]
-    drop_queries: bool,
 }
 
 /// Back-off of an installation that refused kind 17.
@@ -450,7 +427,6 @@ pub(crate) enum MlsTest {
     HoldDials(bool),
     Dial(PeerId, InstallationId),
     Sessions,
-    DropQueries(bool),
 }
 #[cfg(all(feature = "test-hooks", debug_assertions))]
 pub(crate) enum MlsTestReply {
@@ -606,10 +582,6 @@ impl AccountHandle {
             _ => unreachable!(),
         }
     }
-    /// Makes every `GroupQuery` this core sends time out (a link that drops it), or not.
-    pub async fn mls_test_drop_queries(&self, drop: bool) -> Result<(), CoreError> {
-        self.mls_test(MlsTest::DropQueries(drop)).await.map(|_| ())
-    }
     /// How many connections this core finished with so far (results of the dials it spawned,
     /// and connections it accepted), and its live ready sessions: with which installation, and
     /// whether this device dialed it.
@@ -627,8 +599,7 @@ impl Manager {
         let own = self.local()?.keys.peer_id();
         Ok(match test {
             MlsTest::Ensure(peer) => {
-                let conversation = conversation_id(own, peer)?;
-                MlsTestReply::State(self.ensure_group(conversation, peer, Want::Seal).await?)
+                MlsTestReply::State(self.ensure_group(conversation_id(own, peer)?, peer).await?)
             }
             MlsTest::Rejoin(peer) => {
                 let request = self.ready()?;
@@ -694,10 +665,6 @@ impl Manager {
             MlsTest::Recovered => MlsTestReply::Count(self.messages.mls.recovered),
             MlsTest::HoldDials(hold) => {
                 self.messages.mls.dial_hold.send_replace(hold);
-                MlsTestReply::Done
-            }
-            MlsTest::DropQueries(drop) => {
-                self.messages.mls.drop_queries = drop;
                 MlsTestReply::Done
             }
             MlsTest::Dial(peer, installation) => {
@@ -793,10 +760,6 @@ impl Manager {
 
     fn launch(&mut self, session: &Session, body: Vec<u8>, task: Task, request: Request) {
         #[cfg(all(feature = "test-hooks", debug_assertions))]
-        let dropped = self.messages.mls.drop_queries && matches!(task, Task::Query { .. });
-        #[cfg(not(all(feature = "test-hooks", debug_assertions)))]
-        let dropped = false;
-        #[cfg(all(feature = "test-hooks", debug_assertions))]
         {
             self.messages
                 .mls
@@ -808,12 +771,7 @@ impl Manager {
         let session = session.clone();
         let ticket = request.ticket;
         tokio::spawn(async move {
-            let reply = if dropped {
-                Err(ErrorCode::NetworkTimeout)
-            } else {
-                exchange(&session, &body).await
-            };
-            let answer = Answer::Reply(reply);
+            let answer = Answer::Reply(exchange(&session, &body).await);
             let _ = mailbox
                 .send(Input::Mls(MlsEvent {
                     ticket,
@@ -1132,12 +1090,11 @@ impl Manager {
     }
 
     /// Makes sure the conversation has a group, or starts getting one (spec 4.4): ask first,
-    /// join what exists, create only when nobody has one and `want` is `Seal`.
+    /// join what exists, create only when nobody has one.
     pub(super) async fn ensure_group(
         &mut self,
         conversation: ConversationId,
         peer: PeerId,
-        want: Want,
     ) -> Result<GroupState, CoreError> {
         let request = self.ready()?;
         if let GroupReply::Info(Some(_)) =
@@ -1147,7 +1104,7 @@ impl Manager {
             self.messages.mls.phases.remove(&conversation);
             return Ok(GroupState::Ready);
         }
-        self.messages.mls.wanted.insert(conversation, (peer, want));
+        self.messages.mls.wanted.insert(conversation, peer);
         let now = self.schedule_now();
         match self.messages.mls.phases.get(&conversation) {
             Some(Phase::Joining { since }) if now < since.saturating_add(JOIN_WAIT_MS) => {
@@ -1211,40 +1168,6 @@ impl Manager {
         ) {
             self.messages.mls.phases.remove(&conversation);
         }
-    }
-
-    /// A JoinRequest was answered. Anything but `Accepted` asks again after `RETRY_MS`, or, for
-    /// a `Want::Join`, after a pause that doubles with each refusal in a row (a timeout is no
-    /// refusal), so a device that is refused for good does not ask every 2 s.
-    fn join_answered(
-        &mut self,
-        conversation: ConversationId,
-        result: &Result<MlsReply, ErrorCode>,
-    ) {
-        let mls = &mut self.messages.mls;
-        if !matches!(mls.phases.get(&conversation), Some(Phase::Joining { .. })) {
-            return;
-        }
-        let refused = match (result, mls.wanted.get_mut(&conversation)) {
-            (Ok(MlsReply::Accepted), Some((_, Want::Join { refused }))) => {
-                *refused = 0;
-                return;
-            }
-            (Ok(MlsReply::Accepted), _) => return,
-            (Ok(_), Some((_, Want::Join { refused }))) => {
-                *refused = refused.saturating_add(1);
-                *refused
-            }
-            _ => 0,
-        };
-        let pause = RETRY_MS
-            .saturating_mul(1 << refused.min(16))
-            .min(JOIN_REFUSED_MAX_MS);
-        let until = self.schedule_now().saturating_add(pause);
-        self.messages
-            .mls
-            .phases
-            .insert(conversation, Phase::Idle { until });
     }
 
     fn idle(&mut self, conversation: ConversationId) {
@@ -1325,13 +1248,6 @@ impl Manager {
             .encode()
             .to_vec();
             self.launch(&session, body, Task::Join { conversation }, request);
-            return Ok(());
-        }
-        if matches!(
-            self.messages.mls.wanted.get(&conversation),
-            Some((_, Want::Join { .. }))
-        ) {
-            self.idle(conversation);
             return Ok(());
         }
         // Nobody has a group: collect KeyPackages from every device that answered and create it.
@@ -1610,7 +1526,7 @@ impl Manager {
         {
             mls.rejoined += 1;
         }
-        self.ensure_group(conversation, peer, Want::Seal).await?;
+        self.ensure_group(conversation, peer).await?;
         Ok(true)
     }
 
@@ -2174,15 +2090,15 @@ impl Manager {
                 }
             }
         }
-        let wanted: Vec<(ConversationId, (PeerId, Want))> = self
+        let wanted: Vec<(ConversationId, PeerId)> = self
             .messages
             .mls
             .wanted
             .iter()
-            .map(|(conversation, want)| (*conversation, *want))
+            .map(|(conversation, peer)| (*conversation, *peer))
             .collect();
-        for (conversation, (peer, want)) in wanted {
-            if self.ensure_group(conversation, peer, want).await.is_err() {
+        for (conversation, peer) in wanted {
+            if self.ensure_group(conversation, peer).await.is_err() {
                 return;
             }
         }
@@ -2305,7 +2221,14 @@ impl Manager {
                 Ok(())
             }
             Task::Join { conversation } => {
-                self.join_answered(conversation, &result);
+                if !matches!(result, Ok(MlsReply::Accepted))
+                    && matches!(
+                        self.messages.mls.phases.get(&conversation),
+                        Some(Phase::Joining { .. })
+                    )
+                {
+                    self.idle(conversation);
+                }
                 Ok(())
             }
             Task::Learn {
@@ -2831,22 +2754,7 @@ impl Manager {
             self.speaks_mls(carrier);
         }
         match result {
-            Ok(MessageDbReply::Opened(reply)) => {
-                // Any App (a text, a receipt, a routing frame) from a group this device is a
-                // member of but has no Welcome for: the device that added it may be gone, so it
-                // joins through the group the sender has (spec 4.4) instead of waiting for that
-                // Welcome. A want to seal something stays one.
-                if matches!(via, Via::Direct(_))
-                    && matches!(reply, MlsReply::DecryptFailed { class: CLASS_NO_GROUP, .. })
-                {
-                    self.messages
-                        .mls
-                        .wanted
-                        .entry(conversation)
-                        .or_insert((peer, Want::Join { refused: 0 }));
-                }
-                Ok(answer(Some(reply)))
-            }
+            Ok(MessageDbReply::Opened(reply)) => Ok(answer(Some(reply))),
             Ok(MessageDbReply::OpenedText(reply, key, new)) => {
                 // The keyed response checkpoint of tests: the Ack that stores this text.
                 #[cfg(all(feature = "test-hooks", debug_assertions))]
