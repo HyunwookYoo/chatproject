@@ -3,7 +3,8 @@
 //! * `ensure_group` first asks the connected devices of the peer and of this account whether
 //!   the conversation has a group. If one says yes this device sends it a `JoinRequest` with a
 //!   new KeyPackage and waits for the Welcome; otherwise it collects KeyPackages from those
-//!   devices and creates the group.
+//!   devices and creates the group. A device that asks because an App it got cannot be opened
+//!   (`Want::Join`) only joins: it asks again until a device answers that it has the group.
 //! * `sync_members` keeps the group in step with both accounts' device lists: one own Commit at
 //!   a time, queued in `mls_delivery` for every other member installation (and a Welcome for
 //!   every added one) until each of them acknowledges it.
@@ -114,6 +115,18 @@ enum Phase {
     },
 }
 
+/// Why a conversation is in `wanted`, which decides what happens when no asked device answers
+/// that it has a group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Want {
+    /// Something waits to be sealed in the group: create it.
+    Seal,
+    /// An App that came directly opened with class 4 (no group here), so the sender has a group
+    /// this device is missing: ask again. A timed-out query is no answer, and a group made
+    /// here would be a second one that the sender's whole group has to settle.
+    Join,
+}
+
 /// KeyPackages being collected for one `sync_members` Commit.
 struct Collect {
     peer: PeerId,
@@ -125,7 +138,7 @@ struct Collect {
 #[derive(Default)]
 pub(crate) struct Runtime {
     /// Conversations that need a group; every poll drives `ensure_group` until it is ready.
-    wanted: BTreeMap<ConversationId, PeerId>,
+    wanted: BTreeMap<ConversationId, (PeerId, Want)>,
     phases: BTreeMap<ConversationId, Phase>,
     /// First-Commit hashes from `GroupInfo` replies, by conversation and answering installation;
     /// each is used for one Welcome from that installation.
@@ -609,7 +622,8 @@ impl Manager {
         let own = self.local()?.keys.peer_id();
         Ok(match test {
             MlsTest::Ensure(peer) => {
-                MlsTestReply::State(self.ensure_group(conversation_id(own, peer)?, peer).await?)
+                let conversation = conversation_id(own, peer)?;
+                MlsTestReply::State(self.ensure_group(conversation, peer, Want::Seal).await?)
             }
             MlsTest::Rejoin(peer) => {
                 let request = self.ready()?;
@@ -1113,11 +1127,12 @@ impl Manager {
     }
 
     /// Makes sure the conversation has a group, or starts getting one (spec 4.4): ask first,
-    /// join what exists, create only when nobody has one.
+    /// join what exists, create only when nobody has one and `want` is `Seal`.
     pub(super) async fn ensure_group(
         &mut self,
         conversation: ConversationId,
         peer: PeerId,
+        want: Want,
     ) -> Result<GroupState, CoreError> {
         let request = self.ready()?;
         if let GroupReply::Info(Some(_)) =
@@ -1127,7 +1142,7 @@ impl Manager {
             self.messages.mls.phases.remove(&conversation);
             return Ok(GroupState::Ready);
         }
-        self.messages.mls.wanted.insert(conversation, peer);
+        self.messages.mls.wanted.insert(conversation, (peer, want));
         let now = self.schedule_now();
         match self.messages.mls.phases.get(&conversation) {
             Some(Phase::Joining { since }) if now < since.saturating_add(JOIN_WAIT_MS) => {
@@ -1271,6 +1286,13 @@ impl Manager {
             .encode()
             .to_vec();
             self.launch(&session, body, Task::Join { conversation }, request);
+            return Ok(());
+        }
+        if matches!(
+            self.messages.mls.wanted.get(&conversation),
+            Some((_, Want::Join))
+        ) {
+            self.idle(conversation);
             return Ok(());
         }
         // Nobody has a group: collect KeyPackages from every device that answered and create it.
@@ -1549,7 +1571,7 @@ impl Manager {
         {
             mls.rejoined += 1;
         }
-        self.ensure_group(conversation, peer).await?;
+        self.ensure_group(conversation, peer, Want::Seal).await?;
         Ok(true)
     }
 
@@ -2113,15 +2135,15 @@ impl Manager {
                 }
             }
         }
-        let wanted: Vec<(ConversationId, PeerId)> = self
+        let wanted: Vec<(ConversationId, (PeerId, Want))> = self
             .messages
             .mls
             .wanted
             .iter()
-            .map(|(conversation, peer)| (*conversation, *peer))
+            .map(|(conversation, want)| (*conversation, *want))
             .collect();
-        for (conversation, peer) in wanted {
-            if self.ensure_group(conversation, peer).await.is_err() {
+        for (conversation, (peer, want)) in wanted {
+            if self.ensure_group(conversation, peer, want).await.is_err() {
                 return;
             }
         }
@@ -2778,13 +2800,18 @@ impl Manager {
         }
         match result {
             Ok(MessageDbReply::Opened(reply)) => {
-                // A member of the sender's group without its Welcome: the device that added it
-                // may be gone, so it joins through the group the sender has (spec 4.4) instead
-                // of waiting for that Welcome.
+                // Any App (a text, a receipt, a routing frame) from a group this device is a
+                // member of but has no Welcome for: the device that added it may be gone, so it
+                // joins through the group the sender has (spec 4.4) instead of waiting for that
+                // Welcome. A want to seal something stays one.
                 if matches!(via, Via::Direct(_))
                     && matches!(reply, MlsReply::DecryptFailed { class: CLASS_NO_GROUP, .. })
                 {
-                    self.messages.mls.wanted.entry(conversation).or_insert(peer);
+                    self.messages
+                        .mls
+                        .wanted
+                        .entry(conversation)
+                        .or_insert((peer, Want::Join));
                 }
                 Ok(answer(Some(reply)))
             }

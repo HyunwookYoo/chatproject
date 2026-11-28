@@ -1,4 +1,5 @@
 //! M4 message authorization and one bounded network attempt; scheduling remains separate.
+use super::mls::Want;
 use super::*;
 use crate::account::{
     auth,
@@ -1631,7 +1632,7 @@ impl Manager {
             .await
         {
             Ok(MessageDbReply::NeedGroup(conversation)) => {
-                self.ensure_group(conversation, peer).await?;
+                self.ensure_group(conversation, peer, Want::Seal).await?;
                 Ok(())
             }
             Ok(_) => Ok(()),
@@ -1656,7 +1657,7 @@ impl Manager {
         peer: PeerId,
         request: Request,
     ) -> Result<(), CoreError> {
-        self.ensure_group(conversation, peer).await?;
+        self.ensure_group(conversation, peer, Want::Seal).await?;
         if !receipt && self.account_outdated(peer) {
             self.message_db(MessageDbOp::MarkWaitingPeerUpdate(key, true), request)
                 .await?;
