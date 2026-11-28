@@ -46,6 +46,9 @@ use std::collections::{BTreeMap, BTreeSet};
 const JOIN_WAIT_MS: u64 = 10_000;
 /// Pause before asking again when no device could help.
 const RETRY_MS: u64 = 2_000;
+/// A `Want::Join` whose JoinRequests are refused in a row waits `RETRY_MS` doubled once per
+/// refusal, up to this long.
+const JOIN_REFUSED_MAX_MS: u64 = 30_000;
 /// Pause between two lookups of one account for the holds waiting on it.
 const LOOKUP_RETRY_MS: u64 = 30_000;
 /// Pause before planning again while the own Commit is unacknowledged.
@@ -123,8 +126,10 @@ pub(super) enum Want {
     Seal,
     /// An App that came directly opened with class 4 (no group here), so the sender has a group
     /// this device is missing: ask again. A timed-out query is no answer, and a group made
-    /// here would be a second one that the sender's whole group has to settle.
-    Join,
+    /// here would be a second one that the sender's whole group has to settle. `refused`
+    /// counts the JoinRequests answered with anything but `Accepted` in a row (`Busy` for a
+    /// device the record no longer lists), each of which doubles the pause before the next.
+    Join { refused: u32 },
 }
 
 /// KeyPackages being collected for one `sync_members` Commit.
@@ -1208,6 +1213,40 @@ impl Manager {
         }
     }
 
+    /// A JoinRequest was answered. Anything but `Accepted` asks again after `RETRY_MS`, or, for
+    /// a `Want::Join`, after a pause that doubles with each refusal in a row (a timeout is no
+    /// refusal), so a device that is refused for good does not ask every 2 s.
+    fn join_answered(
+        &mut self,
+        conversation: ConversationId,
+        result: &Result<MlsReply, ErrorCode>,
+    ) {
+        let mls = &mut self.messages.mls;
+        if !matches!(mls.phases.get(&conversation), Some(Phase::Joining { .. })) {
+            return;
+        }
+        let refused = match (result, mls.wanted.get_mut(&conversation)) {
+            (Ok(MlsReply::Accepted), Some((_, Want::Join { refused }))) => {
+                *refused = 0;
+                return;
+            }
+            (Ok(MlsReply::Accepted), _) => return,
+            (Ok(_), Some((_, Want::Join { refused }))) => {
+                *refused = refused.saturating_add(1);
+                *refused
+            }
+            _ => 0,
+        };
+        let pause = RETRY_MS
+            .saturating_mul(1 << refused.min(16))
+            .min(JOIN_REFUSED_MAX_MS);
+        let until = self.schedule_now().saturating_add(pause);
+        self.messages
+            .mls
+            .phases
+            .insert(conversation, Phase::Idle { until });
+    }
+
     fn idle(&mut self, conversation: ConversationId) {
         let until = self.schedule_now().saturating_add(RETRY_MS);
         self.messages
@@ -1290,7 +1329,7 @@ impl Manager {
         }
         if matches!(
             self.messages.mls.wanted.get(&conversation),
-            Some((_, Want::Join))
+            Some((_, Want::Join { .. }))
         ) {
             self.idle(conversation);
             return Ok(());
@@ -2266,14 +2305,7 @@ impl Manager {
                 Ok(())
             }
             Task::Join { conversation } => {
-                if !matches!(result, Ok(MlsReply::Accepted))
-                    && matches!(
-                        self.messages.mls.phases.get(&conversation),
-                        Some(Phase::Joining { .. })
-                    )
-                {
-                    self.idle(conversation);
-                }
+                self.join_answered(conversation, &result);
                 Ok(())
             }
             Task::Learn {
@@ -2811,7 +2843,7 @@ impl Manager {
                         .mls
                         .wanted
                         .entry(conversation)
-                        .or_insert((peer, Want::Join));
+                        .or_insert((peer, Want::Join { refused: 0 }));
                 }
                 Ok(answer(Some(reply)))
             }
